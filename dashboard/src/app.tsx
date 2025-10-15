@@ -1,0 +1,221 @@
+import { FunctionalComponent } from 'preact';
+import { useEffect, useMemo, useState } from 'preact/hooks';
+import {
+  parseProgressTracker,
+  parseBuildTimeline,
+  parseAlignmentLog,
+  parseConsentSnapshot,
+  ProgressItem,
+  TimelineEntry,
+  AlignmentEntry,
+} from './data';
+import ProgressTrackerMarkdown from '#docs/PROGRESS_TRACKER.md?raw';
+import BuildTimelineMarkdown from '#docs/BUILD_TIMELINE.md?raw';
+import AlignmentLogMarkdown from '#docs/PRD_ALIGNMENT_LOG.md?raw';
+import ConsentSnapshotMarkdown from '#docs/docs/analytics/consent_mfa_snapshot.md?raw';
+import { SectionCard } from './components/SectionCard';
+import { ProgressOverview } from './components/ProgressOverview';
+import { Timeline } from './components/Timeline';
+import { AlignmentUpdates } from './components/AlignmentUpdates';
+import { ConsentDashboard } from './components/ConsentDashboard';
+import { emitTelemetry, ensureTelemetrySession } from './telemetry';
+
+const getInitialTheme = (): 'light' | 'dark' => {
+  if (typeof window === 'undefined') {
+    return 'light';
+  }
+
+  const stored = window.localStorage.getItem('guideai-theme');
+  if (stored === 'dark' || stored === 'light') {
+    return stored;
+  }
+
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+};
+
+export const App: FunctionalComponent = () => {
+  const [theme, setTheme] = useState<'light' | 'dark'>(getInitialTheme);
+
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    document.body.classList.toggle('dark', theme === 'dark');
+    window.localStorage.setItem('guideai-theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    ensureTelemetrySession();
+  }, []);
+
+  const progressData = useMemo<ReturnType<typeof parseProgressTracker>>(
+    () => parseProgressTracker(ProgressTrackerMarkdown),
+    []
+  );
+  const timelineEntries = useMemo<ReturnType<typeof parseBuildTimeline>>(
+    () => parseBuildTimeline(BuildTimelineMarkdown),
+    []
+  );
+  const alignmentEntries = useMemo<ReturnType<typeof parseAlignmentLog>>(
+    () => parseAlignmentLog(AlignmentLogMarkdown),
+    []
+  );
+  const consentSnapshot = useMemo(() => parseConsentSnapshot(ConsentSnapshotMarkdown), []);
+
+  const consentTotals = useMemo(
+    () =>
+      consentSnapshot.metrics.reduce<{
+        prompts: number;
+        approvals: number;
+        denials: number;
+        mfaRequired: number;
+        mfaCompleted: number;
+        weightedLatency: number;
+      }>((acc, metric) => {
+        acc.prompts += metric.prompts;
+        acc.approvals += metric.approvals;
+        acc.denials += metric.denials;
+        acc.mfaRequired += metric.mfaRequired;
+        acc.mfaCompleted += metric.mfaCompleted;
+        acc.weightedLatency += metric.averageLatencySeconds * metric.prompts;
+        return acc;
+      }, {
+        prompts: 0,
+        approvals: 0,
+        denials: 0,
+        mfaRequired: 0,
+        mfaCompleted: 0,
+        weightedLatency: 0,
+      }),
+    [consentSnapshot.metrics]
+  );
+
+  const consentApprovalRate = consentTotals.prompts === 0
+    ? 0
+    : (consentTotals.approvals / consentTotals.prompts) * 100;
+  const consentMfaCompletion = consentTotals.mfaRequired === 0
+    ? 0
+    : (consentTotals.mfaCompleted / consentTotals.mfaRequired) * 100;
+
+  type Stat = { label: string; value: string };
+
+  const stats = useMemo<Stat[]>(() => {
+    const items: ProgressItem[] = progressData.sections;
+    const total = items.length;
+    const completed = items.filter((item: ProgressItem) => item.status.includes('✅')).length;
+    const inFlight = items.filter((item: ProgressItem) => item.status.includes('⏳')).length;
+    const owners = Array.from(
+      new Set(items.map((item: ProgressItem) => item.owner))
+    ).filter(Boolean).length;
+    const completion = total === 0 ? 0 : Math.round((completed / total) * 100);
+
+    return [
+      { label: 'Scope Complete', value: `${completed}/${total}` },
+      { label: 'Completion', value: `${completion}%` },
+      { label: 'Active Tracks', value: inFlight.toString() },
+      { label: 'Contributors', value: owners.toString() },
+      { label: 'Consent Approval', value: `${consentApprovalRate.toFixed(1)}%` },
+      { label: 'MFA Completion', value: `${consentMfaCompletion.toFixed(1)}%` },
+    ];
+  }, [progressData.sections, consentApprovalRate, consentMfaCompletion]);
+
+  const isDark = theme === 'dark';
+
+  useEffect(() => {
+    emitTelemetry('dashboard_loaded', {
+      last_sync: progressData.lastUpdated,
+      total_artifacts: timelineEntries.length,
+      consent_surfaces: consentSnapshot.metrics.length,
+      consent_prompts: consentTotals.prompts,
+      consent_approval_rate: consentApprovalRate / 100,
+      mfa_completion_rate: consentMfaCompletion / 100,
+      completion_rate: stats.find((stat) => stat.label === 'Completion')?.value,
+    });
+  }, [progressData.lastUpdated, timelineEntries.length, consentSnapshot.metrics.length, consentTotals.prompts, consentApprovalRate, consentMfaCompletion, stats]);
+
+  const renderStat = (stat: Stat) => (
+    <div class="stat-card" key={stat.label}>
+      <span class="stat-card__label">{stat.label}</span>
+      <span class="stat-card__value">{stat.value}</span>
+    </div>
+  );
+
+  return (
+    <div class="app-shell">
+      <header class="hero">
+        <div class="hero__text">
+          <span class="hero__eyebrow">guideAI Program Tracker</span>
+          <h1>Milestone Zero Dashboard</h1>
+          <p>
+            Live status across our documentation, implementation parity, and governance artifacts.
+            Everything here updates whenever the repo changes.
+          </p>
+          <div class="hero__meta">
+            <span class="hero__meta-item">
+              <strong>Last sync:</strong> {progressData.lastUpdated}
+            </span>
+            <span class="hero__meta-item">
+              <strong>Total artifacts tracked:</strong> {timelineEntries.length}
+            </span>
+            <span class="hero__meta-item">
+              <strong>Consent surfaces:</strong> {consentSnapshot.metrics.length}
+            </span>
+          </div>
+        </div>
+        <div class="hero__actions">
+          <button
+            class="theme-toggle"
+            type="button"
+            onClick={() => {
+              const nextTheme = isDark ? 'light' : 'dark';
+              setTheme(nextTheme);
+              emitTelemetry('dashboard_theme_toggled', { theme: nextTheme });
+            }}
+            aria-label="Toggle dark mode"
+          >
+            {isDark ? '☀️ Light Mode' : '🌙 Dark Mode'}
+          </button>
+          <a
+            class="hero__cta"
+            href="https://github.com/nick/guideai"
+            target="_blank"
+            rel="noreferrer"
+            onClick={() => emitTelemetry('dashboard_cta_clicked', { target: 'github' })}
+          >
+            View source
+          </a>
+        </div>
+      </header>
+
+      <section class="stats-grid">{stats.map(renderStat)}</section>
+
+      <main class="layout-grid">
+        <SectionCard
+          title="Milestone Progress"
+          subtitle="Pulled directly from PROGRESS_TRACKER.md via guideai record-action"
+        >
+          <ProgressOverview items={progressData.sections} />
+        </SectionCard>
+
+        <SectionCard
+          title="Build Timeline"
+          subtitle="Sequence of shipped artifacts from BUILD_TIMELINE.md"
+        >
+          <Timeline entries={timelineEntries} />
+        </SectionCard>
+
+        <SectionCard
+          title="Alignment Updates"
+          subtitle="Latest highlights from PRD_ALIGNMENT_LOG.md"
+        >
+          <AlignmentUpdates entries={alignmentEntries} />
+        </SectionCard>
+
+        <SectionCard
+          title="Consent & MFA Dashboard"
+          subtitle="Telemetry snapshot from docs/analytics/consent_mfa_snapshot.md"
+        >
+          <ConsentDashboard metrics={consentSnapshot.metrics} updatedAt={consentSnapshot.updated} />
+        </SectionCard>
+      </main>
+    </div>
+  );
+};

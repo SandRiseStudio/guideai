@@ -1,0 +1,61 @@
+# PRD Alignment Log – 2025-10-15
+
+To ensure the original `PRD.md` themes and success metrics remain consistent across supporting documentation, the following updates were applied:
+
+- **AGENTS.md** – Added metrics discipline reminder so agent summaries reference PRD targets (behavior reuse, token savings, completion rate, compliance coverage).
+- **Agent Playbooks** – Updated Engineering, DX, Compliance, and Product playbooks to call out explicit PRD metrics and confirm observability supports the stated goals.
+- **MCP_SERVER_DESIGN.md** – Clarified analytics capability to report on PRD success metrics and linked to retrieval/telemetry plans.
+- **RETRIEVAL_ENGINE_PERFORMANCE.md** – Captured retriever latency/capacity targets referenced by the PRD architecture.
+- **TELEMETRY_SCHEMA.md** – Defined telemetry envelope and retention policy to satisfy PRD compliance goals.
+- **AUDIT_LOG_STORAGE.md** – Documented immutable evidence pipeline supporting PRD compliance objectives.
+- **SECRETS_MANAGEMENT_PLAN.md** – Ensured authentication flows and rotations align with PRD security requirements.
+- **ACTION_SERVICE_CONTRACT.md** – Linked reproducibility commitments to concrete API/MCP schemas.
+- **PROGRESS_TRACKER.md** – Introduced milestone tracker aligned with PRD metrics governance.
+- **REPRODUCIBILITY_STRATEGY.md** – Added goal tying action logs to PRD metrics.
+- **PRD_NEXT_STEPS.md** – Expanded instrumentation and analytics tasks to measure the PRD targets during execution.
+- **docs/capability_matrix.md** – Established parity matrix to satisfy MCP release checklist requirements and trace PRD capability coverage.
+- **MCP_SERVER_DESIGN.md** – Release checklist now enforces capability matrix updates before feature launches.
+- **guideai/action_service.py**, `guideai/adapters.py`, `tests/test_action_service_parity.py` – Scaffolded ActionService stubs and parity tests to uphold reproducibility commitments.
+- **PROGRESS_TRACKER.md** – Added CLI action logging checklist to document `guideai record-action` usage for milestone changes.
+- **PRD_NEXT_STEPS.md** – Documented VS Code extension roadmap tasks with capability matrix references.
+- **docs/capability_matrix.md** – Added VS Code extension parity row covering IDE surfaces and parity evidence.
+- **BUILD_TIMELINE.md** – Logged VS Code extension roadmap entry to track IDE planning toward Milestone 1.
+- **dashboard/** – Built the Milestone Zero progress dashboard surfacing PRD metrics (completion, behavior reuse evidence, compliance coverage) from source markdown.
+- **PROGRESS_TRACKER.md** – Logged the dashboard artifact, action command, and refresh date to keep milestone evidence tied to PRD success metrics.
+- **BUILD_TIMELINE.md** – Added dashboard release milestone to maintain chronological traceability of shipped artifacts.
+- **docs/AGENT_AUTH_ARCHITECTURE.md** – Captured the centralized AgentAuthService blueprint (JIT OAuth, policy engine, audit hooks) so parity and compliance plans include auth enforcement.
+- **PROGRESS_TRACKER.md** – Recorded the Agent Auth architecture milestone and associated action log entry (CMD-004).
+- **BUILD_TIMELINE.md** – Appended the Agent Auth architecture deliverable to maintain chronological evidence.
+- **PRD.md** – Updated architecture/dependency/release plan sections to incorporate AgentAuthService milestones and flows.
+- **MCP_SERVER_DESIGN.md** – Added auth capability tooling, AgentAuthService component, and security requirements for JIT consent.
+- **ACTION_SERVICE_CONTRACT.md** – Clarified that requests must pass through AgentAuth-issued grants before hitting action endpoints.
+- **PRD_AGENT_REVIEWS.md** – Captured cross-functional Engineering/DX/Compliance/Product feedback on the AgentAuthService architecture (2025-10-15 review).
+- **ACTION_REGISTRY_SPEC.md** – Added `reviews.run` MCP tool and `guideai agents review` CLI command for scheduling agent reviews across surfaces.
+- **docs/capability_matrix.md** – Logged new Agent review automation capability with parity targets.
+- **MCP_SERVER_DESIGN.md** – Introduced AgentReviewService component and review tooling alongside CLI command updates.
+- **docs/AGENT_AUTH_ARCHITECTURE.md** – Added §§16-19 covering token vault SLOs, policy deployment workflow, consent telemetry instrumentation, and surface-specific consent UX plans.
+- **ACTION_SERVICE_CONTRACT.md** – Documented AgentAuth Phase A dependencies (proto/JSON schemas, scope catalog, MCP tools) to keep ActionService clients aligned with auth requirements.
+- **PRD.md** – Clarified Milestone 1 deliverable scope for AgentAuthService contracts (proto, JSON schemas, scope catalog, MCP definitions).
+- **PRD_NEXT_STEPS.md** – Moved the completed AgentAuth review to the Milestone 0 list and expanded short-term actions with detailed Phase A deliverables and consent UX milestones.
+- **PROGRESS_TRACKER.md** – Updated evidence references for CMD-006/CMD-007 to cite the new AgentAuth architecture sections.
+- **proto/agentauth/v1/agent_auth.proto** – Published canonical proto definitions for EnsureGrant, RevokeGrant, ListGrants, and PolicyPreview RPCs.
+- **schema/agentauth/v1/agent_auth.json** – Added JSON schemas mirroring AgentAuth proto types for REST and OpenAPI consumers.
+- **schema/agentauth/scope_catalog.yaml** – Created scope catalog mapping tools to provider scopes, default roles, and consent triggers.
+- **policy/agentauth/bundle.yaml** – Authored baseline policy bundle with GitOps workflow, obligations, and rollback plan.
+- **mcp/tools/auth.*.json** – Documented MCP tool contracts for AgentAuth parity across CLI, IDE, and MCP surfaces.
+- **guideai/agent_auth.py**, `tests/test_agent_auth_contracts.py`, `tests/conftest.py` – Implemented AgentAuth SDK stubs and contract tests loading proto/JSON artifacts (CMD-006).
+- **docs/AGENT_AUTH_ARCHITECTURE.md** – Phase A checklist now cites SDK stubs/tests to close CMD-006 loop.
+- **docs/CONSENT_UX_PROTOTYPE.md** – Added execution summary, telemetry payload examples, usability study results, and compliance escalation policy (CMD-007).
+- **designs/consent/mockups.md** – Documented annotated consent mockups for Web, CLI, VS Code, and escalation flows.
+- **docs/capability_matrix.md** – Updated AgentAuth and consent rows with SDK/test evidence and CMD-006/007 status.
+- **PRD_NEXT_STEPS.md** – Recorded completion of CMD-006/007 and introduced new follow-ups for telemetry instrumentation and MFA review.
+- **PROGRESS_TRACKER.md** – Marked CMD-006/007 as completed with pytest evidence and action log entries.
+- **ACTION_REGISTRY_SPEC.md** – Linked AgentAuth MCP tool contracts for shared schema references.
+- **BUILD_TIMELINE.md** – Updated Milestone 0 entry to mention SDK tests and consent prototype artifacts.
+- **guideai/action_service.py**, `guideai/agent_auth.py`, `dashboard/src/telemetry.ts`, `tests/test_telemetry_integration.py` – Instrumented telemetry events for action capture, consent decisions, and dashboard interactions with automated regression coverage.
+- **schema/agentauth/scope_catalog.yaml**, `policy/agentauth/bundle.yaml`, `docs/AGENT_AUTH_ARCHITECTURE.md`, `docs/CONSENT_UX_PROTOTYPE.md` – Codified MFA requirements for high-risk scopes, updated consent telemetry fields, and resolved prior open questions.
+- **PRD_NEXT_STEPS.md** – Captured new follow-on work for consent/MFA dashboards and UX validation post-instrumentation.
+- Next follow-up: Publish consent + MFA analytics dashboards using the new telemetry feeds and snapshot baseline metrics in the progress dashboard.
+- Next follow-up: Conduct MFA re-prompt usability validation across Web/CLI/VS Code and record learnings in `docs/CONSENT_UX_PROTOTYPE.md`.
+ - **docs/analytics/mfa_usability_validation_plan.md** – Authored cross-surface MFA re-prompt validation playbook covering Strategist → Teacher → Student workflow, telemetry assertions, and parity checkpoints ahead of Milestone 1.
+ - **PRD_NEXT_STEPS.md** – Annotated short-term MFA validation item with link to the new playbook so execution owners can reference scope, metrics, and evidence expectations.

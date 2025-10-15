@@ -1,0 +1,77 @@
+export type TelemetryPayload = Record<string, unknown>;
+
+export interface TelemetryEvent {
+  event_id: string;
+  timestamp: string;
+  actor: {
+    id: string;
+    role: string;
+    surface: 'web' | 'cli' | 'api' | 'vscode' | 'mcp';
+  };
+  run_id?: string;
+  action_id?: string;
+  session_id?: string;
+  event_type: string;
+  payload: TelemetryPayload;
+}
+
+export type TelemetrySink = (event: TelemetryEvent) => void;
+
+declare global {
+  interface Window {
+    __GUIDEAI_TELEMETRY__?: TelemetryEvent[];
+  }
+}
+
+const sinks: TelemetrySink[] = [];
+let sessionInitialized = false;
+
+const ensureStore = (): void => {
+  if (typeof window === 'undefined') return;
+  if (!window.__GUIDEAI_TELEMETRY__) {
+    window.__GUIDEAI_TELEMETRY__ = [];
+  }
+};
+
+const randomId = (): string => {
+  if (typeof window !== 'undefined' && window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
+
+export const ensureTelemetrySession = (): void => {
+  if (typeof window === 'undefined' || sessionInitialized) return;
+  sessionInitialized = true;
+  ensureStore();
+  if (!window.sessionStorage.getItem('guideai-session-id')) {
+    window.sessionStorage.setItem('guideai-session-id', randomId());
+  }
+};
+
+export const registerTelemetrySink = (sink: TelemetrySink): void => {
+  sinks.push(sink);
+};
+
+export const emitTelemetry = (eventType: string, payload: TelemetryPayload = {}): void => {
+  if (typeof window === 'undefined') return;
+  ensureTelemetrySession();
+
+  const event: TelemetryEvent = {
+    event_id: randomId(),
+    timestamp: new Date().toISOString(),
+    actor: {
+      id: window.localStorage.getItem('guideai-actor-id') ?? 'anonymous-web',
+      role: 'STUDENT',
+      surface: 'web',
+    },
+    session_id: window.sessionStorage.getItem('guideai-session-id') ?? undefined,
+    event_type: eventType,
+    payload: { ...payload },
+  };
+
+  ensureStore();
+  window.__GUIDEAI_TELEMETRY__?.push(event);
+  sinks.forEach((sink) => sink(event));
+  window.dispatchEvent(new CustomEvent('guideai-telemetry', { detail: event }));
+};
