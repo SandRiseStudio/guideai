@@ -63,3 +63,5 @@ To ensure the original `PRD.md` themes and success metrics remain consistent acr
 - **AGENTS.md**, `SECRETS_MANAGEMENT_PLAN.md`, `ACTION_REGISTRY_SPEC.md` – Documented `behavior_prevent_secret_leaks`, secret scan action/tool contract, and source control guardrails; updated short-term plan to operationalize security scanning across surfaces.
 - **docs/GIT_STRATEGY.md** – Introduced host-agnostic Git workflow covering branching model, CI guardrails, secret prevention, and agent role expectations.
 - **AGENTS.md** – Added `behavior_git_governance` trigger/steps linking to the new strategy doc and reinforcing secret scan guardrails across branch workflows.
+- **docs/SDK_SCOPE.md** – Clarified SDK language coverage, semantic versioning approach, distribution channels, and integration alignment.
+- **PRD.md**, `docs/capability_matrix.md`, `PRD_NEXT_STEPS.md` – Linked to the SDK plan, added capability row, and marked the short-term SDK scope action complete for engineering owners.

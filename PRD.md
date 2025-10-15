@@ -89,7 +89,7 @@ Deliver a connected platform that captures procedural knowledge, guides agents t
 - **Audit Log Storage:** immutable evidence pipeline outlined in `AUDIT_LOG_STORAGE.md`.
 - **Secrets Management:** device login + rotation policies documented in `SECRETS_MANAGEMENT_PLAN.md`.
 - **Agent Auth Service:** centralized OAuth/OIDC broker with just-in-time consent, policy enforcement, and audit integration per `docs/AGENT_AUTH_ARCHITECTURE.md`.
-- **Client Integrations:** web app (Next.js), CLI (Python Typer), VS Code extension (TypeScript). Shared SDK for authentication and API calls.
+- **Client Integrations:** web app (Next.js), CLI (Python Typer), VS Code extension (TypeScript). Shared SDK for authentication and API calls; see `docs/SDK_SCOPE.md` for supported languages, versioning, and distribution roadmap.
 - **LLM Connectors:** plugable interface for OpenAI, Anthropic, local models; handles prompt templates for behavior-conditioned inference.
 
 ## Data Model

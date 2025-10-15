@@ -25,3 +25,4 @@
 | 21 | `docs/analytics/mfa_usability_validation_plan.md` | Published Strategist → Teacher → Student validation playbook for MFA re-prompts, outlining telemetry assertions, parity checkpoints, and go/no-go criteria ahead of Milestone 1. | 2025-10-15 |
 | 22 | Secret scanning guardrails | Introduced pre-commit Gitleaks hook (`.pre-commit-config.yaml`), helper script (`scripts/scan_secrets.sh`), and platform action contract updates to prevent secret commits across surfaces. | 2025-10-15 |
 | 23 | `docs/GIT_STRATEGY.md` | Authored platform-agnostic Git governance playbook detailing branching, reviews, secret hygiene, and agent responsibilities across all hosting providers. | 2025-10-15 |
+| 24 | `docs/SDK_SCOPE.md` | Defined SDK language coverage, semantic versioning policy, distribution channels, and integration alignment for client teams. | 2025-10-15 |

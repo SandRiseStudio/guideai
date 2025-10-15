@@ -19,7 +19,7 @@
 _All immediate Milestone 0 actions are now complete; upcoming work tracked in Short-Term._
 
 ## Short-Term (Before Milestone 1 Gate)
-- Clarify SDK scope (supported languages, versioning, distribution) and align with client integration plans (Engineering).
+- Clarify SDK scope (supported languages, versioning, distribution) and align with client integration plans (Engineering) — completed 2025-10-15 (`docs/SDK_SCOPE.md`, updates to `PRD.md`, `docs/capability_matrix.md`).
 - Add behavior versioning/migration strategy to Data Model section (Engineering).
 - Instrument onboarding and adoption metrics (time-to-first-behavior, checklist completion, behavior search-to-insert conversion) and ensure analytics can report on the PRD targets (70% behavior reuse, 30% token reduction, 80% task completion, 95% compliance log coverage) (DX + Engineering).
 - Plan guided onboarding assets for VS Code/CLI (tutorials, templates) and assign documentation ownership with release cadence (DX).
