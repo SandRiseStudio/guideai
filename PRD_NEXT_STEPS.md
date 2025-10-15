@@ -30,6 +30,7 @@ _All immediate Milestone 0 actions are now complete; upcoming work tracked in Sh
 - Execute policy deployment runbook outlined in `docs/AGENT_AUTH_ARCHITECTURE.md` §17, including GitOps workflow and rollback tooling (Security + Product).
 - Stand up consent/MFA analytics dashboards leveraging the new telemetry events (DX + Analytics).
 - Validate MFA re-prompt UX across surfaces and document monitoring hooks post-instrumentation (Security + Compliance) — execution playbook in `docs/analytics/mfa_usability_validation_plan.md`.
+- Operationalize automated secret scanning across CLI/UI/CI surfaces (`guideai scan-secrets`, pre-commit hooks) and enforce remediation logging via ActionService (Security + Engineering).
 
 ## Mid-Term (Milestone 2 Planning)
 - Gather external customer research or pilot commitments; update PRD with discovery insights (Product Strategy).

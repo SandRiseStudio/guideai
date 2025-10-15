@@ -23,6 +23,7 @@ build/
 dist/
 coverage/
 *.tgz
+security/scan_reports/
 
 # Testing
 .pytest_cache/

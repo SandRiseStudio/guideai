@@ -59,3 +59,5 @@ To ensure the original `PRD.md` themes and success metrics remain consistent acr
 - Next follow-up: Conduct MFA re-prompt usability validation across Web/CLI/VS Code and record learnings in `docs/CONSENT_UX_PROTOTYPE.md`.
  - **docs/analytics/mfa_usability_validation_plan.md** – Authored cross-surface MFA re-prompt validation playbook covering Strategist → Teacher → Student workflow, telemetry assertions, and parity checkpoints ahead of Milestone 1.
  - **PRD_NEXT_STEPS.md** – Annotated short-term MFA validation item with link to the new playbook so execution owners can reference scope, metrics, and evidence expectations.
+- **.pre-commit-config.yaml**, `scripts/scan_secrets.sh` – Added Gitleaks-based secret scanning guardrail with helper script and CI integration notes.
+- **AGENTS.md**, `SECRETS_MANAGEMENT_PLAN.md`, `ACTION_REGISTRY_SPEC.md` – Documented `behavior_prevent_secret_leaks`, secret scan action/tool contract, and source control guardrails; updated short-term plan to operationalize security scanning across surfaces.

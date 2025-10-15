@@ -55,6 +55,34 @@ Base path: `/v1/actions`
 }
 ```
 
+- **SecretScanRequest**
+```json
+{
+  "surface": "CLI|CI|MCP",
+  "paths": ["."],
+  "fail_on_findings": true,
+  "report_format": "json|table"
+}
+```
+
+- **SecretScanResponse**
+```json
+{
+  "scan_id": "UUID",
+  "started_at": "2025-10-15T22:02:00Z",
+  "finished_at": "2025-10-15T22:02:03Z",
+  "findings": [
+    {
+      "rule": "Generic Credential",
+      "file": "docs/example.md",
+      "line": 42,
+      "excerpt": "***REDACTED***"
+    }
+  ],
+  "status": "PASSED|FAILED"
+}
+```
+
 ## 4. MCP Tool Definitions
 | Tool Name | Type | Input Schema | Output |
 | --- | --- | --- | --- |
@@ -64,6 +92,7 @@ Base path: `/v1/actions`
 | `actions.replay` | `command` | `ReplayRequest` | `ReplayResponse` |
 | `actions.replayStatus` | `query` | `{ replay_id: UUID }` | `ReplayResponse` |
 | `reviews.run` | `command` | `{ artifact: string, scope: string[], behaviors?: string[] }` | `ReviewResponse` (aggregated feedback, action ids) |
+| `security.scanSecrets` | `command` | `SecretScanRequest` | `SecretScanResponse` |
 
 > AgentAuth MCP tools that gate these operations are defined under `mcp/tools/auth.*.json` and share schema definitions with `proto/agentauth/v1/agent_auth.proto`.
 
@@ -78,6 +107,7 @@ Base path: `/v1/actions`
 | `guideai replay` | Replay a set of actions. | `--actions <ids|path>`, `--strategy`, `--dry-run`, `--skip-existing`, `--watch` |
 | `guideai replay-status <id>` | Stream replay progress/logs. | `--follow` |
 | `guideai agents review` | Schedule cross-functional agent reviews (Engineering, DX, Compliance, Product) and fetch feedback. | `--artifact <path>` `--scope <csv>` `--behaviors <csv>` `--wait` |
+| `guideai scan-secrets` | Run repo-wide secret scan via Gitleaks and log results as an action. | `--format (table|json)` `--fail-on-findings` `--output <path>` |
 
 All CLI commands call MCP tools via generated SDK; parity tests ensure outputs mirror REST responses.
 
@@ -99,14 +129,15 @@ guideai record-action \
 
 ## 7. Parity & Testing
 - Contract tests in CI hit REST endpoints and MCP tools using the same schema fixtures.
-- CLI snapshot tests validate command output for create/list/replay flows against golden files.
+- CLI snapshot tests validate command output for create/list/replay/scan flows against golden files.
 - UI E2E tests (Playwright) confirm action logging prompts appear for Strategist/Student/Teacher flows.
-- Observability: metrics `actions_created_total`, `actions_replayed_total`, `action_parity_failures_total` exported to analytics service.
+- Observability: metrics `actions_created_total`, `actions_replayed_total`, `action_parity_failures_total`, `action_secret_scan_failures_total` exported to analytics service.
 
 ## 8. Security & Compliance
 - Actions inherit RBAC scopes: `action.write`, `action.read`, `action.replay` (replay limited to Strategist/Admin).
 - replay jobs include dry-run mode to prevent accidental overwrites; destructive steps require confirmation prompts.
 - Audit logs store hash of request+response for tamper detection; align with requirements in `REPRODUCIBILITY_STRATEGY.md`.
+- Secret scan outputs redact excerpts before storage; `security.scanSecrets` responses reference follow-up `guideai record-action` entries when remediation is required.
 
 ## 9. Open Items
 - Determine policy for redacting sensitive metadata prior to storage.

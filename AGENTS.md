@@ -111,6 +111,7 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
 | CORS, auth decorator, bearer token, cookie | `behavior_lock_down_security_surface` |
 | PRD sync, alignment log, checklist, progress tracker | `behavior_update_docs_after_changes`, `behavior_handbook_compliance_prompt` |
 | consent, JIT auth, scope catalog, prototype | `behavior_prototype_consent_ux`, `behavior_instrument_metrics_pipeline` |
+| secret leak, token, credential, gitleaks | `behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials` |
 | new reusable workflow discovered | Add a behavior entry |
 
 ## Agent etiquette
@@ -243,6 +244,15 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
   2. Explicitly reference the behaviors you will follow in your plan.
   3. Reconfirm checklist compliance after major milestones (plan, implementation, validation).
   4. If new reusable patterns emerge, add behaviors and update the checklist promptly.
+
+  ### `behavior_prevent_secret_leaks`
+  - **When**: Initializing repositories, preparing commits/pushes, or wiring CI pipelines where sensitive tokens might leak.
+  - **Steps**:
+    1. Confirm `.gitignore` excludes secrets directories/files and extend if new providers are introduced.
+    2. Ensure `pre-commit` is installed and the repo hook (`.pre-commit-config.yaml`) is active via `pre-commit install`.
+    3. Run `scripts/scan_secrets.sh` (or `pre-commit run gitleaks --all-files`) before opening PRs; remediate any findings immediately.
+    4. Record a `guideai scan-secrets` action with referenced behaviors (`behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials`) and attach sanitized reports.
+    5. Escalate recurring findings to Compliance and update `SECRETS_MANAGEMENT_PLAN.md` with new suppression rules or rotation steps.
 
 _Last updated: 2025-10-15_
 

@@ -20,12 +20,13 @@
 | Cross-surface telemetry instrumentation | Engineering + DX | ✅ Completed | `dashboard/src/telemetry.ts`, `guideai/action_service.py`, `guideai/agent_auth.py`, `tests/test_telemetry_integration.py` (pytest 2025-10-15) |
 | High-risk scope MFA policy | Security + Compliance | ✅ Completed | `schema/agentauth/scope_catalog.yaml`, `policy/agentauth/bundle.yaml`, `docs/AGENT_AUTH_ARCHITECTURE.md`, `docs/CONSENT_UX_PROTOTYPE.md` |
 | MFA re-prompt validation playbook | Security + Compliance + DX | ✅ Completed | `docs/analytics/mfa_usability_validation_plan.md` (playbook for Milestone 1 readiness) |
+| Secret scanning guardrails | Security + Engineering | ✅ Completed | `.pre-commit-config.yaml`, `scripts/scan_secrets.sh`, `ACTION_REGISTRY_SPEC.md`, `SECRETS_MANAGEMENT_PLAN.md`, `AGENTS.md` |
 
 ## Milestone 1 – Internal Alpha (Planned)
 | Work Item | Owner | Status | Notes |
 | --- | --- | --- | --- |
 | VS Code extension preview | DX + Engineering | ⏳ Planned | Capability matrix row created; roadmap tasks in `PRD_NEXT_STEPS.md` |
-| Checklist automation | Engineering | ⏳ Planned | | 
+| Checklist automation | Engineering | ⏳ Planned | |
 | Initial analytics dashboards | Product Analytics | ⏳ Planned | Requires telemetry pipeline deployment |
 
 ## Action logging checklist
@@ -37,6 +38,7 @@
 - [x] `guideai record-action --artifact proto/agentauth/v1/agent_auth.proto --summary "Ship AgentAuth Phase A contract artifacts" --behaviors behavior_wire_cli_to_orchestrator behavior_update_docs_after_changes` (CMD-006)
 - [x] `guideai record-action --artifact docs/CONSENT_UX_PROTOTYPE.md --summary "Draft consent UX prototypes and testing plan" --behaviors behavior_product_signal_alignment behavior_update_docs_after_changes behavior_prototype_consent_ux` (CMD-007)
 - [ ] `guideai record-action --artifact docs/analytics/mfa_usability_validation_plan.md --summary "Publish MFA re-prompt validation playbook" --behaviors behavior_prototype_consent_ux behavior_instrument_metrics_pipeline behavior_update_docs_after_changes`
+- [ ] `guideai scan-secrets --format json --fail-on-findings --output security/scan_reports/latest.json`
 
 > Record each command above in the ActionService once the CLI is connected; include resulting `action_id` in the Evidence column when available.
 

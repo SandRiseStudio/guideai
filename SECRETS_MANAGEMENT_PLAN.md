@@ -29,6 +29,12 @@
 - Configuration updates require dual-approval workflow (Strategist + Compliance) logged via ActionService.
 - Rotation runbook stored in `docs/runbooks/secret_rotation.md` with step-by-step instructions.
 
+## Source Control Guardrails
+- Pre-commit hook (`.pre-commit-config.yaml`) runs Gitleaks with redaction and whitespace fixers; developers must run `pre-commit install` before committing.
+- `scripts/scan_secrets.sh` provides a deterministic wrapper used by CI (`guideai scan-secrets`) and local workflows; exit status blocks merges if any findings remain.
+- Suppression requires Compliance approval and an audit note referencing the remediation action logged via ActionService.
+- `.gitignore` tracks secret-prone files (`.env`, `.venv`, generated logs); additions must cite `behavior_prevent_secret_leaks`.
+
 ## Compliance & Monitoring
 - Metrics: `secret_rotation_success_total`, `secret_rotation_failure_total`, `cli_plaintext_storage_attempts_total`.
 - Alerts when plaintext flag used more than once per user per day or when rotations fail.
