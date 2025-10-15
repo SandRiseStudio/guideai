@@ -268,7 +268,7 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
   - **When**: Initializing repositories, preparing commits/pushes, or wiring CI pipelines where sensitive tokens might leak.
   - **Steps**:
     1. Confirm `.gitignore` excludes secrets directories/files and extend if new providers are introduced.
-    2. Ensure `pre-commit` is installed and the repo hook (`.pre-commit-config.yaml`) is active via `pre-commit install`.
+  2. Ensure `pre-commit` is installed and enable the repo hooks by running `./scripts/install_hooks.sh` (wraps `pre-commit install`).
     3. Run `scripts/scan_secrets.sh` (or `pre-commit run gitleaks --all-files`) before opening PRs; remediate any findings immediately.
     4. Record a `guideai scan-secrets` action with referenced behaviors (`behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials`) and attach sanitized reports.
     5. Escalate recurring findings to Compliance and update `SECRETS_MANAGEMENT_PLAN.md` with new suppression rules or rotation steps.

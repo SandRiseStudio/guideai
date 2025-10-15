@@ -55,6 +55,7 @@ Establish a platform-agnostic Git operating model for Strategist → Teacher →
 - All roles keep `PROGRESS_TRACKER.md` up to date with branch milestones and reference the git strategy when handing off work.
 
 ## Automation & Tooling Hooks
+- After cloning, run `./scripts/install_hooks.sh` to wire `git commit`/`git push` into the shared pre-commit checks (gitleaks, whitespace fixers).
 - Add `pre-commit` job to CI template; fail builds on any gitleaks findings.
 - Integrate `guideai scan-secrets` into pipeline stage `sec-scan`. Upload JSON to `security/scan_reports/` (ignored by Git) for audit.
 - Optionally configure server-side hooks (pre-receive) to run gitleaks for centralized enforcement.
