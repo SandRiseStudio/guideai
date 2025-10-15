@@ -21,6 +21,7 @@
 | High-risk scope MFA policy | Security + Compliance | ✅ Completed | `schema/agentauth/scope_catalog.yaml`, `policy/agentauth/bundle.yaml`, `docs/AGENT_AUTH_ARCHITECTURE.md`, `docs/CONSENT_UX_PROTOTYPE.md` |
 | MFA re-prompt validation playbook | Security + Compliance + DX | ✅ Completed | `docs/analytics/mfa_usability_validation_plan.md` (playbook for Milestone 1 readiness) |
 | Secret scanning guardrails | Security + Engineering | ✅ Completed | `.pre-commit-config.yaml`, `scripts/scan_secrets.sh`, `ACTION_REGISTRY_SPEC.md`, `SECRETS_MANAGEMENT_PLAN.md`, `AGENTS.md` |
+| Git governance playbook | DX + Engineering | ✅ Completed | `docs/GIT_STRATEGY.md`, `AGENTS.md`, `PRD_ALIGNMENT_LOG.md`, `BUILD_TIMELINE.md` |
 
 ## Milestone 1 – Internal Alpha (Planned)
 | Work Item | Owner | Status | Notes |

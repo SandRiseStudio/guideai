@@ -112,6 +112,7 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
 | PRD sync, alignment log, checklist, progress tracker | `behavior_update_docs_after_changes`, `behavior_handbook_compliance_prompt` |
 | consent, JIT auth, scope catalog, prototype | `behavior_prototype_consent_ux`, `behavior_instrument_metrics_pipeline` |
 | secret leak, token, credential, gitleaks | `behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials` |
+| git workflow, branching, merge policy | `behavior_git_governance`, `behavior_prevent_secret_leaks` |
 | new reusable workflow discovered | Add a behavior entry |
 
 ## Agent etiquette
@@ -244,6 +245,24 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
   2. Explicitly reference the behaviors you will follow in your plan.
   3. Reconfirm checklist compliance after major milestones (plan, implementation, validation).
   4. If new reusable patterns emerge, add behaviors and update the checklist promptly.
+
+### `behavior_prevent_secret_leaks`
+- **When**: Initializing repositories, preparing commits/pushes, or wiring CI pipelines where sensitive tokens might leak.
+- **Steps**:
+  1. Confirm `.gitignore` excludes secrets directories/files and extend if new providers are introduced.
+  2. Ensure `pre-commit` is installed and the repo hook (`.pre-commit-config.yaml`) is active via `pre-commit install`.
+  3. Run `scripts/scan_secrets.sh` (or `pre-commit run gitleaks --all-files`) before opening PRs; remediate any findings immediately.
+  4. Record a `guideai scan-secrets` action with referenced behaviors (`behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials`) and attach sanitized reports.
+  5. Escalate recurring findings to Compliance and update `SECRETS_MANAGEMENT_PLAN.md` with new suppression rules or rotation steps.
+
+### `behavior_git_governance`
+- **When**: Creating branches, preparing merges/rebases, coordinating cross-surface reviews, or mirroring repos across hosts (GitHub/GitLab/Bitbucket/self-hosted).
+- **Steps**:
+  1. Review `docs/GIT_STRATEGY.md` for branching, commit messaging, and review guardrails relevant to the task.
+  2. Create feature branches using `role/short-slug`, run `pre-commit run` (including gitleaks), and ensure `scripts/scan_secrets.sh` passes before pushing.
+  3. Include ActionService action IDs and cited behaviors in commit/PR descriptions; ensure `guideai record-action` logs reference the branch work.
+  4. Require cross-role review prior to merge and confirm CI executed `guideai scan-secrets`, tests, and lint/build jobs successfully.
+  5. Update `PROGRESS_TRACKER.md`, tag releases as needed, and document outcomes in `PRD_ALIGNMENT_LOG.md` when branches merge or repositories mirror.
 
   ### `behavior_prevent_secret_leaks`
   - **When**: Initializing repositories, preparing commits/pushes, or wiring CI pipelines where sensitive tokens might leak.

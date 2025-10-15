@@ -61,3 +61,5 @@ To ensure the original `PRD.md` themes and success metrics remain consistent acr
  - **PRD_NEXT_STEPS.md** – Annotated short-term MFA validation item with link to the new playbook so execution owners can reference scope, metrics, and evidence expectations.
 - **.pre-commit-config.yaml**, `scripts/scan_secrets.sh` – Added Gitleaks-based secret scanning guardrail with helper script and CI integration notes.
 - **AGENTS.md**, `SECRETS_MANAGEMENT_PLAN.md`, `ACTION_REGISTRY_SPEC.md` – Documented `behavior_prevent_secret_leaks`, secret scan action/tool contract, and source control guardrails; updated short-term plan to operationalize security scanning across surfaces.
+- **docs/GIT_STRATEGY.md** – Introduced host-agnostic Git workflow covering branching model, CI guardrails, secret prevention, and agent role expectations.
+- **AGENTS.md** – Added `behavior_git_governance` trigger/steps linking to the new strategy doc and reinforcing secret scan guardrails across branch workflows.
