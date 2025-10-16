@@ -1,9 +1,17 @@
-"""Telemetry integration tests covering ActionService and AgentAuth instrumentation."""
+"""Telemetry integration tests covering ActionService, AgentAuth, and CLI instrumentation."""
 
 from __future__ import annotations
 
+import argparse
+import io
+import json
+import os
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
 
+from guideai import cli
 from guideai.action_contracts import ActionCreateRequest, Actor, ReplayRequest
 from guideai.action_service import ActionService
 from guideai.agent_auth import AgentAuthClient, EnsureGrantRequest, GrantDecision
@@ -58,6 +66,43 @@ class TelemetryIntegrationTests(unittest.TestCase):
         self.assertEqual(decision_events[0].payload["decision"], GrantDecision.ALLOW.value)
         self.assertEqual(decision_events[0].payload["agent_id"], request.agent_id)
         self.assertEqual(decision_events[0].actor["surface"], "cli")
+
+
+class TelemetryCLIEmitTests(unittest.TestCase):
+    def test_cli_emit_persists_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "events.jsonl"
+            os.environ["GUIDEAI_TELEMETRY_PATH"] = str(path)
+            try:
+                args = argparse.Namespace(
+                    event_type="behavior_retrieved",
+                    payload=json.dumps({"result_count": 1}),
+                    actor_id="vscode-user",
+                    actor_role="DX",
+                    actor_surface="VSCODE",
+                    run_id=None,
+                    action_id=None,
+                    session_id="session-123",
+                    format="json",
+                    telemetry_command="emit",
+                    command="telemetry",
+                )
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    exit_code = cli._command_telemetry_emit(args)
+
+                self.assertEqual(exit_code, 0)
+                stdout = buffer.getvalue()
+                self.assertIn("behavior_retrieved", stdout)
+                self.assertTrue(path.exists())
+                lines = path.read_text(encoding="utf-8").strip().splitlines()
+                self.assertTrue(lines)
+                event = json.loads(lines[-1])
+                self.assertEqual(event["event_type"], "behavior_retrieved")
+                self.assertEqual(event["actor"]["surface"], "vscode")
+                self.assertEqual(event["payload"]["result_count"], 1)
+            finally:
+                os.environ.pop("GUIDEAI_TELEMETRY_PATH", None)
 
 
 if __name__ == "__main__":

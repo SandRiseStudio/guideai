@@ -149,10 +149,12 @@ Deliver a connected platform that captures procedural knowledge, guides agents t
    - **Delivered:** ActionService contracts & stubs, Agent Auth Phase A (proto/schema/policy artifacts), secret scanning guardrails, CI/CD pipelines, telemetry instrumentation, compliance control matrix, SDK scope definition, behavior versioning strategy, Git/DevOps governance playbooks, policy deployment runbook, onboarding quickstarts, consent/MFA UX prototypes with validation plan, reproducible build documentation.
    - **Evidence:** 20+ completed work items tracked in `PROGRESS_TRACKER.md`, 35 timeline entries in `BUILD_TIMELINE.md`, full test coverage in `tests/`, contract artifacts in `proto/`, `schema/`, `policy/`, `mcp/tools/`.
 
-2. **Milestone 1 – Internal Alpha (6 weeks):** 🚧 **IN PROGRESS** – VS Code extension preview, checklist automation, initial analytics, AgentAuthService contracts (published proto + JSON schemas, scope catalog, MCP tool definitions) and consent UX prototypes.
-   - **Status:** Checklist automation engine complete with full CLI/REST/MCP parity (`COMPLIANCE_SERVICE_CONTRACT.md`, `guideai/compliance_service.py`, 17 passing parity tests). Foundation complete; VS Code extension remains as primary deliverable.
-   - **Delivered:** ComplianceService with create/record/list/get/validate operations, coverage scoring algorithm, telemetry integration, REST/CLI/MCP adapters, 5 CLI commands (`guideai compliance create-checklist/record-step/list/get/validate`), comprehensive parity tests validating cross-surface consistency.
-   - **Next:** VS Code extension implementation, BehaviorService runtime deployment with persistent backend (PostgreSQL/SQLite for checklist + behavior storage), analytics dashboard deployment to production.
+2. **Milestone 1 – Internal Alpha (6 weeks):** 🚧 **IN PROGRESS** – VS Code extension preview, checklist automation, BehaviorService runtime, initial analytics, AgentAuthService contracts (published proto + JSON schemas, scope catalog, MCP tool definitions) and consent UX prototypes.
+   - **Status:** Checklist automation engine complete with full CLI/REST/MCP parity; BehaviorService runtime with SQLite backend and CLI parity shipped. VS Code extension and analytics dashboards remain as primary deliverables.
+   - **Delivered:**
+     - **ComplianceService** (`COMPLIANCE_SERVICE_CONTRACT.md`, `guideai/compliance_service.py`, `guideai/adapters.py`, 17 passing parity tests) – In-memory service with create/record/list/get/validate operations, coverage scoring algorithm, telemetry integration, REST/CLI/MCP adapters, 5 CLI commands.
+     - **BehaviorService Runtime** (`guideai/behavior_service.py`, `guideai/adapters.py`, `guideai/cli.py`, `tests/test_cli_behaviors.py`) – SQLite-backed runtime with full lifecycle support (create/list/search/get/update/submit/approve/deprecate/delete-draft), telemetry instrumentation, CLI adapters and 9 behaviors subcommands, regression coverage with 2 passing test suites.
+   - **Next:** VS Code extension implementation, BehaviorService backend migration to PostgreSQL with vector index (FAISS/Qdrant), REST/MCP endpoint exposure, analytics dashboard deployment to production.
 
 3. **Milestone 2 – External Beta (8 weeks):** Web console v1, embedding retriever, compliance dashboards, AgentAuthService in production with just-in-time consent for core tools.
 

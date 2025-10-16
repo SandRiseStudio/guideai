@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,10 +17,13 @@ from guideai.adapters import (
     CLIActionServiceAdapter,
     CLIBehaviorServiceAdapter,
     CLIComplianceServiceAdapter,
+    CLIWorkflowServiceAdapter,
 )
 from guideai.compliance_service import ComplianceService
 from guideai.behavior_service import BehaviorService
 from guideai.task_assignments import TaskAssignmentService
+from guideai.telemetry import FileTelemetrySink, TelemetryClient
+from guideai.workflow_service import WorkflowService
 
 DEFAULT_OUTPUT = Path("security/scan_reports/latest.json")
 DEFAULT_ACTOR_ID = "local-cli"
@@ -33,6 +37,8 @@ _COMPLIANCE_SERVICE: ComplianceService | None = None
 _COMPLIANCE_ADAPTER: CLIComplianceServiceAdapter | None = None
 _BEHAVIOR_SERVICE: BehaviorService | None = None
 _BEHAVIOR_ADAPTER: CLIBehaviorServiceAdapter | None = None
+_WORKFLOW_SERVICE: WorkflowService | None = None
+_WORKFLOW_ADAPTER: CLIWorkflowServiceAdapter | None = None
 
 
 def _get_action_adapter() -> CLIActionServiceAdapter:
@@ -87,6 +93,19 @@ def _get_behavior_adapter() -> CLIBehaviorServiceAdapter:
     if _BEHAVIOR_ADAPTER is None:
         _BEHAVIOR_ADAPTER = CLIBehaviorServiceAdapter(_BEHAVIOR_SERVICE)
     return _BEHAVIOR_ADAPTER
+
+
+def _get_workflow_adapter() -> CLIWorkflowServiceAdapter:
+    global _WORKFLOW_SERVICE, _WORKFLOW_ADAPTER, _BEHAVIOR_SERVICE
+    if _BEHAVIOR_SERVICE is None:
+        _BEHAVIOR_SERVICE = BehaviorService()
+    if _WORKFLOW_SERVICE is None:
+        db_path = Path.home() / ".guideai" / "workflows.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        _WORKFLOW_SERVICE = WorkflowService(db_path=db_path, behavior_service=_BEHAVIOR_SERVICE)
+    if _WORKFLOW_ADAPTER is None:
+        _WORKFLOW_ADAPTER = CLIWorkflowServiceAdapter(_WORKFLOW_SERVICE)
+    return _WORKFLOW_ADAPTER
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -571,6 +590,146 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Output format",
     )
 
+    # Workflow subcommands
+    workflow_parser = subparsers.add_parser(
+        "workflow",
+        help="Manage workflow templates and runs",
+    )
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command")
+
+    workflow_create_parser = workflow_subparsers.add_parser(
+        "create-template",
+        help="Create a new workflow template",
+    )
+    workflow_create_parser.add_argument("--name", required=True, help="Template name")
+    workflow_create_parser.add_argument("--description", required=True, help="Template description")
+    workflow_create_parser.add_argument(
+        "--role",
+        dest="role_focus",
+        required=True,
+        choices=["STRATEGIST", "TEACHER", "STUDENT", "MULTI_ROLE"],
+        help="Primary role for this workflow",
+    )
+    workflow_create_parser.add_argument(
+        "--steps-file",
+        required=True,
+        help="Path to JSON file with step definitions array",
+    )
+    workflow_create_parser.add_argument(
+        "--tag",
+        dest="tags",
+        action="append",
+        default=[],
+        help="Tag to apply (repeatable)",
+    )
+    workflow_create_parser.add_argument("--metadata-file", help="Path to JSON metadata object")
+    workflow_create_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
+    workflow_create_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
+    workflow_create_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    workflow_list_parser = workflow_subparsers.add_parser(
+        "list-templates",
+        help="List workflow templates",
+    )
+    workflow_list_parser.add_argument("--role", dest="role_focus", help="Filter by role focus")
+    workflow_list_parser.add_argument(
+        "--tag",
+        dest="tags",
+        action="append",
+        default=[],
+        help="Filter by tag (repeatable)",
+    )
+    workflow_list_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    workflow_get_parser = workflow_subparsers.add_parser(
+        "get-template",
+        help="Retrieve a workflow template by ID",
+    )
+    workflow_get_parser.add_argument("template_id", help="Template identifier")
+    workflow_get_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    workflow_run_parser = workflow_subparsers.add_parser(
+        "run",
+        help="Execute a workflow template with behavior-conditioned inference",
+    )
+    workflow_run_parser.add_argument("template_id", help="Template to execute")
+    workflow_run_parser.add_argument(
+        "--behavior",
+        dest="behavior_ids",
+        action="append",
+        default=[],
+        help="Behavior ID to inject (repeatable, auto-retrieves if omitted)",
+    )
+    workflow_run_parser.add_argument("--metadata-file", help="Path to JSON run metadata")
+    workflow_run_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
+    workflow_run_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
+    workflow_run_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    workflow_status_parser = workflow_subparsers.add_parser(
+        "status",
+        help="Check the status of a workflow run",
+    )
+    workflow_status_parser.add_argument("run_id", help="Run identifier")
+    workflow_status_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    telemetry_parser = subparsers.add_parser(
+        "telemetry",
+        help="Telemetry utilities",
+    )
+    telemetry_subparsers = telemetry_parser.add_subparsers(dest="telemetry_command")
+
+    telemetry_emit_parser = telemetry_subparsers.add_parser(
+        "emit",
+        help="Emit a telemetry event",
+    )
+    telemetry_emit_parser.add_argument("--event-type", required=True, help="Telemetry event type")
+    telemetry_emit_parser.add_argument(
+        "--payload",
+        default="{}",
+        help="JSON payload for the event",
+    )
+    telemetry_emit_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
+    telemetry_emit_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
+    telemetry_emit_parser.add_argument(
+        "--actor-surface",
+        default="CLI",
+        help="Surface emitting the event (e.g., CLI, VSCODE, WEB)",
+    )
+    telemetry_emit_parser.add_argument("--run-id", help="Associated workflow run identifier")
+    telemetry_emit_parser.add_argument("--action-id", help="Associated action identifier")
+    telemetry_emit_parser.add_argument("--session-id", help="Telemetry session identifier")
+    telemetry_emit_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
@@ -580,6 +739,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.exit(1)
     if args.command == "compliance" and not getattr(args, "compliance_command", None):
         compliance_parser.print_help()
+        parser.exit(1)
+    if args.command == "workflow" and not getattr(args, "workflow_command", None):
+        workflow_parser.print_help()
+        parser.exit(1)
+    if args.command == "telemetry" and not getattr(args, "telemetry_command", None):
+        telemetry_parser.print_help()
         parser.exit(1)
     return args
 
@@ -1195,6 +1360,45 @@ def _command_list_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_telemetry_emit(args: argparse.Namespace) -> int:
+    try:
+        payload_raw = args.payload or "{}"
+        payload_obj = json.loads(payload_raw)
+        if not isinstance(payload_obj, dict):
+            raise ValueError("Payload must be a JSON object")
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    surface = args.actor_surface.replace("-", "_").lower()
+    actor = {
+        "id": args.actor_id,
+        "role": args.actor_role,
+        "surface": surface,
+    }
+
+    path_override = os.environ.get("GUIDEAI_TELEMETRY_PATH")
+    sink_path = Path(path_override) if path_override else Path.home() / ".guideai" / "telemetry" / "events.jsonl"
+    telemetry = TelemetryClient(sink=FileTelemetrySink(sink_path), default_actor=actor)
+
+    event = telemetry.emit_event(
+        event_type=args.event_type,
+        payload=payload_obj,
+        actor=actor,
+        run_id=args.run_id,
+        action_id=args.action_id,
+        session_id=args.session_id,
+    )
+
+    if args.format == "json":
+        print(json.dumps(event.to_dict(), indent=2))
+    else:
+        print(
+            f"{event.timestamp} {event.event_type} actor={event.actor['id']} surface={event.actor['surface']}"
+        )
+    return 0
+
+
 def _parse_evidence(items: List[str]) -> Dict[str, Any]:
     """Parse key=value evidence items into a dictionary."""
     evidence: Dict[str, Any] = {}
@@ -1412,6 +1616,169 @@ def run_scan(
     return 0
 
 
+def _render_workflow_templates_table(templates: List[Dict[str, Any]]) -> None:
+    if not templates:
+        print("No workflow templates found.")
+        return
+
+    headers = ["Template ID", "Name", "Role", "Steps", "Tags"]
+    widths = [len(header) for header in headers]
+    rows: List[List[str]] = []
+
+    for template in templates:
+        row = [
+            template["template_id"][:12],
+            template["name"],
+            template["role_focus"],
+            str(len(template["steps"])),
+            ", ".join(template.get("tags", [])) or "-",
+        ]
+        rows.append(row)
+        widths = [max(width, len(value)) for width, value in zip(widths, row)]
+
+    fmt = " | ".join(f"{{:<{width}}}" for width in widths)
+    separator = "-+-".join("-" * width for width in widths)
+
+    print(fmt.format(*headers))
+    print(separator)
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def _render_workflow_run_table(run: Dict[str, Any]) -> None:
+    headers = ["Run ID", "Template", "Status", "Total Tokens", "Behaviors"]
+    row = [
+        run["run_id"][:12],
+        run["template_name"],
+        run["status"],
+        str(run.get("total_tokens", 0)),
+        str(len(run.get("behaviors_cited", []))),
+    ]
+    widths = [max(len(header), len(value)) for header, value in zip(headers, row)]
+    fmt = " | ".join(f"{{:<{width}}}" for width in widths)
+    separator = "-+-".join("-" * width for width in widths)
+    print(fmt.format(*headers))
+    print(separator)
+    print(fmt.format(*row))
+
+
+def _command_workflow_create_template(args: argparse.Namespace) -> int:
+    adapter = _get_workflow_adapter()
+    try:
+        # Load steps from file
+        steps_path = Path(args.steps_file).expanduser().resolve()
+        if not steps_path.exists():
+            print(f"Error: Steps file not found: {steps_path}", file=sys.stderr)
+            return 2
+        steps_data = json.loads(steps_path.read_text(encoding="utf-8"))
+        if not isinstance(steps_data, list):
+            print("Error: Steps file must contain a JSON array", file=sys.stderr)
+            return 2
+
+        metadata = None
+        if args.metadata_file:
+            metadata = _load_metadata([], args.metadata_file)
+
+        template = adapter.create_template(
+            name=args.name,
+            description=args.description,
+            role_focus=args.role_focus,
+            steps=steps_data,
+            tags=args.tags or None,
+            metadata=metadata,
+            actor_id=args.actor_id,
+            actor_role=args.actor_role,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "table":
+        _render_workflow_templates_table([template])
+    else:
+        _print_json(template)
+    return 0
+
+
+def _command_workflow_list_templates(args: argparse.Namespace) -> int:
+    adapter = _get_workflow_adapter()
+    try:
+        templates = adapter.list_templates(
+            role_focus=args.role_focus,
+            tags=args.tags or None,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "table":
+        _render_workflow_templates_table(templates)
+    else:
+        _print_json(templates)
+    return 0
+
+
+def _command_workflow_get_template(args: argparse.Namespace) -> int:
+    adapter = _get_workflow_adapter()
+    try:
+        template = adapter.get_template(args.template_id)
+        if not template:
+            print(f"Error: Template not found: {args.template_id}", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "table":
+        _render_workflow_templates_table([template])
+    else:
+        _print_json(template)
+    return 0
+
+
+def _command_workflow_run(args: argparse.Namespace) -> int:
+    adapter = _get_workflow_adapter()
+    try:
+        metadata = None
+        if args.metadata_file:
+            metadata = _load_metadata([], args.metadata_file)
+
+        run = adapter.run_workflow(
+            template_id=args.template_id,
+            behavior_ids=args.behavior_ids or None,
+            metadata=metadata,
+            actor_id=args.actor_id,
+            actor_role=args.actor_role,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "table":
+        _render_workflow_run_table(run)
+    else:
+        _print_json(run)
+    return 0
+
+
+def _command_workflow_status(args: argparse.Namespace) -> int:
+    adapter = _get_workflow_adapter()
+    try:
+        run = adapter.get_run(args.run_id)
+        if not run:
+            print(f"Error: Run not found: {args.run_id}", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "table":
+        _render_workflow_run_table(run)
+    else:
+        _print_json(run)
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     if args.command == "scan-secrets":
@@ -1463,6 +1830,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.compliance_command == "validate":
             return _command_compliance_validate(args)
         print("Error: Unknown compliance subcommand", file=sys.stderr)
+        return 1
+    if args.command == "telemetry":
+        if args.telemetry_command == "emit":
+            return _command_telemetry_emit(args)
+        print("Error: Unknown telemetry subcommand", file=sys.stderr)
+        return 1
+    if args.command == "workflow":
+        if args.workflow_command == "create-template":
+            return _command_workflow_create_template(args)
+        if args.workflow_command == "list-templates":
+            return _command_workflow_list_templates(args)
+        if args.workflow_command == "get-template":
+            return _command_workflow_get_template(args)
+        if args.workflow_command == "run":
+            return _command_workflow_run(args)
+        if args.workflow_command == "status":
+            return _command_workflow_status(args)
+        print("Error: Unknown workflow subcommand", file=sys.stderr)
         return 1
     return 1
 

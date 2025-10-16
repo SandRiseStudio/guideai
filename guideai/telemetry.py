@@ -8,9 +8,11 @@ forwarded to real backends in future implementations.
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
 
@@ -55,6 +57,18 @@ class InMemoryTelemetrySink:
 
     def write(self, event: TelemetryEvent) -> None:
         self.events.append(event)
+
+
+class FileTelemetrySink:
+    """Append-only sink that persists telemetry events to a JSONL file."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path.expanduser().resolve()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, event: TelemetryEvent) -> None:
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
 
 
 class TelemetryClient:
@@ -108,4 +122,5 @@ __all__ = [
     "TelemetryEvent",
     "TelemetrySink",
     "InMemoryTelemetrySink",
+    "FileTelemetrySink",
 ]

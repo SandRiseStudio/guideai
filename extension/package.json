@@ -1,0 +1,186 @@
+{
+  "name": "guideai-vscode",
+  "displayName": "GuideAI",
+  "description": "Behavior-conditioned inference for AI agents - access your behavior handbook, compose workflows, track execution, and ensure compliance directly in VS Code",
+  "version": "0.1.0",
+  "publisher": "guideai",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nas4146/guideai.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "llm",
+    "agents",
+    "workflow",
+    "compliance",
+    "behavior"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "guideai-sidebar",
+          "title": "GuideAI",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "guideai-sidebar": [
+        {
+          "id": "guideai.behaviorSidebar",
+          "name": "Behavior Handbook",
+          "icon": "resources/icon.svg",
+          "contextualTitle": "GuideAI Behaviors"
+        },
+        {
+          "id": "guideai.workflowExplorer",
+          "name": "Workflow Templates",
+          "icon": "resources/workflow.svg",
+          "contextualTitle": "Workflow Templates"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "guideai.refreshBehaviors",
+        "title": "Refresh Behaviors",
+        "category": "GuideAI",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "guideai.searchBehaviors",
+        "title": "Search Behaviors",
+        "category": "GuideAI",
+        "icon": "$(search)"
+      },
+      {
+        "command": "guideai.insertBehavior",
+        "title": "Insert Behavior Reference",
+        "category": "GuideAI",
+        "icon": "$(add)"
+      },
+      {
+        "command": "guideai.viewBehaviorDetail",
+        "title": "View Behavior Details",
+        "category": "GuideAI"
+      },
+      {
+        "command": "guideai.openPlanComposer",
+        "title": "Open Plan Composer",
+        "category": "GuideAI",
+        "icon": "$(notebook)"
+      },
+      {
+        "command": "guideai.createWorkflow",
+        "title": "Create Workflow from Template",
+        "category": "GuideAI",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "guideai.runWorkflow",
+        "title": "Run Workflow",
+        "category": "GuideAI",
+        "icon": "$(run)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "guideai.refreshBehaviors",
+          "when": "view == guideai.behaviorSidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "guideai.searchBehaviors",
+          "when": "view == guideai.behaviorSidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "guideai.openPlanComposer",
+          "when": "view == guideai.workflowExplorer",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "guideai.insertBehavior",
+          "when": "view == guideai.behaviorSidebar && viewItem == behavior",
+          "group": "inline"
+        },
+        {
+          "command": "guideai.viewBehaviorDetail",
+          "when": "view == guideai.behaviorSidebar && viewItem == behavior"
+        },
+        {
+          "command": "guideai.runWorkflow",
+          "when": "view == guideai.workflowExplorer && viewItem == workflow",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "GuideAI",
+      "properties": {
+        "guideai.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to Python interpreter running guideai CLI"
+        },
+        "guideai.cliPath": {
+          "type": "string",
+          "default": "guideai",
+          "description": "Path to guideai CLI executable"
+        },
+        "guideai.autoRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically refresh behaviors when the handbook changes"
+        },
+        "guideai.defaultRole": {
+          "type": "string",
+          "enum": ["STRATEGIST", "TEACHER", "STUDENT"],
+          "default": "STRATEGIST",
+          "description": "Default role filter for behavior sidebar"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production --devtool hidden-source-map",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.x",
+    "@typescript-eslint/eslint-plugin": "^6.15.0",
+    "@typescript-eslint/parser": "^6.15.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3",
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.4",
+    "ts-loader": "^9.5.1",
+    "@vscode/test-electron": "^2.3.8"
+  },
+  "dependencies": {}
+}

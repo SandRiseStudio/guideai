@@ -803,3 +803,246 @@ class MCPComplianceServiceAdapter(BaseComplianceAdapter):
         actor = self._build_actor(payload.get("actor", {}))
         result = self._service.validate_checklist(payload["checklist_id"], actor)
         return result.to_dict()
+
+
+# Workflow Service Adapters
+
+
+class BaseWorkflowAdapter:
+    """Base adapter for Workflow Service integrations."""
+
+    surface: str
+
+    def __init__(self, service: Any, surface: str) -> None:
+        self._service = service
+        self.surface = surface
+
+    def _build_actor(self, payload: Dict[str, Any]) -> Actor:
+        return Actor(
+            id=payload.get("id", "unknown"),
+            role=payload.get("role", "UNKNOWN"),
+            surface=self.surface,
+        )
+
+
+class CLIWorkflowServiceAdapter(BaseWorkflowAdapter):
+    """Adapter for CLI workflow commands."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="CLI")
+
+    def create_template(
+        self,
+        name: str,
+        description: str,
+        role_focus: str,
+        steps: List[Dict[str, Any]],
+        tags: List[str] | None,
+        metadata: Dict[str, Any] | None,
+        actor_id: str,
+        actor_role: str,
+    ) -> Dict[str, Any]:
+        from .workflow_service import TemplateStep, WorkflowRole
+
+        actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
+        template_steps = [
+            TemplateStep(
+                step_id=step.get("step_id", f"step-{idx}"),
+                name=step["name"],
+                description=step["description"],
+                prompt_template=step["prompt_template"],
+                behavior_injection_point=step.get("behavior_injection_point", "{{BEHAVIORS}}"),
+                required_behaviors=step.get("required_behaviors", []),
+                validation_rules=step.get("validation_rules", {}),
+                metadata=step.get("metadata", {}),
+            )
+            for idx, step in enumerate(steps)
+        ]
+        template = self._service.create_template(
+            name=name,
+            description=description,
+            role_focus=WorkflowRole(role_focus),
+            steps=template_steps,
+            actor=actor,
+            tags=tags,
+            metadata=metadata,
+        )
+        return template.to_dict()
+
+    def get_template(self, template_id: str) -> Dict[str, Any] | None:
+        template = self._service.get_template(template_id)
+        return template.to_dict() if template else None
+
+    def list_templates(
+        self,
+        role_focus: str | None = None,
+        tags: List[str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        from .workflow_service import WorkflowRole
+
+        role = WorkflowRole(role_focus) if role_focus else None
+        templates = self._service.list_templates(role_focus=role, tags=tags)
+        return [template.to_dict() for template in templates]
+
+    def run_workflow(
+        self,
+        template_id: str,
+        behavior_ids: List[str] | None,
+        metadata: Dict[str, Any] | None,
+        actor_id: str,
+        actor_role: str,
+    ) -> Dict[str, Any]:
+        actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
+        run = self._service.run_workflow(
+            template_id=template_id,
+            actor=actor,
+            behavior_ids=behavior_ids,
+            metadata=metadata,
+        )
+        return run.to_dict()
+
+    def get_run(self, run_id: str) -> Dict[str, Any] | None:
+        run = self._service.get_run(run_id)
+        return run.to_dict() if run else None
+
+
+class RestWorkflowServiceAdapter(BaseWorkflowAdapter):
+    """Adapter for REST API workflow endpoints."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="REST_API")
+
+    def create_template(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .workflow_service import TemplateStep, WorkflowRole
+
+        actor = self._build_actor(payload.get("actor", {}))
+        steps_data = payload.get("steps", [])
+        template_steps = [
+            TemplateStep(
+                step_id=step.get("step_id", f"step-{idx}"),
+                name=step["name"],
+                description=step["description"],
+                prompt_template=step["prompt_template"],
+                behavior_injection_point=step.get("behavior_injection_point", "{{BEHAVIORS}}"),
+                required_behaviors=step.get("required_behaviors", []),
+                validation_rules=step.get("validation_rules", {}),
+                metadata=step.get("metadata", {}),
+            )
+            for idx, step in enumerate(steps_data)
+        ]
+        template = self._service.create_template(
+            name=payload["name"],
+            description=payload["description"],
+            role_focus=WorkflowRole(payload["role_focus"]),
+            steps=template_steps,
+            actor=actor,
+            tags=payload.get("tags"),
+            metadata=payload.get("metadata"),
+        )
+        return template.to_dict()
+
+    def get_template(self, template_id: str) -> Dict[str, Any] | None:
+        template = self._service.get_template(template_id)
+        return template.to_dict() if template else None
+
+    def list_templates(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        from .workflow_service import WorkflowRole
+
+        role_focus = payload.get("role_focus")
+        role = WorkflowRole(role_focus) if role_focus else None
+        templates = self._service.list_templates(
+            role_focus=role,
+            tags=payload.get("tags"),
+        )
+        return [template.to_dict() for template in templates]
+
+    def run_workflow(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._build_actor(payload.get("actor", {}))
+        run = self._service.run_workflow(
+            template_id=payload["template_id"],
+            actor=actor,
+            behavior_ids=payload.get("behavior_ids"),
+            metadata=payload.get("metadata"),
+        )
+        return run.to_dict()
+
+    def get_run(self, run_id: str) -> Dict[str, Any] | None:
+        run = self._service.get_run(run_id)
+        return run.to_dict() if run else None
+
+    def update_run_status(self, run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .workflow_service import WorkflowStatus
+
+        status = WorkflowStatus(payload["status"])
+        self._service.update_run_status(
+            run_id=run_id,
+            status=status,
+            total_tokens=payload.get("total_tokens"),
+        )
+        run = self._service.get_run(run_id)
+        return run.to_dict() if run else {}
+
+
+class MCPWorkflowServiceAdapter(BaseWorkflowAdapter):
+    """Adapter for MCP tool workflow invocations."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="MCP")
+
+    def create_template(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .workflow_service import TemplateStep, WorkflowRole
+
+        actor = self._build_actor(payload.get("actor", {}))
+        steps_data = payload.get("steps", [])
+        template_steps = [
+            TemplateStep(
+                step_id=step.get("step_id", f"step-{idx}"),
+                name=step["name"],
+                description=step["description"],
+                prompt_template=step["prompt_template"],
+                behavior_injection_point=step.get("behavior_injection_point", "{{BEHAVIORS}}"),
+                required_behaviors=step.get("required_behaviors", []),
+                validation_rules=step.get("validation_rules", {}),
+                metadata=step.get("metadata", {}),
+            )
+            for idx, step in enumerate(steps_data)
+        ]
+        template = self._service.create_template(
+            name=payload["name"],
+            description=payload["description"],
+            role_focus=WorkflowRole(payload["role_focus"]),
+            steps=template_steps,
+            actor=actor,
+            tags=payload.get("tags"),
+            metadata=payload.get("metadata"),
+        )
+        return template.to_dict()
+
+    def get_template(self, template_id: str) -> Dict[str, Any] | None:
+        template = self._service.get_template(template_id)
+        return template.to_dict() if template else None
+
+    def list_templates(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        from .workflow_service import WorkflowRole
+
+        role_focus = payload.get("role_focus")
+        role = WorkflowRole(role_focus) if role_focus else None
+        templates = self._service.list_templates(
+            role_focus=role,
+            tags=payload.get("tags"),
+        )
+        return [template.to_dict() for template in templates]
+
+    def run_workflow(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._build_actor(payload.get("actor", {}))
+        run = self._service.run_workflow(
+            template_id=payload["template_id"],
+            actor=actor,
+            behavior_ids=payload.get("behavior_ids"),
+            metadata=payload.get("metadata"),
+        )
+        return run.to_dict()
+
+    def get_run(self, run_id: str) -> Dict[str, Any] | None:
+        run = self._service.get_run(run_id)
+        return run.to_dict() if run else None
