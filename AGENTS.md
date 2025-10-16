@@ -113,6 +113,7 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
 | consent, JIT auth, scope catalog, prototype | `behavior_prototype_consent_ux`, `behavior_instrument_metrics_pipeline` |
 | secret leak, token, credential, gitleaks | `behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials` |
 | git workflow, branching, merge policy | `behavior_git_governance`, `behavior_prevent_secret_leaks` |
+| ci pipeline, deployment, rollback | `behavior_orchestrate_cicd`, `behavior_prevent_secret_leaks` |
 | new reusable workflow discovered | Add a behavior entry |
 
 ## Agent etiquette
@@ -263,6 +264,15 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
   3. Include ActionService action IDs and cited behaviors in commit/PR descriptions; ensure `guideai record-action` logs reference the branch work.
   4. Require cross-role review prior to merge and confirm CI executed `guideai scan-secrets`, tests, and lint/build jobs successfully.
   5. Update `PROGRESS_TRACKER.md`, tag releases as needed, and document outcomes in `PRD_ALIGNMENT_LOG.md` when branches merge or repositories mirror.
+
+### `behavior_orchestrate_cicd`
+- **When**: Designing or updating CI/CD pipelines, deployment workflows, or environment automation across GitHub/GitLab/Bitbucket/self-hosted runners.
+- **Steps**:
+  1. Reference `docs/AGENT_DEVOPS.md`, `docs/GIT_STRATEGY.md`, and `.github/workflows/ci.yml` (or equivalent) to ensure parity with local guardrails.
+  2. Configure pipelines to run `pre-commit run --all-files`, `pytest`, `npm run build`, and secret scanning (`guideai scan-secrets` when available) before merge/deploy.
+  3. Capture deployment telemetry and link runs to ActionService entries, including rollback metadata and environment identifiers.
+  4. Coordinate with Security/Compliance to manage secrets via `SECRETS_MANAGEMENT_PLAN.md`; document changes in `PRD_ALIGNMENT_LOG.md` and update runbooks.
+  5. Validate pipelines via dry run or staging deploy, then update `PROGRESS_TRACKER.md`, `BUILD_TIMELINE.md`, and incident playbooks as needed.
 
   ### `behavior_prevent_secret_leaks`
   - **When**: Initializing repositories, preparing commits/pushes, or wiring CI pipelines where sensitive tokens might leak.

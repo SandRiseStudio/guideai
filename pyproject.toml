@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guideai"
+version = "0.1.0"
+description = "GuideAI developer tooling and task orchestration helpers"
+readme = "docs/README.md"
+requires-python = ">=3.10"
+keywords = ["guideai", "cli", "developer-tools"]
+license = { text = "Proprietary" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+]
+authors = [
+  { name = "GuideAI Team" }
+]
+
+[project.urls]
+Documentation = "https://example.com/guideai"
+Source = "https://github.com/Nas4146/guideai"
+
+[project.scripts]
+guideai = "guideai.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]

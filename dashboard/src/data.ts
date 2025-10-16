@@ -34,6 +34,23 @@ export interface ConsentSnapshot {
   updated: string;
 }
 
+export interface OnboardingMetric {
+  surface: string;
+  sampleSize: number;
+  averageTimeToFirstBehaviorMinutes: number;
+  checklistCompletionRate: number;
+  behaviorSearchToInsertRate: number;
+  behaviorReuseRate: number;
+  tokenSavingsAverage: number;
+  taskCompletionRate: number;
+  complianceCoverage: number;
+}
+
+export interface OnboardingSnapshot {
+  metrics: OnboardingMetric[];
+  updated: string;
+}
+
 const tableSectionRegex = /##\s+([^\n]+)\n([\s\S]*?)(?=\n##\s+|\n_Last updated|$)/g;
 
 function parseTableBlock(block: string): string[][] {
@@ -135,6 +152,42 @@ export function parseConsentSnapshot(markdown: string): ConsentSnapshot {
       mfaCompleted: Number(mfaCompleted),
       averageLatencySeconds: Number(avgLatency),
       p95LatencySeconds: Number(p95Latency),
+    };
+  });
+
+  const updatedMatch = markdown.match(/_Updated:\s*([^_]+)_/i);
+
+  return {
+    metrics,
+    updated: updatedMatch ? updatedMatch[1].trim() : 'Unknown',
+  };
+}
+
+export function parseOnboardingSnapshot(markdown: string): OnboardingSnapshot {
+  const rows = parseTableBlock(markdown);
+  const metrics: OnboardingMetric[] = rows.map((row) => {
+    const [
+      surface = '',
+      sampleSize = '0',
+      avgTime = '0',
+      checklist = '0',
+      searchInsert = '0',
+      behaviorReuse = '0',
+      tokenSavings = '0',
+      taskCompletion = '0',
+      compliance = '0',
+    ] = row;
+
+    return {
+      surface,
+      sampleSize: Number(sampleSize),
+      averageTimeToFirstBehaviorMinutes: Number(avgTime),
+      checklistCompletionRate: Number(checklist),
+      behaviorSearchToInsertRate: Number(searchInsert),
+      behaviorReuseRate: Number(behaviorReuse),
+      tokenSavingsAverage: Number(tokenSavings),
+      taskCompletionRate: Number(taskCompletion),
+      complianceCoverage: Number(compliance),
     };
   });
 

@@ -28,6 +28,7 @@ Base path: `/v1/actions`
 | `GET /{action_id}` | Retrieve full details including metadata and replay history. | — | `ActionResponse` |
 | `POST /replay` | Start a replay job for a set of actions (ordered list). | `ReplayRequest` | `ReplayResponse` |
 | `GET /replay/{replay_id}` | Inspect status, logs, parity checks. | — | `ReplayResponse` |
+| `POST /v1/tasks:listAssignments` | List remaining milestone tasks mapped to functions and agents. | `TaskAssignmentRequest` | `TaskAssignmentListResponse` |
 
 ### Request Schemas
 - **ActionCreateRequest**
@@ -83,6 +84,36 @@ Base path: `/v1/actions`
 }
 ```
 
+- **TaskAssignmentRequest**
+```json
+{
+  "function": "engineering"
+}
+```
+
+- **TaskAssignmentListResponse**
+```json
+{
+  "tasks": [
+    {
+      "task_id": "milestone1.vscode_extension",
+      "title": "VS Code Extension Preview",
+      "milestone": "Milestone 1",
+      "status": "PLANNED",
+      "function": "Developer Experience",
+      "primary_agent": "Agent Developer Experience",
+      "agent_playbook": "AGENT_DX.md",
+      "supporting_agents": [
+        {"function": "Engineering", "primary_agent": "Agent Engineering", "agent_playbook": "AGENT_ENGINEERING.md"}
+      ],
+      "surfaces": ["platform", "cli", "api", "mcp"],
+      "dependencies": ["sdk-authentication", "behavior-retrieval-api"],
+      "evidence_targets": ["Extension bundle", "Capability matrix update"]
+    }
+  ]
+}
+```
+
 ## 4. MCP Tool Definitions
 | Tool Name | Type | Input Schema | Output |
 | --- | --- | --- | --- |
@@ -93,6 +124,7 @@ Base path: `/v1/actions`
 | `actions.replayStatus` | `query` | `{ replay_id: UUID }` | `ReplayResponse` |
 | `reviews.run` | `command` | `{ artifact: string, scope: string[], behaviors?: string[] }` | `ReviewResponse` (aggregated feedback, action ids) |
 | `security.scanSecrets` | `command` | `SecretScanRequest` | `SecretScanResponse` |
+| `tasks.listAssignments` | `query` | `{ function?: string }` | `TaskAssignmentListResponse` |
 
 > AgentAuth MCP tools that gate these operations are defined under `mcp/tools/auth.*.json` and share schema definitions with `proto/agentauth/v1/agent_auth.proto`.
 
@@ -106,6 +138,7 @@ Base path: `/v1/actions`
 | `guideai show-action <id>` | Display full details plus diff/checksum. | `--format (json|table)` |
 | `guideai replay` | Replay a set of actions. | `--actions <ids|path>`, `--strategy`, `--dry-run`, `--skip-existing`, `--watch` |
 | `guideai replay-status <id>` | Stream replay progress/logs. | `--follow` |
+| `guideai tasks` | List remaining tasks mapped to functions/agents. | `--function <owner>`, `--format (json|table)` |
 | `guideai agents review` | Schedule cross-functional agent reviews (Engineering, DX, Compliance, Product) and fetch feedback. | `--artifact <path>` `--scope <csv>` `--behaviors <csv>` `--wait` |
 | `guideai scan-secrets` | Run repo-wide secret scan via Gitleaks and log results as an action. | `--format (table|json)` `--fail-on-findings` `--output <path>` |
 

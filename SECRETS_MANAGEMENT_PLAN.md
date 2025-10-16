@@ -17,6 +17,7 @@
 - CLI performs device login (`guideai auth login`) to exchange for short-lived access + refresh tokens.
 - Tokens stored via `keyring` integration (platform-specific secure storage); fallback requires explicit `--allow-plaintext` flag (disabled by default).
 - Commands log token scope changes using `guideai record-action` for compliance traceability.
+- `guideai scan-secrets` shells out to the shared Gitleaks hook (`pre-commit run gitleaks --all-files`) and emits a JSON/table report that is archived under `security/scan_reports/` when `--output` is provided.
 - Auto-rotation: refresh tokens valid 7 days; CLI prompts rotation on expiry.
 
 ## SDK Guidelines
@@ -32,6 +33,8 @@
 ## Source Control Guardrails
 - Pre-commit hook (`.pre-commit-config.yaml`) runs Gitleaks with redaction and whitespace fixers; developers must run `pre-commit install` before committing.
 - `scripts/scan_secrets.sh` provides a deterministic wrapper used by CI (`guideai scan-secrets`) and local workflows; exit status blocks merges if any findings remain.
+- MCP adapters call `security.scanSecrets` to enforce the same guardrail inside IDE integrations; requests must include the invoking surface so telemetry can attribute remediation SLAs.
+- MCP tool contract (`mcp/tools/security.scanSecrets.json`) mirrors the CLI inputs/outputs so IDEs can persist audit-ready reports alongside ActionService entries.
 - Suppression requires Compliance approval and an audit note referencing the remediation action logged via ActionService.
 - `.gitignore` tracks secret-prone files (`.env`, `.venv`, generated logs); additions must cite `behavior_prevent_secret_leaks`.
 

@@ -16,7 +16,8 @@ from .agent_auth import (
     RevokeGrantRequest,
     RevokeGrantResponse,
 )
-from .telemetry import TelemetryClient, TelemetryEvent, InMemoryTelemetrySink
+from .telemetry import InMemoryTelemetrySink, TelemetryClient, TelemetryEvent
+from .task_assignments import TaskAssignmentService
 
 __all__ = [
     "ActionService",
@@ -40,4 +41,5 @@ __all__ = [
     "TelemetryClient",
     "TelemetryEvent",
     "InMemoryTelemetrySink",
+    "TaskAssignmentService",
 ]

@@ -49,8 +49,20 @@ export const ensureTelemetrySession = (): void => {
   }
 };
 
-export const registerTelemetrySink = (sink: TelemetrySink): void => {
+export const registerTelemetrySink = (sink: TelemetrySink): (() => void) => {
   sinks.push(sink);
+  return () => {
+    const index = sinks.indexOf(sink);
+    if (index !== -1) {
+      sinks.splice(index, 1);
+    }
+  };
+};
+
+export const getTelemetryStore = (): TelemetryEvent[] => {
+  if (typeof window === 'undefined') return [];
+  ensureStore();
+  return window.__GUIDEAI_TELEMETRY__ ?? [];
 };
 
 export const emitTelemetry = (eventType: string, payload: TelemetryPayload = {}): void => {

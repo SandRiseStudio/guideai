@@ -74,6 +74,37 @@ Ensure MFA re-prompts feel consistent, fast, and trustworthy across Web, CLI, an
 - **2025-10-19:** Publish findings summary, update dashboards, and finalize go/no-go recommendation for Milestone 1 gate.
 - Deliverable: attach CSV exports, raw telemetry queries, and qualitative notes to `PROGRESS_TRACKER.md` evidence column once available.
 
+## Validation Execution – 2025-10-15 Dry Run
+
+We executed a dry-run of the playbook using the current telemetry harness and ActionService stubs to confirm instrumentation coverage ahead of the scheduled full validation window.
+
+### Summary
+- Triggered synthetic MFA-required events through the integration tests in `tests/test_telemetry_integration.py` to verify required fields (`mfa_required`, `mfa_verified`, `consent_request_id`, `audit_action_id`).
+- Exercised CLI denial and replay flows via the new `guideai` action parity commands to ensure ActionService logging still captures MFA metadata.
+- Confirmed dashboards ingest consent/MFA payloads without schema drift by running the dashboard build (`npm run build` in `dashboard/`).
+- Captured qualitative notes for surfaces that still require manual UX observation (flagged in the table below).
+
+### Scenario Results
+| Scenario | Surface | Status | Evidence | Follow-ups |
+| --- | --- | --- | --- | --- |
+| Approve high-risk replay | Web | ✅ Simulated via telemetry unit test | `tests/test_telemetry_integration.py::test_action_mfa_events` | Capture real modal latency once staging UI is wired.
+| Deny elevated command | CLI | ✅ Verified CLI parity commands emit action logs with MFA metadata | `guideai/cli.py` dry run (`record-action`/`replay-actions`) | Add manual device-flow transcript during Milestone 1 rehearsal.
+| Retry with cached grant | VS Code | ⚠️ Pending manual IDE validation | Telemetry fields present in SDK stub | Schedule IDE smoke test once extension preview branch opens.
+| Forced re-prompt after snooze cap | Web | ⚠️ Pending policy bundle change | Synthetic event emitted, no UI macro yet | Implement snooze counter in modal before live run.
+| Offline CLI | CLI | ✅ Timeout path exercised by telemetry stub | `tests/test_telemetry_integration.py` mocked payload | Capture manual copy review for offline instructions.
+| API parity smoke | API | ✅ REST schema validated | `tests/test_agent_auth_contracts.py` | Add Postman collection to appendix for partner teams.
+| MCP/Extension | MCP | ⚠️ Pending MCP tool validation | `mcp/tools/auth.*.json` schema synced | Coordinate with IDE parity owners for live verification.
+
+### Observations
+- All automated hooks confirmed required telemetry fields; no schema regressions detected.
+- Need staged UI walkthroughs for Web/VS Code to measure actual MFA latency and snooze behavior.
+- CLI output remains concise after the new action commands; ensure documentation references the MFA denial copy once finalized.
+
+### Next Steps
+1. Schedule manual surface walkthroughs (Web, VS Code, MCP) once consent modal updates land.
+2. Export updated latency snapshots from dashboard post-manual run and attach to `docs/analytics/consent_mfa_snapshot.md`.
+3. File follow-up issue for snooze-cap escalation logic (`MFA-VALIDATION-04`).
+
 ## Appendices
 - **Run Scripts**: Provide CLI command templates and API calls in shared internal wiki (link TBD) to avoid duplicating credentials here.
 - **Telemetry Queries**: Saved queries in analytics workspace (`consent_mfa_latency_p95`, `mfa_failure_rate_by_surface`).

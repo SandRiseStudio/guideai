@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pre-commit
+
+      - name: Install Node dependencies
+        run: |
+          cd dashboard
+          npm ci
+
+      - name: Run pre-commit checks
+        run: pre-commit run --all-files
+
+      - name: Run secret scan
+        run: python -m guideai scan-secrets --format json --fail-on-findings --output security/scan_reports/ci-latest.json
+
+      - name: Run Python tests
+        run: pytest
+
+      - name: Run dashboard build
+        run: |
+          cd dashboard
+          npm run build
+
+      - name: Record action (optional)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Use guideai record-action after validating outputs"

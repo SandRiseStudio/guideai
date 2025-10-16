@@ -56,6 +56,7 @@ Establish a platform-agnostic Git operating model for Strategist → Teacher →
 
 ## Automation & Tooling Hooks
 - After cloning, run `./scripts/install_hooks.sh` to wire `git commit`/`git push` into the shared pre-commit checks (gitleaks, whitespace fixers).
+- CI/CD pipelines (GitHub Actions, GitLab CI, Bitbucket Pipelines) must execute the same guardrails (`pre-commit run --all-files`, `pytest`, `npm run build`, planned `guideai scan-secrets`) before merge.
 - Add `pre-commit` job to CI template; fail builds on any gitleaks findings.
 - Integrate `guideai scan-secrets` into pipeline stage `sec-scan`. Upload JSON to `security/scan_reports/` (ignored by Git) for audit.
 - Optionally configure server-side hooks (pre-receive) to run gitleaks for centralized enforcement.

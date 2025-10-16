@@ -5,6 +5,7 @@ import {
   parseBuildTimeline,
   parseAlignmentLog,
   parseConsentSnapshot,
+  parseOnboardingSnapshot,
   ProgressItem,
   TimelineEntry,
   AlignmentEntry,
@@ -13,12 +14,16 @@ import ProgressTrackerMarkdown from '#docs/PROGRESS_TRACKER.md?raw';
 import BuildTimelineMarkdown from '#docs/BUILD_TIMELINE.md?raw';
 import AlignmentLogMarkdown from '#docs/PRD_ALIGNMENT_LOG.md?raw';
 import ConsentSnapshotMarkdown from '#docs/docs/analytics/consent_mfa_snapshot.md?raw';
+import OnboardingSnapshotMarkdown from '#docs/docs/analytics/onboarding_adoption_snapshot.md?raw';
 import { SectionCard } from './components/SectionCard';
 import { ProgressOverview } from './components/ProgressOverview';
 import { Timeline } from './components/Timeline';
 import { AlignmentUpdates } from './components/AlignmentUpdates';
 import { ConsentDashboard } from './components/ConsentDashboard';
+import { OnboardingDashboard } from './components/OnboardingDashboard';
 import { emitTelemetry, ensureTelemetrySession } from './telemetry';
+import { useConsentTelemetry } from './hooks/useConsentTelemetry';
+import { useOnboardingTelemetry } from './hooks/useOnboardingTelemetry';
 
 const getInitialTheme = (): 'light' | 'dark' => {
   if (typeof window === 'undefined') {
@@ -58,11 +63,14 @@ export const App: FunctionalComponent = () => {
     () => parseAlignmentLog(AlignmentLogMarkdown),
     []
   );
-  const consentSnapshot = useMemo(() => parseConsentSnapshot(ConsentSnapshotMarkdown), []);
+  const initialConsentSnapshot = useMemo(() => parseConsentSnapshot(ConsentSnapshotMarkdown), []);
+  const initialOnboardingSnapshot = useMemo(() => parseOnboardingSnapshot(OnboardingSnapshotMarkdown), []);
+  const { metrics: consentMetrics, updatedAt: consentUpdatedAt } = useConsentTelemetry(initialConsentSnapshot);
+  const { metrics: onboardingMetrics, updatedAt: onboardingUpdatedAt } = useOnboardingTelemetry(initialOnboardingSnapshot);
 
   const consentTotals = useMemo(
     () =>
-      consentSnapshot.metrics.reduce<{
+      consentMetrics.reduce<{
         prompts: number;
         approvals: number;
         denials: number;
@@ -85,7 +93,7 @@ export const App: FunctionalComponent = () => {
         mfaCompleted: 0,
         weightedLatency: 0,
       }),
-    [consentSnapshot.metrics]
+    [consentMetrics]
   );
 
   const consentApprovalRate = consentTotals.prompts === 0
@@ -102,10 +110,28 @@ export const App: FunctionalComponent = () => {
     const total = items.length;
     const completed = items.filter((item: ProgressItem) => item.status.includes('✅')).length;
     const inFlight = items.filter((item: ProgressItem) => item.status.includes('⏳')).length;
-    const owners = Array.from(
-      new Set(items.map((item: ProgressItem) => item.owner))
-    ).filter(Boolean).length;
+    const owners = Array.from(new Set(items.map((item: ProgressItem) => item.owner))).filter(Boolean).length;
     const completion = total === 0 ? 0 : Math.round((completed / total) * 100);
+
+    const onboardingSample = onboardingMetrics.reduce((sum, metric) => sum + metric.sampleSize, 0);
+    const onboardingAvgTime = onboardingSample === 0
+      ? 0
+      : onboardingMetrics.reduce(
+          (sum, metric) => sum + metric.averageTimeToFirstBehaviorMinutes * metric.sampleSize,
+          0
+        ) / onboardingSample;
+    const onboardingBehaviorReuse = onboardingSample === 0
+      ? 0
+      : onboardingMetrics.reduce(
+          (sum, metric) => sum + metric.behaviorReuseRate * metric.sampleSize,
+          0
+        ) / onboardingSample;
+    const onboardingCompliance = onboardingSample === 0
+      ? 0
+      : onboardingMetrics.reduce(
+          (sum, metric) => sum + metric.complianceCoverage * metric.sampleSize,
+          0
+        ) / onboardingSample;
 
     return [
       { label: 'Scope Complete', value: `${completed}/${total}` },
@@ -114,8 +140,11 @@ export const App: FunctionalComponent = () => {
       { label: 'Contributors', value: owners.toString() },
       { label: 'Consent Approval', value: `${consentApprovalRate.toFixed(1)}%` },
       { label: 'MFA Completion', value: `${consentMfaCompletion.toFixed(1)}%` },
+      { label: 'Avg Time→Behavior', value: `${onboardingAvgTime.toFixed(1)}m` },
+      { label: 'Behavior Reuse', value: `${onboardingBehaviorReuse.toFixed(1)}%` },
+      { label: 'Compliance Coverage', value: `${onboardingCompliance.toFixed(1)}%` },
     ];
-  }, [progressData.sections, consentApprovalRate, consentMfaCompletion]);
+  }, [progressData.sections, consentApprovalRate, consentMfaCompletion, onboardingMetrics]);
 
   const isDark = theme === 'dark';
 
@@ -123,13 +152,27 @@ export const App: FunctionalComponent = () => {
     emitTelemetry('dashboard_loaded', {
       last_sync: progressData.lastUpdated,
       total_artifacts: timelineEntries.length,
-      consent_surfaces: consentSnapshot.metrics.length,
+      consent_surfaces: consentMetrics.length,
       consent_prompts: consentTotals.prompts,
       consent_approval_rate: consentApprovalRate / 100,
       mfa_completion_rate: consentMfaCompletion / 100,
       completion_rate: stats.find((stat) => stat.label === 'Completion')?.value,
+      consent_updated_at: consentUpdatedAt,
+      onboarding_surfaces: onboardingMetrics.length,
+      onboarding_updated_at: onboardingUpdatedAt,
     });
-  }, [progressData.lastUpdated, timelineEntries.length, consentSnapshot.metrics.length, consentTotals.prompts, consentApprovalRate, consentMfaCompletion, stats]);
+  }, [
+    progressData.lastUpdated,
+    timelineEntries.length,
+    consentMetrics.length,
+    consentTotals.prompts,
+    consentApprovalRate,
+    consentMfaCompletion,
+    stats,
+    consentUpdatedAt,
+    onboardingMetrics.length,
+    onboardingUpdatedAt,
+  ]);
 
   const renderStat = (stat: Stat) => (
     <div class="stat-card" key={stat.label}>
@@ -156,7 +199,16 @@ export const App: FunctionalComponent = () => {
               <strong>Total artifacts tracked:</strong> {timelineEntries.length}
             </span>
             <span class="hero__meta-item">
-              <strong>Consent surfaces:</strong> {consentSnapshot.metrics.length}
+              <strong>Consent surfaces:</strong> {consentMetrics.length}
+            </span>
+            <span class="hero__meta-item">
+              <strong>Consent updated:</strong> {consentUpdatedAt}
+            </span>
+            <span class="hero__meta-item">
+              <strong>Onboarding surfaces:</strong> {onboardingMetrics.length}
+            </span>
+            <span class="hero__meta-item">
+              <strong>Onboarding updated:</strong> {onboardingUpdatedAt}
             </span>
           </div>
         </div>
@@ -211,9 +263,16 @@ export const App: FunctionalComponent = () => {
 
         <SectionCard
           title="Consent & MFA Dashboard"
-          subtitle="Telemetry snapshot from docs/analytics/consent_mfa_snapshot.md"
+          subtitle="Telemetry-backed metrics seeded from docs/analytics/consent_mfa_snapshot.md"
         >
-          <ConsentDashboard metrics={consentSnapshot.metrics} updatedAt={consentSnapshot.updated} />
+          <ConsentDashboard metrics={consentMetrics} updatedAt={consentUpdatedAt} />
+        </SectionCard>
+
+        <SectionCard
+          title="Onboarding & Adoption"
+          subtitle="Telemetry-backed metrics seeded from docs/analytics/onboarding_adoption_snapshot.md"
+        >
+          <OnboardingDashboard metrics={onboardingMetrics} updatedAt={onboardingUpdatedAt} />
         </SectionCard>
       </main>
     </div>
