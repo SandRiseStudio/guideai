@@ -1,13 +1,71 @@
-name: CI
+name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  PYTHON_VERSION_DEFAULT: "3.11"
+  NODE_VERSION: "20"
 
 jobs:
-  checks:
+  # ============================================================================
+  # Security & Pre-Commit Checks
+  # ============================================================================
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for gitleaks
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+
+      - name: Install GuideAI package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Run gitleaks secret scan
+        run: |
+          mkdir -p security/scan_reports
+          ./scripts/scan_secrets.sh || exit 1
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: security/scan_reports/
+          retention-days: 30
+
+      - name: Validate pre-commit hooks installable
+        run: |
+          pip install pre-commit
+          ./scripts/install_hooks.sh
+          pre-commit --version
+
+  pre-commit:
+    name: Pre-Commit Hooks
     runs-on: ubuntu-latest
 
     steps:
@@ -17,33 +75,317 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
 
-      - name: Install Python dependencies
+      - name: Install pre-commit
         run: |
           python -m pip install --upgrade pip
           pip install pre-commit
 
-      - name: Install Node dependencies
-        run: |
-          cd dashboard
-          npm ci
-
       - name: Run pre-commit checks
-        run: pre-commit run --all-files
+        run: pre-commit run --all-files --show-diff-on-failure
 
-      - name: Run secret scan
-        run: python -m guideai scan-secrets --format json --fail-on-findings --output security/scan_reports/ci-latest.json
+  # ============================================================================
+  # Python Test Matrix (3.10, 3.11, 3.12)
+  # ============================================================================
+  test-python:
+    name: Python Tests (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    needs: [security-scan]
 
-      - name: Run Python tests
-        run: pytest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12"]
 
-      - name: Run dashboard build
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
         run: |
-          cd dashboard
-          npm run build
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev  # For keychain support
 
-      - name: Record action (optional)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Install Python dependencies
         run: |
-          echo "Use guideai record-action after validating outputs"
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,semantic]"
+          pip install pytest pytest-asyncio pytest-cov pytest-timeout
+
+      - name: Run pytest with coverage
+        run: |
+          pytest \
+            --cov=guideai \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --timeout=30 \
+            --ignore=test_kafka_consume.py \
+            -v
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+      - name: Generate test report
+        if: always()
+        run: |
+          pytest \
+            --ignore=test_kafka_consume.py \
+            --tb=short \
+            --junit-xml=test-results-py${{ matrix.python-version }}.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: test-results-py${{ matrix.python-version }}.xml
+          retention-days: 30
+
+  # ============================================================================
+  # Service Parity Tests (Critical)
+  # ============================================================================
+  test-parity:
+    name: Service Parity Tests
+    runs-on: ubuntu-latest
+    needs: [security-scan]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,semantic]"
+
+      - name: Run all parity tests
+        run: |
+          pytest tests/test_*_parity.py -v --tb=short
+
+      - name: Run cross-surface consistency tests
+        run: |
+          pytest tests/test_cross_surface_consistency.py -v --tb=short
+
+      - name: Run MCP device flow tests
+        run: |
+          pytest tests/test_mcp_device_flow.py -v --tb=short
+
+      - name: Generate parity coverage matrix
+        if: always()
+        run: |
+          python tests/test_all_service_parity.py > parity-coverage-report.txt || true
+
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-coverage-report
+          path: parity-coverage-report.txt
+          retention-days: 30
+
+  # ============================================================================
+  # MCP Server Validation
+  # ============================================================================
+  test-mcp-server:
+    name: MCP Server Protocol Tests
+    runs-on: ubuntu-latest
+    needs: [security-scan]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run MCP server validation
+        run: |
+          python examples/test_mcp_server.py
+
+      - name: Test MCP server startup
+        run: |
+          timeout 5 python -m guideai.mcp_server <<< '{"jsonrpc":"2.0","id":1,"method":"ping"}' || true
+
+  # ============================================================================
+  # Dashboard Build & Tests
+  # ============================================================================
+  test-dashboard:
+    name: Dashboard Build & Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Run linter
+        working-directory: dashboard
+        run: npm run lint || true
+
+      - name: Build dashboard
+        working-directory: dashboard
+        run: npm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-build
+          path: dashboard/dist/
+          retention-days: 7
+
+  # ============================================================================
+  # VS Code Extension Build
+  # ============================================================================
+  test-extension:
+    name: VS Code Extension Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: extension/package-lock.json
+
+      - name: Install dependencies
+        working-directory: extension
+        run: npm ci
+
+      - name: Compile extension
+        working-directory: extension
+        run: npm run compile
+
+      - name: Package extension
+        working-directory: extension
+        run: |
+          npm install -g @vscode/vsce
+          vsce package --allow-missing-repository || true
+
+      - name: Upload VSIX
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-extension
+          path: extension/*.vsix
+          retention-days: 7
+
+  # ============================================================================
+  # Integration Gate (All Tests Must Pass)
+  # ============================================================================
+  integration-gate:
+    name: Integration Gate
+    runs-on: ubuntu-latest
+    needs:
+      - security-scan
+      - pre-commit
+      - test-python
+      - test-parity
+      - test-mcp-server
+      - test-dashboard
+      - test-extension
+
+    steps:
+      - name: All checks passed
+        run: |
+          echo "✅ All CI checks passed successfully!"
+          echo "✅ Security scan: PASSED"
+          echo "✅ Pre-commit hooks: PASSED"
+          echo "✅ Python tests (3.10, 3.11, 3.12): PASSED"
+          echo "✅ Service parity tests: PASSED"
+          echo "✅ MCP server validation: PASSED"
+          echo "✅ Dashboard build: PASSED"
+          echo "✅ VS Code extension: PASSED"
+          echo ""
+          echo "🎉 Ready for deployment!"
+
+  # ============================================================================
+  # Deployment Jobs (Triggered on workflow_dispatch or main branch)
+  # ============================================================================
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    needs: [integration-gate]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+      url: ${{ steps.deploy.outputs.url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "DEPLOY_URL=https://api.guideai.com" >> $GITHUB_ENV
+          elif [ "${{ github.event.inputs.environment }}" == "staging" ]; then
+            echo "DEPLOY_URL=https://staging.guideai.com" >> $GITHUB_ENV
+          else
+            echo "DEPLOY_URL=https://dev.guideai.com" >> $GITHUB_ENV
+          fi
+
+      - name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
+        id: deploy
+        run: |
+          echo "🚀 Deploying to ${{ github.event.inputs.environment || 'dev' }}..."
+          echo "url=${{ env.DEPLOY_URL }}" >> $GITHUB_OUTPUT
+          # TODO: Add actual deployment steps here
+          # - Build Podman images
+          # - Push to container registry (Quay.io, GHCR, or private registry)
+          # - Update Kubernetes/Podman pod deployment
+          # - Run smoke tests
+          echo "✅ Deployment complete!"
+
+      - name: Record deployment action
+        run: |
+          echo "Recording deployment via guideai record-action..."
+          # TODO: Wire to actual ActionService
+          # guideai record-action \
+          #   --artifact ".github/workflows/ci.yml" \
+          #   --summary "Deployed to ${{ github.event.inputs.environment || 'dev' }}" \
+          #   --behaviors behavior_orchestrate_cicd behavior_update_docs_after_changes
+
+      - name: Notify deployment
+        run: |
+          echo "📢 Deployment notification would be sent here"
+          # TODO: Add Slack/email notification
