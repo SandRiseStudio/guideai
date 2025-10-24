@@ -34,6 +34,15 @@ Documentation = "https://example.com/guideai"
 Source = "https://github.com/Nas4146/guideai"
 
 [project.optional-dependencies]
+dev = [
+  "pytest>=7.4,<9.0",
+  "pytest-cov>=4.1,<6.0",
+  "pytest-asyncio>=0.21,<1.0",
+  "black>=23.0,<25.0",
+  "isort>=5.12,<6.0",
+  "flake8>=6.0,<8.0",
+  "mypy>=1.5,<2.0",
+]
 telemetry = [
   "kafka-python>=2.0,<3.0",
   "duckdb>=0.9,<1.0",
