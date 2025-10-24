@@ -2,10 +2,17 @@
 
 > **Last Updated:** 2025-10-23
 > **Behaviors:** `behavior_orchestrate_cicd`, `behavior_prevent_secret_leaks`, `behavior_git_governance`
+> **Status:** Pipeline operational, test fixtures deferred (see [CICD_TEST_STATUS.md](CICD_TEST_STATUS.md))
 
 ## Overview
 
 This guide documents the GuideAI CI/CD pipeline implementing automated testing, security scanning, and multi-environment deployments. The pipeline enforces quality gates across all 282 tests, secret scanning, and cross-surface parity validation before allowing deployments.
+
+**Current Status (2025-10-23):**
+- ✅ Pipeline infrastructure fully operational (6/9 jobs passing)
+- ✅ Security scanning, linting, builds working
+- ⏸️ Test failures deferred to telemetry infrastructure phase (need PostgreSQL/Kafka fixtures)
+- 📋 See [CICD_TEST_STATUS.md](CICD_TEST_STATUS.md) for detailed analysis
 
 ## Pipeline Architecture
 
