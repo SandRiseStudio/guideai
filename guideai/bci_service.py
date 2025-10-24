@@ -1,0 +1,445 @@
+"""Behavior-Conditioned Inference service stubs leveraging BCI contracts."""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import re
+import statistics
+from collections import Counter
+from dataclasses import asdict
+from time import perf_counter
+from typing import Any, Dict, Iterable, List, Optional
+
+from .behavior_retriever import BehaviorRetriever
+from .behavior_service import BehaviorService, SearchBehaviorsRequest
+from .telemetry import TelemetryClient
+from .bci_contracts import (
+    BatchComposePromptRequest,
+    BatchComposePromptResponse,
+    BatchComposeResult,
+    BehaviorMatch,
+    BehaviorSnippet,
+    Citation,
+    CitationMode,
+    CitationType,
+    ComposePromptRequest,
+    ComposePromptResponse,
+    ComputeTokenSavingsRequest,
+    ComputeTokenSavingsResponse,
+    DetectPatternsRequest,
+    DetectPatternsResponse,
+    Pattern,
+    PatternCandidate,
+    PromptFormat,
+    RetrieveRequest,
+    RetrieveResponse,
+    RetrievalStrategy,
+    RoleFocus,
+    ScoreDimension,
+    ScoreDimensionName,
+    ScoreReusabilityRequest,
+    ScoreReusabilityResponse,
+    SegmentTraceRequest,
+    SegmentTraceResponse,
+    TraceFormat,
+    TraceInput,
+    TraceStep,
+    ValidateCitationsRequest,
+    ValidateCitationsResponse,
+    ParseCitationsRequest,
+    ParseCitationsResponse,
+    PrependedBehavior,
+)
+
+_DEFAULT_PROMPT_INSTRUCTION = (
+    "When solving the task below, reference these behaviors by name when you apply them."
+)
+_DEFAULT_SCORE_WEIGHTS = (
+    (ScoreDimensionName.CLARITY, 0.30),
+    (ScoreDimensionName.GENERALITY, 0.30),
+    (ScoreDimensionName.REUSABILITY, 0.25),
+    (ScoreDimensionName.CORRECTNESS, 0.15),
+)
+_DEFAULT_CITATION_PATTERNS: List[str] = [
+    r"(behavior_[a-zA-Z0-9_]+)",
+    r"\((behavior_[a-zA-Z0-9_]+)\)",
+    r"\[(behavior_[a-zA-Z0-9_]+)\]",
+]
+
+
+def _safe_role_focus(value: Optional[str]) -> Optional[RoleFocus]:
+    if value is None:
+        return None
+    try:
+        return RoleFocus(value)
+    except ValueError:
+        return None
+
+
+logger = logging.getLogger(__name__)
+
+
+class BCIService:
+    """High-level BCI orchestration helpers used across adapters."""
+
+    def __init__(
+        self,
+        *,
+        behavior_service: Optional[BehaviorService] = None,
+        telemetry: Optional[TelemetryClient] = None,
+        behavior_retriever: Optional[BehaviorRetriever] = None,
+    ) -> None:
+        self._telemetry = telemetry or TelemetryClient.noop()
+        self._behavior_service = behavior_service
+        self._retriever = behavior_retriever
+        if self._retriever is None and behavior_service is not None:
+            self._retriever = BehaviorRetriever(
+                behavior_service=behavior_service,
+                telemetry=self._telemetry,
+            )
+
+    # ------------------------------------------------------------------
+    # Retrieval
+    # ------------------------------------------------------------------
+    def retrieve(self, request: RetrieveRequest) -> RetrieveResponse:
+        start = perf_counter()
+        matches = self._retrieve_matches(request)
+        latency_ms = (perf_counter() - start) * 1000.0
+        response = RetrieveResponse(
+            query=request.query,
+            results=matches,
+            strategy_used=request.strategy,
+            latency_ms=round(latency_ms, 3),
+            metadata={
+                "behavior_count": len(matches),
+                "include_metadata": request.include_metadata,
+                "trace_context_present": bool(request.trace_context),
+                "retriever_mode": self._retriever.mode if self._retriever else "legacy",
+            },
+        )
+        self._telemetry.emit_event(
+            event_type="bci.retrieve",
+            payload={
+                "query_length": len(request.query or ""),
+                "strategy": request.strategy.value,
+                "top_k": request.top_k,
+                "result_count": len(matches),
+            },
+        )
+        return response
+
+    def _retrieve_matches(self, request: RetrieveRequest) -> List[BehaviorMatch]:
+        if self._retriever is not None:
+            try:
+                return self._retriever.retrieve(request)
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning("BehaviorRetriever failed, falling back to keyword search. Error: %s", exc)
+
+        if self._behavior_service is None:
+            return []
+
+        search_limit = max(request.top_k, 1) * (2 if request.strategy == RetrievalStrategy.HYBRID else 1)
+        search_request = SearchBehaviorsRequest(
+            query=request.query,
+            tags=request.tags,
+            role_focus=request.role_focus.value if request.role_focus else None,
+            status="APPROVED",
+            limit=search_limit,
+        )
+        results = self._behavior_service.search_behaviors(search_request)
+        matches: List[BehaviorMatch] = []
+        for result in results[: request.top_k]:
+            metadata = result.active_version.metadata if request.include_metadata else None
+            citation_label = metadata.get("citation_label") if metadata else None
+            breakdown = None
+            if request.strategy == RetrievalStrategy.HYBRID:
+                breakdown = {
+                    "embedding": request.embedding_weight,
+                    "keyword": request.keyword_weight,
+                }
+            elif request.strategy == RetrievalStrategy.EMBEDDING:
+                breakdown = {"embedding": 1.0}
+            elif request.strategy == RetrievalStrategy.KEYWORD:
+                breakdown = {"keyword": 1.0}
+
+            match = BehaviorMatch(
+                behavior_id=result.behavior.behavior_id,
+                name=result.behavior.name,
+                instruction=result.active_version.instruction,
+                version=result.active_version.version,
+                score=float(result.score),
+                description=result.behavior.description,
+                role_focus=_safe_role_focus(result.active_version.role_focus),
+                tags=list(result.behavior.tags),
+                strategy_breakdown=breakdown,
+                citation_label=citation_label or result.behavior.name,
+                metadata=metadata,
+            )
+            matches.append(match)
+        return matches
+
+    # ------------------------------------------------------------------
+    # Prompt composition
+    # ------------------------------------------------------------------
+    def compose_prompt(self, request: ComposePromptRequest) -> ComposePromptResponse:
+        behaviors = self._trim_behaviors(request.behaviors, request.max_behaviors)
+        instruction = request.citation_instruction or _DEFAULT_PROMPT_INSTRUCTION
+        prompt = self._render_prompt(request.query, behaviors, request.format, instruction)
+        metadata = {
+            "citation_mode": request.citation_mode.value,
+            "format": request.format.value,
+            "citation_instruction": instruction,
+        }
+        self._telemetry.emit_event(
+            event_type="bci.compose_prompt",
+            payload={
+                "behaviors": len(behaviors),
+                "format": request.format.value,
+                "citation_mode": request.citation_mode.value,
+            },
+        )
+        return ComposePromptResponse(prompt=prompt, behaviors=behaviors, metadata=metadata)
+
+    def compose_prompts_batch(self, request: BatchComposePromptRequest) -> BatchComposePromptResponse:
+        items: List[BatchComposeResult] = []
+        for item in request.items:
+            snippet_mode = item.citation_mode or CitationMode.EXPLICIT
+            snippet_format = item.format or PromptFormat.LIST
+            compose_request = ComposePromptRequest(
+                query=item.query,
+                behaviors=item.behaviors,
+                citation_mode=snippet_mode,
+                format=snippet_format,
+            )
+            response = self.compose_prompt(compose_request)
+            items.append(BatchComposeResult(query=item.query, prompt=response.prompt, behaviors=response.behaviors))
+        return BatchComposePromptResponse(items=items)
+
+    @staticmethod
+    def _trim_behaviors(behaviors: List[BehaviorSnippet], limit: Optional[int]) -> List[BehaviorSnippet]:
+        if limit is None:
+            return behaviors
+        return behaviors[:limit]
+
+    @staticmethod
+    def _render_prompt(
+        query: str,
+        behaviors: List[BehaviorSnippet],
+        prompt_format: PromptFormat,
+        instruction: str,
+    ) -> str:
+        if prompt_format is PromptFormat.LIST:
+            lines = ["Relevant behaviors from the handbook:"]
+            for snippet in behaviors:
+                label = snippet.citation_label or snippet.name
+                lines.append(f"- {label}: {snippet.instruction}")
+            lines.extend(["", instruction, "", "Task:", query])
+            return "\n".join(lines)
+        if prompt_format is PromptFormat.PROSE:
+            entries = [
+                f"{snippet.citation_label or snippet.name} instructs: {snippet.instruction}"
+                for snippet in behaviors
+            ]
+            prose = " ".join(entries)
+            return f"{prose}\n\n{instruction}\n\nTask:\n{query}"
+        # Structured fallback (JSON payload)
+        payload = {
+            "instruction": instruction,
+            "behaviors": [asdict(snippet) for snippet in behaviors],
+            "task": query,
+        }
+        return json.dumps(payload, indent=2)
+
+    # ------------------------------------------------------------------
+    # Citation parsing & validation
+    # ------------------------------------------------------------------
+    def parse_citations(self, request: ParseCitationsRequest) -> ParseCitationsResponse:
+        patterns: List[str] = list(_DEFAULT_CITATION_PATTERNS)
+        if request.patterns:
+            patterns.extend(request.patterns)
+        text = request.output_text
+        citations: List[Citation] = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                label = match.group(1) if match.lastindex else match.group(0)
+                citations.append(
+                    Citation(
+                        text=match.group(0),
+                        type=CitationType.EXPLICIT,
+                        start_index=match.start(),
+                        end_index=match.end(),
+                        behavior_name=label,
+                        confidence=0.8,
+                    )
+                )
+        # Deduplicate citations by span
+        unique: Dict[tuple[int, int], Citation] = {}
+        for citation in citations:
+            key = (citation.start_index, citation.end_index)
+            unique.setdefault(key, citation)
+        return ParseCitationsResponse(citations=list(unique.values()))
+
+    def validate_citations(self, request: ValidateCitationsRequest) -> ValidateCitationsResponse:
+        parsed = self.parse_citations(ParseCitationsRequest(output_text=request.output_text))
+        prepended = {behavior.behavior_name.lower(): behavior for behavior in request.prepended_behaviors}
+        valid: List[Citation] = []
+        invalid: List[Citation] = []
+        warnings: List[str] = []
+
+        for citation in parsed.citations:
+            normalized = (citation.behavior_name or citation.text).lower()
+            match = prepended.get(normalized)
+            if match:
+                citation.behavior_id = match.behavior_id
+                valid.append(citation)
+            else:
+                if request.allow_unlisted_behaviors:
+                    warnings.append(f"Citation '{citation.text}' not in prepended list")
+                else:
+                    invalid.append(citation)
+
+        cited_names = { (citation.behavior_name or "").lower() for citation in valid }
+        missing = [
+            behavior.behavior_name
+            for behavior in request.prepended_behaviors
+            if behavior.behavior_name.lower() not in cited_names
+        ]
+        total_citations = len(parsed.citations)
+        denom = max(len(request.prepended_behaviors), 1)
+        compliance_rate = len(valid) / denom
+        is_compliant = (
+            len(valid) >= request.minimum_citations
+            and (not invalid or request.allow_unlisted_behaviors)
+        )
+        return ValidateCitationsResponse(
+            total_citations=total_citations,
+            valid_citations=valid,
+            invalid_citations=invalid,
+            compliance_rate=round(compliance_rate, 3),
+            is_compliant=is_compliant,
+            missing_behaviors=missing,
+            warnings=warnings,
+        )
+
+    def compute_token_savings(self, request: ComputeTokenSavingsRequest) -> ComputeTokenSavingsResponse:
+        savings = max(request.baseline_tokens - request.bci_tokens, -request.baseline_tokens)
+        pct = 0.0
+        if request.baseline_tokens > 0:
+            pct = savings / request.baseline_tokens
+        return ComputeTokenSavingsResponse(token_savings=savings, token_savings_pct=round(pct, 4))
+
+    # ------------------------------------------------------------------
+    # Trace operations
+    # ------------------------------------------------------------------
+    def segment_trace(self, request: SegmentTraceRequest) -> SegmentTraceResponse:
+        if request.format == TraceFormat.JSON_STEPS:
+            try:
+                parsed = json.loads(request.trace_text)
+                steps = [
+                    TraceStep(index=index, text=item.get("text", json.dumps(item)), metadata={k: v for k, v in item.items() if k != "text"})
+                    for index, item in enumerate(parsed)
+                ]
+                return SegmentTraceResponse(steps=steps)
+            except json.JSONDecodeError:
+                pass  # Fall back to manual parsing
+        if request.format == TraceFormat.PLAN_MARKDOWN:
+            lines = [line.strip("- ") for line in request.trace_text.splitlines() if line.strip()]
+        else:
+            lines = [line.strip() for line in request.trace_text.splitlines() if line.strip()]
+        steps = [TraceStep(index=i, text=line) for i, line in enumerate(lines)]
+        return SegmentTraceResponse(steps=steps)
+
+    def detect_patterns(self, request: DetectPatternsRequest) -> DetectPatternsResponse:
+        counter: Counter[str] = Counter()
+        window = request.window_size or 1
+        segmented: List[List[TraceStep]] = []
+        for trace in request.traces:
+            formatted = trace.format or TraceFormat.CHAIN_OF_THOUGHT
+            segment = self.segment_trace(
+                SegmentTraceRequest(trace_text=trace.trace_text, format=formatted)
+            )
+            segmented.append(segment.steps)
+            texts = [step.text for step in segment.steps]
+            for slice_start in range(len(texts)):
+                slice_end = slice_start + window
+                if slice_end > len(texts):
+                    break
+                snippet = " | ".join(texts[slice_start:slice_end])
+                counter[snippet] += 1
+        patterns: List[Pattern] = []
+        for idx, (snippet, occurrences) in enumerate(counter.most_common()):
+            if occurrences < request.min_occurrences:
+                continue
+            pattern = Pattern(
+                pattern_id=f"pattern-{idx+1:03d}",
+                description=snippet,
+                occurrence_count=occurrences,
+                candidate_behavior=PatternCandidate(
+                    name=f"Candidate {idx+1}",
+                    instruction=snippet.split(" | ")[0],
+                    supporting_traces=[trace.trace_text[:100] for trace in request.traces[:5]],
+                ),
+            )
+            patterns.append(pattern)
+        latency_ms = 5.0 + len(request.traces) * 0.25
+        return DetectPatternsResponse(patterns=patterns, total_traces=len(request.traces), latency_ms=latency_ms)
+
+    def score_reusability(self, request: ScoreReusabilityRequest) -> ScoreReusabilityResponse:
+        dimensions = self._resolve_dimensions(request)
+        score = sum(d.weight * d.score for d in dimensions) * 100.0
+        return ScoreReusabilityResponse(score=round(score, 2), dimensions=dimensions)
+
+    def _resolve_dimensions(self, request: ScoreReusabilityRequest) -> List[ScoreDimension]:
+        if request.override_weights:
+            return request.override_weights
+
+        supporting = request.candidate_behavior.supporting_traces
+        evidence_count = len(supporting) if supporting else 0
+        inferred_scores = {
+            ScoreDimensionName.CLARITY: 0.8,
+            ScoreDimensionName.GENERALITY: min(1.0, evidence_count / 3.0 if evidence_count else 0.6),
+            ScoreDimensionName.REUSABILITY: 0.75 if evidence_count >= 2 else 0.5,
+            ScoreDimensionName.CORRECTNESS: 0.9,
+        }
+        dimensions = [
+            ScoreDimension(name=name, weight=weight, score=inferred_scores.get(name, 0.5))
+            for name, weight in _DEFAULT_SCORE_WEIGHTS
+        ]
+        return dimensions
+
+    # ------------------------------------------------------------------
+    # MCP helpers (alias for clarity)
+    # ------------------------------------------------------------------
+    def retrieve_hybrid(self, request: RetrieveRequest) -> RetrieveResponse:
+        hybrid_request = RetrieveRequest(
+            query=request.query,
+            top_k=request.top_k,
+            strategy=RetrievalStrategy.HYBRID,
+            role_focus=request.role_focus,
+            tags=request.tags,
+            include_metadata=request.include_metadata,
+            embedding_weight=request.embedding_weight,
+            keyword_weight=request.keyword_weight,
+            trace_context=request.trace_context,
+        )
+        return self.retrieve(hybrid_request)
+
+    def rebuild_index(self) -> Dict[str, Any]:
+        if self._retriever is None:
+            payload = {"status": "unsupported", "reason": "behavior retriever not configured"}
+            self._telemetry.emit_event(event_type="bci.rebuild_index", payload=payload)
+            return payload
+
+        result = self._retriever.rebuild_index()
+        telemetry_payload = {
+            "mode": result.get("mode"),
+            "status": result.get("status"),
+            "behavior_count": result.get("behavior_count"),
+        }
+        self._telemetry.emit_event(event_type="bci.rebuild_index", payload=telemetry_payload)
+        return result
+
+
+__all__ = ["BCIService"]

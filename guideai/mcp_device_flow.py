@@ -1,0 +1,602 @@
+"""
+MCP Device Flow Integration
+
+This module provides MCP tool implementations for OAuth 2.0 device authorization flow,
+enabling AI assistants (Claude Desktop, Cursor, etc.) to authenticate with GuideAI
+using the same token storage as the CLI.
+
+Integration points:
+- DeviceFlowManager (guideai/device_flow.py) for RFC 8628 device auth
+- KeychainTokenStore (guideai/auth_tokens.py) for cross-platform token persistence
+- MCPDeviceFlowAdapter (guideai/adapters.py) for MCP surface-specific operations
+
+Tool manifest definitions:
+- mcp/tools/auth.deviceLogin.json
+- mcp/tools/auth.authStatus.json
+- mcp/tools/auth.refreshToken.json
+- mcp/tools/auth.logout.json
+
+Usage:
+    # For MCP server stdio dispatch:
+    handler = MCPDeviceFlowHandler()
+    result = await handler.handle_tool_call("auth.deviceLogin", {
+        "client_id": "guideai-mcp-client",
+        "scopes": ["behaviors.read", "runs.create"],
+        "timeout": 300
+    })
+
+    # For direct Python integration:
+    service = MCPDeviceFlowService()
+    result = await service.device_login(
+        client_id="guideai-mcp-client",
+        scopes=["behaviors.read"],
+        poll_interval=5,
+        timeout=300,
+        store_tokens=True
+    )
+"""
+
+import asyncio
+import time
+import platform
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from pathlib import Path
+
+from .device_flow import (
+    DeviceFlowManager,
+    DeviceAuthorizationSession,
+    DevicePollResult,
+    DeviceAuthorizationStatus,
+)
+from .auth_tokens import (
+    AuthTokenBundle,
+    TokenStore,
+    TokenStoreError,
+    get_default_token_store,
+)
+from .adapters import MCPDeviceFlowAdapter
+from .telemetry import TelemetryClient
+
+
+class MCPDeviceFlowService:
+    """
+    High-level device flow service for MCP tools.
+
+    Orchestrates device authorization flow with automatic polling,
+    token storage, and telemetry integration.
+    """
+
+    def __init__(
+        self,
+        manager: Optional[DeviceFlowManager] = None,
+        token_store: Optional[TokenStore] = None,
+        telemetry: Optional[TelemetryClient] = None,
+    ) -> None:
+        """
+        Initialize MCP device flow service.
+
+        Args:
+            manager: DeviceFlowManager instance (creates default if None)
+            token_store: TokenStore instance (uses get_default_token_store if None)
+            telemetry: TelemetryClient instance (optional)
+        """
+        self._manager = manager or DeviceFlowManager()
+        self._token_store = token_store
+        self._telemetry = telemetry
+        self._adapter = MCPDeviceFlowAdapter(self._manager)
+
+    def _get_token_store(self) -> TokenStore:
+        """Get token store instance, lazily initializing if needed."""
+        if self._token_store is None:
+            self._token_store = get_default_token_store()
+        return self._token_store
+
+    async def device_login(
+        self,
+        *,
+        client_id: str = "guideai-mcp-client",
+        scopes: Optional[List[str]] = None,
+        poll_interval: int = 5,
+        timeout: int = 300,
+        store_tokens: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Initiate device authorization flow and poll until completion.
+
+        This implements the full auth.deviceLogin MCP tool flow:
+        1. Start device authorization (get device_code and user_code)
+        2. Return verification URL and user code to display
+        3. Poll authorization server until user approves/denies
+        4. If successful, optionally persist tokens to keychain
+        5. Return final authorization status with tokens
+
+        Args:
+            client_id: OAuth client identifier
+            scopes: Requested OAuth scopes (defaults to ["behaviors.read", "runs.create"])
+            poll_interval: Polling interval in seconds (server may override)
+            timeout: Maximum wait time in seconds before giving up
+            store_tokens: Whether to persist tokens in keychain/file storage
+
+        Returns:
+            Dictionary with status, tokens, and metadata per auth.deviceLogin.json schema
+        """
+        if scopes is None:
+            scopes = ["behaviors.read", "workflows.read", "runs.create"]
+
+        metadata = {
+            "hostname": platform.node(),
+            "platform": sys.platform,
+            "mcp_client": "guideai-mcp",
+        }
+
+        # Emit telemetry for device login start
+        if self._telemetry:
+            self._telemetry.emit_event(
+                "device_flow.mcp.login_started",
+                {
+                    "client_id": client_id,
+                    "scopes": scopes,
+                    "timeout": timeout,
+                    "store_tokens": store_tokens,
+                },
+            )
+
+        try:
+            # Start authorization and get device/user codes
+            session_data = self._adapter.start_authorization(
+                client_id=client_id,
+                scopes=scopes,
+                metadata=metadata,
+            )
+
+            # Build initial response with verification instructions
+            result: Dict[str, Any] = {
+                "status": "pending",
+                "device_code": session_data["device_code"],
+                "user_code": session_data["user_code"],
+                "verification_uri": session_data["verification_uri"],
+                "verification_uri_complete": session_data.get("verification_uri_complete"),
+                "expires_in": session_data.get("poll_interval", poll_interval) * (timeout // poll_interval),
+                "interval": session_data.get("poll_interval", poll_interval),
+            }
+
+            # Poll until authorization completes or times out
+            deadline = time.monotonic() + timeout
+            device_code = session_data["device_code"]
+            retry_after = session_data.get("poll_interval", poll_interval)
+
+            while time.monotonic() < deadline:
+                await asyncio.sleep(retry_after)
+
+                poll_result = self._adapter.poll(device_code)
+                status_value = poll_result["status"]
+
+                if status_value == "pending":
+                    retry_after = poll_result.get("retry_after", poll_interval)
+                    continue
+
+                # Update result with final status
+                result["status"] = status_value
+
+                if status_value == "authorized":
+                    # Extract tokens from poll result
+                    result.update({
+                        "access_token": poll_result["access_token"],
+                        "refresh_token": poll_result["refresh_token"],
+                        "token_type": poll_result.get("token_type", "Bearer"),
+                        "scopes": poll_result["scopes"],
+                        "expires_at": poll_result["access_token_expires_at"],
+                        "refresh_expires_at": poll_result["refresh_token_expires_at"],
+                    })
+
+                    # Persist tokens if requested
+                    if store_tokens:
+                        try:
+                            store = self._get_token_store()
+                            bundle = AuthTokenBundle(
+                                access_token=poll_result["access_token"],
+                                refresh_token=poll_result["refresh_token"],
+                                token_type=poll_result.get("token_type", "Bearer"),
+                                scopes=poll_result["scopes"],
+                                client_id=poll_result.get("client_id", client_id),
+                                issued_at=datetime.now(timezone.utc),
+                                expires_at=datetime.fromisoformat(poll_result["access_token_expires_at"]),
+                                refresh_expires_at=datetime.fromisoformat(poll_result["refresh_token_expires_at"]),
+                            )
+                            store.save(bundle)
+                            result["token_storage_path"] = self._get_storage_path_description(store)
+
+                            if self._telemetry:
+                                self._telemetry.emit_event(
+                                    "device_flow.mcp.tokens_stored",
+                                    {
+                                        "client_id": client_id,
+                                        "storage_type": type(store).__name__,
+                                    },
+                                )
+                        except TokenStoreError as exc:
+                            result["error"] = "storage_failed"
+                            result["error_description"] = f"Failed to persist tokens: {exc}"
+
+                    if self._telemetry:
+                        self._telemetry.emit_event(
+                            "device_flow.mcp.login_success",
+                            {
+                                "client_id": client_id,
+                                "scopes": poll_result["scopes"],
+                                "tokens_stored": store_tokens and "error" not in result,
+                            },
+                        )
+
+                    return result
+
+                elif status_value == "denied":
+                    result["error"] = "access_denied"
+                    result["error_description"] = poll_result.get("denied_reason", "User denied authorization")
+
+                    if self._telemetry:
+                        self._telemetry.emit_event(
+                            "device_flow.mcp.login_denied",
+                            {"client_id": client_id, "reason": result["error_description"]},
+                        )
+
+                    return result
+
+                elif status_value == "expired":
+                    result["error"] = "expired_token"
+                    result["error_description"] = "Device code expired before user authorization"
+
+                    if self._telemetry:
+                        self._telemetry.emit_event(
+                            "device_flow.mcp.login_expired",
+                            {"client_id": client_id},
+                        )
+
+                    return result
+
+            # Timeout reached
+            result["status"] = "error"
+            result["error"] = "authorization_pending"
+            result["error_description"] = f"Timed out after {timeout}s waiting for user authorization"
+
+            if self._telemetry:
+                self._telemetry.emit_event(
+                    "device_flow.mcp.login_timeout",
+                    {"client_id": client_id, "timeout": timeout},
+                )
+
+            return result
+
+        except Exception as exc:
+            error_result = {
+                "status": "error",
+                "error": "invalid_request",
+                "error_description": str(exc),
+            }
+
+            if self._telemetry:
+                self._telemetry.emit_event(
+                    "device_flow.mcp.login_error",
+                    {"client_id": client_id, "error": str(exc)},
+                )
+
+            return error_result
+
+    async def auth_status(
+        self,
+        *,
+        client_id: str = "guideai-mcp-client",
+        validate_remote: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Check current authentication status from stored tokens.
+
+        Implements auth.authStatus MCP tool by reading from KeychainTokenStore
+        and reporting token validity, expiry, and scopes.
+
+        Args:
+            client_id: OAuth client identifier to check tokens for
+            validate_remote: Whether to validate with authorization server (not yet implemented)
+
+        Returns:
+            Dictionary with authentication status per auth.authStatus.json schema
+        """
+        try:
+            store = self._get_token_store()
+            bundle = store.load()
+
+            if bundle is None or bundle.client_id != client_id:
+                return {
+                    "is_authenticated": False,
+                    "access_token_valid": False,
+                    "refresh_token_valid": False,
+                    "client_id": client_id,
+                    "needs_login": True,
+                }
+
+            now = datetime.now(timezone.utc)
+            access_token_valid = bundle.expires_at > now
+            refresh_token_valid = bundle.refresh_expires_at > now
+
+            result: Dict[str, Any] = {
+                "is_authenticated": access_token_valid or refresh_token_valid,
+                "access_token_valid": access_token_valid,
+                "refresh_token_valid": refresh_token_valid,
+                "client_id": bundle.client_id,
+                "scopes": bundle.scopes,
+                "expires_in": int((bundle.expires_at - now).total_seconds()),
+                "expires_at": bundle.expires_at.isoformat(),
+                "refresh_expires_in": int((bundle.refresh_expires_at - now).total_seconds()),
+                "refresh_expires_at": bundle.refresh_expires_at.isoformat(),
+                "token_storage_type": "keychain" if "keyring" in type(store).__module__ else "file",
+                "token_storage_path": self._get_storage_path_description(store),
+                "needs_refresh": not access_token_valid and refresh_token_valid,
+                "needs_login": not access_token_valid and not refresh_token_valid,
+            }
+
+            if self._telemetry:
+                self._telemetry.emit_event(
+                    "device_flow.mcp.status_checked",
+                    {
+                        "client_id": client_id,
+                        "is_authenticated": result["is_authenticated"],
+                        "needs_refresh": result["needs_refresh"],
+                    },
+                )
+
+            return result
+
+        except TokenStoreError as exc:
+            return {
+                "is_authenticated": False,
+                "access_token_valid": False,
+                "refresh_token_valid": False,
+                "client_id": client_id,
+                "needs_login": True,
+                "error_description": str(exc),
+            }
+
+    async def refresh_token(
+        self,
+        *,
+        client_id: str = "guideai-mcp-client",
+        store_tokens: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Refresh an expired access token using stored refresh token.
+
+        Implements auth.refreshToken MCP tool by reading refresh token from
+        KeychainTokenStore, calling DeviceFlowManager.refresh_access_token,
+        and persisting new tokens.
+
+        Args:
+            client_id: OAuth client identifier to refresh tokens for
+            store_tokens: Whether to persist refreshed tokens (recommended true)
+
+        Returns:
+            Dictionary with refresh status and new tokens per auth.refreshToken.json schema
+        """
+        try:
+            store = self._get_token_store()
+            bundle = store.load()
+
+            if bundle is None or bundle.client_id != client_id:
+                return {
+                    "status": "no_refresh_token",
+                    "error_description": f"No stored tokens found for client_id={client_id}",
+                }
+
+            now = datetime.now(timezone.utc)
+            if bundle.refresh_expires_at <= now:
+                return {
+                    "status": "invalid_token",
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token has expired",
+                }
+
+            # Refresh tokens via DeviceFlowManager
+            refresh_data = self._adapter.refresh(bundle.refresh_token)
+
+            result: Dict[str, Any] = {
+                "status": "refreshed",
+                "access_token": refresh_data["access_token"],
+                "refresh_token": refresh_data["refresh_token"],
+                "token_type": refresh_data.get("token_type", "Bearer"),
+                "scopes": refresh_data["scopes"],
+                "expires_in": refresh_data.get("access_expires_in", 3600),
+                "expires_at": refresh_data["access_token_expires_at"],
+                "refresh_expires_at": refresh_data["refresh_token_expires_at"],
+            }
+
+            # Persist refreshed tokens
+            if store_tokens:
+                try:
+                    new_bundle = AuthTokenBundle(
+                        access_token=refresh_data["access_token"],
+                        refresh_token=refresh_data["refresh_token"],
+                        token_type=refresh_data.get("token_type", "Bearer"),
+                        scopes=refresh_data["scopes"],
+                        client_id=refresh_data.get("client_id", client_id),
+                        issued_at=datetime.now(timezone.utc),
+                        expires_at=datetime.fromisoformat(refresh_data["access_token_expires_at"]),
+                        refresh_expires_at=datetime.fromisoformat(refresh_data["refresh_token_expires_at"]),
+                    )
+                    store.save(new_bundle)
+                    result["token_storage_path"] = self._get_storage_path_description(store)
+
+                    if self._telemetry:
+                        self._telemetry.emit_event(
+                            "device_flow.mcp.token_refreshed",
+                            {
+                                "client_id": client_id,
+                                "storage_type": type(store).__name__,
+                            },
+                        )
+                except TokenStoreError as exc:
+                    result["error_description"] = f"Tokens refreshed but storage failed: {exc}"
+
+            return result
+
+        except TokenStoreError as exc:
+            return {
+                "status": "error",
+                "error_description": str(exc),
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": "invalid_request",
+                "error_description": str(exc),
+            }
+
+    async def logout(
+        self,
+        *,
+        client_id: str = "guideai-mcp-client",
+        revoke_remote: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Revoke OAuth tokens and clear local storage.
+
+        Implements auth.logout MCP tool by optionally revoking tokens with
+        authorization server (RFC 7009), then clearing KeychainTokenStore.
+
+        Args:
+            client_id: OAuth client identifier to logout from
+            revoke_remote: Whether to revoke with server before clearing (recommended true)
+
+        Returns:
+            Dictionary with logout status per auth.logout.json schema
+        """
+        try:
+            store = self._get_token_store()
+            bundle = store.load()
+
+            warnings: List[str] = []
+            access_revoked = False
+            refresh_revoked = False
+
+            # Revoke with server if requested and tokens exist
+            if revoke_remote and bundle and bundle.client_id == client_id:
+                # TODO: Implement remote token revocation (RFC 7009)
+                # For now, just note that it's not yet implemented
+                warnings.append("Remote token revocation not yet implemented")
+
+            # Clear local token storage
+            tokens_cleared = False
+            if bundle and bundle.client_id == client_id:
+                store.clear()
+                tokens_cleared = True
+
+                if self._telemetry:
+                    self._telemetry.emit_event(
+                        "device_flow.mcp.logout",
+                        {
+                            "client_id": client_id,
+                            "tokens_cleared": True,
+                            "remote_revocation_attempted": revoke_remote,
+                        },
+                    )
+
+            status = "logged_out" if tokens_cleared else "no_tokens"
+
+            result: Dict[str, Any] = {
+                "status": status,
+                "tokens_cleared": tokens_cleared,
+                "access_token_revoked": access_revoked,
+                "refresh_token_revoked": refresh_revoked,
+                "token_storage_path": self._get_storage_path_description(store),
+            }
+
+            if warnings:
+                result["warnings"] = warnings
+
+            return result
+
+        except TokenStoreError as exc:
+            return {
+                "status": "error",
+                "tokens_cleared": False,
+                "access_token_revoked": False,
+                "refresh_token_revoked": False,
+                "error_description": str(exc),
+            }
+
+    @staticmethod
+    def _get_storage_path_description(store: TokenStore) -> str:
+        """Get human-readable description of token storage location."""
+        store_type = type(store).__name__
+        if "Keychain" in store_type:
+            return f"keychain:guideai-{sys.platform}"
+        elif "File" in store_type:
+            # Try to get file path from store
+            if hasattr(store, "_path"):
+                return str(store._path)
+            return "~/.guideai/tokens.json"
+        return f"unknown:{store_type}"
+
+
+class MCPDeviceFlowHandler:
+    """
+    MCP tool call dispatcher for device flow authentication.
+
+    Routes MCP tool calls (auth.deviceLogin, auth.authStatus, etc.)
+    to MCPDeviceFlowService methods and handles JSON-RPC protocol.
+
+    This is the integration point for MCP server stdio implementations.
+    """
+
+    def __init__(self, service: Optional[MCPDeviceFlowService] = None) -> None:
+        """
+        Initialize MCP device flow handler.
+
+        Args:
+            service: MCPDeviceFlowService instance (creates default if None)
+        """
+        self._service = service or MCPDeviceFlowService()
+
+    async def handle_tool_call(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle MCP tool call for device flow authentication.
+
+        Args:
+            tool_name: MCP tool name (auth.deviceLogin, auth.authStatus, etc.)
+            params: Tool parameters from MCP client
+
+        Returns:
+            Tool result per corresponding JSON schema
+
+        Raises:
+            ValueError: If tool_name is not recognized
+        """
+        if tool_name == "auth.deviceLogin":
+            return await self._service.device_login(
+                client_id=params.get("client_id", "guideai-mcp-client"),
+                scopes=params.get("scopes"),
+                poll_interval=params.get("poll_interval", 5),
+                timeout=params.get("timeout", 300),
+                store_tokens=params.get("store_tokens", True),
+            )
+
+        elif tool_name == "auth.authStatus":
+            return await self._service.auth_status(
+                client_id=params.get("client_id", "guideai-mcp-client"),
+                validate_remote=params.get("validate_remote", False),
+            )
+
+        elif tool_name == "auth.refreshToken":
+            return await self._service.refresh_token(
+                client_id=params.get("client_id", "guideai-mcp-client"),
+                store_tokens=params.get("store_tokens", True),
+            )
+
+        elif tool_name == "auth.logout":
+            return await self._service.logout(
+                client_id=params.get("client_id", "guideai-mcp-client"),
+                revoke_remote=params.get("revoke_remote", True),
+            )
+
+        else:
+            raise ValueError(f"Unknown MCP tool: {tool_name}")
