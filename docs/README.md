@@ -8,6 +8,7 @@ Maintain an auditable, replayable history of every change to the platform so any
 ### Prerequisites
 - GuideAI repository cloned and bootstrapped (see project root instructions).
 - Python environment with the `guideai` CLI installed (`pip install -e .`). After installation, run `guideai --help` to confirm the console script is on your PATH.
+- **Optional:** For BCI semantic retrieval (behavior recommendations via BGE-M3 embeddings + FAISS), install semantic dependencies: `pip install -e ".[semantic]"`. Without this extra, the BehaviorRetriever operates in keyword-only mode with graceful degradation. For GPU acceleration, replace `faiss-cpu` with `faiss-gpu` in your environment after base install.
 - `pre-commit` and required hooks installed via `./scripts/install_hooks.sh`.
 - Access to the ActionService (CLI, REST, or MCP) with scopes that permit `actions.create` and `actions.replay`.
 - Behavior handbook handy (`AGENTS.md`) to cite applicable behaviors when logging actions.
@@ -64,7 +65,18 @@ Maintain an auditable, replayable history of every change to the platform so any
 - **Artifacts diverge**: Run the validation suite, then re-record the corrective action with an updated summary.
 - **Secrets detected during replay**: Follow `SECRETS_MANAGEMENT_PLAN.md` and run `guideai scan-secrets --fail-on-findings` before re-attempting.
 
-### 7. Key References
+### 7. Analytics KPI projection (local validation)
+- Use the analytics CLI to sanity-check telemetry event streams before pushing to the warehouse. The command reads JSONL telemetry exports (defaults to `~/.guideai/telemetry/events.jsonl`), projects them into the PRD fact collections, and prints KPI summaries or writes full facts to disk for deeper inspection.
+
+   ```bash
+   guideai analytics project-kpi --input ~/.guideai/telemetry/events.jsonl --format table --facts-output prd_metrics_projection.json
+   ```
+
+   - `--format table` renders a concise KPI snapshot (behavior reuse %, token savings %, completion rate, compliance coverage). Switch to `--format json` for machine-readable output.
+   - `--facts-output <path>` emits the entire projection (four fact lists plus summary) for ingestion tests or dashboard mocks.
+   - See `guideai/cli.py` and `tests/test_cli_analytics.py` for command implementation and regression coverage.
+
+### 8. Key References
 - `REPRODUCIBILITY_STRATEGY.md` – overarching principles and taxonomy.
 - `BUILD_TIMELINE.md` – chronological artifact log consumed by the dashboard and replay flows.
 - `PROGRESS_TRACKER.md` – milestone status table that surfaces in the dashboard.

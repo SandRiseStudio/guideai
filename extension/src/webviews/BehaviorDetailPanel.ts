@@ -183,7 +183,7 @@ export class BehaviorDetailPanel {
 
     private async handleMessage(message: any): Promise<void> {
         switch (message.command) {
-            case 'insertBehavior':
+            case 'insertBehavior': {
                 const editor = vscode.window.activeTextEditor;
                 if (editor) {
                     const result = await this.client.getBehavior(message.behaviorId);
@@ -194,6 +194,7 @@ export class BehaviorDetailPanel {
                     });
                 }
                 break;
+            }
             case 'showMessage':
                 vscode.window.showInformationMessage(message.text);
                 break;

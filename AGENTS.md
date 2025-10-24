@@ -108,9 +108,15 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
 | BehaviorService, behavior index, reflection prompt | `behavior_curate_behavior_handbook` |
 | action registry, parity, `guideai record-action` | `behavior_sanitize_action_registry`, `behavior_wire_cli_to_orchestrator` |
 | telemetry event, Kafka, metrics dashboard | `behavior_instrument_metrics_pipeline` |
+| data pipeline, experiment, drift, telemetry | `behavior_instrument_metrics_pipeline`, `behavior_align_storage_layers`, `behavior_update_docs_after_changes` |
 | CORS, auth decorator, bearer token, cookie | `behavior_lock_down_security_surface` |
 | PRD sync, alignment log, checklist, progress tracker | `behavior_update_docs_after_changes`, `behavior_handbook_compliance_prompt` |
 | consent, JIT auth, scope catalog, prototype | `behavior_prototype_consent_ux`, `behavior_instrument_metrics_pipeline` |
+| budget, ROI, forecast, payback | `behavior_validate_financial_impact`, `behavior_instrument_metrics_pipeline` |
+| launch plan, messaging, funnel, adoption | `behavior_plan_go_to_market`, `behavior_instrument_metrics_pipeline` |
+| threat model, vulnerability, pen test, SOC2 | `behavior_lock_down_security_surface`, `behavior_prevent_secret_leaks` |
+| accessibility, WCAG, screen reader, keyboard nav | `behavior_validate_accessibility` |
+| benchmark, research proposal, behavior extraction | `behavior_curate_behavior_handbook`, `behavior_instrument_metrics_pipeline`, `behavior_lock_down_security_surface` |
 | secret leak, token, credential, gitleaks | `behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials` |
 | git workflow, branching, merge policy | `behavior_git_governance`, `behavior_prevent_secret_leaks` |
 | ci pipeline, deployment, rollback | `behavior_orchestrate_cicd`, `behavior_prevent_secret_leaks` |
@@ -274,6 +280,33 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
   4. Coordinate with Security/Compliance to manage secrets via `SECRETS_MANAGEMENT_PLAN.md`; document changes in `PRD_ALIGNMENT_LOG.md` and update runbooks.
   5. Validate pipelines via dry run or staging deploy, then update `PROGRESS_TRACKER.md`, `BUILD_TIMELINE.md`, and incident playbooks as needed.
 
+### `behavior_validate_financial_impact`
+- **When**: Evaluating budget requests, ROI analyses, pricing impacts, or telemetry-driven savings claims.
+- **Steps**:
+  1. Collect latest cost forecasts, vendor quotes, and telemetry baselines tied to the initiative.
+  2. Model best/base/worst-case scenarios, documenting assumptions and sensitivity to adoption metrics.
+  3. Validate ROI/payback targets against Finance guardrails; highlight gaps or overages explicitly.
+  4. Ensure financial telemetry (token savings %, cost per task) is instrumented and reviewed with `behavior_instrument_metrics_pipeline`.
+  5. Record outcomes, approvals, and outstanding actions in `PRD_ALIGNMENT_LOG.md` and `PROGRESS_TRACKER.md`.
+
+### `behavior_plan_go_to_market`
+- **When**: Crafting or reviewing launch plans, messaging frameworks, enablement kits, or adoption campaigns.
+- **Steps**:
+  1. Map target segments, personas, and JTBD to concrete value propositions using current telemetry evidence.
+  2. Align messaging, pricing, and packaging across Web, API, CLI, and MCP surfaces for parity.
+  3. Inventory launch assets (announcements, demos, sales enablement) and assign owners with delivery dates.
+  4. Define adoption KPIs, feedback loops, and telemetry dashboards in coordination with `behavior_instrument_metrics_pipeline`.
+  5. Capture launch readiness status, risks, and mitigations in `PRD_NEXT_STEPS.md` and `BUILD_TIMELINE.md`.
+
+### `behavior_validate_accessibility`
+- **When**: Designing, implementing, or auditing user-facing workflows for accessibility compliance.
+- **Steps**:
+  1. Run automated scans (axe, Lighthouse, PA11y) across responsive breakpoints and document findings.
+  2. Perform manual keyboard and screen reader walkthroughs, validating focus order, announcements, and shortcuts.
+  3. Review copy, error messaging, and documentation for clarity, localization, and consistent tone.
+  4. Verify components expose semantic markup and ARIA metadata; escalate gaps to shared component owners.
+  5. Track remediation commitments, retest results, and evidence links in `PRD_ALIGNMENT_LOG.md` and accessibility dashboards.
+
   ### `behavior_prevent_secret_leaks`
   - **When**: Initializing repositories, preparing commits/pushes, or wiring CI pipelines where sensitive tokens might leak.
   - **Steps**:
@@ -283,7 +316,7 @@ This handbook captures the recurring procedures ("behaviors") we rely on while w
     4. Record a `guideai scan-secrets` action with referenced behaviors (`behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials`) and attach sanitized reports.
     5. Escalate recurring findings to Compliance and update `SECRETS_MANAGEMENT_PLAN.md` with new suppression rules or rotation steps.
 
-_Last updated: 2025-10-15_
+_Last updated: 2025-10-17_
 
 # Agent Compliance Checklist
 

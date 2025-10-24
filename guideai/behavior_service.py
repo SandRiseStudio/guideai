@@ -191,9 +191,11 @@ class BehaviorService:
         *,
         db_path: Optional[Path] = None,
         telemetry: Optional[TelemetryClient] = None,
+        behavior_retriever: Optional[Any] = None,
     ) -> None:
         self._db_path = self._resolve_db_path(db_path)
         self._telemetry = telemetry or TelemetryClient.noop()
+        self._behavior_retriever = behavior_retriever
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -415,6 +417,33 @@ class BehaviorService:
             },
             actor=self._actor_payload(actor),
         )
+
+        # Trigger index rebuild when behaviors are approved
+        if self._behavior_retriever is not None:
+            try:
+                rebuild_result = self._behavior_retriever.rebuild_index()
+                self._telemetry.emit_event(
+                    event_type="bci.behavior_retriever.auto_rebuild",
+                    payload={
+                        "trigger": "behavior_approved",
+                        "behavior_id": request.behavior_id,
+                        "version": request.version,
+                        "rebuild_status": rebuild_result.get("status"),
+                        "behavior_count": rebuild_result.get("behavior_count", 0),
+                        "mode": rebuild_result.get("mode"),
+                    },
+                )
+            except Exception as exc:
+                # Log but don't fail approval if rebuild fails
+                self._telemetry.emit_event(
+                    event_type="bci.behavior_retriever.auto_rebuild_failed",
+                    payload={
+                        "trigger": "behavior_approved",
+                        "behavior_id": request.behavior_id,
+                        "error": str(exc),
+                    },
+                )
+
         return approved
 
     def deprecate_behavior(self, request: DeprecateBehaviorRequest, actor: Actor) -> BehaviorVersion:

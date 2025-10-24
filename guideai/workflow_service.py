@@ -384,6 +384,14 @@ class WorkflowService:
         started_at = utc_now_iso()
 
         # Initialize run with pending steps
+        metadata_copy: Dict[str, Any] = dict(metadata or {})
+        baseline_tokens = metadata_copy.get("baseline_tokens")
+        if baseline_tokens is not None:
+            try:
+                baseline_tokens = int(baseline_tokens)
+            except (TypeError, ValueError):
+                baseline_tokens = None
+
         run = WorkflowRun(
             run_id=run_id,
             template_id=template_id,
@@ -393,8 +401,29 @@ class WorkflowService:
             actor=actor,
             steps=[],
             started_at=started_at,
-            metadata=metadata or {},
+            metadata=metadata_copy,
         )
+
+        # Consolidate behaviors cited from explicit injections and template requirements
+        cited_behaviors: List[str] = []
+        if behavior_ids:
+            cited_behaviors.extend(list(behavior_ids))
+        for step in template.steps:
+            cited_behaviors.extend(step.required_behaviors)
+
+        if cited_behaviors:
+            unique_behaviors = list(dict.fromkeys(cited_behaviors))
+            run.behaviors_cited = unique_behaviors
+        else:
+            run.behaviors_cited = []
+
+        if baseline_tokens is None:
+            # Default baseline equals number of required behaviors * 500 tokens (rough heuristic)
+            baseline_tokens = max(len(run.behaviors_cited) * 500, 0)
+            if baseline_tokens:
+                metadata_copy["baseline_tokens"] = baseline_tokens
+        else:
+            metadata_copy["baseline_tokens"] = baseline_tokens
 
         emit_event(
             "workflow.run.started",
@@ -429,6 +458,21 @@ class WorkflowService:
                 ),
             )
             conn.commit()
+
+        emit_event(
+            "plan_created",
+            {
+                "run_id": run_id,
+                "template_id": template_id,
+                "template_name": template.name,
+                "role_focus": template.role_focus.value,
+                "behavior_ids": list(run.behaviors_cited),
+                "behavior_count": len(run.behaviors_cited),
+                "baseline_tokens": metadata_copy.get("baseline_tokens"),
+                "checklist_snapshot": metadata_copy.get("checklist_snapshot"),
+                "metadata_keys": sorted(metadata_copy.keys()),
+            },
+        )
 
         return run
 
@@ -544,6 +588,27 @@ class WorkflowService:
         if status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED):
             run.completed_at = utc_now_iso()
 
+        baseline_tokens = run.metadata.get("baseline_tokens")
+        if isinstance(baseline_tokens, str):
+            try:
+                baseline_tokens = int(baseline_tokens)
+            except ValueError:
+                baseline_tokens = None
+
+        if baseline_tokens is None and run.total_tokens:
+            baseline_tokens = run.total_tokens
+            run.metadata["baseline_tokens"] = baseline_tokens
+
+        token_savings_pct: Optional[float] = None
+        if baseline_tokens and baseline_tokens > 0:
+            calculated = 1 - (run.total_tokens / baseline_tokens)
+            token_savings_pct = max(min(calculated, 1.0), -1.0)
+
+        context_keys: List[str] = []
+        context = run.metadata.get("context")
+        if isinstance(context, dict):
+            context_keys = sorted(context.keys())
+
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -562,10 +627,17 @@ class WorkflowService:
             conn.commit()
 
         emit_event(
-            "workflow.run.status_changed",
+            "execution_update",
             {
                 "run_id": run_id,
+                "template_id": run.template_id,
                 "status": status.value,
-                "total_tokens": run.total_tokens,
+                "output_tokens": run.total_tokens,
+                "baseline_tokens": baseline_tokens,
+                "token_savings_pct": token_savings_pct,
+                "behaviors_cited": list(run.behaviors_cited),
+                "step": "SUMMARY",
+                "context_keys": context_keys,
+                "completed_at": run.completed_at,
             },
         )

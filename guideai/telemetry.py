@@ -71,6 +71,32 @@ class FileTelemetrySink:
             handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
 
 
+class KafkaTelemetrySink:
+    """Sink that publishes telemetry events to a Kafka topic."""
+
+    def __init__(
+        self,
+        bootstrap_servers: str,
+        topic: str = "telemetry.events",
+    ) -> None:
+        try:
+            from kafka import KafkaProducer
+        except ImportError:
+            raise RuntimeError(
+                "kafka-python not installed. Install with: pip install kafka-python"
+            )
+
+        self._producer = KafkaProducer(
+            bootstrap_servers=bootstrap_servers.split(","),
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
+        self._topic = topic
+
+    def write(self, event: TelemetryEvent) -> None:
+        self._producer.send(self._topic, value=event.to_dict())
+        self._producer.flush()  # Ensure delivery for demo; remove in production
+
+
 class TelemetryClient:
     """Simple telemetry emitter supporting pluggable sinks."""
 
@@ -118,9 +144,11 @@ class TelemetryClient:
 
 
 __all__ = [
-    "TelemetryClient",
-    "TelemetryEvent",
     "TelemetrySink",
+    "TelemetryEvent",
+    "NullTelemetrySink",
     "InMemoryTelemetrySink",
     "FileTelemetrySink",
+    "KafkaTelemetrySink",
+    "TelemetryClient",
 ]

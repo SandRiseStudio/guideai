@@ -409,9 +409,13 @@ class TestTelemetryIntegration:
             actor=sample_actor,
         )
 
-        assert mock_emit.call_count == 1
-        call_args = mock_emit.call_args
-        assert call_args[0][0] == "workflow.run.started"
+        assert mock_emit.call_count == 2
+        event_types = [call.args[0] for call in mock_emit.call_args_list]
+        assert event_types[0] == "workflow.run.started"
+        assert event_types[1] == "plan_created"
+        plan_payload = mock_emit.call_args_list[1].args[1]
+        assert plan_payload["template_id"] == template.template_id
+        assert "baseline_tokens" in plan_payload
 
     @patch("guideai.workflow_service.emit_event")
     def test_update_status_emits_event(self, mock_emit, workflow_service, sample_actor, sample_steps):
@@ -437,10 +441,12 @@ class TestTelemetryIntegration:
         )
 
         assert mock_emit.call_count == 1
-        call_args = mock_emit.call_args
-        assert call_args[0][0] == "workflow.run.status_changed"
-        assert call_args[0][1]["status"] == "COMPLETED"
-        assert call_args[0][1]["total_tokens"] == 5000
+        event_type = mock_emit.call_args.args[0]
+        payload = mock_emit.call_args.args[1]
+        assert event_type == "execution_update"
+        assert payload["status"] == "COMPLETED"
+        assert payload["output_tokens"] == 5000
+        assert "baseline_tokens" in payload
 
 
 class TestTokenAccounting:
@@ -473,6 +479,7 @@ class TestTokenAccounting:
 
         updated_run = workflow_service.get_run(run.run_id)
         assert updated_run.total_tokens == 2500
+        assert updated_run.metadata.get("baseline_tokens") is not None
 
     def test_behavior_citation_tracking(self, workflow_service, sample_actor, sample_steps):
         """Test that runs track which behaviors were used."""
@@ -490,5 +497,8 @@ class TestTokenAccounting:
             behavior_ids=["bhv-001", "bhv-002", "bhv-003"],
         )
 
-        # Run should track behaviors_cited (though not populated until execution)
         assert isinstance(run.behaviors_cited, list)
+        assert set(run.behaviors_cited) >= {"bhv-001", "bhv-002", "bhv-003"}
+        # Should also include required behaviors from template steps
+        assert "bhv-test001" in run.behaviors_cited
+        assert "bhv-test002" in run.behaviors_cited

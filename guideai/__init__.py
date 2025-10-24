@@ -2,6 +2,8 @@
 
 from .action_service import ActionService
 from .action_contracts import Action, ActionCreateRequest, ReplayRequest, ReplayStatus, Actor
+from . import bci_contracts
+from .bci_service import BCIService
 from .agent_auth import (
     AgentAuthClient,
     DecisionReason,
@@ -42,4 +44,6 @@ __all__ = [
     "TelemetryEvent",
     "InMemoryTelemetrySink",
     "TaskAssignmentService",
+    "BCIService",
+    "bci_contracts",
 ]

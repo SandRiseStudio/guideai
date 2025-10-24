@@ -132,7 +132,8 @@ BCI algorithm executes identically regardless of surface:
 All surfaces emit identical telemetry events:
 - `workflow.template.created` - Template creation
 - `workflow.run.started` - Workflow execution start
-- `workflow.run.status_changed` - Status updates
+- `plan_created` - Behavior citation + baseline tokens snapshot
+- `execution_update` - Status + token accounting (output vs baseline)
 
 ### ✅ RBAC Scope Alignment
 All surfaces enforce consistent authorization (future):

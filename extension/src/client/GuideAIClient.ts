@@ -10,6 +10,9 @@
 
 import * as vscode from 'vscode';
 import { spawn, ChildProcess} from 'child_process';
+import { promises as fs } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
 interface BehaviorTelemetryContext {
 	source?: string;
@@ -26,12 +29,6 @@ interface TelemetryEmitOptions {
 	runId?: string;
 	actionId?: string;
 	sessionId?: string;
-}
-
-interface BehaviorSearchResult {
-	behavior: Behavior;
-	active_version?: BehaviorVersion;
-	relevance_score: number;
 }
 
 export interface Behavior {
@@ -76,6 +73,72 @@ export interface WorkflowStep {
 	name: string;
 	description: string;
 	behavior_ids: string[];
+}
+
+export interface BCIBehaviorMatch {
+	behavior_id: string;
+	name: string;
+	version: string;
+	instruction: string;
+	score: number;
+	description?: string;
+	role_focus?: string;
+	tags?: string[];
+	strategy_breakdown?: Record<string, number>;
+	citation_label?: string;
+	metadata?: Record<string, unknown> | null;
+}
+
+export interface BCIRetrieveOptions {
+	query: string;
+	topK?: number;
+	strategy?: 'embedding' | 'keyword' | 'hybrid';
+	roleFocus?: string;
+	tags?: string[];
+	includeMetadata?: boolean;
+	embeddingWeight?: number;
+	keywordWeight?: number;
+}
+
+export interface BCIRetrieveResponse {
+	query: string;
+	results: BCIBehaviorMatch[];
+	strategy_used: string;
+	latency_ms?: number;
+	metadata?: Record<string, unknown> | null;
+}
+
+export interface BCIPrependedBehavior {
+	behavior_name: string;
+	behavior_id?: string;
+	version?: string;
+}
+
+export interface BCICitation {
+	text: string;
+	type: string;
+	start_index: number;
+	end_index: number;
+	behavior_name?: string;
+	behavior_id?: string;
+	confidence?: number;
+}
+
+export interface BCIValidateRequest {
+	outputText: string;
+	prepended: BCIPrependedBehavior[];
+	minimumCitations?: number;
+	allowUnlisted?: boolean;
+}
+
+export interface BCIValidateResponse {
+	total_citations: number;
+	valid_citations: BCICitation[];
+	invalid_citations: BCICitation[];
+	compliance_rate: number;
+	is_compliant: boolean;
+	missing_behaviors: string[];
+	warnings: string[];
 }
 
 export class GuideAIClient {
@@ -252,6 +315,58 @@ export class GuideAIClient {
 		return await this.runCLI(args);
 	}
 
+	async bciRetrieve(options: BCIRetrieveOptions): Promise<BCIRetrieveResponse> {
+		const args = ['bci', 'retrieve', '--query', options.query];
+		if (options.topK !== undefined) {
+			args.push('--top-k', String(options.topK));
+		}
+		if (options.strategy) {
+			args.push('--strategy', options.strategy);
+		}
+		if (options.roleFocus) {
+			args.push('--role-focus', options.roleFocus);
+		}
+		if (options.tags && options.tags.length > 0) {
+			for (const tag of options.tags) {
+				args.push('--tag', tag);
+			}
+		}
+		if (options.includeMetadata) {
+			args.push('--include-metadata');
+		}
+		if (options.embeddingWeight !== undefined) {
+			args.push('--embedding-weight', String(options.embeddingWeight));
+		}
+		if (options.keywordWeight !== undefined) {
+			args.push('--keyword-weight', String(options.keywordWeight));
+		}
+		const response = await this.runCLI(args);
+		return response as BCIRetrieveResponse;
+	}
+
+	async bciValidateCitations(request: BCIValidateRequest): Promise<BCIValidateResponse> {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'guideai-bci-'));
+		const outputPath = path.join(tmpDir, 'output.txt');
+		const prependedPath = path.join(tmpDir, 'prepended.json');
+		try {
+			await fs.writeFile(outputPath, request.outputText, 'utf8');
+			await fs.writeFile(prependedPath, JSON.stringify(request.prepended, null, 2), 'utf8');
+
+			const args = ['bci', 'validate-citations', '--output-file', outputPath, '--prepended-file', prependedPath];
+			if (request.minimumCitations !== undefined) {
+				args.push('--minimum', String(request.minimumCitations));
+			}
+			if (request.allowUnlisted) {
+				args.push('--allow-unlisted');
+			}
+
+			const response = await this.runCLI(args);
+			return response as BCIValidateResponse;
+		} finally {
+			await this.cleanupTempDir(tmpDir);
+		}
+	}
+
 	/**
 	 * Execute CLI command and return parsed JSON result
 	 */
@@ -344,6 +459,15 @@ export class GuideAIClient {
 			return args;
 		}
 		return [...args, '--format', 'json'];
+	}
+
+	private async cleanupTempDir(tmpDir: string): Promise<void> {
+		try {
+			await fs.rm(tmpDir, { recursive: true, force: true });
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.outputChannel.appendLine(`Failed to cleanup temp directory ${tmpDir}: ${message}`);
+		}
 	}
 
 	dispose() {

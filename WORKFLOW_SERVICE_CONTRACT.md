@@ -230,12 +230,32 @@ workflow.run.status         - mcp/tools/workflow.run.status.json
 }
 ```
 
-### workflow.run.status_changed
+### plan_created
 ```json
 {
   "run_id": "run-...",
+  "template_id": "wf-...",
+  "behavior_ids": ["bhv-..."],
+  "behavior_count": 3,
+  "baseline_tokens": 1800,
+  "checklist_snapshot": { "checklist_id": "chk-...", "status": "DRAFT" },
+  "metadata_keys": ["baseline_tokens", "checklist_snapshot"]
+}
+```
+
+### execution_update
+```json
+{
+  "run_id": "run-...",
+  "template_id": "wf-...",
   "status": "COMPLETED",
-  "total_tokens": 2500
+  "output_tokens": 2500,
+  "baseline_tokens": 3200,
+  "token_savings_pct": 0.22,
+  "behaviors_cited": ["bhv-..."],
+  "step": "SUMMARY",
+  "context_keys": ["project_id", "behaviors"],
+  "completed_at": "2025-10-16T12:34:56Z"
 }
 ```
 
@@ -318,8 +338,8 @@ workflow.run.status         - mcp/tools/workflow.run.status.json
 
 **Token Savings (BCI vs. Baseline):**
 - Target: 30% reduction in output tokens (per PRD)
-- Measured via: `total_tokens` in WorkflowRun vs. equivalent non-BCI execution
-- Validation: Compare `workflow.run.status_changed` events with/without behaviors
+- Measured via: `output_tokens` vs. `baseline_tokens` in `execution_update` telemetry
+- Validation: Compare `execution_update` events with/without behaviors
 
 ---
 

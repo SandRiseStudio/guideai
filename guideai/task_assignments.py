@@ -117,6 +117,48 @@ _FUNCTIONS: Dict[str, FunctionSpec] = {
         playbook="AGENT_COMPLIANCE.md",
         notes="Ensures checklist automation, audit evidence, and policy adherence.",
     ),
+    "finance": FunctionSpec(
+        key="finance",
+        label="Finance",
+        agent_name="Finance Agent",
+        playbook="AGENT_FINANCE.md",
+        notes="Evaluates budgets, ROI models, vendor exposure, and telemetry-backed savings.",
+    ),
+    "go_to_market": FunctionSpec(
+        key="go_to_market",
+        label="Go-to-Market (GTM)",
+        agent_name="Go-to-Market Agent",
+        playbook="AGENT_GTM.md",
+        notes="Owns launch strategy, messaging, channel plans, and adoption telemetry.",
+    ),
+    "data_science": FunctionSpec(
+        key="data_science",
+        label="Data Science",
+        agent_name="Data Science Agent",
+        playbook="AGENT_DATA_SCIENCE.md",
+        notes="Stewards data provenance, experimentation rigor, and telemetry-ready model delivery.",
+    ),
+    "ai_research": FunctionSpec(
+        key="ai_research",
+        label="AI Research",
+        agent_name="AI Research Agent",
+        playbook="AGENT_AI_RESEARCH.md",
+        notes="Guides exploratory model research, safety validation, and behavior harvesting pipelines.",
+    ),
+    "security": FunctionSpec(
+        key="security",
+        label="Security",
+        agent_name="Security Agent",
+        playbook="AGENT_SECURITY.md",
+        notes="Oversees threat modeling, auth/secret hygiene, and incident readiness.",
+    ),
+    "accessibility": FunctionSpec(
+        key="accessibility",
+        label="Accessibility",
+        agent_name="Accessibility Agent",
+        playbook="AGENT_ACCESSIBILITY.md",
+        notes="Verifies WCAG compliance, inclusive UX patterns, and regression tests.",
+    ),
 }
 
 
@@ -138,6 +180,23 @@ _FUNCTION_ALIASES: Dict[str, str] = {
     "copy": "copywriting",
     "copywriting": "copywriting",
     "compliance": "compliance",
+    "finance": "finance",
+    "fin": "finance",
+    "gtm": "go_to_market",
+    "go-to-market": "go_to_market",
+    "go_to_market": "go_to_market",
+    "marketing": "go_to_market",
+    "data-science": "data_science",
+    "data_science": "data_science",
+    "datascience": "data_science",
+    "ml": "data_science",
+    "ai-research": "ai_research",
+    "ai_research": "ai_research",
+    "research": "ai_research",
+    "security": "security",
+    "sec": "security",
+    "accessibility": "accessibility",
+    "a11y": "accessibility",
 }
 
 
@@ -158,7 +217,7 @@ _TASKS: List[TaskAssignment] = [
             "Integration tests",
             "Capability matrix update",
         ],
-        supporting_functions=["engineering", "copywriting", "product_management"],
+    supporting_functions=["engineering", "copywriting", "product_management", "accessibility"],
     ),
     TaskAssignment(
         task_id="milestone1.checklist_automation",
@@ -184,7 +243,7 @@ _TASKS: List[TaskAssignment] = [
         function_key="engineering",
         dependencies=["postgres-backend", "vector-db", "embedding-model"],
         evidence_targets=["Service endpoints", "Retrieval benchmarks"],
-        supporting_functions=["devops", "product_management", "compliance"],
+    supporting_functions=["devops", "product_management", "compliance", "ai_research"],
     ),
     TaskAssignment(
         task_id="milestone1.analytics_dashboards",
@@ -200,7 +259,13 @@ _TASKS: List[TaskAssignment] = [
             "Live KPI dashboards",
             "Telemetry validation",
         ],
-        supporting_functions=["engineering", "developer_experience", "copywriting"],
+    supporting_functions=[
+        "engineering",
+        "developer_experience",
+        "copywriting",
+        "finance",
+        "data_science",
+    ],
     ),
     TaskAssignment(
         task_id="milestone1.agent_auth_runtime",
@@ -213,7 +278,7 @@ _TASKS: List[TaskAssignment] = [
         function_key="engineering",
         dependencies=["consent-ux", "policy-engine", "mfa-enforcement"],
         evidence_targets=["Runtime deployment checklist", "Telemetry + audit coverage"],
-        supporting_functions=["compliance", "product_management", "devops"],
+    supporting_functions=["compliance", "product_management", "devops", "security"],
     ),
     TaskAssignment(
         task_id="milestone1.workflow_engine",
@@ -226,7 +291,7 @@ _TASKS: List[TaskAssignment] = [
         function_key="engineering",
         dependencies=["behavior-handbook", "runtime-templates"],
         evidence_targets=["Template library", "Integration tests"],
-        supporting_functions=["developer_experience", "compliance"],
+    supporting_functions=["developer_experience", "compliance", "accessibility"],
     ),
     TaskAssignment(
         task_id="milestone1.embedding_integration",
@@ -237,7 +302,7 @@ _TASKS: List[TaskAssignment] = [
         function_key="engineering",
         dependencies=["vector-store", "model-hosting"],
         evidence_targets=["Retriever benchmarks", "Telemetry on latency"],
-        supporting_functions=["product_management", "devops"],
+        supporting_functions=["product_management", "devops", "data_science", "ai_research"],
     ),
     TaskAssignment(
         task_id="milestone2.customer_research",
@@ -248,7 +313,7 @@ _TASKS: List[TaskAssignment] = [
         function_key="product_management",
         dependencies=["customer-list", "research-plan"],
         evidence_targets=["Research synthesis", "PRD updates"],
-        supporting_functions=["copywriting", "compliance"],
+    supporting_functions=["copywriting", "compliance", "go_to_market"],
     ),
     TaskAssignment(
         task_id="milestone2.pricing_strategy",
@@ -259,7 +324,7 @@ _TASKS: List[TaskAssignment] = [
         function_key="product_management",
         dependencies=["cost-telemetry", "market-analysis"],
         evidence_targets=["Pricing experiment doc", "GA gating criteria"],
-        supporting_functions=["engineering", "devops", "product_analytics"],
+    supporting_functions=["engineering", "devops", "product_analytics", "finance"],
     ),
     TaskAssignment(
         task_id="milestone2.multitenant_behavior",
@@ -270,7 +335,7 @@ _TASKS: List[TaskAssignment] = [
         function_key="engineering",
         dependencies=["tenant-model", "compliance-review"],
         evidence_targets=["Architecture proposal", "Compliance assessment"],
-        supporting_functions=["product_management", "compliance"],
+    supporting_functions=["product_management", "compliance", "security", "ai_research"],
     ),
     TaskAssignment(
         task_id="milestone2.analytics_parity_dashboard",
@@ -283,7 +348,15 @@ _TASKS: List[TaskAssignment] = [
         function_key="product_analytics",
         dependencies=["action-telemetry", "parity-tests"],
         evidence_targets=["Parity metrics dashboard", "Checklist adherence view"],
-        supporting_functions=["engineering", "developer_experience", "compliance"],
+    supporting_functions=[
+        "engineering",
+        "developer_experience",
+        "compliance",
+        "go_to_market",
+        "finance",
+        "data_science",
+        "ai_research",
+    ],
     ),
 ]
 
@@ -300,22 +373,52 @@ class TaskAssignmentService:
 
         return [spec.to_dict() for spec in _FUNCTIONS.values()]
 
-    def list_assignments(self, function: Optional[str] = None) -> List[Dict[str, object]]:
-        """Return task assignments, optionally filtered by function alias."""
+    def list_assignments(
+        self,
+        function: Optional[str] = None,
+        agent: Optional[str] = None
+    ) -> List[Dict[str, object]]:
+        """
+        Return task assignments, optionally filtered by function alias and/or agent.
 
-        normalized = None
+        Args:
+            function: Optional function alias to filter by (e.g., 'engineering', 'product')
+            agent: Optional agent role to filter by (matches primary_agent or support_agents)
+
+        Returns:
+            List of task assignment dictionaries matching the filters
+
+        Raises:
+            ValueError: If function alias is unknown
+        """
+
+        normalized_function = None
         if function:
             key = function.strip().lower().replace(" ", "-")
-            normalized = _FUNCTION_ALIASES.get(key)
-            if normalized is None:
+            normalized_function = _FUNCTION_ALIASES.get(key)
+            if normalized_function is None:
                 raise ValueError(
                     f"Unknown function '{function}'. Expected one of: {sorted(set(_FUNCTION_ALIASES))}."
                 )
 
         results: List[Dict[str, object]] = []
         for assignment in self._assignments:
-            if normalized and assignment.function_key != normalized:
+            # Filter by function if specified
+            if normalized_function and assignment.function_key != normalized_function:
                 continue
+
+            # Filter by agent if specified
+            if agent:
+                agent_normalized = agent.strip().lower()
+                assignment_dict = assignment.to_dict(_FUNCTIONS)
+                primary_agent = str(assignment_dict.get("primary_agent", "")).lower()
+                support_agents_raw = assignment_dict.get("support_agents", [])
+                support_agents = [str(a).lower() for a in (support_agents_raw if isinstance(support_agents_raw, list) else [])]
+
+                # Match if agent is primary or in support list
+                if agent_normalized not in primary_agent and agent_normalized not in support_agents:
+                    continue
+
             results.append(assignment.to_dict(_FUNCTIONS))
         return results
 

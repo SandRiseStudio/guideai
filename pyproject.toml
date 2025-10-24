@@ -21,10 +21,30 @@ classifiers = [
 authors = [
   { name = "GuideAI Team" }
 ]
+dependencies = [
+  "fastapi>=0.110,<1.0",
+  "uvicorn>=0.30,<1.0",
+  "httpx>=0.27,<0.29",
+  "keyring>=24,<25",
+  "python-multipart>=0.0.6,<1.0",
+]
 
 [project.urls]
 Documentation = "https://example.com/guideai"
 Source = "https://github.com/Nas4146/guideai"
+
+[project.optional-dependencies]
+telemetry = [
+  "kafka-python>=2.0,<3.0",
+  "duckdb>=0.9,<1.0",
+]
+postgres = [
+  "psycopg2-binary>=2.9,<3.0",
+]
+semantic = [
+  "sentence-transformers>=2.2.0,<3.0",
+  "faiss-cpu>=1.7.0,<2.0",
+]
 
 [project.scripts]
 guideai = "guideai.cli:main"
