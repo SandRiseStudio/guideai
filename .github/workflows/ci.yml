@@ -45,6 +45,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
+      - name: Install pre-commit
+        run: |
+          pip install pre-commit
+          ./scripts/install_hooks.sh
+          pre-commit --version
+
       - name: Run gitleaks secret scan
         run: |
           mkdir -p security/scan_reports
@@ -57,12 +63,6 @@ jobs:
           name: security-scan-results
           path: security/scan_reports/
           retention-days: 30
-
-      - name: Validate pre-commit hooks installable
-        run: |
-          pip install pre-commit
-          ./scripts/install_hooks.sh
-          pre-commit --version
 
   pre-commit:
     name: Pre-Commit Hooks
