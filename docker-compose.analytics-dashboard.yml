@@ -1,0 +1,129 @@
+services:
+  # Metabase - Analytics dashboard and visualization platform
+  metabase:
+    image: metabase/metabase:v0.48.0
+    container_name: guideai-metabase
+    ports:
+      - "3000:3000"
+    environment:
+      # Application database (H2 embedded for simplicity, use Postgres for production)
+      MB_DB_TYPE: h2
+      MB_DB_FILE: /metabase-data/metabase.db
+
+      # Admin account setup (first-time only)
+      MB_ADMIN_EMAIL: ${MB_ADMIN_EMAIL:-admin@guideai.local}
+      MB_ADMIN_FIRST_NAME: ${MB_ADMIN_FIRST_NAME:-GuideAI}
+      MB_ADMIN_LAST_NAME: ${MB_ADMIN_LAST_NAME:-Admin}
+      MB_ADMIN_PASSWORD: ${MB_ADMIN_PASSWORD:-changeme123}
+
+      # Site settings
+      MB_SITE_NAME: "GuideAI Analytics"
+      MB_SITE_URL: ${MB_SITE_URL:-http://localhost:3000}
+
+      # Performance tuning
+      JAVA_OPTS: "-Xmx1g -Xms512m"
+
+      # Timezone
+      MB_TIMEZONE: ${MB_TIMEZONE:-America/Los_Angeles}
+
+      # Anonymous telemetry (disable for internal deployments)
+      MB_SEND_EMAIL_ON_FIRST_LOGIN_FROM_NEW_DEVICE: false
+      MB_ANON_TRACKING_ENABLED: false
+
+    volumes:
+      # Persistent storage for Metabase application database
+      - metabase-data:/metabase-data
+
+      # Mount DuckDB warehouse (read-only for safety)
+      - ./data/telemetry.duckdb:/duckdb/telemetry.duckdb:ro
+
+      # Mount SQLite export for Metabase compatibility (DuckDB files aren't SQLite-readable)
+      - ./data/telemetry_sqlite.db:/duckdb/telemetry_sqlite.db:ro
+
+      # Dashboard exports (optional, for backup/restore)
+      - ./docs/analytics/dashboard-exports:/dashboard-exports:ro
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+    restart: unless-stopped
+
+    networks:
+      - guideai-analytics
+
+  # DuckDB Query Service (optional REST wrapper for remote access)
+  # Uncomment if you need to query DuckDB from external tools
+  # duckdb-api:
+  #   image: python:3.11-slim
+  #   container_name: guideai-duckdb-api
+  #   working_dir: /app
+  #   command: >
+  #     sh -c "pip install --no-cache-dir 'duckdb>=0.9,<1.0' 'fastapi>=0.104,<1.0' 'uvicorn[standard]>=0.24,<1.0' &&
+  #            uvicorn guideai.api:app --host 0.0.0.0 --port 8000"
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./:/app
+  #     - ./data:/app/data
+  #   environment:
+  #     PYTHONPATH: /app
+  #   networks:
+  #     - guideai-analytics
+  #   depends_on:
+  #     - metabase
+
+networks:
+  guideai-analytics:
+    driver: bridge
+
+volumes:
+  metabase-data:
+    driver: local
+
+# Usage (Podman):
+# 1. Ensure Podman machine is running:
+#    podman machine start
+#
+# 2. Start Metabase:
+#    podman-compose -f docker-compose.analytics-dashboard.yml up -d
+#    (Or use Docker Compose compatibility: docker-compose → podman-compose)
+#
+# 3. Access dashboard:
+#    http://localhost:3000
+#    Login: admin@guideai.local / changeme123 (or configured values)
+#
+# 4. Connect to DuckDB:
+#    IMPORTANT: DuckDB files aren't directly readable by SQLite drivers.
+#    First export to SQLite format:
+#      python scripts/export_duckdb_to_sqlite.py
+#    Then connect Metabase to SQLite export:
+#    - Database type: SQLite
+#    - Database file path: /duckdb/telemetry_sqlite.db
+#    (Re-export daily or after schema changes)
+#
+# 5. Import dashboards:
+#    Settings > Admin > Data Model > Import
+#    Upload JSON files from /dashboard-exports
+#
+# 6. Stop services:
+#    podman-compose -f docker-compose.analytics-dashboard.yml down
+#
+# Production deployment notes:
+# - Change MB_DB_TYPE to postgres for production (requires separate Postgres service)
+# - Update MB_ADMIN_PASSWORD via environment variable or secrets manager
+# - Configure MB_SITE_URL to match your domain
+# - Set up reverse proxy (nginx) with TLS termination
+# - Mount DuckDB warehouse via network volume if using distributed storage
+# - Enable authentication provider (SAML, LDAP, OAuth) via Metabase Enterprise
+# - Configure email settings for alerts and subscriptions
+# - Set up backup strategy for metabase-data volume
+#
+# Podman considerations:
+# - Podman machine must be running: `podman machine start`
+# - Use podman-compose for Docker Compose compatibility
+# - Rootless mode: volumes mount with user permissions (recommended)
+# - For production: consider Kubernetes/OpenShift for container orchestration

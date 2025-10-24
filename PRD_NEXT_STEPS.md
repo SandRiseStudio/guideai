@@ -465,6 +465,11 @@ Test failures are due to missing infrastructure (PostgreSQL, Kafka, DuckDB) that
 - **Supporting Functions → Agents:** Engineering → `AGENT_ENGINEERING.md`; Security → `AGENT_SECURITY.md`
 - **Evidence Target:** Zero-downtime deploys with rollback capability per `behavior_orchestrate_cicd`
 
+### Future Enhancements – Agentic Postgres Alignment
+- **MCP-first Postgres operations:** Add Phase 3 follow-up to ship an MCP toolkit for PostgreSQL schema design, query tuning, and migrations so agents inherit safe defaults inspired by Agentic Postgres “master prompts.”
+- **Hybrid retrieval inside Postgres:** Extend the telemetry warehouse plan with BM25 + semantic indexing (pg_textsearch + pgvector/pgvectorscale) to keep hybrid search co-located with production data.
+- **Forkable telemetry sandboxes:** Design copy-on-write snapshot tooling so Strategist/Student agents can spawn short-lived Postgres sandboxes for experiments, mirroring the instant forks highlighted in the launch while respecting our audit logging guardrails.
+
 ---
 
 ## PHASE 4: VS Code UX Polish ✨

@@ -991,6 +991,23 @@ The **AgentAuthService REST API endpoints** have been implemented in `guideai/ap
 
 _Last Updated: 2025-10-23_
 
+## 2025-10-23 – Agentic Postgres Future Enhancements Logged (PRD Next Steps #2 Planning)
+
+**Context:** Reviewed Tiger’s Agentic Postgres launch to inform our upcoming telemetry infrastructure build. Documented future enhancements across PRD artifacts to capture MCP tooling, hybrid retrieval, and forkable sandboxes as explicit backlog items.
+
+**Documentation Updates:**
+- **PRD.md** – Added “Future Enhancements – Agentic Postgres Alignment” subsection outlining MCP-native Postgres playbooks, hybrid search inside PostgreSQL, and copy-on-write sandboxes for experimentation.
+- **PRD_NEXT_STEPS.md** – Appended the same enhancement trio to Phase 3 so the production infrastructure roadmap explicitly tracks MCP tooling, BM25+semantic indexing, and forkable sandboxes as follow-ups.
+- **BUILD_TIMELINE.md** – Pending entry once implementation begins (placeholder noted to record the effort when executed).
+
+**Rationale:** Embedding these enhancements keeps the telemetry migration grounded in agent-first workflows (safe database prompts, native retrieval, inexpensive forks) while allowing us to stay on self-hosted infrastructure.
+
+**Behaviors Applied:** `behavior_curate_behavior_handbook`, `behavior_update_docs_after_changes`, `behavior_instrument_metrics_pipeline`
+
+**Next Steps:** Incorporate design spikes for MCP Postgres toolkit and copy-on-write sandboxing during telemetry architecture planning; evaluate pg_textsearch/pgvectorscale parity for on-cluster hybrid retrieval.
+
+_Last Updated: 2025-10-23_
+
 ---
 
 ## **2025-10-23 – AgentAuthService CLI Commands Complete (Phase 1 Service Parity 11/11 COMPLETE 🎉)**

@@ -96,6 +96,11 @@ The platform has successfully completed Milestone 0 foundations and all four pri
 
 **Next Focus (Milestone 1 → Milestone 2):** Production Flink deployment for real-time analytics, deliver REST API endpoints + MCP manifests for all shipped capabilities, expand the VS Code extension with compliance/action analytics views, migrate to PostgreSQL + vector index for production scale, and begin external beta planning.
 
+### Future Enhancements – Agentic Postgres Alignment
+- **MCP-native database playbooks:** Bundle a GuideAI-run MCP toolkit for Postgres administration (schema design, query tuning, migrations) so agents inherit the “master prompt” guardrails highlighted in Agentic Postgres while staying on our self-managed stack.
+- **Hybrid search inside PostgreSQL:** Enrich the telemetry migration with BM25 + semantic extensions (e.g., pg_textsearch-style ranking alongside vector indices) to keep retrieval local to the warehouse and mirror the native search ergonomics described in the launch.
+- **Instant forkable sandboxes:** Design copy-on-write database snapshots for behavior experiments and telemetry replay so Strategist and Student agents can spin up safe sandboxes without duplicating storage, echoing the fast fork workflow Tiger surfaced.
+
 ## Problem Statement
 AI-assisted development teams repeatedly solve similar orchestration and remediation problems, causing long LLM traces, inconsistent outcomes, and weak institutional memory. Behavior handbooks exist but are siloed, hard to enforce, and unaudited. We need a product that operationalizes behavior discovery, retrieval, and compliance so that Strategist/Teacher/Student roles can collaborate efficiently and traceably.
 
