@@ -3,7 +3,7 @@
 ## Document Control
 - **Status:** Milestone 1 In Progress – Parity audit completed; analytics CLI live, REST/MCP & IDE follow-ups pending
 - **Date:** 2025-10-16
-- **Last Updated:** 2025-10-16
+- **Last Updated:** 2025-10-24
 - **Author(s):** Product & AI Enablement Team
 - **Stakeholders:** Engineering, Developer Experience, Developer Productivity, Security & Compliance, Customer Success
 
@@ -100,6 +100,12 @@ The platform has successfully completed Milestone 0 foundations and all four pri
 - **MCP-native database playbooks:** Bundle a GuideAI-run MCP toolkit for Postgres administration (schema design, query tuning, migrations) so agents inherit the “master prompt” guardrails highlighted in Agentic Postgres while staying on our self-managed stack.
 - **Hybrid search inside PostgreSQL:** Enrich the telemetry migration with BM25 + semantic extensions (e.g., pg_textsearch-style ranking alongside vector indices) to keep retrieval local to the warehouse and mirror the native search ergonomics described in the launch.
 - **Instant forkable sandboxes:** Design copy-on-write database snapshots for behavior experiments and telemetry replay so Strategist and Student agents can spin up safe sandboxes without duplicating storage, echoing the fast fork workflow Tiger surfaced.
+
+### Future Enhancements – Runtime Agent Orchestration
+- **Agent Orchestrator service:** Introduce a dedicated service that maps domain agents (Engineering, Product, Finance, Security, etc.) onto the Strategist → Teacher → Student pipeline at run creation time. The orchestrator will select the appropriate domain behaviors, inject playbook-specific prompts, and record which agent persona executed each step for auditability.
+- **Dynamic agent switching heuristics:** Implement policy- and telemetry-driven rules (e.g., task taxonomy, compliance tags, incident severity) so runs can transition between agents mid-execution while preserving cited behaviors and checklist requirements.
+- **Surface parity:** Extend CLI/REST/MCP/IDE surfaces with `agent` selectors (e.g., `--agent engineering`, “Run as Finance Agent”) so users can request or override agent assignments, with fallback to default Strategist/Teacher/Student flows.
+- **Instrumentation + governance:** Capture agent selection metrics (reuse %, token savings, completion rate by agent) and update `PRD_ALIGNMENT_LOG.md` / `PROGRESS_TRACKER.md` playbooks to reflect runtime orchestration evidence and review cadences across functional leads.
 
 ## Problem Statement
 AI-assisted development teams repeatedly solve similar orchestration and remediation problems, causing long LLM traces, inconsistent outcomes, and weak institutional memory. Behavior handbooks exist but are siloed, hard to enforce, and unaudited. We need a product that operationalizes behavior discovery, retrieval, and compliance so that Strategist/Teacher/Student roles can collaborate efficiently and traceably.

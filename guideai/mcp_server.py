@@ -35,13 +35,19 @@ Protocol:
 
 import asyncio
 import json
-import sys
 import logging
-from typing import Any, Dict, List, Optional
+import os
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 # MCP protocol types
-from dataclasses import dataclass, asdict
+
+from .action_service import ActionService
+from .action_service_postgres import PostgresActionService
+from .behavior_service import BehaviorService
+from .workflow_service import WorkflowService
 
 
 @dataclass
@@ -70,6 +76,62 @@ class MCPError:
     data: Optional[Any] = None
 
 
+class MCPServiceRegistry:
+    """Lazy initializer for MCP service singletons using PostgreSQL DSNs."""
+
+    def __init__(self, logger: Optional[logging.Logger] = None) -> None:
+        self._logger = logger or logging.getLogger("guideai.mcp_server.services")
+        self._behavior_service: Optional[BehaviorService] = None
+        self._workflow_service: Optional[WorkflowService] = None
+        self._action_service: Optional[Union[PostgresActionService, ActionService]] = None
+
+    def behavior_service(self) -> BehaviorService:
+        if self._behavior_service is None:
+            service = BehaviorService()
+            dsn_repr = getattr(service, "_dsn", "<hidden>")
+            self._logger.info(
+                "Initialized BehaviorService for MCP with PostgreSQL backend (dsn=%s)",
+                dsn_repr,
+            )
+            self._behavior_service = service
+        return self._behavior_service
+
+    def workflow_service(self) -> WorkflowService:
+        if self._workflow_service is None:
+            service = WorkflowService(
+                dsn=None,
+                behavior_service=self.behavior_service(),
+            )
+            dsn_repr = getattr(service, "dsn", "<hidden>")
+            self._logger.info(
+                "Initialized WorkflowService for MCP with PostgreSQL backend (dsn=%s)",
+                dsn_repr,
+            )
+            self._workflow_service = service
+        return self._workflow_service
+
+    def action_service(self) -> Union[PostgresActionService, ActionService]:
+        if self._action_service is None:
+            dsn = os.environ.get("GUIDEAI_ACTION_PG_DSN")
+            if dsn:
+                from .telemetry import TelemetryClient
+
+                service: Union[PostgresActionService, ActionService] = PostgresActionService(
+                    dsn=dsn, telemetry=TelemetryClient.noop()
+                )
+                self._logger.info(
+                    "Initialized PostgresActionService for MCP with PostgreSQL backend"
+                )
+            else:
+                # Fallback to in-memory for development
+                service = ActionService()
+                self._logger.warning(
+                    "Using in-memory ActionService (GUIDEAI_ACTION_PG_DSN not set)"
+                )
+            self._action_service = service
+        return self._action_service
+
+
 class MCPServer:
     """
     GuideAI MCP server implementing JSON-RPC 2.0 over stdio.
@@ -89,6 +151,7 @@ class MCPServer:
         """Initialize MCP server with tool handlers."""
         self._setup_logging()
         self._logger = logging.getLogger("guideai.mcp_server")
+        self._services = MCPServiceRegistry(logger=self._logger)
 
         # Import device flow handler
         try:

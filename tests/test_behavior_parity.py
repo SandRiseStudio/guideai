@@ -10,11 +10,14 @@ The service returns nested structures: {"behavior": {...}, "versions": [...]}
 
 from __future__ import annotations
 
-import tempfile
+import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, Generator
 
+try:
+    import psycopg2  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - psycopg2 is optional for lint environments
+    psycopg2 = None
 import pytest
 
 from guideai.action_contracts import Actor
@@ -26,14 +29,39 @@ from guideai.adapters import (
 from guideai.behavior_service import BehaviorService, BehaviorNotFoundError, BehaviorVersionError
 
 
+NONEXISTENT_BEHAVIOR_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def _truncate_behavior_tables(dsn: str) -> None:
+    """Remove all data from behavior tables to ensure test isolation."""
+    if psycopg2 is None:
+        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
+    conn = psycopg2.connect(dsn)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE behavior_versions, behaviors RESTART IDENTITY CASCADE;")
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def behavior_service() -> Generator[BehaviorService, None, None]:
-    """Create a fresh BehaviorService for each test."""
-    temp_db = Path(tempfile.mktemp(suffix=".db"))
-    service = BehaviorService(db_path=temp_db)
-    yield service
-    if temp_db.exists():
-        temp_db.unlink()
+    """Create a fresh BehaviorService backed by PostgreSQL for each test."""
+    dsn = os.environ.get("GUIDEAI_BEHAVIOR_PG_DSN")
+    if not dsn:
+        pytest.skip("GUIDEAI_BEHAVIOR_PG_DSN not set; skipping PostgreSQL parity tests")
+
+    _truncate_behavior_tables(dsn)
+    service = BehaviorService(dsn=dsn)
+
+    try:
+        yield service
+    finally:
+        _truncate_behavior_tables(dsn)
+        conn = getattr(service, "_conn", None)
+        if conn is not None and getattr(conn, "closed", 1) == 0:
+            conn.close()
 
 
 @pytest.fixture
@@ -554,15 +582,15 @@ class TestErrorHandlingParity:
 
     def test_cli_get_nonexistent(self, cli_adapter: CLIBehaviorServiceAdapter):
         with pytest.raises(BehaviorNotFoundError):
-            cli_adapter.get("bhv-nonexistent", None)
+            cli_adapter.get(NONEXISTENT_BEHAVIOR_ID, None)
 
     def test_rest_get_nonexistent(self, rest_adapter: RestBehaviorServiceAdapter):
         with pytest.raises(BehaviorNotFoundError):
-            rest_adapter.get_behavior("bhv-nonexistent", None)
+            rest_adapter.get_behavior(NONEXISTENT_BEHAVIOR_ID, None)
 
     def test_mcp_get_nonexistent(self, mcp_adapter: MCPBehaviorServiceAdapter):
         with pytest.raises(BehaviorNotFoundError):
-            mcp_adapter.get({"behavior_id": "bhv-nonexistent"})
+            mcp_adapter.get({"behavior_id": NONEXISTENT_BEHAVIOR_ID})
 
     def test_update_nonexistent_behavior(
         self,
@@ -575,7 +603,7 @@ class TestErrorHandlingParity:
         # CLI - update raises BehaviorVersionError when version not found
         with pytest.raises(BehaviorVersionError):
             cli_adapter.update(
-                behavior_id="bhv-nonexistent",
+                behavior_id=NONEXISTENT_BEHAVIOR_ID,
                 version="1.0.0",
                 instruction="Updated",
                 description=None, trigger_keywords=None, tags=[],
@@ -586,7 +614,7 @@ class TestErrorHandlingParity:
         # REST
         with pytest.raises(BehaviorVersionError):
             rest_adapter.update_draft(
-                behavior_id="bhv-nonexistent",
+                behavior_id=NONEXISTENT_BEHAVIOR_ID,
                 version="1.0.0",
                 payload={
                     "instruction": "Updated",
@@ -597,7 +625,7 @@ class TestErrorHandlingParity:
         # MCP
         with pytest.raises(BehaviorVersionError):
             mcp_adapter.update({
-                "behavior_id": "bhv-nonexistent",
+                "behavior_id": NONEXISTENT_BEHAVIOR_ID,
                 "version": "1.0.0",
                 "instruction": "Updated",
                 "actor": {"id": "test", "role": "STRATEGIST", "surface": "MCP"}

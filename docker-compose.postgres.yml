@@ -1,0 +1,254 @@
+version: '3.9'
+
+# PostgreSQL infrastructure for guideAI migration validation
+# Three isolated databases matching service architecture:
+# - telemetry: TelemetryService (events, metrics, audit logs)
+# - behaviors: BehaviorService (behavior definitions, versions, handbook)
+# - workflows: WorkflowService (workflow templates, runs, execution state)
+
+services:
+  # PostgreSQL - Telemetry Service Database
+  postgres-telemetry:
+    image: postgres:16-alpine
+    hostname: postgres-telemetry
+    container_name: guideai-postgres-telemetry
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: guideai_telemetry
+      POSTGRES_PASSWORD: dev_telemetry_pass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-telemetry-data:/var/lib/postgresql/data
+      - ./schema/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guideai_telemetry -d telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guideai-postgres-net
+
+  # PostgreSQL - Behavior Service Database
+  postgres-behavior:
+    image: postgres:16-alpine
+    hostname: postgres-behavior
+    container_name: guideai-postgres-behavior
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: behaviors
+      POSTGRES_USER: guideai_behavior
+      POSTGRES_PASSWORD: dev_behavior_pass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-behavior-data:/var/lib/postgresql/data
+      - ./schema/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guideai_behavior -d behaviors"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guideai-postgres-net
+
+  # PostgreSQL - Workflow Service Database
+  postgres-workflow:
+    image: postgres:16-alpine
+    hostname: postgres-workflow
+    container_name: guideai-postgres-workflow
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: workflows
+      POSTGRES_USER: guideai_workflow
+      POSTGRES_PASSWORD: dev_workflow_pass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-workflow-data:/var/lib/postgresql/data
+      - ./schema/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guideai_workflow -d workflows"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guideai-postgres-net
+
+  # PostgreSQL - Action Service Database
+  postgres-action:
+    image: postgres:16-alpine
+    hostname: postgres-action
+    container_name: guideai-postgres-action
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_DB: guideai_action
+      POSTGRES_USER: guideai_user
+      POSTGRES_PASSWORD: local_dev_pw
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-action-data:/var/lib/postgresql/data
+      - ./schema/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guideai_user -d guideai_action"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guideai-postgres-net
+
+  # PostgreSQL - Run Service Database
+  postgres-run:
+    image: postgres:16-alpine
+    hostname: postgres-run
+    container_name: guideai-postgres-run
+    ports:
+      - "5436:5432"
+    environment:
+      POSTGRES_DB: guideai_run
+      POSTGRES_USER: guideai_user
+      POSTGRES_PASSWORD: local_dev_pw
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-run-data:/var/lib/postgresql/data
+      - ./schema/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guideai_user -d guideai_run"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guideai-postgres-net
+
+  # PostgreSQL for ComplianceService - Port 5437
+  postgres-compliance:
+    image: postgres:16-alpine
+    hostname: postgres-compliance
+    container_name: guideai-postgres-compliance
+    ports:
+      - "5437:5432"
+    environment:
+      POSTGRES_DB: guideai_compliance
+      POSTGRES_USER: guideai_user
+      POSTGRES_PASSWORD: local_dev_pw
+    volumes:
+      - postgres-compliance-data:/var/lib/postgresql/data
+      - ./schema/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guideai_user -d guideai_compliance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guideai-postgres-net
+
+  # PgBouncer connection pooler for PostgreSQL services
+  pgbouncer:
+    image: bitnami/pgbouncer:1.23.0
+    hostname: pgbouncer
+    container_name: guideai-pgbouncer
+    restart: unless-stopped
+    ports:
+      - "6432:6432"
+    environment:
+      PGBOUNCER_CONFIGURATION_FILE: /opt/bitnami/pgbouncer/conf/pgbouncer.ini
+    volumes:
+      - ./deployment/config/pgbouncer.ini:/opt/bitnami/pgbouncer/conf/pgbouncer.ini:ro
+      - ./deployment/config/pgbouncer.userlist:/opt/bitnami/pgbouncer/conf/userlist.txt:ro
+    depends_on:
+      - postgres-telemetry
+      - postgres-behavior
+      - postgres-workflow
+      - postgres-action
+      - postgres-run
+      - postgres-compliance
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6432'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - guideai-postgres-net
+
+  # pgAdmin - Web interface for PostgreSQL inspection
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    hostname: pgadmin
+    container_name: guideai-pgadmin
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@guideai.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+      - ./deployment/config/pgadmin_servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      - postgres-telemetry
+      - postgres-behavior
+      - postgres-workflow
+      - postgres-action
+      - postgres-run
+      - postgres-compliance
+    networks:
+      - guideai-postgres-net
+
+volumes:
+  postgres-telemetry-data:
+    driver: local
+  postgres-behavior-data:
+    driver: local
+  postgres-workflow-data:
+    driver: local
+  postgres-action-data:
+    driver: local
+  postgres-run-data:
+    driver: local
+  postgres-compliance-data:
+    driver: local
+  pgadmin-data:
+    driver: local
+
+networks:
+  guideai-postgres-net:
+    driver: bridge
+
+# Usage:
+# 1. Start all PostgreSQL services:
+#    podman-compose -f docker-compose.postgres.yml up -d
+#
+# 2. Verify health:
+#    podman-compose -f docker-compose.postgres.yml ps
+#
+# 3. Access pgAdmin:
+#    http://localhost:5050
+#    (email: admin@guideai.local, password: admin)
+#
+# 4. Connect to databases:
+#    Telemetry:  postgresql://guideai_telemetry:dev_telemetry_pass@localhost:5432/telemetry
+#    Behavior:   postgresql://guideai_behavior:dev_behavior_pass@localhost:5433/behaviors
+#    Workflow:   postgresql://guideai_workflow:dev_workflow_pass@localhost:5434/workflows
+#    Action:     postgresql://guideai_user:local_dev_pw@localhost:5435/guideai_action
+#    Run:        postgresql://guideai_user:local_dev_pw@localhost:5436/guideai_run
+#    Compliance: postgresql://guideai_user:local_dev_pw@localhost:5437/guideai_compliance
+#
+#    Through PgBouncer (recommended for application connections):
+#    postgresql://guideai_behavior:dev_behavior_pass@localhost:6432/behaviors
+#    postgresql://guideai_workflow:dev_workflow_pass@localhost:6432/workflows
+#    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai_action
+#    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai_run
+#    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai_compliance
+#    postgresql://guideai_telemetry:dev_telemetry_pass@localhost:6432/telemetry
+#
+#    (PgBouncer listens on port 6432 and forwards to the individual service databases.)
+#
+# 5. Stop and clean up:
+#    podman-compose -f docker-compose.postgres.yml down -v
+#
+# Note: If using Docker compatibility alias, podman commands are identical:
+#    alias docker=podman
+#    alias docker-compose=podman-compose

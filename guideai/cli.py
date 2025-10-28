@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from guideai.action_service import ActionService
 from guideai.adapters import (
     CLIAgentAuthServiceAdapter,
+    CLIAgentOrchestratorAdapter,
     CLITaskAssignmentAdapter,
     CLIActionServiceAdapter,
     CLIBehaviorServiceAdapter,
@@ -54,12 +55,13 @@ from guideai.bci_contracts import (
 from guideai.behavior_retriever import BehaviorRetriever
 from guideai.compliance_service import ComplianceService
 from guideai.behavior_service import BehaviorService
+from guideai.agent_orchestrator_service import AgentOrchestratorService
 from guideai.metrics_service import MetricsService
 from guideai.reflection_service import ReflectionService
 from guideai.reflection_contracts import TraceFormat
 from guideai.run_service import RunService
 from guideai.task_assignments import TaskAssignmentService
-from guideai.telemetry import FileTelemetrySink, TelemetryClient
+from guideai.telemetry import TelemetryClient, create_sink_from_env
 from guideai.workflow_service import WorkflowService
 from guideai.auth_tokens import (
     AuthTokenBundle,
@@ -95,6 +97,13 @@ _REFLECTION_SERVICE: ReflectionService | None = None
 _REFLECTION_ADAPTER: CLIReflectionAdapter | None = None
 _DEVICE_FLOW_MANAGER: DeviceFlowManager | None = None
 _TOKEN_STORE: TokenStore | None = None
+_AGENT_ORCHESTRATOR_SERVICE: AgentOrchestratorService | None = None
+_AGENT_ORCHESTRATOR_ADAPTER: CLIAgentOrchestratorAdapter | None = None
+
+
+def _create_telemetry_client(default_actor: Dict[str, str]) -> TelemetryClient:
+    sink = create_sink_from_env(default_path=DEFAULT_TELEMETRY_EVENTS_PATH)
+    return TelemetryClient(sink=sink, default_actor=default_actor)
 
 
 def _get_action_adapter() -> CLIActionServiceAdapter:
@@ -120,6 +129,7 @@ def _reset_action_state_for_testing() -> None:
     global _BCI_SERVICE, _BEHAVIOR_RETRIEVER
     global _REFLECTION_SERVICE, _REFLECTION_ADAPTER
     global _DEVICE_FLOW_MANAGER, _TOKEN_STORE
+    global _AGENT_ORCHESTRATOR_SERVICE, _AGENT_ORCHESTRATOR_ADAPTER
 
     _ACTION_SERVICE = ActionService()
     _ACTION_ADAPTER = CLIActionServiceAdapter(_ACTION_SERVICE)
@@ -143,6 +153,8 @@ def _reset_action_state_for_testing() -> None:
     _REFLECTION_ADAPTER = None
     _DEVICE_FLOW_MANAGER = None
     _TOKEN_STORE = None
+    _AGENT_ORCHESTRATOR_SERVICE = None
+    _AGENT_ORCHESTRATOR_ADAPTER = None
 
 
 def _get_task_adapter() -> CLITaskAssignmentAdapter:
@@ -177,9 +189,8 @@ def _get_workflow_adapter() -> CLIWorkflowServiceAdapter:
     if _BEHAVIOR_SERVICE is None:
         _BEHAVIOR_SERVICE = BehaviorService()
     if _WORKFLOW_SERVICE is None:
-        db_path = Path.home() / ".guideai" / "workflows.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        _WORKFLOW_SERVICE = WorkflowService(db_path=db_path, behavior_service=_BEHAVIOR_SERVICE)
+        # WorkflowService now uses PostgreSQL DSN from environment
+        _WORKFLOW_SERVICE = WorkflowService(dsn=None, behavior_service=_BEHAVIOR_SERVICE)
     if _WORKFLOW_ADAPTER is None:
         _WORKFLOW_ADAPTER = CLIWorkflowServiceAdapter(_WORKFLOW_SERVICE)
     return _WORKFLOW_ADAPTER
@@ -251,18 +262,26 @@ def _get_device_flow_manager() -> DeviceFlowManager:
 
     global _DEVICE_FLOW_MANAGER
     if _DEVICE_FLOW_MANAGER is None:
-        telemetry_path = DEFAULT_TELEMETRY_EVENTS_PATH
-        telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-        telemetry = TelemetryClient(
-            sink=FileTelemetrySink(telemetry_path),
-            default_actor={
+        telemetry = _create_telemetry_client(
+            {
                 "id": DEFAULT_ACTOR_ID,
                 "role": DEFAULT_ACTOR_ROLE,
                 "surface": "CLI",
-            },
+            }
         )
         _DEVICE_FLOW_MANAGER = DeviceFlowManager(telemetry=telemetry)
     return _DEVICE_FLOW_MANAGER
+
+
+def _get_agent_orchestrator_adapter() -> CLIAgentOrchestratorAdapter:
+    """Get or create CLIAgentOrchestratorAdapter singleton."""
+
+    global _AGENT_ORCHESTRATOR_SERVICE, _AGENT_ORCHESTRATOR_ADAPTER
+    if _AGENT_ORCHESTRATOR_SERVICE is None:
+        _AGENT_ORCHESTRATOR_SERVICE = AgentOrchestratorService()
+    if _AGENT_ORCHESTRATOR_ADAPTER is None:
+        _AGENT_ORCHESTRATOR_ADAPTER = CLIAgentOrchestratorAdapter(_AGENT_ORCHESTRATOR_SERVICE)
+    return _AGENT_ORCHESTRATOR_ADAPTER
 
 
 def _get_token_store(*, allow_plaintext: Optional[bool] = None) -> TokenStore:
@@ -844,17 +863,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     workflow_run_parser = workflow_subparsers.add_parser(
         "run",
-        help="Execute a workflow template with behavior-conditioned inference",
+        help="Execute a workflow template",
     )
-    workflow_run_parser.add_argument("template_id", help="Template to execute")
+    workflow_run_parser.add_argument("template_id", help="Workflow template identifier")
     workflow_run_parser.add_argument(
         "--behavior",
         dest="behavior_ids",
         action="append",
         default=[],
-        help="Behavior ID to inject (repeatable, auto-retrieves if omitted)",
+        help="Behavior ID to attach (repeatable)",
     )
-    workflow_run_parser.add_argument("--metadata-file", help="Path to JSON run metadata")
+    workflow_run_parser.add_argument("--metadata-file", help="Path to JSON metadata object")
     workflow_run_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
     workflow_run_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
     workflow_run_parser.add_argument(
@@ -965,6 +984,101 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     run_cancel_parser.add_argument("run_id", help="Run identifier")
     run_cancel_parser.add_argument("--reason", help="Cancellation reason")
     run_cancel_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    agents_parser = subparsers.add_parser(
+        "agents",
+        help="Manage runtime agent assignments",
+    )
+    agents_subparsers = agents_parser.add_subparsers(dest="agents_command")
+
+    agents_assign_parser = agents_subparsers.add_parser(
+        "assign",
+        help="Assign an agent persona to a run",
+    )
+    agents_assign_parser.add_argument("--run-id", help="Existing run identifier to attach the assignment")
+    agents_assign_parser.add_argument("--agent-id", help="Requested agent persona identifier")
+    agents_assign_parser.add_argument(
+        "--stage",
+        default="EXECUTION",
+        help="Pipeline stage for the assignment (defaults to EXECUTION)",
+    )
+    agents_assign_parser.add_argument(
+        "--context",
+        dest="context_json",
+        help="Inline JSON object describing task context (task_type, severity, etc.)",
+    )
+    agents_assign_parser.add_argument(
+        "--context-file",
+        dest="context_file",
+        help="Path to JSON file containing task context details",
+    )
+    agents_assign_parser.add_argument(
+        "--requested-by-id",
+        default=DEFAULT_ACTOR_ID,
+        help="Requester identifier (defaults to local CLI actor)",
+    )
+    agents_assign_parser.add_argument(
+        "--requested-by-role",
+        default=DEFAULT_ACTOR_ROLE,
+        help="Requester role (defaults to STRATEGIST)",
+    )
+    agents_assign_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    agents_switch_parser = agents_subparsers.add_parser(
+        "switch",
+        help="Switch the active agent for an existing assignment",
+    )
+    agents_switch_parser.add_argument("assignment_id", help="Agent assignment identifier")
+    agents_switch_parser.add_argument(
+        "--target-agent-id",
+        dest="target_agent_id",
+        required=True,
+        help="Persona identifier to switch to",
+    )
+    agents_switch_parser.add_argument("--reason", help="Reason for the switch (optional)")
+    agents_switch_parser.add_argument(
+        "--allow-downgrade",
+        action="store_true",
+        help="Permit switching to an agent with fewer capabilities",
+    )
+    agents_switch_parser.add_argument(
+        "--stage",
+        help="Override the pipeline stage after switching",
+    )
+    agents_switch_parser.add_argument(
+        "--issued-by-id",
+        default=DEFAULT_ACTOR_ID,
+        help="Identifier of the actor issuing the switch",
+    )
+    agents_switch_parser.add_argument(
+        "--issued-by-role",
+        default=DEFAULT_ACTOR_ROLE,
+        help="Role of the actor issuing the switch",
+    )
+    agents_switch_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    agents_status_parser = agents_subparsers.add_parser(
+        "status",
+        help="Inspect the current agent assignment for a run or assignment ID",
+    )
+    agents_status_parser.add_argument("--assignment-id", help="Agent assignment identifier to inspect")
+    agents_status_parser.add_argument("--run-id", help="Run identifier to inspect")
+    agents_status_parser.add_argument(
         "--format",
         choices=("json", "table"),
         default="json",
@@ -1766,6 +1880,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if args.command == "workflow" and not getattr(args, "workflow_command", None):
         workflow_parser.print_help()
         parser.exit(1)
+    if args.command == "agents" and not getattr(args, "agents_command", None):
+        agents_parser.print_help()
+        parser.exit(1)
     if args.command == "telemetry" and not getattr(args, "telemetry_command", None):
         telemetry_parser.print_help()
         parser.exit(1)
@@ -1798,6 +1915,28 @@ def _load_metadata(items: List[str], metadata_file: Optional[str]) -> Dict[str, 
         metadata[key] = value
 
     return metadata
+
+
+def _load_agent_context(context_json: Optional[str], context_file: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Load agent assignment context from direct JSON or a JSON file."""
+
+    if context_json and context_file:
+        raise ValueError("Provide either --context or --context-file, not both")
+
+    payload: Any = None
+    if context_file:
+        payload = _load_json_file(context_file)
+    elif context_json:
+        try:
+            payload = json.loads(context_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Context must be valid JSON") from exc
+
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("Context must be a JSON object")
+    return payload
 
 
 def _parse_embedding_arg(raw: Optional[str]) -> Optional[List[float]]:
@@ -2406,9 +2545,7 @@ def _command_telemetry_emit(args: argparse.Namespace) -> int:
         "surface": surface,
     }
 
-    path_override = os.environ.get("GUIDEAI_TELEMETRY_PATH")
-    sink_path = Path(path_override) if path_override else Path.home() / ".guideai" / "telemetry" / "events.jsonl"
-    telemetry = TelemetryClient(sink=FileTelemetrySink(sink_path), default_actor=actor)
+    telemetry = _create_telemetry_client(actor)
 
     event = telemetry.emit_event(
         event_type=args.event_type,
@@ -3965,6 +4102,134 @@ def _command_workflow_status(args: argparse.Namespace) -> int:
 
 
 # ------------------------------------------------------------------
+# Agent Orchestrator Commands
+# ------------------------------------------------------------------
+
+
+def _build_cli_actor_payload(actor_id: str, actor_role: str) -> Dict[str, Any]:
+    return {
+        "id": actor_id,
+        "role": actor_role,
+        "surface": "CLI",
+    }
+
+
+def _render_agent_assignment_table(assignment: Dict[str, Any]) -> None:
+    active_agent = assignment.get("active_agent") or {}
+    requested_by = assignment.get("requested_by") or {}
+
+    print(f"Assignment ID : {assignment.get('assignment_id', '?')}")
+    print(f"Run ID        : {assignment.get('run_id', '?')}")
+    print(f"Stage         : {assignment.get('stage', '-')}")
+    print(f"Timestamp     : {assignment.get('timestamp', '-')}")
+
+    requester_id = requested_by.get("id", "-")
+    requester_role = requested_by.get("role", "-")
+    print(f"Requested By  : {requester_id} ({requester_role})")
+
+    agent_id = active_agent.get("agent_id", "-")
+    agent_name = active_agent.get("display_name", "Unknown")
+    print(f"Active Agent  : {agent_id} ({agent_name})")
+
+    metadata = assignment.get("metadata") or {}
+    if metadata:
+        print("\nContext:")
+        for key, value in metadata.items():
+            formatted = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+            print(f"  {key}: {formatted}")
+
+    heuristics = assignment.get("heuristics_applied") or {}
+    if heuristics:
+        print("\nHeuristics Applied:")
+        for key, value in heuristics.items():
+            formatted = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+            print(f"  {key}: {formatted}")
+
+    history = assignment.get("history") or []
+    if history:
+        print(f"\nHistory ({len(history)} event(s)):")
+        for event in history:
+            from_agent = event.get("from_agent_id", "-")
+            to_agent = event.get("to_agent_id", "-")
+            trigger = event.get("trigger", "-")
+            timestamp = event.get("timestamp", "-")
+            stage = event.get("stage", "-")
+            print(f"  - {timestamp} :: {from_agent} → {to_agent} [{trigger}] (stage={stage})")
+            trigger_details = event.get("trigger_details") or {}
+            reason = trigger_details.get("reason")
+            if reason:
+                print(f"    Reason: {reason}")
+            allow_downgrade = trigger_details.get("allow_downgrade")
+            if allow_downgrade is not None:
+                print(f"    Allow Downgrade: {allow_downgrade}")
+            issued_by = event.get("issued_by") or {}
+            issuer_id = issued_by.get("id")
+            if issuer_id:
+                issuer_role = issued_by.get("role", "-")
+                print(f"    Issued By: {issuer_id} ({issuer_role})")
+
+
+def _output_agent_assignment(assignment: Dict[str, Any], output_format: str) -> None:
+    if output_format == "json":
+        _print_json(assignment)
+    else:
+        _render_agent_assignment_table(assignment)
+
+
+def _command_agents_assign(args: argparse.Namespace) -> int:
+    adapter = _get_agent_orchestrator_adapter()
+    try:
+        context = _load_agent_context(getattr(args, "context_json", None), getattr(args, "context_file", None))
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    assignment = adapter.assign_agent(
+        run_id=args.run_id,
+        requested_agent_id=args.agent_id,
+        stage=args.stage,
+        context=context,
+        requested_by=_build_cli_actor_payload(args.requested_by_id, args.requested_by_role),
+    )
+    _output_agent_assignment(assignment, args.format)
+    return 0
+
+
+def _command_agents_switch(args: argparse.Namespace) -> int:
+    adapter = _get_agent_orchestrator_adapter()
+    try:
+        assignment = adapter.switch_agent(
+            assignment_id=args.assignment_id,
+            target_agent_id=args.target_agent_id,
+            reason=args.reason,
+            allow_downgrade=args.allow_downgrade,
+            stage=args.stage,
+            issued_by=_build_cli_actor_payload(args.issued_by_id, args.issued_by_role),
+        )
+    except KeyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    _output_agent_assignment(assignment, args.format)
+    return 0
+
+
+def _command_agents_status(args: argparse.Namespace) -> int:
+    if not args.assignment_id and not args.run_id:
+        print("Error: Provide --assignment-id or --run-id", file=sys.stderr)
+        return 2
+
+    adapter = _get_agent_orchestrator_adapter()
+    assignment = adapter.get_status(run_id=args.run_id, assignment_id=args.assignment_id)
+    if not assignment:
+        target = args.assignment_id or args.run_id or "unknown"
+        print(f"Error: Agent assignment not found for '{target}'", file=sys.stderr)
+        return 1
+
+    _output_agent_assignment(assignment, args.format)
+    return 0
+
+
+# ------------------------------------------------------------------
 # Run Commands
 # ------------------------------------------------------------------
 
@@ -4219,6 +4484,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.run_command == "cancel":
             return _command_run_cancel(args)
         print("Error: Unknown run subcommand", file=sys.stderr)
+        return 1
+    if args.command == "agents":
+        if args.agents_command == "assign":
+            return _command_agents_assign(args)
+        if args.agents_command == "switch":
+            return _command_agents_switch(args)
+        if args.agents_command == "status":
+            return _command_agents_status(args)
+        print("Error: Unknown agents subcommand", file=sys.stderr)
         return 1
     if args.command == "analytics":
         if args.analytics_command == "project-kpi":

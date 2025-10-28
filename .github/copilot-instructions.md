@@ -27,3 +27,9 @@
 ## Collaboration reminders
 - Before finalizing, run the relevant agent playbooks (`AGENT_ENGINEERING.md`, `AGENT_DX.md`, `AGENT_COMPLIANCE.md`, `AGENT_PRODUCT.md`, `AGENT_COPYWRITING.md`) to capture feedback.
 - Note any new reusable workflow in `AGENTS.md` and update the capability matrix (once introduced) to keep parity enforced.
+## Additional Instructions
+
+- Prioritize updating existing documentation files instead of creating new summary documents after every update (languages: TypeScript, JavaScript, Python)
+- Always run pre-commit hooks before pushing code (languages: JavaScript, Python, TypeScript)
+- Use descriptive variable names that explain purpose and intent (languages: JavaScript, TypeScript, Python)
+- Document all public API endpoints with OpenAPI specs (languages: JavaScript, TypeScript, Python)

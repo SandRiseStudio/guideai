@@ -6,9 +6,13 @@ regardless of which surface invokes them (CLI, REST API, MCP tools).
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-from typing import Any, Dict
+import os
+from typing import Any, Dict, Generator
+
+try:
+    import psycopg2  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - psycopg2 optional for lint envs
+    psycopg2 = None
 
 import pytest
 
@@ -18,17 +22,43 @@ from guideai.adapters import (
     RestWorkflowServiceAdapter,
     MCPWorkflowServiceAdapter,
 )
-from guideai.workflow_service import WorkflowService, TemplateStep, WorkflowRole
+from guideai.workflow_service import WorkflowService
+
+
+NONEXISTENT_TEMPLATE_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def _truncate_workflow_tables(dsn: str) -> None:
+    """Clear workflow tables to maintain test isolation."""
+    if psycopg2 is None:
+        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
+
+    conn = psycopg2.connect(dsn)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE workflow_runs, workflow_templates RESTART IDENTITY CASCADE;")
+    finally:
+        conn.close()
 
 
 @pytest.fixture
-def workflow_service() -> WorkflowService:
-    """Create a fresh WorkflowService for each test."""
-    temp_db = Path(tempfile.mktemp(suffix=".db"))
-    service = WorkflowService(db_path=temp_db)
-    yield service
-    if temp_db.exists():
-        temp_db.unlink()
+def workflow_service() -> Generator[WorkflowService, None, None]:
+    """Create a fresh PostgreSQL-backed WorkflowService for each test."""
+    dsn = os.environ.get("GUIDEAI_WORKFLOW_PG_DSN")
+    if not dsn:
+        pytest.skip("GUIDEAI_WORKFLOW_PG_DSN not set; skipping PostgreSQL parity tests")
+
+    _truncate_workflow_tables(dsn)
+    service = WorkflowService(dsn=dsn)
+
+    try:
+        yield service
+    finally:
+        _truncate_workflow_tables(dsn)
+        conn = getattr(service, "_conn", None)
+        if conn is not None and getattr(conn, "closed", 1) == 0:
+            conn.close()
 
 
 @pytest.fixture
@@ -334,21 +364,21 @@ class TestErrorHandling:
     """Verify error handling consistency across surfaces."""
 
     def test_cli_get_nonexistent_template(self, cli_adapter: CLIWorkflowServiceAdapter):
-        result = cli_adapter.get_template("wf-nonexistent")
+        result = cli_adapter.get_template(NONEXISTENT_TEMPLATE_ID)
         assert result is None
 
     def test_rest_get_nonexistent_template(self, rest_adapter: RestWorkflowServiceAdapter):
-        result = rest_adapter.get_template("wf-nonexistent")
+        result = rest_adapter.get_template(NONEXISTENT_TEMPLATE_ID)
         assert result is None
 
     def test_mcp_get_nonexistent_template(self, mcp_adapter: MCPWorkflowServiceAdapter):
-        result = mcp_adapter.get_template("wf-nonexistent")
+        result = mcp_adapter.get_template(NONEXISTENT_TEMPLATE_ID)
         assert result is None
 
     def test_cli_run_nonexistent_template(self, cli_adapter: CLIWorkflowServiceAdapter):
         with pytest.raises(ValueError, match="Template not found"):
             cli_adapter.run_workflow(
-                template_id="wf-nonexistent",
+                template_id=NONEXISTENT_TEMPLATE_ID,
                 behavior_ids=None,
                 metadata=None,
                 actor_id="test",
@@ -358,7 +388,7 @@ class TestErrorHandling:
     def test_rest_run_nonexistent_template(self, rest_adapter: RestWorkflowServiceAdapter):
         with pytest.raises(ValueError, match="Template not found"):
             rest_adapter.run_workflow({
-                "template_id": "wf-nonexistent",
+                "template_id": NONEXISTENT_TEMPLATE_ID,
                 "behavior_ids": [],
                 "metadata": {},
                 "actor": {"id": "test", "role": "STRATEGIST", "surface": "REST_API"}
@@ -367,7 +397,7 @@ class TestErrorHandling:
     def test_mcp_run_nonexistent_template(self, mcp_adapter: MCPWorkflowServiceAdapter):
         with pytest.raises(ValueError, match="Template not found"):
             mcp_adapter.run_workflow({
-                "template_id": "wf-nonexistent",
+                "template_id": NONEXISTENT_TEMPLATE_ID,
                 "behavior_ids": [],
                 "metadata": {},
                 "actor": {"id": "test", "role": "STRATEGIST", "surface": "MCP"}

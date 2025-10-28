@@ -331,3 +331,9 @@ Use this checklist at the start of every task and after major milestones to stay
 7. **Update the handbook if needed** – When you uncover a reusable workflow that isn’t documented, add a new behavior to `AGENTS.md` and extend this checklist if required.
 
 Following these steps satisfies `behavior_handbook_compliance_prompt` and keeps the remediation workflow transparent.
+## Additional Instructions
+
+- Prioritize updating existing documentation files instead of creating new summary documents after every update (languages: TypeScript, JavaScript, Python)
+- Always run pre-commit hooks before pushing code (languages: JavaScript, Python, TypeScript)
+- Use descriptive variable names that explain purpose and intent (languages: JavaScript, TypeScript, Python)
+- Document all public API endpoints with OpenAPI specs (languages: JavaScript, TypeScript, Python)

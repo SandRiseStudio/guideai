@@ -1,0 +1,5 @@
+"guideai_telemetry" "dev_telemetry_pass"
+"guideai_behavior" "dev_behavior_pass"
+"guideai_workflow" "dev_workflow_pass"
+"guideai_user" "local_dev_pw"
+"guideai_admin" "pgbouncer_admin_pass"

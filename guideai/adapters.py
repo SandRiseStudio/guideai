@@ -1763,6 +1763,78 @@ class MCPMetricsServiceAdapter(BaseMetricsServiceAdapter):
         return self._format_subscription(subscription)
 
 
+# ============================================================================
+# AgentOrchestratorService Adapters
+# ============================================================================
+
+
+class BaseAgentOrchestratorAdapter:
+    """Shared adapter utilities for AgentOrchestratorService surfaces."""
+
+    surface: str
+
+    def __init__(self, service: Any, surface: str) -> None:
+        self._service = service
+        self.surface = surface
+
+    def _format_assignment(self, assignment: Any) -> Dict[str, Any]:
+        return assignment.to_dict()
+
+
+class CLIAgentOrchestratorAdapter(BaseAgentOrchestratorAdapter):
+    """Adapter backing CLI agent orchestration commands."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="CLI")
+
+    def assign_agent(
+        self,
+        *,
+        run_id: Optional[str],
+        requested_agent_id: Optional[str],
+        stage: str,
+        context: Optional[Dict[str, Any]],
+        requested_by: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        assignment = self._service.assign_agent(
+            run_id=run_id,
+            requested_agent_id=requested_agent_id,
+            stage=stage,
+            context=context,
+            requested_by=requested_by,
+        )
+        return self._format_assignment(assignment)
+
+    def switch_agent(
+        self,
+        *,
+        assignment_id: str,
+        target_agent_id: str,
+        reason: Optional[str],
+        allow_downgrade: bool,
+        stage: Optional[str],
+        issued_by: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        assignment = self._service.switch_agent(
+            assignment_id=assignment_id,
+            target_agent_id=target_agent_id,
+            reason=reason,
+            allow_downgrade=allow_downgrade,
+            stage=stage,
+            issued_by=issued_by,
+        )
+        return self._format_assignment(assignment)
+
+    def get_status(
+        self,
+        *,
+        run_id: Optional[str],
+        assignment_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        assignment = self._service.get_status(run_id=run_id, assignment_id=assignment_id)
+        return self._format_assignment(assignment) if assignment else None
+
+
 # =============================================================================
 # AgentAuth Service Adapters
 # =============================================================================

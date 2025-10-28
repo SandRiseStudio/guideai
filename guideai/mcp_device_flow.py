@@ -134,8 +134,8 @@ class MCPDeviceFlowService:
         # Emit telemetry for device login start
         if self._telemetry:
             self._telemetry.emit_event(
-                "device_flow.mcp.login_started",
-                {
+                event_type="device_flow.mcp.login_started",
+                payload={
                     "client_id": client_id,
                     "scopes": scopes,
                     "timeout": timeout,
@@ -210,8 +210,8 @@ class MCPDeviceFlowService:
 
                             if self._telemetry:
                                 self._telemetry.emit_event(
-                                    "device_flow.mcp.tokens_stored",
-                                    {
+                                    event_type="device_flow.mcp.tokens_stored",
+                                    payload={
                                         "client_id": client_id,
                                         "storage_type": type(store).__name__,
                                     },
@@ -222,8 +222,8 @@ class MCPDeviceFlowService:
 
                     if self._telemetry:
                         self._telemetry.emit_event(
-                            "device_flow.mcp.login_success",
-                            {
+                            event_type="device_flow.mcp.login_success",
+                            payload={
                                 "client_id": client_id,
                                 "scopes": poll_result["scopes"],
                                 "tokens_stored": store_tokens and "error" not in result,
@@ -238,8 +238,8 @@ class MCPDeviceFlowService:
 
                     if self._telemetry:
                         self._telemetry.emit_event(
-                            "device_flow.mcp.login_denied",
-                            {"client_id": client_id, "reason": result["error_description"]},
+                            event_type="device_flow.mcp.login_denied",
+                            payload={"client_id": client_id, "reason": result["error_description"]},
                         )
 
                     return result
@@ -250,8 +250,8 @@ class MCPDeviceFlowService:
 
                     if self._telemetry:
                         self._telemetry.emit_event(
-                            "device_flow.mcp.login_expired",
-                            {"client_id": client_id},
+                            event_type="device_flow.mcp.login_expired",
+                            payload={"client_id": client_id},
                         )
 
                     return result
@@ -263,8 +263,8 @@ class MCPDeviceFlowService:
 
             if self._telemetry:
                 self._telemetry.emit_event(
-                    "device_flow.mcp.login_timeout",
-                    {"client_id": client_id, "timeout": timeout},
+                    event_type="device_flow.mcp.login_timeout",
+                    payload={"client_id": client_id, "timeout": timeout},
                 )
 
             return result
@@ -278,8 +278,8 @@ class MCPDeviceFlowService:
 
             if self._telemetry:
                 self._telemetry.emit_event(
-                    "device_flow.mcp.login_error",
-                    {"client_id": client_id, "error": str(exc)},
+                    event_type="device_flow.mcp.login_error",
+                    payload={"client_id": client_id, "error": str(exc)},
                 )
 
             return error_result
@@ -338,8 +338,8 @@ class MCPDeviceFlowService:
 
             if self._telemetry:
                 self._telemetry.emit_event(
-                    "device_flow.mcp.status_checked",
-                    {
+                    event_type="device_flow.mcp.status_checked",
+                    payload={
                         "client_id": client_id,
                         "is_authenticated": result["is_authenticated"],
                         "needs_refresh": result["needs_refresh"],
@@ -428,8 +428,8 @@ class MCPDeviceFlowService:
 
                     if self._telemetry:
                         self._telemetry.emit_event(
-                            "device_flow.mcp.token_refreshed",
-                            {
+                            event_type="device_flow.mcp.token_refreshed",
+                            payload={
                                 "client_id": client_id,
                                 "storage_type": type(store).__name__,
                             },
@@ -492,8 +492,8 @@ class MCPDeviceFlowService:
 
                 if self._telemetry:
                     self._telemetry.emit_event(
-                        "device_flow.mcp.logout",
-                        {
+                        event_type="device_flow.mcp.logout",
+                        payload={
                             "client_id": client_id,
                             "tokens_cleared": True,
                             "remote_revocation_attempted": revoke_remote,

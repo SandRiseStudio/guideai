@@ -1,21 +1,21 @@
-"""BehaviorService runtime implementation with SQLite persistence."""
+"""BehaviorService runtime implementation with PostgreSQL persistence."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+from guideai.storage.postgres_pool import PostgresPool
 
 from .action_contracts import Actor, utc_now_iso
 from .telemetry import TelemetryClient
 
-_BEHAVIOR_DB_ENV = "GUIDEAI_BEHAVIOR_DB_PATH"
-_DEFAULT_DB_PATH = Path.home() / ".guideai" / "data" / "behaviors.db"
+_BEHAVIOR_PG_DSN_ENV = "GUIDEAI_BEHAVIOR_PG_DSN"
+_DEFAULT_PG_DSN = "postgresql://guideai_behavior:dev_behavior_pass@localhost:5433/behaviors"
 
 
 # ---------------------------------------------------------------------------
@@ -184,19 +184,19 @@ class PersistenceError(BehaviorServiceError):
 
 
 class BehaviorService:
-    """SQLite-backed behavior service runtime."""
+    """PostgreSQL-backed behavior service runtime."""
 
     def __init__(
         self,
         *,
-        db_path: Optional[Path] = None,
+        dsn: Optional[str] = None,
         telemetry: Optional[TelemetryClient] = None,
         behavior_retriever: Optional[Any] = None,
     ) -> None:
-        self._db_path = self._resolve_db_path(db_path)
+        self._dsn = self._resolve_dsn(dsn)
         self._telemetry = telemetry or TelemetryClient.noop()
         self._behavior_retriever = behavior_retriever
-        self._init_db()
+        self._pool = PostgresPool(self._dsn)
 
     # ------------------------------------------------------------------
     # Public API
@@ -210,12 +210,14 @@ class BehaviorService:
         timestamp = utc_now_iso()
         embedding_checksum = self._calculate_embedding_checksum(request.embedding)
 
-        with self._connect() as conn:
-            conn.execute(
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            # Insert behavior
+            cur.execute(
                 """
                 INSERT INTO behaviors (
                     behavior_id, name, description, tags, created_at, updated_at, latest_version, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     behavior_id,
@@ -228,24 +230,14 @@ class BehaviorService:
                     "DRAFT",
                 ),
             )
-            conn.execute(
+            # Insert behavior version
+            cur.execute(
                 """
                 INSERT INTO behavior_versions (
-                    behavior_id,
-                    version,
-                    instruction,
-                    role_focus,
-                    status,
-                    trigger_keywords,
-                    examples,
-                    metadata,
-                    effective_from,
-                    effective_to,
-                    created_by,
-                    approval_action_id,
-                    embedding_checksum,
-                    embedding
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    behavior_id, version, instruction, role_focus, status,
+                    trigger_keywords, examples, metadata, effective_from, effective_to,
+                    created_by, approval_action_id, embedding_checksum, embedding
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     behavior_id,
@@ -261,7 +253,7 @@ class BehaviorService:
                     actor.id,
                     None,
                     embedding_checksum,
-                    self._encode_embedding(request.embedding),
+                    json.dumps(request.embedding) if request.embedding else None,
                 ),
             )
 
@@ -288,44 +280,52 @@ class BehaviorService:
                 f"Cannot update behavior {request.behavior_id} version {request.version}: status={version.status}"
             )
 
-        updates: Dict[str, Any] = {}
-        if request.instruction is not None:
-            updates["instruction"] = request.instruction
-        if request.trigger_keywords is not None:
-            updates["trigger_keywords"] = json.dumps(request.trigger_keywords)
-        if request.examples is not None:
-            updates["examples"] = json.dumps(request.examples)
-        if request.metadata is not None:
-            updates["metadata"] = json.dumps(request.metadata)
-        if request.embedding is not None:
-            updates["embedding"] = self._encode_embedding(request.embedding)
-            updates["embedding_checksum"] = self._calculate_embedding_checksum(request.embedding)
-        if updates:
-            updates["updated_fields"] = list(updates.keys())
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            # Update behavior version fields
+            updates = []
+            values = []
+            if request.instruction is not None:
+                updates.append("instruction = %s")
+                values.append(request.instruction)
+            if request.trigger_keywords is not None:
+                updates.append("trigger_keywords = %s")
+                values.append(json.dumps(request.trigger_keywords))
+            if request.examples is not None:
+                updates.append("examples = %s")
+                values.append(json.dumps(request.examples))
+            if request.metadata is not None:
+                updates.append("metadata = %s")
+                values.append(json.dumps(request.metadata))
+            if request.embedding is not None:
+                updates.append("embedding = %s")
+                values.append(json.dumps(request.embedding))
+                updates.append("embedding_checksum = %s")
+                values.append(self._calculate_embedding_checksum(request.embedding))
 
-        with self._connect() as conn:
             if updates:
-                assignments = ", ".join(f"{column} = ?" for column in updates if column != "updated_fields")
-                values = [value for key, value in updates.items() if key != "updated_fields"]
                 values.extend([request.behavior_id, request.version])
-                conn.execute(
-                    f"UPDATE behavior_versions SET {assignments} WHERE behavior_id = ? AND version = ?",
-                    tuple(values),
+                cur.execute(
+                    f"UPDATE behavior_versions SET {', '.join(updates)} WHERE behavior_id = %s AND version = %s",
+                    values,
                 )
-            if request.description is not None or request.tags is not None:
-                behavior_updates = {
-                    "updated_at": utc_now_iso(),
-                }
-                if request.description is not None:
-                    behavior_updates["description"] = request.description
-                if request.tags is not None:
-                    behavior_updates["tags"] = json.dumps(request.tags)
-                assignments = ", ".join(f"{column} = ?" for column in behavior_updates)
-                values = list(behavior_updates.values())
-                values.extend([request.behavior_id])
-                conn.execute(
-                    f"UPDATE behaviors SET {assignments} WHERE behavior_id = ?",
-                    tuple(values),
+
+            # Update behavior table if needed
+            behavior_updates = []
+            behavior_values = []
+            if request.description is not None:
+                behavior_updates.append("description = %s")
+                behavior_values.append(request.description)
+            if request.tags is not None:
+                behavior_updates.append("tags = %s")
+                behavior_values.append(json.dumps(request.tags))
+            if behavior_updates:
+                behavior_updates.append("updated_at = %s")
+                behavior_values.append(utc_now_iso())
+                behavior_values.append(request.behavior_id)
+                cur.execute(
+                    f"UPDATE behaviors SET {', '.join(behavior_updates)} WHERE behavior_id = %s",
+                    behavior_values,
                 )
 
         updated_version = self._fetch_behavior_version(request.behavior_id, request.version)
@@ -334,7 +334,7 @@ class BehaviorService:
             payload={
                 "behavior_id": request.behavior_id,
                 "version": request.version,
-                "updated_fields": updates.get("updated_fields", []),
+                "updated_fields": [k.split()[0] for k in updates],
             },
             actor=self._actor_payload(actor),
         )
@@ -348,26 +348,27 @@ class BehaviorService:
             raise BehaviorVersionError(
                 f"Only drafts can be submitted for review (status={version_obj.status})."
             )
-        with self._connect() as conn:
-            conn.execute(
+
+        conn = self._ensure_connection()
+        timestamp = utc_now_iso()
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE behavior_versions
-                   SET status = ?, effective_from = ?
-                 WHERE behavior_id = ? AND version = ?
+                   SET status = %s, effective_from = %s
+                 WHERE behavior_id = %s AND version = %s
                 """,
-                ("IN_REVIEW", utc_now_iso(), behavior_id, version),
+                ("IN_REVIEW", timestamp, behavior_id, version),
             )
-            conn.execute(
-                "UPDATE behaviors SET status = ?, updated_at = ? WHERE behavior_id = ?",
-                ("IN_REVIEW", utc_now_iso(), behavior_id),
+            cur.execute(
+                "UPDATE behaviors SET status = %s, updated_at = %s WHERE behavior_id = %s",
+                ("IN_REVIEW", timestamp, behavior_id),
             )
+
         updated = self._fetch_behavior_version(behavior_id, version)
         self._telemetry.emit_event(
             event_type="behaviors.submitted_for_review",
-            payload={
-                "behavior_id": behavior_id,
-                "version": version,
-            },
+            payload={"behavior_id": behavior_id, "version": version},
             actor=self._actor_payload(actor),
         )
         return updated
@@ -377,32 +378,31 @@ class BehaviorService:
 
         version_obj = self._fetch_behavior_version(request.behavior_id, request.version)
         if version_obj.status not in {"IN_REVIEW", "DRAFT"}:
-            raise BehaviorVersionError(
-                f"Cannot approve version with status={version_obj.status}."
-            )
+            raise BehaviorVersionError(f"Cannot approve version with status={version_obj.status}.")
 
-        with self._connect() as conn:
-            conn.execute(
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE behavior_versions
-                   SET status = ?, effective_from = ?, approval_action_id = ?
-                 WHERE behavior_id = ? AND version = ?
+                   SET status = %s, effective_from = %s, approval_action_id = %s
+                 WHERE behavior_id = %s AND version = %s
                 """,
                 ("APPROVED", request.effective_from, request.approval_action_id, request.behavior_id, request.version),
             )
-            conn.execute(
+            cur.execute(
                 """
                 UPDATE behaviors
-                   SET latest_version = ?, status = ?, updated_at = ?
-                 WHERE behavior_id = ?
+                   SET latest_version = %s, status = %s, updated_at = %s
+                 WHERE behavior_id = %s
                 """,
                 (request.version, "APPROVED", utc_now_iso(), request.behavior_id),
             )
-            conn.execute(
+            cur.execute(
                 """
                 UPDATE behavior_versions
-                   SET status = 'DEPRECATED', effective_to = ?
-                 WHERE behavior_id = ? AND version != ? AND status = 'APPROVED' AND effective_to IS NULL
+                   SET status = 'DEPRECATED', effective_to = %s
+                 WHERE behavior_id = %s AND version != %s AND status = 'APPROVED' AND effective_to IS NULL
                 """,
                 (request.effective_from, request.behavior_id, request.version),
             )
@@ -434,7 +434,6 @@ class BehaviorService:
                     },
                 )
             except Exception as exc:
-                # Log but don't fail approval if rebuild fails
                 self._telemetry.emit_event(
                     event_type="bci.behavior_retriever.auto_rebuild_failed",
                     payload={
@@ -453,17 +452,18 @@ class BehaviorService:
         if version_obj.status != "APPROVED":
             raise BehaviorVersionError("Only approved versions can be deprecated.")
 
-        with self._connect() as conn:
-            conn.execute(
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE behavior_versions
-                   SET status = ?, effective_to = ?
-                 WHERE behavior_id = ? AND version = ?
+                   SET status = %s, effective_to = %s
+                 WHERE behavior_id = %s AND version = %s
                 """,
                 ("DEPRECATED", request.effective_to, request.behavior_id, request.version),
             )
-            conn.execute(
-                "UPDATE behaviors SET status = ?, updated_at = ? WHERE behavior_id = ?",
+            cur.execute(
+                "UPDATE behaviors SET status = %s, updated_at = %s WHERE behavior_id = %s",
                 ("DEPRECATED", utc_now_iso(), request.behavior_id),
             )
 
@@ -480,20 +480,26 @@ class BehaviorService:
         return deprecated
 
     def delete_behavior_draft(self, behavior_id: str, version: str, actor: Actor) -> None:
+        """Delete a draft version."""
+
         version_obj = self._fetch_behavior_version(behavior_id, version)
         if version_obj.status != "DRAFT":
             raise BehaviorVersionError("Only draft versions can be deleted.")
-        with self._connect() as conn:
-            conn.execute(
-                "DELETE FROM behavior_versions WHERE behavior_id = ? AND version = ?",
+
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM behavior_versions WHERE behavior_id = %s AND version = %s",
                 (behavior_id, version),
             )
-            remaining = conn.execute(
-                "SELECT COUNT(*) FROM behavior_versions WHERE behavior_id = ?",
+            cur.execute(
+                "SELECT COUNT(*) FROM behavior_versions WHERE behavior_id = %s",
                 (behavior_id,),
-            ).fetchone()[0]
+            )
+            remaining = cur.fetchone()[0]
             if remaining == 0:
-                conn.execute("DELETE FROM behaviors WHERE behavior_id = ?", (behavior_id,))
+                cur.execute("DELETE FROM behaviors WHERE behavior_id = %s", (behavior_id,))
+
         self._telemetry.emit_event(
             event_type="behaviors.draft_deleted",
             payload={"behavior_id": behavior_id, "version": version},
@@ -501,6 +507,8 @@ class BehaviorService:
         )
 
     def get_behavior(self, behavior_id: str, version: Optional[str] = None) -> Dict[str, Any]:
+        """Get a behavior and its versions."""
+
         behavior = self._fetch_behavior(behavior_id)
         versions = self._fetch_behavior_versions(behavior_id)
         if version:
@@ -519,6 +527,8 @@ class BehaviorService:
         tags: Optional[List[str]] = None,
         role_focus: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        """List behaviors matching criteria."""
+
         rows = self._fetch_behaviors(status=status)
         results = []
         for behavior in rows:
@@ -537,9 +547,12 @@ class BehaviorService:
         return results
 
     def search_behaviors(self, request: SearchBehaviorsRequest, actor: Optional[Actor] = None) -> List[BehaviorSearchResult]:
+        """Search behaviors by query, tags, role focus."""
+
         query = (request.query or "").lower()
         behaviors = self._fetch_behaviors(status=request.status)
         matches: List[BehaviorSearchResult] = []
+
         for behavior in behaviors:
             versions = self._fetch_behavior_versions(behavior.behavior_id)
             active = next((v for v in versions if v.status == "APPROVED"), versions[0] if versions else None)
@@ -549,12 +562,15 @@ class BehaviorService:
                 continue
             if request.tags and not set(request.tags).issubset(set(behavior.tags)):
                 continue
+
             score = self._calculate_score(query, behavior, active)
             if request.query and score == 0.0:
                 continue
             matches.append(BehaviorSearchResult(behavior=behavior, active_version=active, score=score))
+
         matches.sort(key=lambda result: result.score, reverse=True)
         limited = matches[: request.limit]
+
         self._telemetry.emit_event(
             event_type="behaviors.search_performed",
             payload={
@@ -572,123 +588,82 @@ class BehaviorService:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        try:
-            conn = sqlite3.connect(self._db_path)
-            conn.row_factory = sqlite3.Row
-            return conn
-        except sqlite3.Error as exc:  # pragma: no cover - catastrophic failure
-            raise PersistenceError(f"Failed to connect to behavior database: {exc}") from exc
-
-    def _init_db(self) -> None:
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS behaviors (
-                    behavior_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    description TEXT NOT NULL,
-                    tags TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    latest_version TEXT NOT NULL,
-                    status TEXT NOT NULL
-                )
-                """,
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS behavior_versions (
-                    behavior_id TEXT NOT NULL,
-                    version TEXT NOT NULL,
-                    instruction TEXT NOT NULL,
-                    role_focus TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    trigger_keywords TEXT NOT NULL,
-                    examples TEXT NOT NULL,
-                    metadata TEXT NOT NULL,
-                    effective_from TEXT NOT NULL,
-                    effective_to TEXT,
-                    created_by TEXT NOT NULL,
-                    approval_action_id TEXT,
-                    embedding_checksum TEXT,
-                    embedding BLOB,
-                    PRIMARY KEY (behavior_id, version),
-                    FOREIGN KEY (behavior_id) REFERENCES behaviors(behavior_id) ON DELETE CASCADE
-                )
-                """,
-            )
+    def _ensure_connection(self):
+        """Acquire a pooled PostgreSQL connection proxy."""
+        return self._pool.proxy()
 
     def _fetch_behavior(self, behavior_id: str) -> Behavior:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM behaviors WHERE behavior_id = ?",
+        """Fetch a single behavior by ID."""
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM behaviors WHERE behavior_id = %s",
                 (behavior_id,),
-            ).fetchone()
+            )
+            row = cur.fetchone()
+
         if row is None:
             raise BehaviorNotFoundError(f"Behavior '{behavior_id}' not found")
-        return self._row_to_behavior(row)
+        return self._row_to_behavior(row, cur.description)
 
     def _fetch_behaviors(self, status: Optional[str] = None) -> List[Behavior]:
-        with self._connect() as conn:
+        """Fetch behaviors optionally filtered by status."""
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
             if status:
-                rows = conn.execute(
-                    "SELECT * FROM behaviors WHERE status = ? ORDER BY updated_at DESC",
+                cur.execute(
+                    "SELECT * FROM behaviors WHERE status = %s ORDER BY updated_at DESC",
                     (status,),
-                ).fetchall()
+                )
             else:
-                rows = conn.execute(
-                    "SELECT * FROM behaviors ORDER BY updated_at DESC",
-                ).fetchall()
-        return [self._row_to_behavior(row) for row in rows]
+                cur.execute("SELECT * FROM behaviors ORDER BY updated_at DESC")
+            rows = cur.fetchall()
+            desc = cur.description
+
+        return [self._row_to_behavior(row, desc) for row in rows]
 
     def _fetch_behavior_version(self, behavior_id: str, version: str) -> BehaviorVersion:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM behavior_versions
-                 WHERE behavior_id = ? AND version = ?
-                """,
+        """Fetch a single behavior version."""
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM behavior_versions WHERE behavior_id = %s AND version = %s",
                 (behavior_id, version),
-            ).fetchone()
+            )
+            row = cur.fetchone()
+
         if row is None:
             raise BehaviorVersionError(f"Version '{version}' not found for behavior '{behavior_id}'")
-        return self._row_to_behavior_version(row)
+        return self._row_to_behavior_version(row, cur.description)
 
     def _fetch_behavior_versions(self, behavior_id: str) -> List[BehaviorVersion]:
-        with self._connect() as conn:
-            rows = conn.execute(
+        """Fetch all versions for a behavior."""
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 SELECT * FROM behavior_versions
-                 WHERE behavior_id = ?
+                 WHERE behavior_id = %s
                  ORDER BY status = 'APPROVED' DESC, effective_from DESC
                 """,
                 (behavior_id,),
-            ).fetchall()
-        return [self._row_to_behavior_version(row) for row in rows]
+            )
+            rows = cur.fetchall()
+            desc = cur.description
+
+        return [self._row_to_behavior_version(row, desc) for row in rows]
 
     @staticmethod
     def _calculate_embedding_checksum(embedding: Optional[Iterable[float]]) -> Optional[str]:
+        """Calculate SHA256 checksum of embedding."""
         if embedding is None:
             return None
         encoded = json.dumps(list(embedding))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _encode_embedding(embedding: Optional[Iterable[float]]) -> Optional[bytes]:
-        if embedding is None:
-            return None
-        return json.dumps(list(embedding)).encode("utf-8")
-
-    @staticmethod
-    def _decode_embedding(blob: Optional[bytes]) -> Optional[List[float]]:
-        if blob is None:
-            return None
-        return json.loads(blob.decode("utf-8"))
-
-    @staticmethod
     def _calculate_score(query: str, behavior: Behavior, version: BehaviorVersion) -> float:
+        """Simple text matching score for search."""
         if not query:
             return 1.0
         haystacks = [
@@ -702,16 +677,18 @@ class BehaviorService:
         return matches / len(haystacks)
 
     @staticmethod
-    def _resolve_db_path(db_path: Optional[Path]) -> Path:
-        if db_path is not None:
-            return db_path.expanduser().resolve()
-        env_override = os.getenv(_BEHAVIOR_DB_ENV)
-        if env_override:
-            return Path(env_override).expanduser().resolve()
-        return _DEFAULT_DB_PATH
+    def _resolve_dsn(dsn: Optional[str]) -> str:
+        """Resolve PostgreSQL DSN from argument or environment."""
+        if dsn:
+            return dsn
+        env_dsn = os.getenv(_BEHAVIOR_PG_DSN_ENV)
+        if env_dsn:
+            return env_dsn
+        return _DEFAULT_PG_DSN
 
     @staticmethod
     def _actor_payload(actor: Actor) -> Dict[str, str]:
+        """Convert Actor to telemetry payload."""
         return {
             "id": actor.id,
             "role": actor.role,
@@ -719,32 +696,39 @@ class BehaviorService:
         }
 
     @staticmethod
-    def _row_to_behavior(row: sqlite3.Row) -> Behavior:
+    def _row_to_behavior(row: tuple, description) -> Behavior:
+        """Convert PostgreSQL row to Behavior object."""
+        columns = [desc[0] for desc in description]
+        data = dict(zip(columns, row))
         return Behavior(
-            behavior_id=row["behavior_id"],
-            name=row["name"],
-            description=row["description"],
-            tags=list(json.loads(row["tags"] or "[]")),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            latest_version=row["latest_version"],
-            status=row["status"],
+            behavior_id=data["behavior_id"],
+            name=data["name"],
+            description=data["description"],
+            tags=json.loads(data["tags"]) if isinstance(data["tags"], str) else data["tags"],
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+            latest_version=data["latest_version"],
+            status=data["status"],
         )
 
-    def _row_to_behavior_version(self, row: sqlite3.Row) -> BehaviorVersion:
+    @staticmethod
+    def _row_to_behavior_version(row: tuple, description) -> BehaviorVersion:
+        """Convert PostgreSQL row to BehaviorVersion object."""
+        columns = [desc[0] for desc in description]
+        data = dict(zip(columns, row))
         return BehaviorVersion(
-            behavior_id=row["behavior_id"],
-            version=row["version"],
-            instruction=row["instruction"],
-            role_focus=row["role_focus"],
-            status=row["status"],
-            trigger_keywords=list(json.loads(row["trigger_keywords"] or "[]")),
-            examples=list(json.loads(row["examples"] or "[]")),
-            metadata=dict(json.loads(row["metadata"] or "{}")),
-            effective_from=row["effective_from"],
-            effective_to=row["effective_to"],
-            created_by=row["created_by"],
-            approval_action_id=row["approval_action_id"],
-            embedding_checksum=row["embedding_checksum"],
-            embedding=self._decode_embedding(row["embedding"]),
+            behavior_id=data["behavior_id"],
+            version=data["version"],
+            instruction=data["instruction"],
+            role_focus=data["role_focus"],
+            status=data["status"],
+            trigger_keywords=json.loads(data["trigger_keywords"]) if isinstance(data["trigger_keywords"], str) else data["trigger_keywords"],
+            examples=json.loads(data["examples"]) if isinstance(data["examples"], str) else data["examples"],
+            metadata=json.loads(data["metadata"]) if isinstance(data["metadata"], str) else data["metadata"],
+            effective_from=data["effective_from"],
+            effective_to=data.get("effective_to"),
+            created_by=data["created_by"],
+            approval_action_id=data.get("approval_action_id"),
+            embedding_checksum=data.get("embedding_checksum"),
+            embedding=json.loads(data["embedding"]) if data.get("embedding") else None,
         )

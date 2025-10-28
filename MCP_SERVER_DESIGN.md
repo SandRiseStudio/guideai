@@ -23,6 +23,7 @@ The Metacognitive Control Plane (MCP) server provides a contract-first integrati
 | Configuration | `config.get`, `config.update`, `config.listLLMConnectors` | Manage model connectors, embedding indices, and token budgets (admin-scoped). |
 | Action Registry | `actions.create`, `actions.list`, `actions.replay`, `actions.get` | Record, inspect, and replay build actions to ensure reproducibility and parity. |
 | Agent Reviews | `reviews.run`, `reviews.list`, `reviews.get` | Trigger cross-functional agent reviewers (Engineering, DX, Compliance, Product) and retrieve synthesized feedback for artifacts. |
+| Agent Orchestration | `agents.assign`, `agents.switch`, `agents.status` | Select domain agents for runs, switch personas mid-execution, and expose assignment history with audit metadata. |
 | Agent Authentication | `auth.ensureGrant`, `auth.listGrants`, `auth.revoke`, `auth.status` | Broker OAuth/OIDC flows, enforce policy decisions, and expose grant state for agents and tools. |
 
 ## 4. Integration Surfaces
@@ -43,6 +44,7 @@ The Metacognitive Control Plane (MCP) server provides a contract-first integrati
   - `MetricsService` (streams telemetry to warehouse and caches recent metrics).
   - `ActionService` (captures reproducible actions, links to artifacts, exposes replay state).
   - `AgentReviewService` (coordinates cross-functional agent runs, stores feedback summaries, records linked actions).
+  - `AgentOrchestratorService` (maps domain agents to the Strategist → Teacher → Student pipeline, applies policy heuristics for switching, and emits telemetry about agent effectiveness).
   - `AgentAuthService` (token broker, policy engine, consent orchestration, telemetry + audit integration per `docs/AGENT_AUTH_ARCHITECTURE.md`).
   - **New Meta Algorithm Services (Milestone 2 Phase 1):**
     - `BehaviorRetriever` (hybrid retrieval: BGE-M3 embeddings + FAISS index + keyword matching; Top-K selection for BCI pipeline; latency <100ms P95).

@@ -9,6 +9,7 @@ forwarded to real backends in future implementations.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -97,6 +98,49 @@ class KafkaTelemetrySink:
         self._producer.flush()  # Ensure delivery for demo; remove in production
 
 
+def create_sink_from_env(*, default_path: Optional[Path] = None) -> TelemetrySink:
+    """Create a telemetry sink using the standard environment configuration.
+
+    Environment variables:
+
+    ``GUIDEAI_TELEMETRY_PG_DSN``
+        When set, a :class:`PostgresTelemetrySink` will be created using the
+        provided DSN.  Optionally accepts ``GUIDEAI_TELEMETRY_PG_TIMEOUT`` to
+        override the connection timeout (seconds).
+
+    ``GUIDEAI_TELEMETRY_PATH``
+        When Postgres is not configured, falls back to a JSONL file sink.  This
+        variable overrides the default location used by :class:`FileTelemetrySink`.
+    """
+
+    default_path = default_path or Path.home() / ".guideai" / "telemetry" / "events.jsonl"
+
+    dsn = os.environ.get("GUIDEAI_TELEMETRY_PG_DSN")
+    if dsn:
+        timeout_raw = os.environ.get("GUIDEAI_TELEMETRY_PG_TIMEOUT")
+        kwargs: Dict[str, Any] = {}
+        if timeout_raw:
+            try:
+                kwargs["connect_timeout"] = int(timeout_raw)
+            except ValueError as exc:
+                raise ValueError("GUIDEAI_TELEMETRY_PG_TIMEOUT must be an integer") from exc
+
+        from guideai.storage.postgres_telemetry import PostgresTelemetrySink
+
+        try:
+            return PostgresTelemetrySink(dsn, **kwargs)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Failed to initialise Postgres telemetry sink. Install psycopg2 and "
+                "validate the connection string."
+            ) from exc
+
+    path_override = os.environ.get("GUIDEAI_TELEMETRY_PATH")
+    sink_path = Path(path_override) if path_override else default_path
+    sink_path.parent.mkdir(parents=True, exist_ok=True)
+    return FileTelemetrySink(sink_path)
+
+
 class TelemetryClient:
     """Simple telemetry emitter supporting pluggable sinks."""
 
@@ -150,5 +194,6 @@ __all__ = [
     "InMemoryTelemetrySink",
     "FileTelemetrySink",
     "KafkaTelemetrySink",
+    "create_sink_from_env",
     "TelemetryClient",
 ]

@@ -51,7 +51,7 @@ from .device_flow import (
     RefreshTokenExpiredError,
 )
 from .task_assignments import TaskAssignmentService
-from .telemetry import TelemetryClient
+from .telemetry import TelemetryClient, create_sink_from_env
 from .workflow_service import WorkflowService, WorkflowStatus
 from .analytics.telemetry_kpi_projector import TelemetryKPIProjector, TelemetryProjection
 from .analytics.warehouse import AnalyticsWarehouse
@@ -86,7 +86,14 @@ class _ServiceContainer:
         behavior_db_path: Optional[Path] = None,
         workflow_db_path: Optional[Path] = None,
     ) -> None:
-        telemetry = TelemetryClient.noop()
+        telemetry = TelemetryClient(
+            sink=create_sink_from_env(),
+            default_actor={
+                "id": "guideai-api",
+                "role": "SYSTEM",
+                "surface": "api",
+            },
+        )
 
         # Core services and adapters
         self.action_service = ActionService(telemetry=telemetry)
@@ -95,8 +102,10 @@ class _ServiceContainer:
         self.compliance_service = ComplianceService(telemetry=telemetry)
         self.compliance_adapter = RestComplianceServiceAdapter(self.compliance_service)
 
+        # BehaviorService now uses PostgreSQL DSN from environment or default
+        # behavior_db_path parameter is deprecated (was SQLite path)
         self.behavior_service = BehaviorService(
-            db_path=behavior_db_path,
+            dsn=None,  # Uses GUIDEAI_BEHAVIOR_PG_DSN environment variable
             telemetry=telemetry,
         )
         self.behavior_adapter = RestBehaviorServiceAdapter(self.behavior_service)
@@ -121,15 +130,17 @@ class _ServiceContainer:
         )
         self.reflection_adapter = RestReflectionAdapter(self.reflection_service)
 
-        workflow_db = Path(workflow_db_path) if workflow_db_path else Path.home() / ".guideai" / "workflows.db"
-        workflow_db.parent.mkdir(parents=True, exist_ok=True)
+        # WorkflowService now uses PostgreSQL DSN from environment or default
+        # workflow_db_path parameter is deprecated (was SQLite path)
         self.workflow_service = WorkflowService(
-            db_path=workflow_db,
+            dsn=None,  # Uses GUIDEAI_WORKFLOW_PG_DSN environment variable
             behavior_service=self.behavior_service,
         )
         self.workflow_adapter = RestWorkflowServiceAdapter(self.workflow_service)
 
-        run_db_path = workflow_db.parent / "runs.db"
+        # RunService still uses SQLite (will be migrated in Priority 1.2)
+        run_db_path = Path.home() / ".guideai" / "runs.db"
+        run_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.run_service = RunService(db_path=run_db_path, telemetry=telemetry)
         self.run_adapter = RestRunServiceAdapter(self.run_service)
 

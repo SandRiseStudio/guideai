@@ -11,17 +11,20 @@ Aligns with:
 
 from __future__ import annotations
 
-import sqlite3
 import json
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from guideai.action_contracts import Actor, utc_now_iso
 from guideai.telemetry import TelemetryClient
+from guideai.storage.postgres_pool import PostgresPool
+
+_WORKFLOW_PG_DSN_ENV = "GUIDEAI_WORKFLOW_PG_DSN"
+_DEFAULT_PG_DSN = "postgresql://guideai_workflow:dev_workflow_pass@localhost:5434/workflows"
 
 
 # Module-level telemetry client
@@ -144,55 +147,20 @@ class WorkflowRun:
 class WorkflowService:
     """Service for workflow template management and execution with BCI."""
 
-    def __init__(self, db_path: Path, behavior_service=None):
-        """Initialize the WorkflowService with SQLite backend.
+    def __init__(self, dsn: Optional[str] = None, behavior_service=None):
+        """Initialize the WorkflowService with PostgreSQL backend.
 
         Args:
-            db_path: Path to SQLite database file
+            dsn: PostgreSQL DSN connection string
             behavior_service: Optional BehaviorService instance for behavior retrieval
         """
-        self.db_path = db_path
+        self.dsn = dsn or os.getenv(_WORKFLOW_PG_DSN_ENV, _DEFAULT_PG_DSN)
         self.behavior_service = behavior_service
-        self._init_db()
+        self._pool = PostgresPool(self.dsn)
 
-    def _init_db(self) -> None:
-        """Create database schema if not exists."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS workflow_templates (
-                    template_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    description TEXT,
-                    role_focus TEXT NOT NULL,
-                    version TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    created_by_id TEXT NOT NULL,
-                    created_by_role TEXT NOT NULL,
-                    created_by_surface TEXT NOT NULL,
-                    template_data TEXT NOT NULL,
-                    tags TEXT
-                )
-            """)
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS workflow_runs (
-                    run_id TEXT PRIMARY KEY,
-                    template_id TEXT NOT NULL,
-                    template_name TEXT NOT NULL,
-                    role_focus TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    actor_id TEXT NOT NULL,
-                    actor_role TEXT NOT NULL,
-                    actor_surface TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    total_tokens INTEGER DEFAULT 0,
-                    run_data TEXT NOT NULL,
-                    FOREIGN KEY (template_id) REFERENCES workflow_templates(template_id)
-                )
-            """)
-
-            conn.commit()
+    def _ensure_connection(self):
+        """Acquire a pooled PostgreSQL connection proxy."""
+        return self._pool.proxy()
 
     def create_template(
         self,
@@ -233,14 +201,15 @@ class WorkflowService:
             metadata=metadata or {},
         )
 
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 INSERT INTO workflow_templates (
                     template_id, name, description, role_focus, version,
                     created_at, created_by_id, created_by_role, created_by_surface,
                     template_data, tags
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     template_id,
@@ -256,7 +225,6 @@ class WorkflowService:
                     json.dumps(tags or []),
                 ),
             )
-            conn.commit()
 
         emit_event(
             "workflow.template.created",
@@ -280,18 +248,19 @@ class WorkflowService:
         Returns:
             WorkflowTemplate if found, None otherwise
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT template_data FROM workflow_templates WHERE template_id = ?",
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT template_data FROM workflow_templates WHERE template_id = %s",
                 (template_id,),
             )
-            row = cursor.fetchone()
+            row = cur.fetchone()
 
             if not row:
                 return None
 
-            data = json.loads(row["template_data"])
+            # PostgreSQL returns JSONB as dict, SQLite returned string
+            data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
             return WorkflowTemplate(
                 template_id=data["template_id"],
                 name=data["name"],
@@ -325,17 +294,18 @@ class WorkflowService:
         params: List[Any] = []
 
         if role_focus:
-            query += " AND role_focus = ?"
+            query += " AND role_focus = %s"
             params.append(role_focus.value)
 
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(query, params)
-            rows = cursor.fetchall()
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
 
             templates = []
             for row in rows:
-                data = json.loads(row["template_data"])
+                # PostgreSQL returns JSONB as dict, SQLite returned string
+                data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
 
                 # Filter by tags if specified
                 if tags and not any(tag in data["tags"] for tag in tags):
@@ -436,13 +406,14 @@ class WorkflowService:
         )
 
         # Store run record
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 INSERT INTO workflow_runs (
                     run_id, template_id, template_name, role_focus, status,
                     actor_id, actor_role, actor_surface, started_at, run_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     run_id,
@@ -457,7 +428,6 @@ class WorkflowService:
                     json.dumps(run.to_dict()),
                 ),
             )
-            conn.commit()
 
         emit_event(
             "plan_created",
@@ -524,18 +494,19 @@ class WorkflowService:
         Returns:
             WorkflowRun if found, None otherwise
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT run_data FROM workflow_runs WHERE run_id = ?",
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT run_data FROM workflow_runs WHERE run_id = %s",
                 (run_id,),
             )
-            row = cursor.fetchone()
+            row = cur.fetchone()
 
             if not row:
                 return None
 
-            data = json.loads(row["run_data"])
+            # PostgreSQL returns JSONB as dict, SQLite returned string
+            data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
             return WorkflowRun(
                 run_id=data["run_id"],
                 template_id=data["template_id"],
@@ -609,12 +580,13 @@ class WorkflowService:
         if isinstance(context, dict):
             context_keys = sorted(context.keys())
 
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE workflow_runs
-                SET status = ?, total_tokens = ?, completed_at = ?, run_data = ?
-                WHERE run_id = ?
+                SET status = %s, total_tokens = %s, completed_at = %s, run_data = %s
+                WHERE run_id = %s
                 """,
                 (
                     status.value,
@@ -624,7 +596,6 @@ class WorkflowService:
                     run_id,
                 ),
             )
-            conn.commit()
 
         emit_event(
             "execution_update",
