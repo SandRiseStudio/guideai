@@ -86,7 +86,7 @@ jobs:
         run: pre-commit run --all-files --show-diff-on-failure
 
   # ============================================================================
-  # Python Test Matrix (3.10, 3.11, 3.12)
+  # Python Test Matrix (3.10, 3.11, 3.12) with Service Containers
   # ============================================================================
   test-python:
     name: Python Tests (Python ${{ matrix.python-version }})
@@ -98,6 +98,109 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12"]
+
+    # Service containers mirroring production setup
+    services:
+      postgres-behavior:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: guideai_behavior
+          POSTGRES_PASSWORD: behavior_test_pass
+          POSTGRES_DB: guideai_behavior
+        ports:
+          - 6433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --memory 256m
+
+      postgres-workflow:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: guideai_workflow
+          POSTGRES_PASSWORD: workflow_test_pass
+          POSTGRES_DB: guideai_workflow
+        ports:
+          - 6434:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --memory 256m
+
+      postgres-action:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: guideai_action
+          POSTGRES_PASSWORD: action_test_pass
+          POSTGRES_DB: guideai_action
+        ports:
+          - 6435:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --memory 256m
+
+      postgres-run:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: guideai_run
+          POSTGRES_PASSWORD: run_test_pass
+          POSTGRES_DB: guideai_run
+        ports:
+          - 6436:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --memory 256m
+
+      postgres-compliance:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: guideai_compliance
+          POSTGRES_PASSWORD: compliance_test_pass
+          POSTGRES_DB: guideai_compliance
+        ports:
+          - 6437:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --memory 256m
+
+      postgres-telemetry:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: guideai_telemetry
+          POSTGRES_PASSWORD: telemetry_test_pass
+          POSTGRES_DB: guideai_telemetry
+        ports:
+          - 6438:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --memory 256m
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6479:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+          --memory 128m
 
     steps:
       - name: Checkout repository
@@ -116,17 +219,62 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,semantic]"
-          pip install pytest pytest-asyncio pytest-cov pytest-timeout
+          pip install -e ".[dev,postgres,telemetry,semantic]"
 
-      - name: Run pytest with coverage
+      - name: Wait for services to be ready
         run: |
-          pytest \
+          echo "Waiting for PostgreSQL services..."
+          for port in 6433 6434 6435 6436 6437 6438; do
+            timeout 30 bash -c "until pg_isready -h localhost -p $port; do sleep 1; done" || exit 1
+          done
+          echo "Waiting for Redis..."
+          timeout 30 bash -c "until redis-cli -h localhost -p 6479 ping; do sleep 1; done" || exit 1
+          echo "All services ready!"
+
+      - name: Run database migrations
+        run: |
+          python scripts/run_migrations.py || true
+
+      - name: Run pytest with coverage (parallel)
+        env:
+          GUIDEAI_PG_HOST_BEHAVIOR: localhost
+          GUIDEAI_PG_PORT_BEHAVIOR: 6433
+          GUIDEAI_PG_USER_BEHAVIOR: guideai_behavior
+          GUIDEAI_PG_PASS_BEHAVIOR: behavior_test_pass
+          GUIDEAI_PG_DB_BEHAVIOR: guideai_behavior
+          GUIDEAI_PG_HOST_WORKFLOW: localhost
+          GUIDEAI_PG_PORT_WORKFLOW: 6434
+          GUIDEAI_PG_USER_WORKFLOW: guideai_workflow
+          GUIDEAI_PG_PASS_WORKFLOW: workflow_test_pass
+          GUIDEAI_PG_DB_WORKFLOW: guideai_workflow
+          GUIDEAI_PG_HOST_ACTION: localhost
+          GUIDEAI_PG_PORT_ACTION: 6435
+          GUIDEAI_PG_USER_ACTION: guideai_action
+          GUIDEAI_PG_PASS_ACTION: action_test_pass
+          GUIDEAI_PG_DB_ACTION: guideai_action
+          GUIDEAI_PG_HOST_RUN: localhost
+          GUIDEAI_PG_PORT_RUN: 6436
+          GUIDEAI_PG_USER_RUN: guideai_run
+          GUIDEAI_PG_PASS_RUN: run_test_pass
+          GUIDEAI_PG_DB_RUN: guideai_run
+          GUIDEAI_PG_HOST_COMPLIANCE: localhost
+          GUIDEAI_PG_PORT_COMPLIANCE: 6437
+          GUIDEAI_PG_USER_COMPLIANCE: guideai_compliance
+          GUIDEAI_PG_PASS_COMPLIANCE: compliance_test_pass
+          GUIDEAI_PG_DB_COMPLIANCE: guideai_compliance
+          GUIDEAI_PG_HOST_TELEMETRY: localhost
+          GUIDEAI_PG_PORT_TELEMETRY: 6438
+          GUIDEAI_PG_USER_TELEMETRY: guideai_telemetry
+          GUIDEAI_PG_PASS_TELEMETRY: telemetry_test_pass
+          GUIDEAI_PG_DB_TELEMETRY: guideai_telemetry
+          REDIS_HOST: localhost
+          REDIS_PORT: 6479
+        run: |
+          pytest -n auto \
             --cov=guideai \
             --cov-report=xml \
             --cov-report=term-missing \
             --timeout=30 \
-            --ignore=test_kafka_consume.py \
             -v
 
       - name: Upload coverage to Codecov
