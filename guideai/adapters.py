@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Type, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Type, TypeVar, Union
 
 from .action_contracts import (
     Action,
@@ -13,6 +13,7 @@ from .action_contracts import (
     ReplayStatus,
 )
 from .action_service import ActionService
+from .action_service_postgres import PostgresActionService
 from .behavior_service import (
     ApproveBehaviorRequest,
     BehaviorService,
@@ -52,7 +53,7 @@ class BaseAdapter:
 
     surface: str
 
-    def __init__(self, service: ActionService, surface: str) -> None:
+    def __init__(self, service: Union[ActionService, PostgresActionService], surface: str) -> None:
         self._service = service
         self.surface = surface
 
@@ -69,14 +70,14 @@ class BaseAdapter:
         return Actor(
             id=actor_payload.get("id", "unknown"),
             role=actor_payload.get("role", "UNKNOWN"),
-            surface=self.surface,
+            surface=actor_payload.get("surface", self.surface),
         )
 
 
 class RestActionServiceAdapter(BaseAdapter):
     """Mimics REST API payloads/behavior."""
 
-    def __init__(self, service: ActionService) -> None:
+    def __init__(self, service: Union[ActionService, PostgresActionService]) -> None:
         super().__init__(service, surface="REST_API")
 
     def create_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -120,7 +121,7 @@ class RestActionServiceAdapter(BaseAdapter):
 class CLIActionServiceAdapter(BaseAdapter):
     """Adapter that would back the CLI commands."""
 
-    def __init__(self, service: ActionService) -> None:
+    def __init__(self, service: Union[ActionService, PostgresActionService]) -> None:
         super().__init__(service, surface="CLI")
 
     def record_action(
@@ -133,6 +134,7 @@ class CLIActionServiceAdapter(BaseAdapter):
         actor_role: str,
         checksum: str | None = None,
         related_run_id: str | None = None,
+        audit_log_event_id: str | None = None,
     ) -> Dict[str, Any]:
         actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
         request = ActionCreateRequest(
@@ -142,6 +144,7 @@ class CLIActionServiceAdapter(BaseAdapter):
             metadata=metadata,
             related_run_id=related_run_id,
             checksum=checksum,
+            audit_log_event_id=audit_log_event_id,
         )
         action = self._service.create_action(request, actor)
         return self._format_action(action)
@@ -178,7 +181,7 @@ class CLIActionServiceAdapter(BaseAdapter):
 class MCPActionServiceAdapter(BaseAdapter):
     """Adapter simulating MCP tool invocations."""
 
-    def __init__(self, service: ActionService) -> None:
+    def __init__(self, service: Union[ActionService, "PostgresActionService"]) -> None:
         super().__init__(service, surface="MCP")
 
     def create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -860,7 +863,7 @@ class CLIRunServiceAdapter(BaseRunServiceAdapter):
     """Adapter backing CLI run commands."""
 
     def __init__(self, service: RunService) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def create_run(
         self,
@@ -970,7 +973,7 @@ class RestRunServiceAdapter(BaseRunServiceAdapter):
     """REST-style adapter for RunService endpoints."""
 
     def __init__(self, service: RunService) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def create_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -1040,7 +1043,7 @@ class MCPRunServiceAdapter(BaseRunServiceAdapter):
     """Adapter simulating MCP tool interactions for runs."""
 
     def __init__(self, service: RunService) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -2316,3 +2319,145 @@ class MCPDeviceFlowAdapter(BaseDeviceFlowAdapter):
 
     def __init__(self, manager: DeviceFlowManager) -> None:
         super().__init__(manager, surface="MCP")
+
+
+class BaseTraceAnalysisAdapter:
+    """Shared utilities for TraceAnalysisService adapters."""
+
+    def __init__(self, service: Any, surface: str) -> None:
+        """Initialize adapter with TraceAnalysisService instance."""
+        self._service = service
+        self.surface = surface
+
+
+class CLITraceAnalysisServiceAdapter(BaseTraceAnalysisAdapter):
+    """CLI adapter for TraceAnalysisService pattern detection and scoring."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="CLI")
+
+    def detect_patterns(
+        self,
+        *,
+        run_ids: List[str],
+        min_frequency: int = 3,
+        min_similarity: float = 0.7,
+        max_patterns: int = 100,
+        include_context: bool = True,
+    ) -> Dict[str, Any]:
+        """Detect patterns across multiple runs via CLI.
+
+        Args:
+            run_ids: List of run IDs to analyze
+            min_frequency: Minimum occurrences to consider a pattern
+            min_similarity: Minimum sequence similarity threshold 0-1
+            max_patterns: Maximum number of patterns to return
+            include_context: Whether to capture before/after steps
+
+        Returns:
+            DetectPatternsResponse as dict with patterns, stats, metadata
+        """
+        from .trace_analysis_contracts import DetectPatternsRequest
+
+        request = DetectPatternsRequest(
+            run_ids=run_ids,
+            min_frequency=min_frequency,
+            min_similarity=min_similarity,
+            max_patterns=max_patterns,
+            include_context=include_context,
+        )
+        response = self._service.detect_patterns(request)
+        return response.to_dict()
+
+    def score_reusability(
+        self,
+        *,
+        pattern_id: str,
+        total_runs: int,
+        avg_trace_tokens: float,
+        unique_task_types: int,
+        total_task_types: int,
+    ) -> Dict[str, Any]:
+        """Score a pattern's reusability via CLI.
+
+        Args:
+            pattern_id: Pattern identifier to score
+            total_runs: Total runs in analysis period
+            avg_trace_tokens: Average tokens per trace
+            unique_task_types: Number of distinct task types where pattern occurred
+            total_task_types: Total task types in corpus
+
+        Returns:
+            ScoreReusabilityResponse as dict with score, pattern, threshold check
+        """
+        from .trace_analysis_contracts import ScoreReusabilityRequest
+
+        request = ScoreReusabilityRequest(
+            pattern_id=pattern_id,
+            total_runs=total_runs,
+            avg_trace_tokens=avg_trace_tokens,
+            unique_task_types=unique_task_types,
+            total_task_types=total_task_types,
+        )
+        response = self._service.score_reusability(request)
+        return response.to_dict()
+
+
+class RestTraceAnalysisServiceAdapter(BaseTraceAnalysisAdapter):
+    """REST adapter for TraceAnalysisService endpoints."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="REST_API")
+
+    def detect_patterns(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect patterns via REST API.
+
+        Args:
+            payload: DetectPatternsRequest as dict
+
+        Returns:
+            DetectPatternsResponse as dict
+        """
+        from .trace_analysis_contracts import DetectPatternsRequest
+
+        request = DetectPatternsRequest.from_dict(payload)
+        response = self._service.detect_patterns(request)
+        return response.to_dict()
+
+    def score_reusability(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Score reusability via REST API.
+
+        Args:
+            payload: ScoreReusabilityRequest as dict
+
+        Returns:
+            ScoreReusabilityResponse as dict
+        """
+        from .trace_analysis_contracts import ScoreReusabilityRequest
+
+        request = ScoreReusabilityRequest.from_dict(payload)
+        response = self._service.score_reusability(request)
+        return response.to_dict()
+
+
+class MCPTraceAnalysisServiceAdapter(BaseTraceAnalysisAdapter):
+    """MCP adapter for TraceAnalysisService tool invocations."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="MCP")
+
+    def detectPatterns(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802 - MCP naming parity
+        """MCP tool: detectPatterns."""
+        from .trace_analysis_contracts import DetectPatternsRequest
+
+        request = DetectPatternsRequest.from_dict(payload)
+        response = self._service.detect_patterns(request)
+        return response.to_dict()
+
+    def scoreReusability(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802 - MCP naming parity
+        """MCP tool: scoreReusability."""
+        from .trace_analysis_contracts import ScoreReusabilityRequest
+
+        request = ScoreReusabilityRequest.from_dict(payload)
+        response = self._service.score_reusability(request)
+        return response.to_dict()

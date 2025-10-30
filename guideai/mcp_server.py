@@ -84,6 +84,7 @@ class MCPServiceRegistry:
         self._behavior_service: Optional[BehaviorService] = None
         self._workflow_service: Optional[WorkflowService] = None
         self._action_service: Optional[Union[PostgresActionService, ActionService]] = None
+        self._trace_analysis_service: Optional[Any] = None
 
     def behavior_service(self) -> BehaviorService:
         if self._behavior_service is None:
@@ -130,6 +131,33 @@ class MCPServiceRegistry:
                 )
             self._action_service = service
         return self._action_service
+
+    def trace_analysis_service(self) -> Any:
+        """Get or create TraceAnalysisService singleton for MCP."""
+        if self._trace_analysis_service is None:
+            from .trace_analysis_service import TraceAnalysisService
+
+            dsn = os.environ.get("GUIDEAI_TRACE_ANALYSIS_PG_DSN")
+            if dsn:
+                try:
+                    from .trace_analysis_service_postgres import PostgresTraceAnalysisService
+                    storage = PostgresTraceAnalysisService(dsn=dsn)
+                    service = TraceAnalysisService(storage=storage)
+                    self._logger.info(
+                        "Initialized TraceAnalysisService for MCP with PostgreSQL backend"
+                    )
+                except ImportError:
+                    service = TraceAnalysisService()
+                    self._logger.warning(
+                        "Using in-memory TraceAnalysisService (PostgreSQL backend unavailable)"
+                    )
+            else:
+                service = TraceAnalysisService()
+                self._logger.info(
+                    "Initialized TraceAnalysisService for MCP (in-memory mode)"
+                )
+            self._trace_analysis_service = service
+        return self._trace_analysis_service
 
 
 class MCPServer:
@@ -320,6 +348,102 @@ class MCPServer:
                     request_id,
                     self.INTERNAL_ERROR,
                     f"Tool execution failed: {str(e)}",
+                )
+
+        # Route pattern analysis tools
+        if tool_name.startswith("patterns."):
+            try:
+                from .adapters import MCPTraceAnalysisServiceAdapter
+
+                adapter = MCPTraceAnalysisServiceAdapter(self._services.trace_analysis_service())
+
+                if tool_name == "patterns.detectPatterns":
+                    result = adapter.detectPatterns(tool_params)
+                elif tool_name == "patterns.scoreReusability":
+                    result = adapter.scoreReusability(tool_params)
+                else:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown patterns tool: {tool_name}",
+                    )
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Pattern tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Pattern tool execution failed: {str(e)}",
+                )
+
+        # Route action service tools
+        if tool_name.startswith("actions."):
+            try:
+                from .adapters import MCPActionServiceAdapter
+
+                adapter = MCPActionServiceAdapter(self._services.action_service())
+
+                if tool_name == "actions.create":
+                    result = adapter.create(tool_params)
+                elif tool_name == "actions.list":
+                    result = adapter.list()
+                elif tool_name == "actions.get":
+                    action_id = tool_params.get("action_id")
+                    if not action_id:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: action_id",
+                        )
+                    result = adapter.get(action_id)
+                elif tool_name == "actions.replay":
+                    result = adapter.replay(tool_params)
+                elif tool_name == "actions.replayStatus":
+                    replay_id = tool_params.get("replay_id")
+                    if not replay_id:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: replay_id",
+                        )
+                    result = adapter.get_replay_status(replay_id)
+                else:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown actions tool: {tool_name}",
+                    )
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Action tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Action tool execution failed: {str(e)}",
                 )
 
         # Unknown tool prefix
