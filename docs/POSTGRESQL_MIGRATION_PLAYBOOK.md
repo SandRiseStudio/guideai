@@ -13,6 +13,8 @@ This playbook documents the step-by-step procedures for migrating guideAI servic
 
 **Phase 3 Services (Current):**
 - ✅ TelemetryService (warehouse) – Complete
+- ✅ MetricsService (Timescale observability) – Schema tooling complete via `run_postgres_metrics_migration.py`
+- ✅ TraceAnalysisService – Schema tooling complete via `run_postgres_trace_migration.py`
 - 🚧 BehaviorService – Tooling complete, execution pending
 - 🚧 WorkflowService – Tooling complete, execution pending
 
@@ -109,13 +111,17 @@ source .env.postgres
 
 # Or manual configuration:
 export GUIDEAI_TELEMETRY_PG_DSN="postgresql://guideai_telemetry:dev_telemetry_pass@localhost:5432/telemetry"
+export GUIDEAI_METRICS_PG_DSN="postgresql://guideai_metrics:dev_metrics_pass@localhost:5439/metrics"
 export GUIDEAI_BEHAVIOR_PG_DSN="postgresql://guideai_behavior:dev_behavior_pass@localhost:5433/behaviors"
 export GUIDEAI_WORKFLOW_PG_DSN="postgresql://guideai_workflow:dev_workflow_pass@localhost:5434/workflows"
+export GUIDEAI_TRACE_ANALYSIS_PG_DSN="postgresql://guideai_trace:dev_trace_pass@localhost:5435/trace_analysis"
 
 # Production (use secrets manager per SECRETS_MANAGEMENT_PLAN.md)
 export GUIDEAI_BEHAVIOR_PG_DSN="postgresql://guideai_prod:${PG_PASSWORD}@postgres.internal:5432/guideai_prod?sslmode=require"
 export GUIDEAI_WORKFLOW_PG_DSN="postgresql://guideai_prod:${PG_PASSWORD}@postgres.internal:5432/guideai_prod?sslmode=require"
 export GUIDEAI_TELEMETRY_PG_DSN="postgresql://guideai_prod:${PG_PASSWORD}@postgres.internal:5432/guideai_prod?sslmode=require"
+export GUIDEAI_METRICS_PG_DSN="postgresql://guideai_prod:${PG_PASSWORD}@postgres.internal:5432/guideai_metrics?sslmode=require"
+export GUIDEAI_TRACE_ANALYSIS_PG_DSN="postgresql://guideai_prod:${PG_PASSWORD}@postgres.internal:5432/guideai_trace_analysis?sslmode=require"
 ```
 
 **Note:** Docker setup uses separate databases per service (matching production microservice architecture). Each service has isolated credentials and ports.
@@ -192,10 +198,14 @@ ls -lh schema/migrations/
 # Expected: 001_create_telemetry_warehouse.sql
 #           002_create_behavior_service.sql
 #           003_create_workflow_service.sql
+#           012_create_metrics_service.sql
+#           013_create_trace_analysis.sql
 
 # Check migration runners
 ls -lh scripts/run_postgres_*.py
 # Expected: run_postgres_telemetry_migration.py
+#           run_postgres_metrics_migration.py
+#           run_postgres_trace_migration.py
 #           run_postgres_behavior_migration.py
 #           run_postgres_workflow_migration.py
 
@@ -255,6 +265,36 @@ Attach the generated report to the change request or ticket for audit evidence
 ---
 
 ## Phase 2: Schema Migration (Dry Run)
+
+### 2.0 Observability Warehouse (Telemetry + Metrics + Trace)
+
+Before touching BehaviorService or WorkflowService, bring every observability
+database to the latest schema so telemetry, KPI dashboards, and trace analysis
+all share the same ground truth (`behavior_instrument_metrics_pipeline`). Use
+the CLI runners to dry-run and then apply the migrations. Each command accepts
+`--dry-run`, `--migration`, and `--connect-timeout` just like the telemetry
+runner.
+
+```bash
+# Dry run (preview statements without executing)
+python scripts/run_postgres_telemetry_migration.py --dsn "${GUIDEAI_TELEMETRY_PG_DSN}" --dry-run
+python scripts/run_postgres_metrics_migration.py --dsn "${GUIDEAI_METRICS_PG_DSN}" --dry-run
+python scripts/run_postgres_trace_migration.py --dsn "${GUIDEAI_TRACE_ANALYSIS_PG_DSN}" --dry-run
+
+# Apply migrations when ready
+python scripts/run_postgres_telemetry_migration.py --dsn "${GUIDEAI_TELEMETRY_PG_DSN}"
+python scripts/run_postgres_metrics_migration.py --dsn "${GUIDEAI_METRICS_PG_DSN}"
+python scripts/run_postgres_trace_migration.py --dsn "${GUIDEAI_TRACE_ANALYSIS_PG_DSN}"
+```
+
+**Verification checklist:**
+- [ ] Telemetry hypertables and retention policies exist (`SELECT table_name FROM information_schema.tables WHERE table_schema='prd_telemetry';`).
+- [ ] Metrics hypertables (`metrics_snapshots`, `behavior_usage_events`, `token_usage_events`, `completion_events`, `compliance_events`) are visible in `prd_metrics` schema.
+- [ ] Trace analysis tables (`trace_runs`, `trace_segments`, `pattern_library`, continuous aggregates) exist in `prd_trace_analysis` schema.
+- [ ] All three runners print the "✅ Migration applied successfully." confirmation before proceeding.
+
+Archive the stdout for each command inside the change request bundle; this is
+required evidence for `behavior_update_docs_after_changes` and the audit log.
 
 ### 2.1 BehaviorService Schema Migration
 

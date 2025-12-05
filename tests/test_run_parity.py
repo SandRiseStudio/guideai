@@ -6,10 +6,13 @@ regardless of which surface invokes them (CLI, REST API, MCP tools).
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
+import os
 from typing import Generator
 
+try:
+    import psycopg2  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - psycopg2 is optional for lint environments
+    psycopg2 = None
 import pytest
 
 from guideai.action_contracts import Actor
@@ -18,18 +21,40 @@ from guideai.adapters import (
     RestRunServiceAdapter,
     MCPRunServiceAdapter,
 )
-from guideai.run_service import RunService, RunNotFoundError
+from guideai.run_service_postgres import PostgresRunService as RunService
+from guideai.run_service_postgres import RunNotFoundError
 from guideai.run_contracts import RunStatus
+
+
+def _truncate_run_tables(dsn: str) -> None:
+    """Remove all data from run tables to ensure test isolation."""
+    if psycopg2 is None:
+        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
+    conn = psycopg2.connect(dsn)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE run_steps, runs RESTART IDENTITY CASCADE;")
+    finally:
+        conn.close()
 
 
 @pytest.fixture
 def run_service() -> Generator[RunService, None, None]:
-    """Create a fresh RunService for each test."""
-    temp_db = Path(tempfile.mktemp(suffix=".db"))
-    service = RunService(db_path=temp_db)
-    yield service
-    if temp_db.exists():
-        temp_db.unlink()
+    """Create a fresh RunService backed by PostgreSQL for each test."""
+    dsn = os.environ.get("GUIDEAI_RUN_PG_DSN")
+    if not dsn:
+        pytest.skip("GUIDEAI_RUN_PG_DSN not set; skipping PostgreSQL parity tests")
+
+    _truncate_run_tables(dsn)
+    service = RunService(dsn=dsn)
+
+    try:
+        yield service
+    finally:
+        _truncate_run_tables(dsn)
+        if hasattr(service, "_pool") and service._pool:
+            service._pool.close()
 
 
 @pytest.fixture
@@ -72,11 +97,11 @@ class TestCreateRunParity:
         assert result["progress_pct"] == 0.0
         assert result["message"] == "Starting test run"
         assert result["actor"]["id"] == "cli-user"
-        assert result["actor"]["surface"] == "CLI"
+        assert result["actor"]["surface"] == "cli"
 
     def test_rest_create_run(self, rest_adapter: RestRunServiceAdapter):
         payload = {
-            "actor": {"id": "rest-user", "role": "TEACHER", "surface": "REST_API"},
+            "actor": {"id": "rest-user", "role": "TEACHER", "surface": "api"},
             "template_id": "template-1",
             "template_name": "Test Template",
             "behavior_ids": ["b3", "b4"],
@@ -92,11 +117,11 @@ class TestCreateRunParity:
         assert result["behavior_ids"] == ["b3", "b4"]
         assert result["message"] == "REST test run"
         assert result["actor"]["id"] == "rest-user"
-        assert result["actor"]["surface"] == "REST_API"
+        assert result["actor"]["surface"] == "api"
 
     def test_mcp_create_run(self, mcp_adapter: MCPRunServiceAdapter):
         payload = {
-            "actor": {"id": "mcp-user", "role": "STUDENT", "surface": "MCP"},
+            "actor": {"id": "mcp-user", "role": "STUDENT", "surface": "mcp"},
             "workflow_id": "workflow-2",
             "behavior_ids": ["b5"],
             "metadata": {"source": "mcp"},
@@ -107,7 +132,7 @@ class TestCreateRunParity:
         assert result["status"] == RunStatus.PENDING
         assert result["workflow_id"] == "workflow-2"
         assert result["behavior_ids"] == ["b5"]
-        assert result["actor"]["surface"] == "MCP"
+        assert result["actor"]["surface"] == "mcp"
 
 
 class TestGetRunParity:
@@ -414,15 +439,15 @@ class TestRunNotFoundParity:
 
     def test_cli_get_nonexistent_run(self, cli_adapter: CLIRunServiceAdapter):
         with pytest.raises(RunNotFoundError):
-            cli_adapter.get_run("nonexistent")
+            cli_adapter.get_run("00000000-0000-0000-0000-000000000001")
 
     def test_rest_get_nonexistent_run(self, rest_adapter: RestRunServiceAdapter):
         with pytest.raises(RunNotFoundError):
-            rest_adapter.get_run("nonexistent")
+            rest_adapter.get_run("00000000-0000-0000-0000-000000000002")
 
     def test_mcp_get_nonexistent_run(self, mcp_adapter: MCPRunServiceAdapter):
         with pytest.raises(RunNotFoundError):
-            mcp_adapter.get("nonexistent")
+            mcp_adapter.get("00000000-0000-0000-0000-000000000003")
 
 
 class TestStepTrackingParity:

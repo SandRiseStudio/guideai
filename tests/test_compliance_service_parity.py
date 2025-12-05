@@ -1,14 +1,54 @@
 """Parity tests for ComplianceService ensuring CLI/REST/MCP consistency."""
 
+import os
 import pytest
 
 from guideai.action_contracts import Actor
-from guideai.adapters import (
-    CLIComplianceServiceAdapter,
-    MCPComplianceServiceAdapter,
-    RestComplianceServiceAdapter,
-)
+import os
+import pytest
+import psycopg2
+from guideai.adapters import CLIComplianceServiceAdapter, RestComplianceServiceAdapter, MCPComplianceServiceAdapter
 from guideai.compliance_service import ComplianceService
+from guideai.compliance_service import ComplianceService
+from guideai.storage.postgres_pool import PostgresPool
+
+
+@pytest.fixture(autouse=True)
+def cleanup_compliance_db():
+    """Clean compliance database before each test to prevent data pollution."""
+    dsn = os.getenv("GUIDEAI_COMPLIANCE_PG_DSN")
+    if not dsn:
+        pytest.skip("GUIDEAI_COMPLIANCE_PG_DSN not set")
+
+    # Clean up any existing test data before the test runs
+    try:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True  # Ensure changes commit immediately
+        cur = conn.cursor()
+        cur.execute(
+            "TRUNCATE TABLE checklists, checklist_steps RESTART IDENTITY CASCADE"
+        )
+        cur.close()
+        conn.close()
+    except Exception as e:
+        # Debug: print exception details to understand why cleanup fails
+        print(f"Cleanup BEFORE test failed: {type(e).__name__}: {e}")
+
+    yield
+
+    # Cleanup after test completes
+    try:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True  # Ensure changes commit immediately
+        cur = conn.cursor()
+        cur.execute(
+            "TRUNCATE TABLE checklists, checklist_steps RESTART IDENTITY CASCADE"
+        )
+        cur.close()
+        conn.close()
+    except Exception as e:
+        # Debug: print exception details to understand why cleanup fails
+        print(f"Cleanup AFTER test failed: {type(e).__name__}: {e}")
 
 
 @pytest.fixture
@@ -301,16 +341,22 @@ class TestErrorHandling:
     """Verify error handling is consistent across surfaces."""
 
     def test_cli_get_nonexistent_checklist(self, cli_adapter):
+        # Use a valid UUID format that won't exist in the database
+        nonexistent_uuid = "00000000-0000-0000-0000-000000000000"
         with pytest.raises(Exception) as exc_info:
-            cli_adapter.get_checklist("nonexistent-id")
+            cli_adapter.get_checklist(nonexistent_uuid)
         assert "not found" in str(exc_info.value).lower()
 
     def test_rest_get_nonexistent_checklist(self, rest_adapter):
+        # Use a valid UUID format that won't exist in the database
+        nonexistent_uuid = "00000000-0000-0000-0000-000000000000"
         with pytest.raises(Exception) as exc_info:
-            rest_adapter.get_checklist("nonexistent-id")
+            rest_adapter.get_checklist(nonexistent_uuid)
         assert "not found" in str(exc_info.value).lower()
 
     def test_mcp_get_nonexistent_checklist(self, mcp_adapter):
+        # Use a valid UUID format that won't exist in the database
+        nonexistent_uuid = "00000000-0000-0000-0000-000000000000"
         with pytest.raises(Exception) as exc_info:
-            mcp_adapter.get_checklist("nonexistent-id")
+            mcp_adapter.get_checklist(nonexistent_uuid)
         assert "not found" in str(exc_info.value).lower()

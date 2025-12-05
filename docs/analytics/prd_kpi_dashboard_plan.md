@@ -79,6 +79,7 @@ _Action Items_: backfill compliance events when checklist engine moves to persis
 ## 7. Validation & QA
 - Automated contract tests in `tests/test_telemetry_integration.py` extended to assert new fields.
 - End-to-end smoke: trigger sample workflow run via CLI, verify Kafka topic ingestion and warehouse load (local docker-compose harness).
+- CLI sink selection: `guideai telemetry emit --sink file --telemetry-path ~/.guideai/telemetry/events.jsonl` for JSONL exports or `--sink kafka --kafka-servers localhost:9092 --kafka-topic telemetry.events` when validating the streaming pipeline; `--sink auto` keeps the previous env-based behavior.
 - Dashboard snapshot tests using Playwright to detect metric tile regressions.
 
 ## 8. Next Steps & Owners

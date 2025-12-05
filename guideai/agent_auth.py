@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from .surfaces import normalize_actor_surface
 from .telemetry import TelemetryClient
 
 
@@ -26,6 +27,16 @@ REST_SCHEMA_PATH = REPO_ROOT / "schema" / "agentauth" / "v1" / "agent_auth.json"
 SCOPE_CATALOG_PATH = REPO_ROOT / "schema" / "agentauth" / "scope_catalog.yaml"
 POLICY_BUNDLE_PATH = REPO_ROOT / "policy" / "agentauth" / "bundle.yaml"
 MCP_TOOLS_DIR = REPO_ROOT / "mcp" / "tools"
+MCP_AUTH_TOOL_NAMES: Tuple[str, ...] = (
+    "auth.deviceLogin",
+    "auth.authStatus",
+    "auth.refreshToken",
+    "auth.logout",
+    "auth.ensureGrant",
+    "auth.listGrants",
+    "auth.policy.preview",
+    "auth.revoke",
+)
 
 
 class GrantDecision(str, Enum):
@@ -62,16 +73,6 @@ MFA_REQUIRED_VALUE = "true"
 
 DEFAULT_PROVIDER = "guideai.stubs"
 DEFAULT_TTL = timedelta(minutes=60)
-
-_SURFACE_ALIASES = {
-    "WEB": "web",
-    "CLI": "cli",
-    "API": "api",
-    "REST_API": "api",
-    "VS_CODE": "vscode",
-    "MCP": "mcp",
-}
-
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -181,7 +182,8 @@ class AgentAuthClient:
     rest_schema_path = REST_SCHEMA_PATH
     scope_catalog_path = SCOPE_CATALOG_PATH
     policy_bundle_path = POLICY_BUNDLE_PATH
-    mcp_tool_paths = tuple(sorted(MCP_TOOLS_DIR.glob("auth.*.json")))
+    mcp_tool_names = MCP_AUTH_TOOL_NAMES
+    mcp_tool_paths = tuple(MCP_TOOLS_DIR / f"{name}.json" for name in MCP_AUTH_TOOL_NAMES)
 
     def __init__(self, telemetry: Optional[TelemetryClient] = None) -> None:
         self._grants: Dict[str, GrantMetadata] = {}
@@ -305,7 +307,7 @@ class AgentAuthClient:
         approver_actor = {
             "id": approver,
             "role": request.context.get("approver_role", "APPROVER"),
-            "surface": self._normalize_surface(request.surface),
+            "surface": normalize_actor_surface(request.surface),
         }
         self._emit_auth_event(
             event_type="auth_consent_approved",
@@ -401,7 +403,7 @@ class AgentAuthClient:
         actor_payload = {
             "id": request.user_id or request.agent_id,
             "role": request.context.get("roles", "UNKNOWN"),
-            "surface": self._normalize_surface(request.context.get("surface", "API")),
+            "surface": normalize_actor_surface(request.context.get("surface", "API")),
         }
 
         if requires_mfa and not mfa_verified:
@@ -496,15 +498,11 @@ class AgentAuthClient:
     def _is_mfa_verified(request: EnsureGrantRequest) -> bool:
         return request.context.get(MFA_CONTEXT_KEY) == MFA_REQUIRED_VALUE
 
-    @staticmethod
-    def _normalize_surface(surface: str) -> str:
-        return _SURFACE_ALIASES.get(surface.upper(), surface.lower())
-
     def _actor_from_request(self, request: EnsureGrantRequest) -> Dict[str, str]:
         return {
             "id": request.user_id or request.agent_id,
             "role": request.context.get("roles", "UNKNOWN"),
-            "surface": self._normalize_surface(request.surface),
+            "surface": normalize_actor_surface(request.surface),
         }
 
     def _emit_auth_event(

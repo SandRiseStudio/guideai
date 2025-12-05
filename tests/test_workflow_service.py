@@ -9,8 +9,6 @@ Validates:
 """
 
 import json
-import tempfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,16 +25,6 @@ from guideai.adapters import CLIWorkflowServiceAdapter
 
 
 @pytest.fixture
-def temp_db():
-    """Temporary database for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = Path(f.name)
-    yield db_path
-    if db_path.exists():
-        db_path.unlink()
-
-
-@pytest.fixture
 def mock_behavior_service():
     """Mock BehaviorService that returns sample behaviors."""
     service = MagicMock(spec=BehaviorService)
@@ -50,10 +38,31 @@ def mock_behavior_service():
     return service
 
 
+@pytest.fixture(autouse=True)
+def clean_workflow_db(postgres_dsn_workflow):
+    """Clean workflow tables between tests to prevent state bleed."""
+    from guideai.storage.postgres_pool import PostgresPool
+    from guideai.storage.redis_cache import get_cache
+
+    pool = PostgresPool(dsn=postgres_dsn_workflow)
+    cache = get_cache()
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE workflow_runs CASCADE")
+            cur.execute("TRUNCATE TABLE workflow_template_versions CASCADE")
+            cur.execute("TRUNCATE TABLE workflow_templates CASCADE")
+        conn.commit()
+
+    cache.invalidate_service("workflow")
+    yield
+    cache.invalidate_service("workflow")
+
+
 @pytest.fixture
-def workflow_service(temp_db, mock_behavior_service):
-    """WorkflowService instance with test database."""
-    return WorkflowService(db_path=temp_db, behavior_service=mock_behavior_service)
+def workflow_service(postgres_dsn_workflow, mock_behavior_service, clean_workflow_db):
+    """WorkflowService instance backed by PostgreSQL."""
+    return WorkflowService(dsn=postgres_dsn_workflow, behavior_service=mock_behavior_service)
 
 
 @pytest.fixture
@@ -299,7 +308,7 @@ class TestWorkflowExecution:
 class TestCLIAdapter:
     """Test CLI adapter parity."""
 
-    def test_create_template_via_adapter(self, workflow_service, temp_db):
+    def test_create_template_via_adapter(self, workflow_service):
         """Test creating a template through the CLI adapter."""
         adapter = CLIWorkflowServiceAdapter(workflow_service)
 

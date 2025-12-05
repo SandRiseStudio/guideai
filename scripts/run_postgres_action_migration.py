@@ -68,7 +68,7 @@ def main() -> int:
         return 1
     print()
 
-    # Step 3: Load and apply schema
+    # Step 3: Load and apply base schema
     migration_file = Path(__file__).parent.parent / "schema" / "migrations" / "004_create_action_service.sql"
     print(f"Applying schema from: {migration_file}")
 
@@ -77,9 +77,24 @@ def main() -> int:
         statements = split_sql_statements(sql)
         print(f"  Executing {len(statements)} SQL statements...")
         execute_statements(dsn, statements, connect_timeout=5)
-        print("✅ Schema applied successfully")
+        print("✅ Base schema applied successfully")
     except Exception as e:
         print(f"❌ Schema application failed: {e}")
+        return 1
+    print()
+
+    # Step 3b: Apply replays metadata extension migration
+    migration_007_file = Path(__file__).parent.parent / "schema" / "migrations" / "007_extend_replays_metadata.sql"
+    print(f"Applying replays extension from: {migration_007_file}")
+
+    try:
+        sql = load_migration(migration_007_file)
+        statements = split_sql_statements(sql)
+        print(f"  Executing {len(statements)} SQL statements...")
+        execute_statements(dsn, statements, connect_timeout=5)
+        print("✅ Replays metadata extension applied successfully")
+    except Exception as e:
+        print(f"❌ Replays extension failed: {e}")
         return 1
     print()
 

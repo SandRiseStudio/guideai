@@ -50,6 +50,8 @@
     "out",
     "dist",
     "**/*.d.ts",
+    "src/webviews/**/*.js",
+    "scripts/**/*.js",
     "node_modules",
     ".vscode-test"
   ]

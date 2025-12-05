@@ -1,0 +1,50 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.8, pytest-8.4.2, pluggy-1.5.0 -- /Users/nick/miniconda3/bin/python
+cachedir: .pytest_cache
+rootdir: /Users/nick/guideai
+configfile: pyproject.toml
+plugins: cov-4.1.0, anyio-3.7.1, asyncio-0.26.0, langsmith-0.4.8
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 1 item
+
+tests/load/test_service_load.py::test_behavior_service_load FAILED       [100%]
+
+=================================== FAILURES ===================================
+__________________________ test_behavior_service_load __________________________
+
+load_tester = <test_service_load.ServiceLoadTester object at 0x1054128d0>
+load_params = {'concurrent': 50, 'total': 1000}
+
+    def test_behavior_service_load(load_tester, load_params):
+        """Test BehaviorService list operation under load."""
+        stats = load_tester.test_behavior_list(
+            num_requests=load_params["total"],
+            num_workers=load_params["concurrent"],
+        )
+
+        print(f"\nBehaviorService Load Test Results:")
+        print(f"  Total time: {stats['total_time']:.2f}s")
+        print(f"  Throughput: {stats['requests_per_second']:.2f} req/s")
+        print(f"  P50 latency: {stats['p50']*1000:.2f}ms")
+        print(f"  P95 latency: {stats['p95']*1000:.2f}ms")
+        print(f"  P99 latency: {stats['p99']*1000:.2f}ms")
+        print(f"  Error rate: {stats['error_rate']*100:.2f}%")
+
+        # Assert P95 < 100ms for read operations per RETRIEVAL_ENGINE_PERFORMANCE.md
+>       assert stats["p95"] < 0.1, f"P95 latency {stats['p95']*1000:.0f}ms exceeds 100ms threshold"
+E       AssertionError: P95 latency 732ms exceeds 100ms threshold
+E       assert 0.7316751480102539 < 0.1
+
+tests/load/test_service_load.py:227: AssertionError
+----------------------------- Captured stdout call -----------------------------
+
+BehaviorService Load Test Results:
+  Total time: 3.45s
+  Throughput: 290.07 req/s
+  P50 latency: 104.09ms
+  P95 latency: 731.68ms
+  P99 latency: 781.32ms
+  Error rate: 0.00%
+=========================== short test summary info ============================
+FAILED tests/load/test_service_load.py::test_behavior_service_load - Assertio...
+============================== 1 failed in 3.57s ===============================

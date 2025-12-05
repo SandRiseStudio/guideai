@@ -15,6 +15,7 @@ from .action_contracts import (
     ReplayStatus,
     utc_now_iso,
 )
+from .action_replay_executor import ActionReplayExecutor, ExecutionStatus
 from .telemetry import TelemetryClient
 
 
@@ -35,13 +36,15 @@ class ActionService:
 
     The service mimics the behavior described in `ACTION_SERVICE_CONTRACT.md` while
     remaining lightweight enough for unit tests. It stores actions in memory and
-    simulates replay jobs with deterministic outcomes.
+    uses ActionReplayExecutor for real execution with support for sequential/parallel
+    strategies and checkpointing.
     """
 
     def __init__(self, telemetry: Optional[TelemetryClient] = None) -> None:
         self._actions: Dict[str, Action] = {}
         self._replays: Dict[str, ReplayStatus] = {}
         self._telemetry = telemetry or TelemetryClient.noop()
+        self._executor = ActionReplayExecutor(telemetry=self._telemetry)
 
     # ------------------------------------------------------------------
     # CRUD Operations
@@ -96,15 +99,15 @@ class ActionService:
     # Replay Operations
     # ------------------------------------------------------------------
     def replay_actions(self, request: ReplayRequest, actor: Actor) -> ReplayStatus:
-        """Simulate replaying a set of actions."""
+        """Replay a set of actions using real execution."""
 
         missing = [action_id for action_id in request.action_ids if action_id not in self._actions]
         if missing:
             raise ActionNotFoundError(f"Cannot replay missing actions: {missing}")
 
         replay_id = str(uuid.uuid4())
-        succeeded = []
-        failed: List[str] = []
+        created_at = utc_now_iso()
+        audit_log_event_id = f"urn:guideai:audit:replay:{replay_id}"
 
         self._telemetry.emit_event(
             event_type="action_replay_start",
@@ -120,31 +123,64 @@ class ActionService:
             action_id=replay_id,
         )
 
-        for action_id in request.action_ids:
-            action = self._actions[action_id]
-            if request.options.skip_existing and action.replay_status == "SUCCEEDED":
-                continue
+        # Get actions to replay
+        actions = [self._actions[action_id] for action_id in request.action_ids]
 
-            if request.options.dry_run:
-                # Dry run does not mutate state but records the intent.
-                continue
+        # Execute using real executor
+        if request.strategy == "PARALLEL":
+            succeeded, failed, results = self._executor.execute_parallel(
+                actions=actions,
+                skip_existing=request.options.skip_existing,
+                dry_run=request.options.dry_run,
+            )
+        else:  # SEQUENTIAL
+            succeeded, failed, results = self._executor.execute_sequential(
+                actions=actions,
+                skip_existing=request.options.skip_existing,
+                dry_run=request.options.dry_run,
+            )
 
-            # Simulate successful replays for stub purposes.
-            succeeded.append(action_id)
-            self._actions[action_id].replay_status = "SUCCEEDED"
+        # Update action replay status
+        if not request.options.dry_run:
+            for action_id in succeeded:
+                self._actions[action_id].replay_status = "SUCCEEDED"
+            for action_id in failed:
+                self._actions[action_id].replay_status = "FAILED"
+
+        # Build logs from execution results
+        logs = [
+            audit_log_event_id,
+            f"Replay triggered by {actor.id} using strategy={request.strategy}",
+        ]
+        for result in results:
+            if result.status == ExecutionStatus.SUCCEEDED:
+                logs.append(f"✓ {result.action_id}: {result.output[:100]}")
+            elif result.status == ExecutionStatus.FAILED:
+                logs.append(f"✗ {result.action_id}: {result.error}")
+            elif result.status == ExecutionStatus.SKIPPED:
+                logs.append(f"⊘ {result.action_id}: Skipped")
 
         progress = 1.0 if not request.options.dry_run else 0.0
-        status = "SUCCEEDED" if not failed else "FAILED"
-        logs = [
-            f"Replay triggered by {actor.id} using strategy={request.strategy}",
-            f"Actions processed: {len(request.action_ids)}",
-        ]
+        status = "SUCCEEDED" if not failed else ("PARTIAL" if succeeded else "FAILED")
+        started_at = created_at
+        completed_at = utc_now_iso() if progress == 1.0 else None
+
         replay_status = ReplayStatus(
             replay_id=replay_id,
             status=status,
             progress=progress,
             logs=logs,
             failed_action_ids=failed,
+            action_ids=list(request.action_ids),
+            completed_action_ids=succeeded,
+            audit_log_event_id=audit_log_event_id,
+            strategy=request.strategy,
+            created_at=created_at,
+            started_at=started_at,
+            completed_at=completed_at,
+            actor_id=actor.id,
+            actor_role=actor.role,
+            actor_surface=actor.surface.lower(),
         )
         self._replays[replay_id] = replay_status
         self._telemetry.emit_event(
@@ -152,8 +188,15 @@ class ActionService:
             payload={
                 "action_ids": list(request.action_ids),
                 "status": status,
-                "succeeded": list(succeeded),
-                "failed": list(failed),
+                "succeeded": succeeded,
+                "failed": failed,
+                "progress": progress,
+                "audit_log_event_id": audit_log_event_id,
+                "logs": logs,
+                "created_at": created_at,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "strategy": request.strategy,
             },
             actor=self._actor_payload(actor),
             action_id=replay_id,

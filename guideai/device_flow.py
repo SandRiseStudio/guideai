@@ -19,6 +19,17 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 
+from .auth.providers import (
+    GitHubOAuthProvider,
+    InternalAuthProvider,
+    OAuthProvider,
+    AuthorizationPendingError,
+    SlowDownError,
+    ExpiredTokenError,
+    AccessDeniedError,
+    InvalidCredentialsError,
+    OAuthError,
+)
 from .telemetry import TelemetryClient
 
 
@@ -151,6 +162,8 @@ class DeviceFlowManager:
         access_token_ttl: Optional[int] = None,
         refresh_token_ttl: Optional[int] = None,
         user_code_length: Optional[int] = None,
+        provider: Optional[OAuthProvider] = None,
+        use_real_oauth: bool = False,
     ) -> None:
         self._telemetry = telemetry or TelemetryClient.noop()
         self._verification_uri = (
@@ -173,6 +186,16 @@ class DeviceFlowManager:
             os.getenv("GUIDEAI_DEVICE_USER_CODE_LENGTH", "8")
         )
 
+        # OAuth provider support
+        self._use_real_oauth = use_real_oauth or os.getenv("GUIDEAI_USE_REAL_OAUTH", "").lower() in ("1", "true", "yes")
+        self._provider = provider
+        if self._use_real_oauth and not self._provider:
+            # Default to GitHub provider if real OAuth enabled but no provider specified
+            client_id = os.getenv("OAUTH_CLIENT_ID")
+            client_secret = os.getenv("OAUTH_CLIENT_SECRET")
+            if client_id and client_secret:
+                self._provider = GitHubOAuthProvider(client_id=client_id, client_secret=client_secret)
+
         self._sessions: Dict[str, DeviceAuthorizationSession] = {}
         self._user_code_index: Dict[str, str] = {}
         self._refresh_token_index: Dict[str, str] = {}
@@ -181,6 +204,226 @@ class DeviceFlowManager:
     # ------------------------------------------------------------------
     # Lifecycle helpers
     # ------------------------------------------------------------------
+    async def start_authorization_real_oauth(
+        self,
+        *,
+        scopes: List[str],
+        surface: str,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> DeviceAuthorizationSession:
+        """Create a new device authorization request using real OAuth provider."""
+
+        if not self._provider:
+            raise DeviceFlowError("No OAuth provider configured. Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET.")
+
+        # Start device flow with the OAuth provider
+        device_flow_response = await self._provider.start_device_flow(scopes)
+
+        # Create session with OAuth provider's response
+        created_at = _now()
+        expires_at = created_at + timedelta(seconds=device_flow_response.expires_in)
+
+        session = DeviceAuthorizationSession(
+            device_code=device_flow_response.device_code,
+            user_code=device_flow_response.user_code,
+            client_id="oauth_provider",  # OAuth provider manages client_id
+            scopes=list(scopes),
+            surface=surface,
+            verification_uri=device_flow_response.verification_uri,
+            verification_uri_complete=device_flow_response.verification_uri,
+            created_at=created_at,
+            expires_at=expires_at,
+            poll_interval=device_flow_response.interval,
+            metadata=dict(metadata or {}),
+        )
+
+        with self._lock:
+            self._prune_expired_locked()
+            self._sessions[device_flow_response.device_code] = session
+            self._user_code_index[device_flow_response.user_code] = device_flow_response.device_code
+
+        self._emit_event(
+            "auth_device_flow_started",
+            session,
+            extra={
+                "client_id": "oauth_provider",
+                "scopes": scopes,
+                "surface": surface,
+                "expires_at": _isoformat(expires_at),
+                "provider": "real_oauth",
+            },
+        )
+        return session
+
+    async def start_authorization_internal(
+        self,
+        *,
+        username: str,
+        password: str,
+        surface: str,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> DeviceTokens:
+        """
+        Authenticate using internal auth provider (username/password).
+
+        This bypasses the device flow and directly returns tokens for local/air-gapped environments.
+
+        Args:
+            username: Username for internal authentication
+            password: Password for internal authentication
+            surface: Surface initiating auth (CLI, API, IDE)
+            metadata: Optional metadata about the request
+
+        Returns:
+            DeviceTokens: Access and refresh tokens
+
+        Raises:
+            InvalidCredentialsError: If credentials are invalid
+            DeviceFlowError: If internal provider not configured
+        """
+        if not self._provider or not isinstance(self._provider, InternalAuthProvider):
+            raise DeviceFlowError("Internal auth provider not configured. Use --provider=internal or set GUIDEAI_AUTH_PROVIDER=internal")
+
+        try:
+            # Login with internal provider
+            token_response = await self._provider.login(username, password)
+
+            # Convert to DeviceTokens
+            created_at = _now()
+            access_expires_at = created_at + timedelta(seconds=token_response.expires_in)
+            # Refresh token typically valid for 30 days for internal auth
+            refresh_expires_at = created_at + timedelta(days=30)
+
+            tokens = DeviceTokens(
+                access_token=token_response.access_token,
+                refresh_token=token_response.refresh_token or "",
+                access_token_expires_at=access_expires_at,
+                refresh_token_expires_at=refresh_expires_at,
+                token_type=token_response.token_type,
+            )
+
+            self._emit_event(
+                "auth_internal_login",
+                None,
+                extra={
+                    "username": username,
+                    "surface": surface,
+                    "provider": "internal",
+                    "expires_at": _isoformat(access_expires_at),
+                },
+            )
+
+            return tokens
+
+        except InvalidCredentialsError as exc:
+            self._emit_event(
+                "auth_internal_login_failed",
+                None,
+                extra={
+                    "username": username,
+                    "surface": surface,
+                    "provider": "internal",
+                    "error": str(exc),
+                },
+            )
+            raise
+        except Exception as exc:
+            self._emit_event(
+                "auth_internal_login_error",
+                None,
+                extra={
+                    "username": username,
+                    "surface": surface,
+                    "provider": "internal",
+                    "error": str(exc),
+                },
+            )
+            raise DeviceFlowError(f"Internal authentication failed: {exc}") from exc
+
+    async def register_internal_user(
+        self,
+        *,
+        username: str,
+        password: str,
+        email: Optional[str] = None,
+        surface: str,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> DeviceTokens:
+        """
+        Register a new user with internal auth provider.
+
+        Args:
+            username: Desired username
+            password: Password (min 8 chars)
+            email: Optional email address
+            surface: Surface initiating registration (CLI, API, IDE)
+            metadata: Optional metadata about the request
+
+        Returns:
+            DeviceTokens: Access and refresh tokens for the new user
+
+        Raises:
+            OAuthError: If registration fails (e.g., duplicate username)
+            DeviceFlowError: If internal provider not configured
+        """
+        if not self._provider or not isinstance(self._provider, InternalAuthProvider):
+            raise DeviceFlowError("Internal auth provider not configured")
+
+        try:
+            # Register with internal provider
+            token_response = await self._provider.register(username, password, email or "")
+
+            # Convert to DeviceTokens
+            created_at = _now()
+            access_expires_at = created_at + timedelta(seconds=token_response.expires_in)
+            refresh_expires_at = created_at + timedelta(days=30)
+
+            tokens = DeviceTokens(
+                access_token=token_response.access_token,
+                refresh_token=token_response.refresh_token or "",
+                access_token_expires_at=access_expires_at,
+                refresh_token_expires_at=refresh_expires_at,
+                token_type=token_response.token_type,
+            )
+
+            self._emit_event(
+                "auth_internal_registration",
+                None,
+                extra={
+                    "username": username,
+                    "email": email or "",
+                    "surface": surface,
+                    "provider": "internal",
+                },
+            )
+
+            return tokens
+
+        except OAuthError as exc:
+            self._emit_event(
+                "auth_internal_registration_failed",
+                None,
+                extra={
+                    "username": username,
+                    "surface": surface,
+                    "provider": "internal",
+                    "error": str(exc),
+                },
+            )
+            raise
+        except Exception as exc:
+            self._emit_event(
+                "auth_internal_registration_error",
+                None,
+                extra={
+                    "username": username,
+                    "surface": surface,
+                    "provider": "internal",
+                    "error": str(exc),
+                },
+            )
+            raise DeviceFlowError(f"Internal user registration failed: {exc}") from exc
+
     def start_authorization(
         self,
         *,
@@ -315,6 +558,122 @@ class DeviceFlowManager:
             },
         )
         return session
+
+    async def poll_device_code_real_oauth(self, device_code: str) -> DevicePollResult:
+        """Poll a device code using real OAuth provider."""
+
+        if not self._provider:
+            raise DeviceFlowError("No OAuth provider configured")
+
+        with self._lock:
+            session = self._sessions.get(device_code)
+            if session is None:
+                raise DeviceCodeNotFoundError(f"Device code {device_code} not found")
+            self._update_status_for_expiry(session)
+
+            if session.status is DeviceAuthorizationStatus.EXPIRED:
+                return DevicePollResult(
+                    status=DeviceAuthorizationStatus.EXPIRED,
+                    expires_in=0,
+                )
+
+            if session.status is DeviceAuthorizationStatus.APPROVED:
+                # Already approved, return tokens
+                return DevicePollResult(
+                    status=DeviceAuthorizationStatus.APPROVED,
+                    tokens=session.tokens,
+                    scopes=session.scopes,
+                    client_id=session.client_id,
+                )
+
+            if session.status is DeviceAuthorizationStatus.DENIED:
+                return DevicePollResult(
+                    status=DeviceAuthorizationStatus.DENIED,
+                    denied_reason=session.denied_reason,
+                )
+
+        # Poll OAuth provider
+        try:
+            token_response = await self._provider.poll_token(device_code)
+
+            # Authorization approved! Store tokens
+            with self._lock:
+                session.status = DeviceAuthorizationStatus.APPROVED
+                session.approved_at = _now()
+                session.tokens = DeviceTokens(
+                    access_token=token_response.access_token,
+                    refresh_token=token_response.refresh_token or "",
+                    access_token_expires_at=_now() + timedelta(seconds=token_response.expires_in),
+                    refresh_token_expires_at=_now() + timedelta(days=90),  # Default 90 days
+                    token_type=token_response.token_type,
+                )
+                self._register_tokens_locked(session)
+
+            self._emit_event(
+                "auth_device_flow_approved",
+                session,
+                extra={
+                    "approver": "oauth_provider",
+                    "approver_surface": "oauth",
+                    "provider": "real_oauth",
+                },
+            )
+
+            return DevicePollResult(
+                status=DeviceAuthorizationStatus.APPROVED,
+                tokens=session.tokens,
+                scopes=session.scopes,
+                client_id=session.client_id,
+            )
+
+        except AuthorizationPendingError:
+            # Still pending
+            session.last_poll_at = _now()
+            return DevicePollResult(
+                status=DeviceAuthorizationStatus.PENDING,
+                retry_after=session.poll_interval,
+                expires_in=session.expires_in(),
+            )
+
+        except SlowDownError:
+            # Provider wants us to slow down
+            session.last_poll_at = _now()
+            return DevicePollResult(
+                status=DeviceAuthorizationStatus.PENDING,
+                retry_after=session.poll_interval + 5,  # Add 5 seconds
+                expires_in=session.expires_in(),
+            )
+
+        except ExpiredTokenError:
+            # Device code expired
+            with self._lock:
+                session.status = DeviceAuthorizationStatus.EXPIRED
+            return DevicePollResult(
+                status=DeviceAuthorizationStatus.EXPIRED,
+                expires_in=0,
+            )
+
+        except AccessDeniedError:
+            # User denied authorization
+            with self._lock:
+                session.status = DeviceAuthorizationStatus.DENIED
+                session.denied_at = _now()
+                session.denied_reason = "User denied access"
+
+            self._emit_event(
+                "auth_device_flow_denied",
+                session,
+                extra={
+                    "approver": "oauth_provider",
+                    "approver_surface": "oauth",
+                    "reason": "User denied access",
+                },
+            )
+
+            return DevicePollResult(
+                status=DeviceAuthorizationStatus.DENIED,
+                denied_reason=session.denied_reason,
+            )
 
     def poll_device_code(self, device_code: str) -> DevicePollResult:
         """Poll a device code for completion."""

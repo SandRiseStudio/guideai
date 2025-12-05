@@ -13,9 +13,14 @@ Behaviors Referenced:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import Any, Dict, List
+
+# Set dummy DSNs before importing guideai.api to avoid ValueError at module level
+os.environ.setdefault("GUIDEAI_COMPLIANCE_PG_DSN", "postgresql://user:pass@localhost:5432/db")
+os.environ.setdefault("GUIDEAI_TELEMETRY_PG_DSN", "postgresql://user:pass@localhost:5432/db")
 
 import pytest
 from fastapi.testclient import TestClient
@@ -44,8 +49,10 @@ def rest_adapter(task_service: TaskAssignmentService) -> RestTaskAssignmentAdapt
 
 
 @pytest.fixture
-def api_client() -> TestClient:
+def api_client(monkeypatch) -> TestClient:
     """FastAPI test client for REST endpoint testing."""
+    monkeypatch.setenv("GUIDEAI_COMPLIANCE_PG_DSN", "postgresql://user:pass@localhost:5432/db")
+    monkeypatch.setenv("GUIDEAI_TELEMETRY_PG_DSN", "postgresql://user:pass@localhost:5432/db")
     app = create_app()
     return TestClient(app)
 
@@ -171,15 +178,13 @@ class TestErrorHandlingParity:
             cli_adapter.list_assignments(function="invalid_function_xyz")
 
     def test_rest_invalid_function(self, api_client: TestClient):
-        """REST API currently raises 500 for invalid function (needs error handling)."""
-        # NOTE: This test documents current behavior. Ideally should return 400 BAD REQUEST
-        # with proper error handling in the REST endpoint.
-        with pytest.raises(ValueError, match="Unknown function"):
-            # TestClient will raise the exception since FastAPI doesn't catch ValueError
-            response = api_client.post(
-                "/v1/tasks:listAssignments",
-                json={"function": "invalid_function_xyz"}
-            )
+        """REST API returns 400 for invalid function."""
+        response = api_client.post(
+            "/v1/tasks:listAssignments",
+            json={"function": "invalid_function_xyz"}
+        )
+        assert response.status_code == 400
+        assert "Unknown function" in response.text
 
 
 class TestAdapterConsistency:

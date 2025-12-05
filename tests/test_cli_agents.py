@@ -6,6 +6,9 @@ import pytest
 from guideai import cli
 
 
+pytestmark = pytest.mark.unit
+
+
 @pytest.fixture(autouse=True)
 def reset_cli_state() -> None:
     cli._reset_action_state_for_testing()

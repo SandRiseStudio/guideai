@@ -1,0 +1,282 @@
+# Local Test Suite Blueprint
+# Full services for running integration tests locally
+# Mirrors production topology with all 7 databases
+#
+# Usage:
+#   amprealize plan --blueprint local-test-suite --env development
+#   amprealize apply --blueprint local-test-suite --env development
+#
+# Or with podman-compose directly:
+#   podman-compose -f local-test-suite.yaml up -d
+#   podman-compose -f local-test-suite.yaml --profile streaming up -d
+#
+# Port Conventions (local development):
+#   PostgreSQL: 5432-5438
+#   Redis: 6379
+#   Kafka: 9092 (with streaming profile)
+
+name: local-test-suite
+version: 1.0.0
+
+# =============================================================================
+# MODULES
+# =============================================================================
+modules:
+  core:
+    description: "Core data plane services"
+    enabled: true
+  streaming:
+    description: "Kafka streaming pipeline - optional"
+    enabled: false
+  monitoring:
+    description: "Prometheus/Grafana monitoring - optional"
+    enabled: false
+
+# =============================================================================
+# SERVICES
+# =============================================================================
+# Variable Naming Convention: GUIDEAI_PG_{USER|PASS|DB|HOST|PORT}_{SERVICE}
+# These match the variable names in environments.yaml for seamless amprealize integration.
+#
+services:
+  # ---------------------------------------------------------------------------
+  # MODULE: CORE - Data Stores
+  # ---------------------------------------------------------------------------
+
+  # --- Telemetry Database (Port 5432) ---
+  telemetry-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_TELEMETRY:-5432}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_TELEMETRY:-telemetry}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Behavior Database (Port 5433) ---
+  behavior-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_BEHAVIOR:-5433}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_BEHAVIOR:-behavior}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_BEHAVIOR:-behavior_dev}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_BEHAVIOR:-behavior}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Workflow Database (Port 5434) ---
+  workflow-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_WORKFLOW:-5434}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_WORKFLOW:-workflow}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_WORKFLOW:-workflow_dev}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_WORKFLOW:-workflow}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Action Database (Port 5435) ---
+  action-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_ACTION:-5435}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_ACTION:-action}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_ACTION:-action_dev}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_ACTION:-action}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Run Database (Port 5436) ---
+  run-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_RUN:-5436}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_RUN:-run}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_RUN:-run_dev}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_RUN:-run}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Compliance Database (Port 5437) ---
+  compliance-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_COMPLIANCE:-5437}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_COMPLIANCE:-compliance}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_COMPLIANCE:-compliance_dev}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_COMPLIANCE:-compliance}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Agent Orchestrator Database (Port 5438) ---
+  orchestrator-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_AGENT_ORCHESTRATOR:-5438}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_AGENT_ORCHESTRATOR:-orchestrator}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_AGENT_ORCHESTRATOR:-orchestrator_dev}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_AGENT_ORCHESTRATOR:-orchestrator}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Metrics Database (Port 5439) ---
+  metrics-db:
+    image: docker.io/timescale/timescaledb:latest-pg15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_METRICS:-5439}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_METRICS:-guideai_metrics_user}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_METRICS:-local_metrics_dev_pw}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_METRICS:-guideai_metrics}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Auth Database (Port 5440) ---
+  auth-db:
+    image: docker.io/library/postgres:15
+    module: core
+    ports:
+      - "${GUIDEAI_PG_PORT_AUTH:-5440}:5432"
+    environment:
+      POSTGRES_USER: "${GUIDEAI_PG_USER_AUTH:-guideai_auth}"
+      POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_AUTH:-dev_auth_pass}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_AUTH:-guideai_auth}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- Redis Cache ---
+  redis:
+    image: docker.io/library/redis:7-alpine
+    module: core
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- NGINX Reverse Proxy ---
+  # Proxies requests to host machine where API server runs
+  nginx:
+    image: docker.io/library/nginx:alpine
+    module: core
+    ports:
+      - "${NGINX_PORT:-8080}:80"
+    environment:
+      GUIDEAI_STAGING_UPSTREAM_HOST: "${GUIDEAI_API_HOST:-host.containers.internal}"
+      GUIDEAI_STAGING_UPSTREAM_PORT: "${GUIDEAI_API_PORT:-8000}"
+      NGINX_TEMPLATE_VARS: "GUIDEAI_STAGING_UPSTREAM_HOST GUIDEAI_STAGING_UPSTREAM_PORT"
+    volumes:
+      - "${GUIDEAI_REPO_ROOT:-/Users/nick/guideai}/deployment/config/nginx-staging.conf:/etc/nginx/nginx.conf.template:ro"
+      - "${GUIDEAI_REPO_ROOT:-/Users/nick/guideai}/deployment/scripts/nginx-entrypoint.sh:/etc/nginx/start-guideai.sh:ro"
+    command: ["/bin/sh", "/etc/nginx/start-guideai.sh"]
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # MODULE: STREAMING (Optional)
+  # ---------------------------------------------------------------------------
+
+  zookeeper:
+    image: docker.io/confluentinc/cp-zookeeper:7.5.0
+    module: streaming
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep -q imok || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  kafka:
+    image: docker.io/confluentinc/cp-kafka:7.5.0
+    module: streaming
+    depends_on:
+      - zookeeper
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-10092}:9092"
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_EXTERNAL_PORT:-10092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # MODULE: MONITORING (Optional)
+  # ---------------------------------------------------------------------------
+
+  prometheus:
+    image: docker.io/prom/prometheus:v2.47.0
+    module: monitoring
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: docker.io/grafana/grafana:10.1.0
+    module: monitoring
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin

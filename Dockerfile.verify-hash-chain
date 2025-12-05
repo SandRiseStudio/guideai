@@ -1,0 +1,54 @@
+# Dockerfile for Hash Chain Verification Cloud Run Job
+#
+# This image runs the hash chain verification job that validates
+# audit log integrity across storage tiers (PostgreSQL, OpenSearch, S3).
+#
+# Build:
+#   docker build -f Dockerfile.verify-hash-chain -t guideai-verify-hash-chain .
+#
+# Run locally:
+#   docker run --env-file .env guideai-verify-hash-chain --window-hours 24
+#
+# Deploy to Cloud Run:
+#   gcloud run jobs deploy guideai-verify-hash-chain \
+#     --image gcr.io/PROJECT_ID/guideai-verify-hash-chain \
+#     --region us-central1 \
+#     --set-env-vars "GUIDEAI_AUDIT_PG_DSN=..." \
+#     --memory 512Mi \
+#     --cpu 1 \
+#     --task-timeout 15m
+
+FROM python:3.12-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+# We install a minimal set for the verification job
+COPY requirements-verify.txt .
+RUN pip install --no-cache-dir -r requirements-verify.txt
+
+# Copy only what's needed for verification
+COPY guideai/crypto/ guideai/crypto/
+COPY guideai/storage/opensearch_storage.py guideai/storage/
+COPY guideai/config/settings.py guideai/config/
+COPY guideai/__init__.py guideai/
+COPY guideai/config/__init__.py guideai/config/
+COPY guideai/storage/__init__.py guideai/storage/
+COPY scripts/verify_hash_chain.py scripts/
+
+# Create non-root user for security
+RUN useradd -m -s /bin/bash verifier
+USER verifier
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Default command
+ENTRYPOINT ["python", "scripts/verify_hash_chain.py"]
+CMD ["--window-hours", "24"]

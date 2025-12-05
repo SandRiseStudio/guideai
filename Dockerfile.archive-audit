@@ -1,0 +1,28 @@
+# Dockerfile for Audit Log Archival Cloud Run Job
+# Archives aged PostgreSQL partitions to S3 WORM storage
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY scripts/requirements-archive.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy archival script
+COPY scripts/archive_audit_logs.py archive_audit_logs.py
+
+# Run as non-root user
+RUN useradd -m -u 1000 archiver
+USER archiver
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import psycopg2; import boto3; print('ok')"
+
+ENTRYPOINT ["python", "archive_audit_logs.py"]

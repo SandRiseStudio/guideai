@@ -15,6 +15,9 @@ Tool manifest definitions:
 - mcp/tools/auth.authStatus.json
 - mcp/tools/auth.refreshToken.json
 - mcp/tools/auth.logout.json
+- mcp/tools/auth.consentLookup.json
+- mcp/tools/auth.consentApprove.json
+- mcp/tools/auth.consentDeny.json
 
 Usage:
     # For MCP server stdio dispatch:
@@ -58,6 +61,15 @@ from .auth_tokens import (
 )
 from .adapters import MCPDeviceFlowAdapter
 from .telemetry import TelemetryClient
+from .services.agent_auth_service import (
+    AgentAuthService,
+    EnsureGrantRequest,
+    ListGrantsRequest,
+    PolicyPreviewRequest,
+    RevokeGrantRequest,
+)
+from .auth.providers.registry import ProviderRegistry
+from .auth.providers.base import OAuthProvider
 
 
 class MCPDeviceFlowService:
@@ -73,6 +85,7 @@ class MCPDeviceFlowService:
         manager: Optional[DeviceFlowManager] = None,
         token_store: Optional[TokenStore] = None,
         telemetry: Optional[TelemetryClient] = None,
+        agent_auth_service: Optional[AgentAuthService] = None,
     ) -> None:
         """
         Initialize MCP device flow service.
@@ -81,10 +94,12 @@ class MCPDeviceFlowService:
             manager: DeviceFlowManager instance (creates default if None)
             token_store: TokenStore instance (uses get_default_token_store if None)
             telemetry: TelemetryClient instance (optional)
+            agent_auth_service: AgentAuthService instance for policy enforcement (optional)
         """
         self._manager = manager or DeviceFlowManager()
         self._token_store = token_store
         self._telemetry = telemetry
+        self._agent_auth_service = agent_auth_service
         self._adapter = MCPDeviceFlowAdapter(self._manager)
 
     def _get_token_store(self) -> TokenStore:
@@ -173,14 +188,20 @@ class MCPDeviceFlowService:
                 poll_result = self._adapter.poll(device_code)
                 status_value = poll_result["status"]
 
-                if status_value == "pending":
+                if status_value.upper() == "PENDING":
                     retry_after = poll_result.get("retry_after", poll_interval)
                     continue
 
-                # Update result with final status
-                result["status"] = status_value
+                # Update result with final status (normalize APPROVED→authorized, DENIED→denied, etc.)
+                status_normalized = {
+                    "APPROVED": "authorized",
+                    "DENIED": "denied",
+                    "EXPIRED": "expired",
+                    "PENDING": "pending",
+                }.get(status_value.upper(), status_value.lower())
+                result["status"] = status_normalized
 
-                if status_value == "authorized":
+                if status_value.upper() == "APPROVED":
                     # Extract tokens from poll result
                     result.update({
                         "access_token": poll_result["access_token"],
@@ -232,7 +253,7 @@ class MCPDeviceFlowService:
 
                     return result
 
-                elif status_value == "denied":
+                elif status_value.upper() == "DENIED":
                     result["error"] = "access_denied"
                     result["error_description"] = poll_result.get("denied_reason", "User denied authorization")
 
@@ -244,7 +265,7 @@ class MCPDeviceFlowService:
 
                     return result
 
-                elif status_value == "expired":
+                elif status_value.upper() == "EXPIRED":
                     result["error"] = "expired_token"
                     result["error_description"] = "Device code expired before user authorization"
 
@@ -463,6 +484,11 @@ class MCPDeviceFlowService:
         Implements auth.logout MCP tool by optionally revoking tokens with
         authorization server (RFC 7009), then clearing KeychainTokenStore.
 
+        RFC 7009 Token Revocation:
+        - Access tokens are revoked to prevent further API access
+        - Refresh tokens are revoked to prevent new token issuance
+        - Revocation is best-effort (graceful degradation on failure)
+
         Args:
             client_id: OAuth client identifier to logout from
             revoke_remote: Whether to revoke with server before clearing (recommended true)
@@ -480,9 +506,40 @@ class MCPDeviceFlowService:
 
             # Revoke with server if requested and tokens exist
             if revoke_remote and bundle and bundle.client_id == client_id:
-                # TODO: Implement remote token revocation (RFC 7009)
-                # For now, just note that it's not yet implemented
-                warnings.append("Remote token revocation not yet implemented")
+                provider_name = getattr(bundle, 'provider', 'github')
+
+                try:
+                    # Get provider for remote revocation
+                    provider = await self._get_oauth_provider(provider_name)
+
+                    if provider:
+                        # RFC 7009: Revoke access token first
+                        if bundle.access_token:
+                            try:
+                                await provider.revoke_token(bundle.access_token)
+                                access_revoked = True
+                            except Exception as e:
+                                warnings.append(f"Access token revocation failed: {e}")
+
+                        # RFC 7009: Revoke refresh token
+                        if bundle.refresh_token:
+                            try:
+                                await provider.revoke_token(bundle.refresh_token)
+                                refresh_revoked = True
+                            except Exception as e:
+                                warnings.append(f"Refresh token revocation failed: {e}")
+
+                        # Clean up provider resources
+                        if hasattr(provider, 'close'):
+                            await provider.close()
+                    else:
+                        warnings.append(f"Provider '{provider_name}' not available for remote revocation")
+
+                except ValueError as e:
+                    # Provider credentials not configured
+                    warnings.append(f"Remote revocation skipped: {e}")
+                except Exception as e:
+                    warnings.append(f"Remote revocation error: {e}")
 
             # Clear local token storage
             tokens_cleared = False
@@ -497,10 +554,19 @@ class MCPDeviceFlowService:
                             "client_id": client_id,
                             "tokens_cleared": True,
                             "remote_revocation_attempted": revoke_remote,
+                            "access_token_revoked": access_revoked,
+                            "refresh_token_revoked": refresh_revoked,
                         },
                     )
 
-            status = "logged_out" if tokens_cleared else "no_tokens"
+            # Determine status based on results
+            if tokens_cleared:
+                if revoke_remote and warnings:
+                    status = "partial_revocation"
+                else:
+                    status = "logged_out"
+            else:
+                status = "no_tokens"
 
             result: Dict[str, Any] = {
                 "status": status,
@@ -523,6 +589,25 @@ class MCPDeviceFlowService:
                 "refresh_token_revoked": False,
                 "error_description": str(exc),
             }
+
+    async def _get_oauth_provider(self, provider_name: str) -> Optional[OAuthProvider]:
+        """
+        Get OAuth provider instance for token revocation.
+
+        Args:
+            provider_name: Provider name (github, google, internal)
+
+        Returns:
+            OAuthProvider instance or None if not available
+
+        Raises:
+            ValueError: If provider credentials not configured
+        """
+        try:
+            return ProviderRegistry.create_provider(provider_name)
+        except ValueError:
+            # Credentials not available - this is expected in some environments
+            return None
 
     @staticmethod
     def _get_storage_path_description(store: TokenStore) -> str:
@@ -597,6 +682,265 @@ class MCPDeviceFlowHandler:
                 client_id=params.get("client_id", "guideai-mcp-client"),
                 revoke_remote=params.get("revoke_remote", True),
             )
+
+        elif tool_name == "auth.ensureGrant":
+            # Policy-based authorization check
+            if not self._service._agent_auth_service:
+                # Fallback to stub response if service not configured
+                return {
+                    "decision": "ALLOW",
+                    "reason": "Policy enforcement not configured - allowing by default",
+                    "grant": {
+                        "grant_id": f"stub-grant-{params.get('agent_id', 'unknown')}",
+                        "scopes": params.get("scopes", []),
+                        "provider": "stub",
+                    },
+                    "audit_action_id": None,
+                }
+
+            # Build request from params
+            request = EnsureGrantRequest(
+                agent_id=params.get("agent_id", "unknown"),
+                surface="MCP",
+                tool_name=params.get("tool_name", "unknown"),
+                scopes=params.get("scopes", []),
+                user_id=params.get("user_id"),
+                context=params.get("context", {}),
+            )
+
+            # Call service
+            response = self._service._agent_auth_service.ensure_grant(request)
+
+            # Map to MCP response format
+            result: Dict[str, Any] = {
+                "decision": response.decision.value,
+                "audit_action_id": response.audit_action_id,
+            }
+
+            if response.reason:
+                result["reason"] = response.reason.value
+
+            if response.consent_url:
+                result["consent_url"] = response.consent_url
+                result["consent_request_id"] = response.consent_request_id
+
+            if response.grant:
+                result["grant"] = {
+                    "grant_id": response.grant.grant_id,
+                    "agent_id": response.grant.agent_id,
+                    "user_id": response.grant.user_id,
+                    "tool_name": response.grant.tool_name,
+                    "scopes": response.grant.scopes,
+                    "provider": response.grant.provider,
+                    "issued_at": response.grant.issued_at,
+                    "expires_at": response.grant.expires_at,
+                    "obligations": [
+                        {"type": ob.type, "attributes": ob.attributes}
+                        for ob in response.grant.obligations
+                    ],
+                }
+
+            return result
+
+        elif tool_name == "auth.listGrants":
+            # List active grants for an agent
+            if not self._service._agent_auth_service:
+                return {"grants": []}
+
+            # agent_id is required
+            agent_id = params.get("agent_id")
+            if not agent_id:
+                return {"grants": [], "error": "agent_id required"}
+
+            # Build request from params
+            request = ListGrantsRequest(
+                agent_id=agent_id,
+                user_id=params.get("user_id"),
+                tool_name=params.get("tool_name"),
+                include_expired=params.get("include_expired", False),
+            )
+
+            # Call service
+            grants = self._service._agent_auth_service.list_grants(request)
+
+            # Map to MCP response format
+            return {
+                "grants": [
+                    {
+                        "grant_id": g.grant_id,
+                        "agent_id": g.agent_id,
+                        "user_id": g.user_id,
+                        "tool_name": g.tool_name,
+                        "scopes": g.scopes,
+                        "provider": g.provider,
+                        "issued_at": g.issued_at,
+                        "expires_at": g.expires_at,
+                        "obligations": [
+                            {"type": ob.type, "attributes": ob.attributes}
+                            for ob in g.obligations
+                        ],
+                    }
+                    for g in grants
+                ]
+            }
+
+        elif tool_name == "auth.policy.preview":
+            # Preview policy decision without creating grant
+            if not self._service._agent_auth_service:
+                return {
+                    "decision": "ALLOW",
+                    "reason": "Policy enforcement not configured - allowing by default",
+                    "bundle_version": None,
+                    "obligations": [],
+                }
+
+            # Build request from params
+            request = PolicyPreviewRequest(
+                agent_id=params.get("agent_id", "unknown"),
+                tool_name=params.get("tool_name", "unknown"),
+                scopes=params.get("scopes", []),
+                user_id=params.get("user_id"),
+                context=params.get("context", {}),
+                bundle_version=params.get("bundle_version"),
+            )
+
+            # Call service
+            response = self._service._agent_auth_service.policy_preview(request)
+
+            # Map to MCP response format
+            result: Dict[str, Any] = {
+                "decision": response.decision.value,
+                "bundle_version": response.bundle_version,
+                "obligations": [
+                    {"type": ob.type, "attributes": ob.attributes}
+                    for ob in response.obligations
+                ],
+            }
+
+            if response.reason:
+                result["reason"] = response.reason.value
+
+            return result
+
+        elif tool_name == "auth.revoke":
+            # Revoke a grant
+            if not self._service._agent_auth_service:
+                grant_id = params.get("grant_id")
+                return {
+                    "grant_id": grant_id,
+                    "success": True,
+                    "reason": "Policy enforcement not configured - stub revocation",
+                }
+
+            # Build request from params
+            grant_id = params.get("grant_id")
+            if not grant_id:
+                return {
+                    "success": False,
+                    "reason": "grant_id required",
+                }
+
+            request = RevokeGrantRequest(
+                grant_id=grant_id,
+                revoked_by=params.get("revoked_by", "MCP"),
+                reason=params.get("reason"),
+            )
+
+            # Call service
+            response = self._service._agent_auth_service.revoke_grant(request)
+
+            # Map to MCP response format
+            result: Dict[str, Any] = {
+                "grant_id": response.grant_id,
+                "success": response.success,
+            }
+
+            if response.reason:
+                result["reason"] = response.reason.value
+
+            return result
+
+        elif tool_name == "auth.consentLookup":
+            # Lookup consent request details by user code
+            user_code = params.get("user_code")
+            if not user_code:
+                return {"error": "user_code required"}
+
+            try:
+                session_data = self._service._adapter.lookup_user_code(user_code)
+                return {
+                    "user_code": session_data["user_code"],
+                    "status": session_data["status"],
+                    "client_id": session_data["client_id"],
+                    "scopes": session_data["scopes"],
+                    "surface": session_data["surface"],
+                    "created_at": session_data["created_at"],
+                    "expires_at": session_data["expires_at"],
+                    "verification_uri": session_data["verification_uri"],
+                    "verification_uri_complete": session_data.get("verification_uri_complete"),
+                    "approved_at": session_data.get("approved_at"),
+                    "denied_at": session_data.get("denied_at"),
+                    "denied_reason": session_data.get("denied_reason"),
+                }
+            except ValueError as e:
+                return {"error": str(e)}
+            except Exception as e:
+                return {"error": f"Consent lookup failed: {str(e)}"}
+
+        elif tool_name == "auth.consentApprove":
+            # Approve a consent request via user code
+            user_code = params.get("user_code")
+            approver = params.get("approver")
+            if not user_code:
+                return {"success": False, "error": "user_code required"}
+            if not approver:
+                return {"success": False, "error": "approver required"}
+
+            try:
+                session_data = self._service._adapter.approve(
+                    user_code=user_code,
+                    approver=approver,
+                    roles=params.get("roles"),
+                    mfa_verified=params.get("mfa_verified", False),
+                )
+                return {
+                    "success": True,
+                    "user_code": session_data["user_code"],
+                    "status": session_data["status"],
+                    "scopes": session_data["scopes"],
+                    "approved_at": session_data.get("approved_at"),
+                }
+            except ValueError as e:
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                return {"success": False, "error": f"Consent approval failed: {str(e)}"}
+
+        elif tool_name == "auth.consentDeny":
+            # Deny a consent request via user code
+            user_code = params.get("user_code")
+            approver = params.get("approver")
+            if not user_code:
+                return {"success": False, "error": "user_code required"}
+            if not approver:
+                return {"success": False, "error": "approver required"}
+
+            try:
+                session_data = self._service._adapter.deny(
+                    user_code=user_code,
+                    approver=approver,
+                    reason=params.get("reason"),
+                )
+                return {
+                    "success": True,
+                    "user_code": session_data["user_code"],
+                    "status": session_data["status"],
+                    "denied_at": session_data.get("denied_at"),
+                    "denied_reason": session_data.get("denied_reason"),
+                }
+            except ValueError as e:
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                return {"success": False, "error": f"Consent denial failed: {str(e)}"}
 
         else:
             raise ValueError(f"Unknown MCP tool: {tool_name}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, List
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -60,8 +61,9 @@ def test_action_endpoints(api_client: TestClient) -> None:
 
 
 def test_behavior_workflow_and_compliance_flows(api_client: TestClient) -> None:
+    unique_suffix = uuid.uuid4().hex[:8]
     behavior_payload = {
-        "name": "Rest Behavior",
+        "name": f"Rest Behavior {unique_suffix}",
         "description": "Test behavior via REST",
         "instruction": "Follow documented workflow",
         "role_focus": "STRATEGIST",
@@ -77,7 +79,7 @@ def test_behavior_workflow_and_compliance_flows(api_client: TestClient) -> None:
     behavior_id = behavior["behavior"]["behavior_id"]
 
     template_payload = {
-        "name": "REST Workflow",
+        "name": f"REST Workflow {unique_suffix}",
         "description": "Exercise API integration",
         "role_focus": "STRATEGIST",
         "steps": [
@@ -116,7 +118,7 @@ def test_behavior_workflow_and_compliance_flows(api_client: TestClient) -> None:
     assert status_resp.json()["run_id"] == run_id
 
     checklist_payload = {
-        "title": "API Compliance",
+        "title": f"API Compliance {unique_suffix}",
         "description": "Ensure parity",
         "template_id": template_id,
         "milestone": "Milestone 2",
@@ -144,6 +146,35 @@ def test_behavior_workflow_and_compliance_flows(api_client: TestClient) -> None:
     )
     assert validate_resp.status_code == 200
     assert "coverage_score" in validate_resp.json()
+
+
+def test_invalid_uuid_paths_return_404(api_client: TestClient) -> None:
+    invalid_id = "not-a-valid-uuid"
+
+    run_resp = api_client.get(f"/v1/runs/{invalid_id}")
+    assert run_resp.status_code == 404
+    assert run_resp.json()["detail"] == "Run not found"
+
+    checklist_resp = api_client.get(f"/v1/compliance/checklists/{invalid_id}")
+    assert checklist_resp.status_code == 404
+    assert checklist_resp.json()["detail"] == "Checklist not found"
+
+    record_resp = api_client.post(
+        f"/v1/compliance/checklists/{invalid_id}/steps",
+        json={
+            "title": "Invalid reference",
+            "status": "PENDING",
+            "evidence": {},
+            "actor": _sample_actor("REST_API"),
+        },
+    )
+    assert record_resp.status_code == 404
+
+    validate_resp = api_client.post(
+        f"/v1/compliance/checklists/{invalid_id}:validate",
+        json={"actor": _sample_actor("REST_API")},
+    )
+    assert validate_resp.status_code == 404
 
 
 def test_task_assignment_and_analytics(api_client: TestClient) -> None:

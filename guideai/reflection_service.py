@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from difflib import SequenceMatcher
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .bci_contracts import (
     PatternCandidate,
     ScoreReusabilityRequest,
     ScoreReusabilityResponse,
-    SegmentTraceRequest,
-    TraceFormat,
     TraceStep,
 )
 from .bci_service import BCIService
@@ -26,6 +23,7 @@ from .reflection_contracts import (
     ReflectionQualityScores,
 )
 from .telemetry import TelemetryClient
+from .trace_analysis_service import TraceAnalysisService, _Snippet
 
 logger = logging.getLogger(__name__)
 
@@ -57,41 +55,6 @@ def _title_case(snippet: str) -> str:
 
 def _sequence_similarity(lhs: str, rhs: str) -> float:
     return SequenceMatcher(None, lhs.lower(), rhs.lower()).ratio()
-
-
-@dataclass
-class _Snippet:
-    text: str
-    steps: Sequence[TraceStep]
-
-
-class TraceAnalysisService:
-    """Lightweight helper focused on trace segmentation and snippet discovery."""
-
-    def __init__(self, *, bci_service: Optional[BCIService] = None) -> None:
-        self._bci_service = bci_service or BCIService()
-
-    def segment(self, *, trace_text: str, trace_format: TraceFormat) -> List[TraceStep]:
-        request = SegmentTraceRequest(trace_text=trace_text, format=trace_format)
-        response = self._bci_service.segment_trace(request)
-        return response.steps
-
-    def iter_snippets(self, steps: Sequence[TraceStep], window_sizes: Sequence[int]) -> Iterable[_Snippet]:
-        normalized = [step for step in steps if step.text.strip()]
-        for window in window_sizes:
-            if window <= 0:
-                continue
-            for start in range(0, len(normalized)):
-                end = start + window
-                if end > len(normalized):
-                    break
-                chunk = normalized[start:end]
-                text = " ".join(step.text.strip() for step in chunk).strip()
-                if not text:
-                    continue
-                if len(text.split()) < 4:
-                    continue
-                yield _Snippet(text=text, steps=chunk)
 
 
 class ReflectionService:
@@ -201,7 +164,7 @@ class ReflectionService:
         duplicate_behavior_id: Optional[str]
         duplicate_behavior_name: Optional[str]
         duplicate_behavior_id, duplicate_behavior_name = self._find_duplicate_behavior(
-            display_name, pattern.instruction
+            display_name, pattern.instruction or ""
         )
 
         examples: List[ReflectionExample] = []
@@ -216,7 +179,7 @@ class ReflectionService:
         return ReflectionCandidate(
             slug=slug,
             display_name=display_name,
-            instruction=pattern.instruction,
+            instruction=pattern.instruction or _normalize_sentence(snippet.text),
             summary=self._summarize_steps(snippet.steps),
             supporting_steps=[step.text for step in snippet.steps],
             examples=examples,
@@ -318,4 +281,4 @@ class ReflectionService:
             logger.debug("Reflection telemetry emission failed", exc_info=True)
 
 
-__all__ = ["ReflectionService", "TraceAnalysisService"]
+__all__ = ["ReflectionService"]

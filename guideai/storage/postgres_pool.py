@@ -3,14 +3,27 @@
 from __future__ import annotations
 
 import os
+import random
 import threading
+import time
 from contextlib import contextmanager
-from typing import Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, TypeVar
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
+from guideai.storage import postgres_metrics
+
+# Import settings for multi-environment configuration
+try:
+    from guideai.config.settings import settings
+    SETTINGS_AVAILABLE = True
+except ImportError:
+    SETTINGS_AVAILABLE = False
+
 __all__ = ["PostgresPool"]
+
+_T = TypeVar("_T")
 
 _POOL_CACHE: Dict[Tuple[str, int, int, int, int, int], Engine] = {}
 _CACHE_LOCK = threading.Lock()
@@ -24,11 +37,21 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _pool_config() -> Tuple[int, int, int, int, int]:
-    pool_size = _int_env("GUIDEAI_PG_POOL_SIZE", 10)
-    max_overflow = _int_env("GUIDEAI_PG_POOL_MAX_OVERFLOW", 20)
-    pool_timeout = _int_env("GUIDEAI_PG_POOL_TIMEOUT", 30)
-    pool_recycle = _int_env("GUIDEAI_PG_POOL_RECYCLE", 1800)
-    connect_timeout = _int_env("GUIDEAI_PG_CONNECT_TIMEOUT", 5)
+    """Get pool configuration from settings or environment variables."""
+    if SETTINGS_AVAILABLE:
+        # Prefer settings.database configuration
+        pool_size = settings.database.pool_size
+        max_overflow = settings.database.max_overflow
+        pool_timeout = settings.database.pool_timeout
+        pool_recycle = _int_env("GUIDEAI_PG_POOL_RECYCLE", 1800)
+        connect_timeout = _int_env("GUIDEAI_PG_CONNECT_TIMEOUT", 5)
+    else:
+        # Fallback to legacy environment variables
+        pool_size = _int_env("GUIDEAI_PG_POOL_SIZE", 10)
+        max_overflow = _int_env("GUIDEAI_PG_POOL_MAX_OVERFLOW", 20)
+        pool_timeout = _int_env("GUIDEAI_PG_POOL_TIMEOUT", 30)
+        pool_recycle = _int_env("GUIDEAI_PG_POOL_RECYCLE", 1800)
+        connect_timeout = _int_env("GUIDEAI_PG_CONNECT_TIMEOUT", 5)
     return pool_size, max_overflow, pool_timeout, pool_recycle, connect_timeout
 
 
@@ -76,9 +99,33 @@ class _ConnectionProxy:
 class PostgresPool:
     """Lightweight wrapper around SQLAlchemy engine for pooled connections."""
 
-    def __init__(self, dsn: str) -> None:
-        self._dsn = dsn
-        self._engine = _get_engine(dsn)
+    def __init__(self, dsn: Optional[str] = None, service_name: Optional[str] = None) -> None:
+        """Initialize PostgresPool with DSN from parameter, settings, or environment.
+
+        Args:
+            dsn: PostgreSQL DSN string. If None, falls back to settings.database.postgres_url
+            service_name: Optional service name for metrics tracking
+        """
+        # Resolve DSN from multiple sources (parameter > settings > error)
+        resolved_dsn: str
+        if dsn is None:
+            if SETTINGS_AVAILABLE:
+                resolved_dsn = settings.database.postgres_url  # type: ignore[possibly-unbound]
+            else:
+                raise ValueError(
+                    "PostgresPool requires dsn parameter or settings module "
+                    "(install pydantic-settings and configure DATABASE__POSTGRES_URL)"
+                )
+        else:
+            resolved_dsn = dsn
+
+        self._dsn = resolved_dsn
+        self._engine = _get_engine(resolved_dsn)
+        self._service_name = service_name or "postgres"
+
+        # Register Prometheus metrics collection if available
+        if service_name and postgres_metrics.PROMETHEUS_AVAILABLE:
+            postgres_metrics.register_pool_metrics(self._engine, service_name)
 
     @contextmanager
     def connection(self, *, autocommit: bool = True):
@@ -90,10 +137,12 @@ class PostgresPool:
                 if hasattr(raw, "autocommit"):
                     raw.autocommit = autocommit
                 yield raw
-                if not autocommit and hasattr(raw, "commit"):
+                # Always commit before returning connection to pool
+                # Even in autocommit mode, ensure any pending statements are flushed
+                if hasattr(raw, "commit") and not hasattr(raw, "_closed"):
                     raw.commit()
             except Exception:
-                if not autocommit and hasattr(raw, "rollback"):
+                if hasattr(raw, "rollback"):
                     raw.rollback()
                 raise
             finally:
@@ -103,6 +152,165 @@ class PostgresPool:
     def proxy(self, *, autocommit: bool = True) -> _ConnectionProxy:
         """Return a compatibility proxy exposing cursor()/commit() helpers."""
         return _ConnectionProxy(self, autocommit=autocommit)
+
+    def run_transaction(
+        self,
+        operation: str,
+        *,
+        service_prefix: str = "postgres",
+        actor: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        executor: Callable[[Any], _T],
+        telemetry: Optional[Any] = None,
+        max_attempts: int = 3,
+        base_retry_delay: float = 0.05,
+    ) -> _T:
+        """Execute a database transaction with retry + telemetry instrumentation.
+
+        Args:
+            operation: Human-readable operation name for logging (e.g., "create_action")
+            service_prefix: Service name for telemetry events (e.g., "action", "behavior")
+            actor: Optional actor metadata dict for telemetry
+            metadata: Optional additional payload for telemetry
+            executor: Callable receiving a connection and returning the result
+            telemetry: Optional TelemetryClient instance for event emission
+            max_attempts: Maximum retry attempts (default: 3)
+            base_retry_delay: Base delay in seconds, exponentially increased per retry (default: 0.05s)
+
+        Returns:
+            The result from the executor callable
+
+        Raises:
+            Exception: The last exception encountered if all retries exhausted
+        """
+        payload_base: Dict[str, Any] = dict(metadata or {})
+        last_exception: Optional[Exception] = None
+
+        # Record transaction attempt for Prometheus
+        postgres_metrics.record_transaction_start(self._service_name, operation)
+
+        start_time = time.time()
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with self.connection(autocommit=False) as conn:
+                    if telemetry:
+                        telemetry.emit_event(
+                            event_type=f"{service_prefix}_transaction_start",
+                            payload={
+                                "operation": operation,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                **payload_base,
+                            },
+                            actor=actor,
+                        )
+
+                    result = executor(conn)
+
+                    if telemetry:
+                        telemetry.emit_event(
+                            event_type=f"{service_prefix}_transaction_commit",
+                            payload={
+                                "operation": operation,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                **payload_base,
+                            },
+                            actor=actor,
+                        )
+
+                    # Record successful transaction duration
+                    duration = time.time() - start_time
+                    postgres_metrics.transaction_duration_seconds.labels(
+                        service=self._service_name, operation=operation
+                    ).observe(duration)
+
+                    return result
+            except Exception as exc:  # noqa: BLE001 - propagate after telemetry
+                last_exception = exc
+                if self._is_retryable_pg_error(exc) and attempt < max_attempts:
+                    # Record retry for Prometheus
+                    postgres_metrics.record_transaction_retry(self._service_name, operation)
+
+                    if telemetry:
+                        telemetry.emit_event(
+                            event_type=f"{service_prefix}_transaction_retry",
+                            payload={
+                                "operation": operation,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "error": str(exc),
+                                **payload_base,
+                            },
+                            actor=actor,
+                        )
+                    # Exponential backoff with jitter
+                    delay = base_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.01)
+                    time.sleep(delay)
+                    continue
+
+                # Record failure for Prometheus
+                error_type = type(exc).__name__
+                postgres_metrics.record_transaction_failure(
+                    self._service_name, operation, error_type
+                )
+
+                if telemetry:
+                    telemetry.emit_event(
+                        event_type=f"{service_prefix}_transaction_failure",
+                        payload={
+                            "operation": operation,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "error": str(exc),
+                            **payload_base,
+                        },
+                        actor=actor,
+                    )
+                raise
+
+        if last_exception is not None:
+            raise last_exception
+        raise RuntimeError(f"Transaction '{operation}' terminated without executing")
+
+    @staticmethod
+    def _is_retryable_pg_error(exc: Exception) -> bool:
+        """Check if a PostgreSQL error is retryable (deadlock or serialization failure)."""
+        # Check for PostgreSQL error codes: 40P01 (deadlock), 40001 (serialization failure)
+        pgcode = getattr(exc, "pgcode", None)
+        if pgcode and pgcode in {"40P01", "40001"}:
+            return True
+
+        # Fallback to message inspection for non-psycopg2 exceptions
+        message = str(exc).lower()
+        return "deadlock detected" in message or "could not serialize access" in message
+
+    def get_pool_stats(self) -> Dict[str, Any]:
+        """Get current connection pool statistics.
+
+        Returns:
+            Dictionary with pool metrics including:
+            - checked_out: Number of connections currently in use
+            - pool_size: Total number of connections in pool
+            - overflow: Number of overflow connections (above pool_size)
+            - available: Number of idle connections available
+        """
+        pool = self._engine.pool
+        checked_out = pool.checkedout()
+        pool_size = pool.size()
+        overflow = pool.overflow() if hasattr(pool, "overflow") else 0
+
+        # Update Prometheus metrics
+        if hasattr(self._engine, "_update_pool_metrics"):
+            self._engine._update_pool_metrics()  # type: ignore[attr-defined]
+
+        return {
+            "service": self._service_name,
+            "checked_out": checked_out,
+            "pool_size": pool_size,
+            "overflow": overflow,
+            "available": pool_size - checked_out,
+        }
 
     def close(self) -> None:
         """Dispose underlying engine connections."""

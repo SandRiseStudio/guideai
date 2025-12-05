@@ -1,0 +1,59 @@
+# Grafana datasource configuration for GuideAI scaling
+# Date: 2025-11-08
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      queryTimeout: 60s
+      timeInterval: 15s
+    version: 1
+
+  - name: GuideAI-Metrics
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    editable: true
+    jsonData:
+      httpMethod: POST
+      queryTimeout: 60s
+      timeInterval: 15s
+      customQueryParameters: 'rate(replication_lag[5m])'
+    version: 1
+
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    url: postgres-behavior:5432
+    database: behaviors
+    user: guideai_user
+    secureJsonData:
+      password: local_dev_pw
+    jsonData:
+      sslmode: 'disable'
+      maxOpenConns: 0
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    version: 1
+
+  - name: GuideAI-Compliance
+    type: postgres
+    access: proxy
+    url: postgres-compliance:5432
+    database: guideai_compliance
+    user: guideai_user
+    secureJsonData:
+      password: local_dev_pw
+    jsonData:
+      sslmode: 'disable'
+      maxOpenConns: 0
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    version: 1

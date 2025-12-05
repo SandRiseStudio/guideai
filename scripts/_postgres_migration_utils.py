@@ -36,12 +36,29 @@ def split_sql_statements(sql: str) -> List[str]:
     current: List[str] = []
     in_single = False
     in_double = False
+    in_line_comment = False
+    in_block_comment = False
     dollar_quote: Optional[str] = None
     length = len(sql)
     i = 0
 
     while i < length:
         ch = sql[i]
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                current.append("\n")
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and i + 1 < length and sql[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
 
         if dollar_quote is not None:
             if sql.startswith(dollar_quote, i):
@@ -52,6 +69,17 @@ def split_sql_statements(sql: str) -> List[str]:
             current.append(ch)
             i += 1
             continue
+
+        if not in_single and not in_double and dollar_quote is None:
+            if ch == "-" and i + 1 < length and sql[i + 1] == "-":
+                in_line_comment = True
+                i += 2
+                continue
+
+            if ch == "/" and i + 1 < length and sql[i + 1] == "*":
+                in_block_comment = True
+                i += 2
+                continue
 
         if not in_single and not in_double and ch == "$":
             j = i + 1

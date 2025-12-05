@@ -71,11 +71,17 @@
           },
           "surface": {
             "type": "string",
-            "enum": ["CLI", "REST_API", "MCP", "WEB"]
+            "enum": ["CLI", "REST_API", "MCP", "WEB", "VSCODE"]
           }
         },
         "required": ["id", "role", "surface"],
         "description": "Actor recording the action"
+      },
+      "tier": {
+        "type": "string",
+        "enum": ["hot", "warm", "cold"],
+        "default": "hot",
+        "description": "Storage tier for the action. hot=recent/frequent access, warm=moderate retention, cold=archive/long-term"
       }
     },
     "required": ["artifact_path", "summary", "behaviors_cited", "actor"]

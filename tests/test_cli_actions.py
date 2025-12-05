@@ -27,6 +27,8 @@ def test_record_action_and_list_actions(capsys: pytest.CaptureFixture[str]) -> N
             "Record from CLI",
             "--behavior",
             "behavior_wire_cli_to_orchestrator",
+            "--audit-log-event-id",
+            "00000000-0000-4000-8000-000000000001",
         ],
         capsys,
     )
@@ -34,12 +36,14 @@ def test_record_action_and_list_actions(capsys: pytest.CaptureFixture[str]) -> N
     assert err == ""
     action_payload = json.loads(out)
     action_id = action_payload["action_id"]
+    assert action_payload["audit_log_event_id"] == "00000000-0000-4000-8000-000000000001"
 
     exit_code, out, err = _run_cli(["list-actions", "--format", "json"], capsys)
     assert exit_code == 0
     assert err == ""
     actions = json.loads(out)
     assert [item["action_id"] for item in actions] == [action_id]
+    assert actions[0]["audit_log_event_id"] == "00000000-0000-4000-8000-000000000001"
 
 
 def test_record_action_merges_metadata(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -69,6 +73,26 @@ def test_record_action_merges_metadata(tmp_path: Path, capsys: pytest.CaptureFix
     assert payload["metadata"]["branch"] == "main"
     assert payload["metadata"]["commit"] == "abc123"
     assert payload["metadata"]["commands"] == ["pytest"]
+
+
+def test_record_action_without_audit_log_defaults_to_none(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code, out, err = _run_cli(
+        [
+            "record-action",
+            "--artifact",
+            "docs/example.md",
+            "--summary",
+            "Record without audit log",
+            "--behavior",
+            "behavior_wire_cli_to_orchestrator",
+        ],
+        capsys,
+    )
+
+    assert exit_code == 0
+    assert err == ""
+    payload = json.loads(out)
+    assert payload.get("audit_log_event_id") is None
 
 
 def test_replay_actions_and_status(capsys: pytest.CaptureFixture[str]) -> None:

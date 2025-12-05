@@ -1,0 +1,10 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.8, pytest-8.4.2, pluggy-1.5.0 -- /Users/nick/miniconda3/bin/python
+cachedir: .pytest_cache
+rootdir: /Users/nick/guideai
+configfile: pyproject.toml
+plugins: cov-4.1.0, anyio-3.7.1, asyncio-0.26.0, langsmith-0.4.8
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 7 items
+
+tests/load/test_service_load.py::test_health_endpoint_load

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from typing import Dict, cast
+
 from guideai.analytics import TelemetryKPIProjector
 from guideai.telemetry import TelemetryEvent
 
@@ -138,6 +140,32 @@ class TelemetryKPIProjectorTests(unittest.TestCase):
         self.assertEqual(len(compliance_facts), 1)
         self.assertEqual(compliance_facts[0]["coverage_score"], 0.8)
 
+        resource_facts_run1 = [fact for fact in projection.fact_resource_usage if fact["run_id"] == "run-1"]
+        self.assertGreaterEqual(len(resource_facts_run1), 2)
+        for fact in resource_facts_run1:
+            self.assertIsInstance(fact["timestamp"], str)
+            self.assertTrue(fact["timestamp"])
+            self.assertIn(fact["service_name"], {"BehaviorService", "ActionService", "RunService", "ComplianceService"})
+            self.assertIsInstance(fact["token_count"], int)
+            token_value = cast(int, fact["token_count"])
+            self.assertGreater(token_value, 0)
+
+        cost_facts = {fact["run_id"]: fact for fact in projection.fact_cost_allocation}
+        self.assertIn("run-1", cost_facts)
+        run1_cost_fact = cost_facts["run-1"]
+        self.assertIsInstance(run1_cost_fact["total_cost_usd"], float)
+        run1_cost = cast(float, run1_cost_fact["total_cost_usd"])
+        self.assertGreater(run1_cost, 0.0)
+        service_costs_obj = run1_cost_fact["service_costs"]
+        self.assertIsInstance(service_costs_obj, dict)
+        service_costs = cast(Dict[str, float], service_costs_obj)
+        self.assertTrue("BehaviorService" in service_costs)
+        total_cost_summary_obj = projection.summary["total_cost_usd"]
+        self.assertIsInstance(total_cost_summary_obj, (int, float))
+        assert isinstance(total_cost_summary_obj, (int, float))
+        total_cost_summary = float(total_cost_summary_obj)
+        self.assertGreaterEqual(total_cost_summary, run1_cost)
+
     def test_accepts_raw_mapping_events(self) -> None:
         raw_events = [
             {
@@ -182,6 +210,12 @@ class TelemetryKPIProjectorTests(unittest.TestCase):
         usage_fact = projection.fact_behavior_usage[0]
         self.assertEqual(usage_fact["baseline_tokens"], 1500)
         self.assertEqual(usage_fact["behavior_ids"], ["behavior-x"])
+        self.assertTrue(projection.fact_resource_usage)
+        self.assertTrue(projection.fact_cost_allocation)
+        total_cost_value = projection.summary["total_cost_usd"]
+        self.assertIsInstance(total_cost_value, (int, float))
+        assert isinstance(total_cost_value, (int, float))
+        self.assertGreater(float(total_cost_value), 0)
 
 
 if __name__ == "__main__":

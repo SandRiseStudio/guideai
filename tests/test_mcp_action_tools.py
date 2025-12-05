@@ -99,7 +99,11 @@ async def test_actions_list_tool(mcp_server):
 
     assert isinstance(result, list)
     assert len(result) >= 1
-    assert result[0]["artifact_path"] == "test/file.py"
+
+    # Find the action we just created
+    created_action = next((a for a in result if a["artifact_path"] == "test/file.py"), None)
+    assert created_action is not None, "Created action not found in list"
+    assert created_action["summary"] == "Test action"
 
 
 @pytest.mark.asyncio

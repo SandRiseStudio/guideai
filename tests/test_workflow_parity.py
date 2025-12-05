@@ -234,6 +234,7 @@ class TestListTemplatesParity:
         result = cli_adapter.list_templates(role_focus=None, tags=None)
         assert len(result) >= 1
         assert any(t["name"] == "List Test" for t in result)
+        assert any(t["created_by"]["surface"] == "CLI" for t in result if t["name"] == "List Test")
 
     def test_cli_list_filtered_by_role(self, cli_adapter: CLIWorkflowServiceAdapter, sample_steps: list):
         cli_adapter.create_template(
@@ -265,6 +266,7 @@ class TestListTemplatesParity:
         result = rest_adapter.list_templates({"tags": ["rest"]})
         assert len(result) >= 1
         assert all("rest" in t.get("tags", []) for t in result)
+        assert all(t["created_by"]["surface"] == "REST_API" for t in result)
 
     def test_mcp_list(self, mcp_adapter: MCPWorkflowServiceAdapter, sample_steps: list):
         mcp_adapter.create_template({
@@ -279,6 +281,7 @@ class TestListTemplatesParity:
 
         result = mcp_adapter.list_templates({"role_focus": "STRATEGIST"})
         assert len(result) >= 1
+        assert all(t["created_by"]["surface"] == "MCP" for t in result)
 
 
 class TestRunWorkflowParity:
@@ -310,6 +313,7 @@ class TestRunWorkflowParity:
         assert run["status"] == "PENDING"
         assert "run_id" in run
         assert run["metadata"]["test"] == "cli"
+        assert run["actor"]["surface"] == "CLI"
 
     def test_rest_run_workflow(self, rest_adapter: RestWorkflowServiceAdapter, sample_steps: list):
         # Create template
@@ -334,6 +338,7 @@ class TestRunWorkflowParity:
         assert run["template_id"] == template["template_id"]
         assert run["status"] == "PENDING"
         assert "run_id" in run
+        assert run["actor"]["surface"] == "REST_API"
 
     def test_mcp_run_workflow(self, mcp_adapter: MCPWorkflowServiceAdapter, sample_steps: list):
         # Create template
@@ -358,6 +363,7 @@ class TestRunWorkflowParity:
         assert run["template_id"] == template["template_id"]
         assert run["status"] == "PENDING"
         assert "run_id" in run
+        assert run["actor"]["surface"] == "MCP"
 
 
 class TestErrorHandling:

@@ -141,6 +141,165 @@ export interface BCIValidateResponse {
 	warnings: string[];
 }
 
+// Cost Analytics interfaces (Customer-Facing)
+export interface CostByServiceRow {
+	service: string;
+	total_cost_usd: number;
+	total_runs: number;
+	avg_cost_per_run: number;
+	pct_of_total: number;
+}
+
+export interface CostByServiceResponse {
+	period_days: number;
+	rows: CostByServiceRow[];
+	total_cost_usd: number;
+}
+
+export interface CostPerRunRow {
+	run_id: string;
+	workflow_name: string;
+	cost_usd: number;
+	tokens_generated: number;
+	created_at: string;
+	status: string;
+}
+
+export interface CostPerRunResponse {
+	period_days: number;
+	rows: CostPerRunRow[];
+	avg_cost_per_run: number;
+	total_runs: number;
+}
+
+export interface ROISummaryResponse {
+	period_days: number;
+	total_cost_usd: number;
+	total_tokens_saved: number;
+	token_savings_value_usd: number;
+	net_cost_usd: number;
+	roi_ratio: number;
+	runs_analyzed: number;
+}
+
+export interface DailyCostRow {
+	date: string;
+	cost_usd: number;
+	runs: number;
+	tokens: number;
+}
+
+export interface DailyCostResponse {
+	period_days: number;
+	rows: DailyCostRow[];
+	avg_daily_cost: number;
+	max_daily_cost: number;
+}
+
+export interface TopExpensiveRow {
+	workflow_id: string;
+	workflow_name: string;
+	total_cost_usd: number;
+	run_count: number;
+	avg_cost_per_run: number;
+}
+
+export interface TopExpensiveResponse {
+	period_days: number;
+	rows: TopExpensiveRow[];
+}
+
+// Run-related interfaces
+export interface Run {
+	run_id: string;
+	status: string;
+	progress_pct: number;
+	actor: {
+		id: string;
+		role: string;
+		surface: string;
+	};
+	workflow_id?: string;
+	workflow_name?: string;
+	template_id?: string;
+	template_name?: string;
+	behavior_ids: string[];
+	initial_message?: string;
+	total_steps?: number;
+	created_at: string;
+	updated_at: string;
+	completed_at?: string;
+	metadata: Record<string, any>;
+	step_current?: {
+		step_id: string;
+		name: string;
+		status: string;
+	};
+	step_progress?: {
+		current: number;
+		total: number;
+	};
+	tokens_generated?: number;
+	tokens_baseline?: number;
+	error?: string;
+	outputs?: Record<string, any>;
+}
+
+// Compliance-related interfaces
+export interface ComplianceChecklist {
+	checklist_id: string;
+	title: string;
+	description: string;
+	template_id?: string;
+	milestone?: string;
+	compliance_category: string[];
+	actor: {
+		id: string;
+		role: string;
+		surface: string;
+	};
+	created_at: string;
+	updated_at: string;
+	status: 'DRAFT' | 'IN_PROGRESS' | 'COMPLETED' | 'APPROVED' | 'REJECTED';
+	progress: {
+		total_steps: number;
+		completed_steps: number;
+		coverage_score: number;
+	};
+	steps: ComplianceStep[];
+}
+
+export interface ComplianceStep {
+	step_id: string;
+	checklist_id: string;
+	title: string;
+	status: 'PENDING' | 'IN_PROGRESS' | 'COMPLETED' | 'BLOCKED' | 'SKIPPED';
+	actor: {
+		id: string;
+		role: string;
+		surface: string;
+	};
+	created_at: string;
+	updated_at: string;
+	completed_at?: string;
+	evidence: Record<string, any>;
+	behaviors_cited: string[];
+	related_run_id?: string;
+	comments: ComplianceComment[];
+}
+
+export interface ComplianceComment {
+	comment_id: string;
+	step_id: string;
+	actor: {
+		id: string;
+		role: string;
+		surface: string;
+	};
+	content: string;
+	created_at: string;
+}
+
 export class GuideAIClient {
 	private pythonPath: string;
 	private cliPath: string;
@@ -148,7 +307,7 @@ export class GuideAIClient {
 	private telemetryEnabled: boolean;
 	private telemetryActorId: string;
 	private telemetryActorRole: string;
-	private readonly telemetrySurface = 'VSCODE';
+	private readonly telemetrySurface = 'MCP';  // IDE-agnostic: works across VS Code, Cursor, Claude Desktop
 
 	constructor(private context: vscode.ExtensionContext) {
 		const config = vscode.workspace.getConfiguration('guideai');
@@ -156,7 +315,7 @@ export class GuideAIClient {
 		this.cliPath = config.get('cliPath', 'guideai');
 		this.outputChannel = vscode.window.createOutputChannel('GuideAI');
 		this.telemetryEnabled = config.get('telemetryEnabled', true);
-		this.telemetryActorId = config.get('telemetryActorId', 'vscode-user');
+		this.telemetryActorId = config.get('telemetryActorId', 'ide-user');  // IDE-agnostic default
 		this.telemetryActorRole = config.get('telemetryActorRole', 'STUDENT');
 	}
 
@@ -315,6 +474,204 @@ export class GuideAIClient {
 		return await this.runCLI(args);
 	}
 
+	// ========================================
+	// RunService Methods (Epic 5.4)
+	// ========================================
+
+	/**
+	 * List all workflow runs with optional filters
+	 */
+	async listRuns(filters?: { status?: string; workflow_id?: string; template_id?: string; limit?: number }): Promise<Run[]> {
+		const args = ['runs', 'list'];
+		if (filters?.status) {
+			args.push('--status', filters.status);
+		}
+		if (filters?.workflow_id) {
+			args.push('--workflow-id', filters.workflow_id);
+		}
+		if (filters?.template_id) {
+			args.push('--template-id', filters.template_id);
+		}
+		if (filters?.limit) {
+			args.push('--limit', String(filters.limit));
+		}
+
+		const startedAt = Date.now();
+		const runs: Run[] = await this.runCLI(args);
+		const latencyMs = Date.now() - startedAt;
+		this.sendTelemetry('runs_retrieved', {
+			source: 'execution_tracker.load',
+			status_filter: filters?.status,
+			workflow_id: filters?.workflow_id,
+			template_id: filters?.template_id,
+			run_count: runs.length,
+			latency_ms: latencyMs,
+			run_ids: runs.map(r => r.run_id)
+		});
+
+		return runs;
+	}
+
+	/**
+	 * Get detailed information about a specific run
+	 */
+	async getRun(runId: string): Promise<Run> {
+		const args = ['runs', 'get', runId];
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Update run progress and status
+	 */
+	async updateRun(runId: string, update: {
+		status?: string;
+		progress_pct?: number;
+		message?: string;
+		step_id?: string;
+		step_name?: string;
+		step_status?: string;
+		tokens_generated?: number;
+		tokens_baseline?: number;
+		metadata?: Record<string, any>;
+	}): Promise<Run> {
+		const args = ['runs', 'update', runId];
+		if (update.status) {
+			args.push('--status', update.status);
+		}
+		if (update.progress_pct !== undefined) {
+			args.push('--progress-pct', String(update.progress_pct));
+		}
+		if (update.message) {
+			args.push('--message', update.message);
+		}
+		if (update.step_id) {
+			args.push('--step-id', update.step_id);
+		}
+		if (update.step_name) {
+			args.push('--step-name', update.step_name);
+		}
+		if (update.step_status) {
+			args.push('--step-status', update.step_status);
+		}
+		if (update.tokens_generated !== undefined) {
+			args.push('--tokens-generated', String(update.tokens_generated));
+		}
+		if (update.tokens_baseline !== undefined) {
+			args.push('--tokens-baseline', String(update.tokens_baseline));
+		}
+		if (update.metadata) {
+			args.push('--metadata', JSON.stringify(update.metadata));
+		}
+
+		return await this.runCLI(args);
+	}
+
+	// ========================================
+	// ComplianceService Methods (Epic 5.5)
+	// ========================================
+
+	/**
+	 * List compliance checklists with optional filters
+	 */
+	async listComplianceChecklists(filters?: {
+		milestone?: string;
+		compliance_category?: string[];
+		status_filter?: string;
+	}): Promise<ComplianceChecklist[]> {
+		const args = ['compliance', 'list-checklists'];
+		if (filters?.milestone) {
+			args.push('--milestone', filters.milestone);
+		}
+		if (filters?.compliance_category && filters.compliance_category.length > 0) {
+			args.push('--category', ...filters.compliance_category);
+		}
+		if (filters?.status_filter) {
+			args.push('--status-filter', filters.status_filter);
+		}
+
+		const startedAt = Date.now();
+		const checklists: ComplianceChecklist[] = await this.runCLI(args);
+		const latencyMs = Date.now() - startedAt;
+		this.sendTelemetry('compliance_checklists_retrieved', {
+			source: 'compliance_panel.load',
+			milestone: filters?.milestone,
+			compliance_category: filters?.compliance_category,
+			status_filter: filters?.status_filter,
+			checklist_count: checklists.length,
+			latency_ms: latencyMs,
+			checklist_ids: checklists.map(c => c.checklist_id)
+		});
+
+		return checklists;
+	}
+
+	/**
+	 * Get detailed information about a specific compliance checklist
+	 */
+	async getComplianceChecklist(checklistId: string): Promise<ComplianceChecklist> {
+		const args = ['compliance', 'get-checklist', checklistId];
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Create a new compliance checklist
+	 */
+	async createComplianceChecklist(checklist: {
+		title: string;
+		description: string;
+		template_id?: string;
+		milestone?: string;
+		compliance_category: string[];
+		actor: { id: string; role: string; surface: string };
+	}): Promise<ComplianceChecklist> {
+		const args = ['compliance', 'create-checklist', checklist.title, '--description', checklist.description];
+		if (checklist.template_id) {
+			args.push('--template-id', checklist.template_id);
+		}
+		if (checklist.milestone) {
+			args.push('--milestone', checklist.milestone);
+		}
+		if (checklist.compliance_category.length > 0) {
+			args.push('--category', ...checklist.compliance_category);
+		}
+
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Record a step in a compliance checklist
+	 */
+	async recordComplianceStep(step: {
+		checklist_id: string;
+		title: string;
+		status: string;
+		evidence?: Record<string, any>;
+		behaviors_cited?: string[];
+		related_run_id?: string;
+		actor: { id: string; role: string; surface: string };
+	}): Promise<ComplianceStep> {
+		const args = ['compliance', 'record-step', step.checklist_id, step.title, '--status', step.status];
+		if (step.evidence) {
+			args.push('--evidence', JSON.stringify(step.evidence));
+		}
+		if (step.behaviors_cited && step.behaviors_cited.length > 0) {
+			args.push('--behaviors-cited', ...step.behaviors_cited);
+		}
+		if (step.related_run_id) {
+			args.push('--related-run-id', step.related_run_id);
+		}
+
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Validate a compliance checklist
+	 */
+	async validateComplianceChecklist(checklistId: string, actor: { id: string; role: string; surface: string }): Promise<any> {
+		const args = ['compliance', 'validate-checklist', checklistId];
+		return await this.runCLI(args);
+	}
+
 	async bciRetrieve(options: BCIRetrieveOptions): Promise<BCIRetrieveResponse> {
 		const args = ['bci', 'retrieve', '--query', options.query];
 		if (options.topK !== undefined) {
@@ -367,10 +724,72 @@ export class GuideAIClient {
 		}
 	}
 
+	// ─────────────────────────────────────────────────────────────────────────────
+	// Cost Analytics (Customer-Facing)
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Convert days to start/end date strings for CLI
+	 */
+	private daysToDateRange(days: number): { startDate: string; endDate: string } {
+		const endDate = new Date();
+		const startDate = new Date();
+		startDate.setDate(startDate.getDate() - days);
+
+		const formatDate = (d: Date) => d.toISOString().split('T')[0];
+		return {
+			startDate: formatDate(startDate),
+			endDate: formatDate(endDate)
+		};
+	}
+
+	/**
+	 * Get cost breakdown by service (LLM, storage, compute, etc.)
+	 */
+	async getCostByService(days: number = 30): Promise<CostByServiceResponse> {
+		const { startDate, endDate } = this.daysToDateRange(days);
+		const args = ['analytics', 'cost-by-service', '--start-date', startDate, '--end-date', endDate];
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Get cost per run statistics
+	 */
+	async getCostPerRun(days: number = 30, limit: number = 100): Promise<CostPerRunResponse> {
+		const { startDate, endDate } = this.daysToDateRange(days);
+		const args = ['analytics', 'cost-per-run', '--start-date', startDate, '--end-date', endDate, '--limit', String(limit)];
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Get ROI summary with token savings value
+	 */
+	async getROISummary(days: number = 30): Promise<ROISummaryResponse> {
+		const args = ['analytics', 'roi-summary'];
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Get daily cost trend
+	 */
+	async getDailyCosts(days: number = 30): Promise<DailyCostResponse> {
+		const { startDate, endDate } = this.daysToDateRange(days);
+		const args = ['analytics', 'daily-costs', '--start-date', startDate, '--end-date', endDate, '--limit', String(days)];
+		return await this.runCLI(args);
+	}
+
+	/**
+	 * Get top expensive workflows
+	 */
+	async getTopExpensiveWorkflows(days: number = 30, limit: number = 10): Promise<TopExpensiveResponse> {
+		const args = ['analytics', 'top-expensive', '--limit', String(limit)];
+		return await this.runCLI(args);
+	}
+
 	/**
 	 * Execute CLI command and return parsed JSON result
 	 */
-	private async runCLI(args: string[], options: { parseJson?: boolean } = {}): Promise<any> {
+	async runCLI(args: string[], options: { parseJson?: boolean } = {}): Promise<any> {
 		const parseJson = options.parseJson !== false;
 		const finalArgs = parseJson ? this.withJsonFormat(args) : args;
 

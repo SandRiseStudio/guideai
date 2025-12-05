@@ -1,35 +1,43 @@
-# Copilot Instructions for guideai
+# Copilot Instructions
 
-## Understand the blueprint first
-- Start with `PRD.md` to grasp the product vision, personas (Strategist/Teacher/Student/Admin), and success metrics (70% behavior reuse, 30% token savings, 80% completion, 95% compliance coverage).
-- Read `MCP_SERVER_DESIGN.md` for the control-plane architecture (BehaviorService, ActionService, RunService, ComplianceService, ReflectionService, MetricsService) and parity expectations across Web, API, CLI, and MCP tools.
-- Consult `ACTION_REGISTRY_SPEC.md` and `REPRODUCIBILITY_STRATEGY.md` to see how every platform action must be recorded and replayable via API/CLI/MCP.
-- Review supporting specs: `RETRIEVAL_ENGINE_PERFORMANCE.md` (retriever SLOs), `TELEMETRY_SCHEMA.md` (event model), `AUDIT_LOG_STORAGE.md` (immutable evidence), `SECRETS_MANAGEMENT_PLAN.md` (auth/rotation), and `ACTION_SERVICE_CONTRACT.md` (parity contract).
+Reference `AGENTS.md` for the full behavior handbook. This file provides quick triggers for common patterns.
 
-## Behaviors & agent workflow
-- Treat `AGENTS.md` as the procedural memory handbook. Reuse existing behaviors before inventing new flows; document any additions there.
-- When updating workflows, ensure they map to the Strategist → Student → Teacher pipeline and cite behaviors (see build examples in `PRD_AGENT_REVIEWS.md`).
+## Quick Triggers
 
-## Keep documents in sync
-- `PRD_NEXT_STEPS.md` lists live follow-up items; update it when plans change.
-- Log cross-document updates in `PRD_ALIGNMENT_LOG.md` so the PRD remains the single source of truth.
-- Maintain `BUILD_TIMELINE.md` whenever new artifacts are created and sync status in `PROGRESS_TRACKER.md` (log updates via `guideai record-action`).
+| Keywords | Behavior |
+|----------|----------|
+| MCP tool, MCP server, IDE extension | `behavior_prefer_mcp_tools` |
+| logging, structured logs, telemetry sink | `behavior_use_raze_for_logging` |
+| environment, blueprint, podman, container | `behavior_use_amprealize_for_environments` |
+| standalone package, reusable service, extract module | `behavior_extract_standalone_package` |
+| secret, credential, leak, gitleaks | `behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials` |
+| execution record, SSE, progress, run status | `behavior_unify_execution_records` |
+| storage adapter, audit log, timeline | `behavior_align_storage_layers` |
+| config path, env var, secrets manager | `behavior_externalize_configuration` |
+| action registry, `guideai record-action` | `behavior_sanitize_action_registry` |
+| telemetry event, Kafka, metrics dashboard | `behavior_instrument_metrics_pipeline` |
+| CORS, auth decorator, bearer token | `behavior_lock_down_security_surface` |
+| git workflow, branching, merge policy | `behavior_git_governance` |
+| ci pipeline, deployment, rollback | `behavior_orchestrate_cicd` |
 
-## Conventions for new work
-- New specs or playbooks should mirror the structure of existing files (mission, checklists, rubrics, escalation rules).
-- Any feature or workflow must include parity notes (Web/API/CLI/MCP) and instrumentation hooks for the PRD metrics.
-- If you touch execution flows, reference the compliance checklist (`agent-compliance-checklist.md`) and note evidence requirements.
+## Key Principles
 
-## Pending implementation cues
-- CLI command names and parameters must align with `ACTION_REGISTRY_SPEC.md` (`guideai record-action`, `guideai replay`, etc.).
-- Analytics outputs should ladder up to the metrics called out in the PRD and MCP design (`analytics.metrics`, `analytics.tokenSavings`, `analytics.behaviorUsage`).
+- **Logging**: Use **Raze** for all structured logging (`packages/raze/`)
+- **Environments**: Use **Amprealize** for container/resource management (`packages/amprealize/`)
+- **MCP-first**: When MCP tools are available, prefer them over manual CLI/API calls—they provide consistent schemas and automatic telemetry
+- **Standalone-first**: When adding significant functionality, consider creating a standalone package under `packages/`
+- **Testing**: Run `pytest` or `npm run build` after changes; record outcomes
+- **Secrets**: Never hardcode; run `pre-commit` before pushing
+- **Docs**: Update `README.md`, `PRD.md`, `BUILD_TIMELINE.md` when APIs/workflows change
 
-## Collaboration reminders
-- Before finalizing, run the relevant agent playbooks (`AGENT_ENGINEERING.md`, `AGENT_DX.md`, `AGENT_COMPLIANCE.md`, `AGENT_PRODUCT.md`, `AGENT_COPYWRITING.md`) to capture feedback.
-- Note any new reusable workflow in `AGENTS.md` and update the capability matrix (once introduced) to keep parity enforced.
-## Additional Instructions
+## Standalone Package Pattern
 
-- Prioritize updating existing documentation files instead of creating new summary documents after every update (languages: TypeScript, JavaScript, Python)
-- Always run pre-commit hooks before pushing code (languages: JavaScript, Python, TypeScript)
-- Use descriptive variable names that explain purpose and intent (languages: JavaScript, TypeScript, Python)
-- Document all public API endpoints with OpenAPI specs (languages: JavaScript, TypeScript, Python)
+When creating reusable functionality, follow the Raze/Amprealize model:
+1. Create under `packages/<name>/` with zero guideai core dependencies
+2. Use hooks/callbacks for integration points
+3. Define optional extras: `[cli]`, `[fastapi]`, `[dev]`
+4. Add thin wrapper in `guideai/<name>/` for service integration
+
+For detailed behavior steps and compliance checklist, see `AGENTS.md`.
+
+_Last synced with AGENTS.md: 2025-11-24_

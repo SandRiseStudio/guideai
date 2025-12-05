@@ -1,186 +1,463 @@
 {
-  "name": "guideai-vscode",
-  "displayName": "GuideAI",
-  "description": "Behavior-conditioned inference for AI agents - access your behavior handbook, compose workflows, track execution, and ensure compliance directly in VS Code",
-  "version": "0.1.0",
-  "publisher": "guideai",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Nas4146/guideai.git"
-  },
-  "engines": {
-    "vscode": "^1.85.0"
-  },
-  "categories": [
-    "Machine Learning",
-    "Other"
-  ],
-  "keywords": [
-    "ai",
-    "llm",
-    "agents",
-    "workflow",
-    "compliance",
-    "behavior"
-  ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
-  "main": "./dist/extension.js",
-  "contributes": {
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "guideai-sidebar",
-          "title": "GuideAI",
-          "icon": "resources/icon.svg"
-        }
-      ]
-    },
-    "views": {
-      "guideai-sidebar": [
-        {
-          "id": "guideai.behaviorSidebar",
-          "name": "Behavior Handbook",
-          "icon": "resources/icon.svg",
-          "contextualTitle": "GuideAI Behaviors"
-        },
-        {
-          "id": "guideai.workflowExplorer",
-          "name": "Workflow Templates",
-          "icon": "resources/workflow.svg",
-          "contextualTitle": "Workflow Templates"
-        }
-      ]
-    },
-    "commands": [
-      {
-        "command": "guideai.refreshBehaviors",
-        "title": "Refresh Behaviors",
-        "category": "GuideAI",
-        "icon": "$(refresh)"
-      },
-      {
-        "command": "guideai.searchBehaviors",
-        "title": "Search Behaviors",
-        "category": "GuideAI",
-        "icon": "$(search)"
-      },
-      {
-        "command": "guideai.insertBehavior",
-        "title": "Insert Behavior Reference",
-        "category": "GuideAI",
-        "icon": "$(add)"
-      },
-      {
-        "command": "guideai.viewBehaviorDetail",
-        "title": "View Behavior Details",
-        "category": "GuideAI"
-      },
-      {
-        "command": "guideai.openPlanComposer",
-        "title": "Open Plan Composer",
-        "category": "GuideAI",
-        "icon": "$(notebook)"
-      },
-      {
-        "command": "guideai.createWorkflow",
-        "title": "Create Workflow from Template",
-        "category": "GuideAI",
-        "icon": "$(new-file)"
-      },
-      {
-        "command": "guideai.runWorkflow",
-        "title": "Run Workflow",
-        "category": "GuideAI",
-        "icon": "$(run)"
-      }
-    ],
-    "menus": {
-      "view/title": [
-        {
-          "command": "guideai.refreshBehaviors",
-          "when": "view == guideai.behaviorSidebar",
-          "group": "navigation"
-        },
-        {
-          "command": "guideai.searchBehaviors",
-          "when": "view == guideai.behaviorSidebar",
-          "group": "navigation"
-        },
-        {
-          "command": "guideai.openPlanComposer",
-          "when": "view == guideai.workflowExplorer",
-          "group": "navigation"
-        }
-      ],
-      "view/item/context": [
-        {
-          "command": "guideai.insertBehavior",
-          "when": "view == guideai.behaviorSidebar && viewItem == behavior",
-          "group": "inline"
-        },
-        {
-          "command": "guideai.viewBehaviorDetail",
-          "when": "view == guideai.behaviorSidebar && viewItem == behavior"
-        },
-        {
-          "command": "guideai.runWorkflow",
-          "when": "view == guideai.workflowExplorer && viewItem == workflow",
-          "group": "inline"
-        }
-      ]
-    },
-    "configuration": {
-      "title": "GuideAI",
-      "properties": {
-        "guideai.pythonPath": {
-          "type": "string",
-          "default": "python",
-          "description": "Path to Python interpreter running guideai CLI"
-        },
-        "guideai.cliPath": {
-          "type": "string",
-          "default": "guideai",
-          "description": "Path to guideai CLI executable"
-        },
-        "guideai.autoRefresh": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically refresh behaviors when the handbook changes"
-        },
-        "guideai.defaultRole": {
-          "type": "string",
-          "enum": ["STRATEGIST", "TEACHER", "STUDENT"],
-          "default": "STRATEGIST",
-          "description": "Default role filter for behavior sidebar"
-        }
-      }
-    }
-  },
-  "scripts": {
-    "vscode:prepublish": "npm run package",
-    "compile": "webpack",
-    "watch": "webpack --watch",
-    "package": "webpack --mode production --devtool hidden-source-map",
-    "compile-tests": "tsc -p . --outDir out",
-    "watch-tests": "tsc -p . -w --outDir out",
-    "pretest": "npm run compile-tests && npm run compile && npm run lint",
-    "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
-  },
-  "devDependencies": {
-    "@types/vscode": "^1.85.0",
-    "@types/node": "^20.x",
-    "@typescript-eslint/eslint-plugin": "^6.15.0",
-    "@typescript-eslint/parser": "^6.15.0",
-    "eslint": "^8.56.0",
-    "typescript": "^5.3.3",
-    "webpack": "^5.89.0",
-    "webpack-cli": "^5.1.4",
-    "ts-loader": "^9.5.1",
-    "@vscode/test-electron": "^2.3.8"
-  },
-  "dependencies": {}
+	"name": "guideai-ide-extension",
+	"displayName": "GuideAI IDE Extension",
+	"description": "GuideAI IDE extension with real-time run monitoring, behavior management, and AI agent orchestration for development workflows",
+	"version": "1.0.0",
+	"publisher": "guideai",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/guideai/guideai"
+	},
+	"homepage": "https://guideai.com",
+	"bugs": {
+		"url": "https://github.com/guideai/guideai/issues"
+	},
+	"engines": {
+		"vscode": "^1.74.0"
+	},
+	"categories": [
+		"Machine Learning",
+		"Extension Packs"
+	],
+	"keywords": [
+		"ai",
+		"machine-learning",
+		"agents",
+		"automation",
+		"workflows",
+		"compliance",
+		"behavior-management",
+		"mcp",
+		"model-context-protocol"
+	],
+	"icon": "resources/icon.svg",
+	"badges": [
+		{
+			"url": "https://img.shields.io/github/v/release/guideai/guideai?label=version",
+			"href": "https://github.com/guideai/guideai/releases",
+			"description": "Latest Release"
+		},
+		{
+			"url": "https://img.shields.io/github/workflow/status/guideai/guideai/CI?label=build",
+			"href": "https://github.com/guideai/guideai/actions/workflows/ci.yml",
+			"description": "Build Status"
+		}
+	],
+	"license": "MIT",
+	"galleryBanner": {
+		"color": "#1e1e1e",
+		"theme": "dark"
+	},
+	"markdown": "github",
+	"qna": "https://github.com/guideai/guideai/discussions",
+	"pricing": "free",
+	"year": "2025",
+	"activationEvents": [
+		"onCommand:guideai.refreshExecutionTracker",
+		"onCommand:guideai.viewRunDetails",
+		"onCommand:guideai.refreshComplianceTracker",
+		"onCommand:guideai.openComplianceReview",
+		"onView:guideai.executionTracker",
+		"onView:guideai.complianceTracker",
+		"onView:guideai.actionTracker"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"views": {
+			"explorer": [
+				{
+					"id": "guideai.executionTracker",
+					"name": "Execution Tracker",
+					"when": "true"
+				},
+				{
+					"id": "guideai.complianceTracker",
+					"name": "Compliance Tracker",
+					"when": "true"
+				},
+				{
+					"id": "guideai.actionTracker",
+					"name": "Action Registry",
+					"when": "true"
+				},
+				{
+					"id": "guideai.costTracker",
+					"name": "Cost Analytics",
+					"when": "true"
+				},
+				{
+					"id": "guideai.behaviorAccuracy",
+					"name": "Behavior Accuracy",
+					"when": "true"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "guideai.refreshExecutionTracker",
+				"title": "Refresh Execution Tracker",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "guideai.viewRunDetails",
+				"title": "View Run Details"
+			},
+			{
+				"command": "guideai.refreshComplianceTracker",
+				"title": "Refresh Compliance Tracker",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "guideai.openComplianceReview",
+				"title": "Open Compliance Review"
+			},
+			{
+				"command": "guideai.createComplianceChecklist",
+				"title": "Create Compliance Checklist"
+			},
+			{
+				"command": "guideai.showOutput",
+				"title": "Show Output"
+			},
+			{
+				"command": "guideai.executionTracker.copyRunId",
+				"title": "Copy Run ID"
+			},
+			{
+				"command": "guideai.executionTracker.refreshRun",
+				"title": "Refresh Run"
+			},
+			{
+				"command": "guideai.complianceTracker.createChecklist",
+				"title": "Create Checklist"
+			},
+			{
+				"command": "guideai.complianceTracker.refreshChecklist",
+				"title": "Refresh Checklist"
+			},
+			{
+				"command": "guideai.mcp.showStatus",
+				"title": "GuideAI: MCP Connection Status",
+				"icon": "$(plug)"
+			},
+			{
+				"command": "guideai.refreshActionTracker",
+				"title": "Refresh Action Registry",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "guideai.openActionTimeline",
+				"title": "GuideAI: Open Action Timeline",
+				"icon": "$(history)"
+			},
+			{
+				"command": "guideai.recordAction",
+				"title": "GuideAI: Record Action",
+				"icon": "$(record)"
+			},
+			{
+				"command": "guideai.listActions",
+				"title": "GuideAI: List Actions"
+			},
+			{
+				"command": "guideai.replayAction",
+				"title": "GuideAI: Replay Action",
+				"icon": "$(play)"
+			},
+			{
+				"command": "guideai.viewActionDetail",
+				"title": "View Action Details"
+			},
+			{
+				"command": "guideai.actionTracker.copyActionId",
+				"title": "Copy Action ID"
+			},
+			{
+				"command": "guideai.actionTracker.filterByBehavior",
+				"title": "Filter by Behavior"
+			},
+			{
+				"command": "guideai.actionTracker.clearFilters",
+				"title": "Clear Filters"
+			},
+			{
+				"command": "guideai.refreshCostTracker",
+				"title": "Refresh Cost Analytics",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "guideai.costTracker.setPeriod7d",
+				"title": "Show Last 7 Days"
+			},
+			{
+				"command": "guideai.costTracker.setPeriod30d",
+				"title": "Show Last 30 Days"
+			},
+			{
+				"command": "guideai.costTracker.setPeriod90d",
+				"title": "Show Last 90 Days"
+			},
+			{
+				"command": "guideai.openBehaviorAccuracy",
+				"title": "GuideAI: Behavior Accuracy Dashboard",
+				"icon": "$(graph)"
+			},
+			{
+				"command": "guideai.submitBehaviorFeedback",
+				"title": "GuideAI: Submit Behavior Feedback",
+				"icon": "$(feedback)"
+			},
+			{
+				"command": "guideai.refreshBehaviorAccuracy",
+				"title": "Refresh Behavior Accuracy",
+				"icon": "$(refresh)"
+			}
+		],
+		"menus": {
+			"view/title": [
+				{
+					"command": "guideai.actionTracker.refresh",
+					"when": "view == guideai.actionTracker",
+					"group": "navigation"
+				},
+				{
+					"command": "guideai.openActionTimeline",
+					"when": "view == guideai.actionTracker",
+					"group": "navigation"
+				},
+				{
+					"command": "guideai.actionTracker.clearFilters",
+					"when": "view == guideai.actionTracker",
+					"group": "1_filters"
+				},
+				{
+					"command": "guideai.refreshCostTracker",
+					"when": "view == guideai.costTracker",
+					"group": "navigation"
+				},
+				{
+					"command": "guideai.costTracker.setPeriod7d",
+					"when": "view == guideai.costTracker",
+					"group": "1_period"
+				},
+				{
+					"command": "guideai.costTracker.setPeriod30d",
+					"when": "view == guideai.costTracker",
+					"group": "1_period"
+				},
+				{
+					"command": "guideai.costTracker.setPeriod90d",
+					"when": "view == guideai.costTracker",
+					"group": "1_period"
+				}
+			],
+			"view/item/context": [
+				{
+					"command": "guideai.viewActionDetail",
+					"when": "view == guideai.actionTracker && viewItem == action-item",
+					"group": "inline"
+				},
+				{
+					"command": "guideai.replayAction",
+					"when": "view == guideai.actionTracker && viewItem == action-item",
+					"group": "inline"
+				},
+				{
+					"command": "guideai.actionTracker.copyActionId",
+					"when": "view == guideai.actionTracker && viewItem == action-item",
+					"group": "1_actions"
+				},
+				{
+					"command": "guideai.actionTracker.filterByBehavior",
+					"when": "view == guideai.actionTracker && viewItem == action-item",
+					"group": "2_filters"
+				}
+			]
+		},
+		"viewItems": {
+			"guideai.actionTracker": [
+				{
+					"id": "action-item",
+					"name": "Action Item"
+				},
+				{
+					"id": "status-group",
+					"name": "Status Group"
+				}
+			],
+			"guideai.executionTracker": [
+				{
+					"id": "run-item",
+					"name": "Run Item"
+				},
+				{
+					"id": "run-running",
+					"name": "Running Run"
+				},
+				{
+					"id": "run-completed",
+					"name": "Completed Run"
+				},
+				{
+					"id": "run-failed",
+					"name": "Failed Run"
+				},
+				{
+					"id": "run-cancelled",
+					"name": "Cancelled Run"
+				},
+				{
+					"id": "run-step",
+					"name": "Run Step"
+				},
+				{
+					"id": "run-step-pending",
+					"name": "Pending Step"
+				},
+				{
+					"id": "run-step-running",
+					"name": "Running Step"
+				},
+				{
+					"id": "run-step-completed",
+					"name": "Completed Step"
+				},
+				{
+					"id": "run-step-failed",
+					"name": "Failed Step"
+				}
+			],
+			"guideai.complianceTracker": [
+				{
+					"id": "checklist-draft",
+					"name": "Draft Checklist"
+				},
+				{
+					"id": "checklist-in-progress",
+					"name": "In Progress Checklist"
+				},
+				{
+					"id": "checklist-completed",
+					"name": "Completed Checklist"
+				},
+				{
+					"id": "checklist-approved",
+					"name": "Approved Checklist"
+				},
+				{
+					"id": "checklist-rejected",
+					"name": "Rejected Checklist"
+				},
+				{
+					"id": "step-pending",
+					"name": "Pending Step"
+				},
+				{
+					"id": "step-in-progress",
+					"name": "In Progress Step"
+				},
+				{
+					"id": "step-completed",
+					"name": "Completed Step"
+				},
+				{
+					"id": "step-blocked",
+					"name": "Blocked Step"
+				},
+				{
+					"id": "step-skipped",
+					"name": "Skipped Step"
+				},
+				{
+					"id": "comment",
+					"name": "Comment"
+				}
+			]
+		},
+		"configuration": {
+			"title": "GuideAI",
+			"properties": {
+				"guideai.pythonPath": {
+					"type": "string",
+					"default": "python",
+					"description": "Path to Python executable for running the GuideAI CLI and MCP server"
+				},
+				"guideai.cliPath": {
+					"type": "string",
+					"default": "guideai",
+					"description": "Path to the GuideAI CLI executable"
+				},
+				"guideai.mcpRequestTimeout": {
+					"type": "number",
+					"default": 30000,
+					"minimum": 1000,
+					"maximum": 300000,
+					"description": "Timeout for individual MCP tool calls in milliseconds (default: 30 seconds)"
+				},
+				"guideai.mcpHeartbeatInterval": {
+					"type": "number",
+					"default": 30000,
+					"minimum": 5000,
+					"maximum": 120000,
+					"description": "Interval between heartbeat pings to MCP server in milliseconds (default: 30 seconds)"
+				},
+				"guideai.mcpMaxReconnectAttempts": {
+					"type": "number",
+					"default": 10,
+					"minimum": 0,
+					"maximum": 100,
+					"description": "Maximum number of automatic reconnection attempts before giving up (0 to disable)"
+				},
+				"guideai.mcpAutoReconnect": {
+					"type": "boolean",
+					"default": true,
+					"description": "Automatically reconnect to MCP server when connection is lost"
+				},
+				"guideai.telemetryEnabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "Enable telemetry for usage analytics and diagnostics"
+				},
+				"guideai.telemetryActorId": {
+					"type": "string",
+					"default": "vscode-user",
+					"description": "Actor ID for telemetry events"
+				},
+				"guideai.telemetryActorRole": {
+					"type": "string",
+					"default": "STUDENT",
+					"enum": ["STUDENT", "TEACHER", "STRATEGIST"],
+					"description": "Actor role for telemetry events"
+				}
+			}
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./",
+		"pretest": "npm run compile && npm run lint",
+		"lint": "eslint src --ext ts",
+		"test": "node ./out/test/runTest.js",
+		"package": "node scripts/package.js",
+		"package:vsix": "vsce package",
+		"publish": "vsce publish"
+	},
+	"devDependencies": {
+		"@types/vscode": "^1.74.0",
+		"@types/node": "16.x",
+		"@types/mocha": "^10.0.6",
+		"@types/glob": "^8.1.0",
+		"@typescript-eslint/eslint-plugin": "^5.59.1",
+		"@typescript-eslint/parser": "^5.59.1",
+		"@vscode/test-electron": "^2.3.8",
+		"@vscode/vsce": "^2.22.0",
+		"eslint": "^8.39.0",
+		"glob": "^8.1.0",
+		"mocha": "^10.2.0",
+		"typescript": "^5.0.4"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.0.0"
+	}
 }

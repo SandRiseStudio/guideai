@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 import unittest
+from typing import Any, Mapping, cast
 
 from guideai.agent_auth import (
     AgentAuthClient,
@@ -13,6 +14,7 @@ from guideai.agent_auth import (
     EnsureGrantRequest,
     GrantDecision,
     ListGrantsRequest,
+    MCP_AUTH_TOOL_NAMES,
     PolicyPreviewRequest,
     RevokeGrantRequest,
 )
@@ -35,19 +37,17 @@ class AgentAuthContractTests(unittest.TestCase):
     def test_rest_schema_definitions_present(self) -> None:
         schema = AgentAuthClient.load_rest_schema()
         self.assertIn("definitions", schema)
-        self.assertIn("EnsureGrantRequest", schema["definitions"])
-        self.assertIn("GrantMetadata", schema["definitions"])
+        definitions_obj = schema["definitions"]
+        self.assertIsInstance(definitions_obj, dict)
+        definitions = cast(Mapping[str, Any], definitions_obj)
+        self.assertIn("EnsureGrantRequest", definitions)
+        self.assertIn("GrantMetadata", definitions)
 
     def test_mcp_tool_contracts_exist(self) -> None:
         tool_names = [json.loads(path.read_text(encoding="utf-8"))["name"] for path in AgentAuthClient.mcp_tool_paths]
         self.assertCountEqual(
             tool_names,
-            [
-                "auth.ensureGrant",
-                "auth.revoke",
-                "auth.listGrants",
-                "auth.policy.preview",
-            ],
+            list(MCP_AUTH_TOOL_NAMES),
         )
 
     def test_scope_catalog_lists_expected_scopes(self) -> None:
@@ -71,11 +71,16 @@ class AgentAuthContractTests(unittest.TestCase):
         self.assertEqual(response.decision, GrantDecision.ALLOW)
         self.assertIsNotNone(response.grant)
         self.assertIsNotNone(response.audit_action_id)
+        initial_grant = response.grant
+        assert initial_grant is not None
 
         # Grant should be returned on subsequent calls without new issuance.
         repeat = self.client.ensure_grant(request)
         self.assertEqual(repeat.decision, GrantDecision.ALLOW)
-        self.assertEqual(repeat.grant.grant_id, response.grant.grant_id)
+        self.assertIsNotNone(repeat.grant)
+        repeat_grant = repeat.grant
+        assert repeat_grant is not None
+        self.assertEqual(repeat_grant.grant_id, initial_grant.grant_id)
 
     def test_consent_flow_for_high_risk_scope(self) -> None:
         request = EnsureGrantRequest(
@@ -102,21 +107,30 @@ class AgentAuthContractTests(unittest.TestCase):
         self.assertEqual(response.reason, DecisionReason.SCOPE_NOT_APPROVED)
         self.assertIsNotNone(response.consent_request_id)
         self.assertIn("/consent/", response.consent_url or "")
+        consent_request_id = response.consent_request_id
+        assert consent_request_id is not None
 
         # Approve the consent and ensure subsequent calls allow execution.
-        grant = self.client.approve_consent(response.consent_request_id, approver="admin-user")
+        grant = self.client.approve_consent(consent_request_id, approver="admin-user")
         self.assertEqual(grant.agent_id, mfa_request.agent_id)
 
         allowed = self.client.ensure_grant(request)
         self.assertEqual(allowed.decision, GrantDecision.ALLOW)
-        self.assertEqual(allowed.grant.grant_id, grant.grant_id)
-        self.assertTrue(any(obligation.type == "mfa" for obligation in allowed.grant.obligations))
+        self.assertIsNotNone(allowed.grant)
+        allowed_grant = allowed.grant
+        assert allowed_grant is not None
+        self.assertEqual(allowed_grant.grant_id, grant.grant_id)
+        self.assertTrue(any(obligation.type == "mfa" for obligation in allowed_grant.obligations))
 
-        decision_events = [event for event in self.telemetry_sink.events if event.event_type == "auth_grant_decision"]
+        decision_events = [
+            event for event in self.telemetry_sink.events if event.event_type == "auth_grant_decision"
+        ]
         self.assertTrue(any(event.payload["decision"] == GrantDecision.DENY.value for event in decision_events))
         self.assertTrue(any(event.payload.get("mfa_required") for event in decision_events))
 
-        consent_events = [event for event in self.telemetry_sink.events if event.event_type == "auth_consent_approved"]
+        consent_events = [
+            event for event in self.telemetry_sink.events if event.event_type == "auth_consent_approved"
+        ]
         self.assertEqual(len(consent_events), 1)
         self.assertTrue(consent_events[0].payload.get("mfa_required"))
 
@@ -129,6 +143,7 @@ class AgentAuthContractTests(unittest.TestCase):
         )
         grant = self.client.ensure_grant(request).grant
         self.assertIsNotNone(grant)
+        assert grant is not None
 
         grants = self.client.list_grants(ListGrantsRequest(agent_id="agent-cli"))
         self.assertEqual(len(grants), 1)
@@ -187,6 +202,7 @@ class AgentAuthContractTests(unittest.TestCase):
         )
         grant = self.client.ensure_grant(request).grant
         self.assertIsNotNone(grant)
+        assert grant is not None
         payload = asdict(grant)
         self.assertIsInstance(payload, dict)
 

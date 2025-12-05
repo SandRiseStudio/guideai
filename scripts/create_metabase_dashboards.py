@@ -650,6 +650,136 @@ ORDER BY coverage_bucket DESC;""",
     return dashboard_id
 
 
+def create_dashboard_5_cost_optimization(client: MetabaseClient, database_id: int) -> int:
+    """Create Dashboard #5: Cost Optimization (PRD 8.17) with 6 cards."""
+    print("\n📊 Creating Dashboard #5: Cost Optimization...")
+
+    dashboard = client.create_dashboard(
+        name="Cost Optimization",
+        description="LLM cost tracking, budget monitoring, and ROI analysis (PRD 8.17)"
+    )
+    dashboard_id = dashboard["id"]
+
+    # Card 1: Total Cost Summary (Scalar)
+    card1 = client.create_native_question(
+        name="Total Cost Summary",
+        sql="""SELECT
+  ROUND(SUM(cost_usd), 4) as total_cost_usd,
+  SUM(total_tokens) as total_tokens,
+  COUNT(DISTINCT run_id) as total_runs
+FROM view_cost_by_run;""",
+        database_id=database_id,
+        visualization_type="table"
+    )
+    client.add_card_to_dashboard(dashboard_id, card1["id"], row=0, col=0, size_x=16, size_y=3)
+
+    # Card 2: Cost by Service (Pie Chart)
+    card2 = client.create_native_question(
+        name="Cost by Service",
+        sql="""SELECT
+  service_name,
+  ROUND(SUM(cost_usd), 4) as total_cost_usd,
+  COUNT(DISTINCT run_id) as run_count
+FROM view_cost_by_run
+GROUP BY service_name
+ORDER BY total_cost_usd DESC;""",
+        database_id=database_id,
+        visualization_type="pie",
+        visualization_settings={
+            "pie.dimension": "service_name",
+            "pie.metric": "total_cost_usd"
+        }
+    )
+    client.add_card_to_dashboard(dashboard_id, card2["id"], row=3, col=0, size_x=8, size_y=4)
+
+    # Card 3: Daily Cost Trend (Line Chart)
+    card3 = client.create_native_question(
+        name="Daily Cost Trend",
+        sql="""SELECT
+  DATE(started_at) as cost_date,
+  ROUND(SUM(cost_usd), 4) as daily_cost_usd,
+  COUNT(DISTINCT run_id) as run_count,
+  SUM(total_tokens) as daily_tokens
+FROM view_cost_by_run
+GROUP BY DATE(started_at)
+ORDER BY cost_date DESC
+LIMIT 30;""",
+        database_id=database_id,
+        visualization_type="line",
+        visualization_settings={
+            "graph.dimensions": ["cost_date"],
+            "graph.metrics": ["daily_cost_usd"],
+            "graph.show_goal": True,
+            "graph.goal_value": 50.0,
+            "graph.goal_label": "Daily Budget"
+        }
+    )
+    client.add_card_to_dashboard(dashboard_id, card3["id"], row=3, col=8, size_x=8, size_y=4)
+
+    # Card 4: Top Expensive Workflows (Bar Chart)
+    card4 = client.create_native_question(
+        name="Top Expensive Workflows",
+        sql="""SELECT
+  COALESCE(template_id, 'ad-hoc') as template_id,
+  ROUND(SUM(cost_usd), 4) as total_cost_usd,
+  COUNT(DISTINCT run_id) as run_count,
+  ROUND(AVG(cost_usd), 4) as avg_cost_per_run
+FROM view_cost_by_run
+GROUP BY template_id
+ORDER BY total_cost_usd DESC
+LIMIT 10;""",
+        database_id=database_id,
+        visualization_type="bar",
+        visualization_settings={
+            "graph.dimensions": ["template_id"],
+            "graph.metrics": ["total_cost_usd"]
+        }
+    )
+    client.add_card_to_dashboard(dashboard_id, card4["id"], row=7, col=0, size_x=8, size_y=4)
+
+    # Card 5: ROI Summary (Table)
+    card5 = client.create_native_question(
+        name="ROI Analysis",
+        sql="""SELECT
+  ROUND(SUM(cost_usd), 4) as total_cost_usd,
+  SUM(tokens_saved) as total_tokens_saved,
+  CASE
+    WHEN SUM(tokens_saved) > 0 THEN ROUND(SUM(cost_usd) / SUM(tokens_saved), 6)
+    ELSE 0
+  END as cost_per_token_saved,
+  CASE
+    WHEN SUM(cost_usd) > 0 THEN ROUND(SUM(tokens_saved) * 0.00001 / SUM(cost_usd), 2)
+    ELSE 0
+  END as efficiency_score,
+  COUNT(DISTINCT run_id) as total_runs
+FROM view_roi_summary;""",
+        database_id=database_id,
+        visualization_type="table"
+    )
+    client.add_card_to_dashboard(dashboard_id, card5["id"], row=7, col=8, size_x=8, size_y=4)
+
+    # Card 6: Cost Per Run Table
+    card6 = client.create_native_question(
+        name="Recent Runs by Cost",
+        sql="""SELECT
+  run_id,
+  COALESCE(template_id, 'ad-hoc') as template,
+  service_name,
+  ROUND(cost_usd, 4) as cost_usd,
+  total_tokens,
+  started_at
+FROM view_cost_by_run
+ORDER BY cost_usd DESC
+LIMIT 25;""",
+        database_id=database_id,
+        visualization_type="table"
+    )
+    client.add_card_to_dashboard(dashboard_id, card6["id"], row=11, col=0, size_x=16, size_y=4)
+
+    print(f"✅ Dashboard #5 complete with 6 cards")
+    return dashboard_id
+
+
 def clean_all_dashboards_and_cards(client: MetabaseClient) -> None:
     """Delete all existing GuideAI dashboards and cards."""
     print("\n🧹 Cleaning up existing dashboards and cards...")
@@ -660,6 +790,7 @@ def clean_all_dashboards_and_cards(client: MetabaseClient) -> None:
         "Behavior Usage Trends",
         "Token Savings Analysis",
         "Compliance Coverage",
+        "Cost Optimization",
     ]
 
     # Card names to delete (all cards from all dashboards)
@@ -686,6 +817,13 @@ def clean_all_dashboards_and_cards(client: MetabaseClient) -> None:
         "Step Completion Summary",
         "Audit Queue (Incomplete Runs)",
         "Coverage Distribution",
+        # Dashboard 5: Cost Optimization
+        "Total Cost Summary",
+        "Cost by Service",
+        "Daily Cost Trend",
+        "Top Expensive Workflows",
+        "ROI Analysis",
+        "Recent Runs by Cost",
     ]
 
     # Delete all dashboards
@@ -734,12 +872,13 @@ def main():
         # Clean up all existing dashboards and cards first
         clean_all_dashboards_and_cards(client)
 
-        # Create all 4 dashboards
+        # Create all 5 dashboards
         dashboard_ids = []
         dashboard_ids.append(create_dashboard_1_prd_kpi_summary(client, database_id))
         dashboard_ids.append(create_dashboard_2_behavior_usage(client, database_id))
         dashboard_ids.append(create_dashboard_3_token_savings(client, database_id))
         dashboard_ids.append(create_dashboard_4_compliance_coverage(client, database_id))
+        dashboard_ids.append(create_dashboard_5_cost_optimization(client, database_id))
 
         # Success summary
         print("\n" + "=" * 60)
@@ -749,7 +888,7 @@ def main():
         for i, dash_id in enumerate(dashboard_ids, 1):
             print(f"  Dashboard #{i}: {metabase_url}/dashboard/{dash_id}")
 
-        print(f"\n💡 Total: 4 dashboards with 18 cards created")
+        print(f"\n💡 Total: 5 dashboards with 24 cards created")
         print(f"🌐 Access Metabase at: {metabase_url}")
 
     except Exception as e:

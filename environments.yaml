@@ -1,0 +1,526 @@
+environments:
+  development:
+    name: "development"
+    description: "Local developer sandbox"
+    default_compliance_tier: "dev"
+    default_lifetime: "infinite"
+    active_modules: ["core"]  # Default: only core services. Use --module streaming for Kafka, --module monitoring for Prometheus/Grafana
+    runtime:
+      provider: "native"
+      auto_start: false
+      auto_init: false
+      memory_limit_mb: 4096
+      cpu_limit: 2
+      network_mbps: 100
+      auto_scaling_strategy: "serialize"
+    infrastructure:
+      blueprint_id: "local-test-suite"
+      teardown_on_exit: false
+    # Embedding optimization for resource-constrained environments (MacBook Air, etc.)
+    # behavior_curate_behavior_handbook: Use lightweight model + lazy loading to conserve memory
+    embedding:
+      model_name: "sentence-transformers/all-MiniLM-L6-v2"  # 80MB vs 2.3GB BGE-M3
+      lazy_load: true  # Defer model load until first query
+      cache_size: 500  # Smaller cache for limited RAM
+      rollout_percentage: 100  # Always use new model in dev (saves ~3GB RAM)
+    variables:
+      GUIDEAI_ENV: "development"
+      # Embedding Configuration (behavior_instrument_metrics_pipeline)
+      EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
+      EMBEDDING_MODEL_LAZY_LOAD: "true"
+      EMBEDDING_CACHE_SIZE: "500"
+      EMBEDDING_ROLLOUT_PERCENTAGE: "100"
+      # Telemetry
+      GUIDEAI_PG_HOST_TELEMETRY: "localhost"
+      GUIDEAI_PG_PORT_TELEMETRY: "5432"
+      GUIDEAI_PG_USER_TELEMETRY: "telemetry"
+      GUIDEAI_PG_PASS_TELEMETRY: "telemetry_dev"
+      GUIDEAI_PG_DB_TELEMETRY: "telemetry"
+      # Behavior
+      GUIDEAI_PG_HOST_BEHAVIOR: "localhost"
+      GUIDEAI_PG_PORT_BEHAVIOR: "5433"
+      GUIDEAI_PG_USER_BEHAVIOR: "behavior"
+      GUIDEAI_PG_PASS_BEHAVIOR: "behavior_dev"
+      GUIDEAI_PG_DB_BEHAVIOR: "behavior"
+      # Workflow
+      GUIDEAI_PG_HOST_WORKFLOW: "localhost"
+      GUIDEAI_PG_PORT_WORKFLOW: "5434"
+      GUIDEAI_PG_USER_WORKFLOW: "workflow"
+      GUIDEAI_PG_PASS_WORKFLOW: "workflow_dev"
+      GUIDEAI_PG_DB_WORKFLOW: "workflow"
+      # Action
+      GUIDEAI_PG_HOST_ACTION: "localhost"
+      GUIDEAI_PG_PORT_ACTION: "5435"
+      GUIDEAI_PG_USER_ACTION: "action"
+      GUIDEAI_PG_PASS_ACTION: "action_dev"
+      GUIDEAI_PG_DB_ACTION: "action"
+      # Run
+      GUIDEAI_PG_HOST_RUN: "localhost"
+      GUIDEAI_PG_PORT_RUN: "5436"
+      GUIDEAI_PG_USER_RUN: "run"
+      GUIDEAI_PG_PASS_RUN: "run_dev"
+      GUIDEAI_PG_DB_RUN: "run"
+      # Compliance
+      GUIDEAI_PG_HOST_COMPLIANCE: "localhost"
+      GUIDEAI_PG_PORT_COMPLIANCE: "5437"
+      GUIDEAI_PG_USER_COMPLIANCE: "compliance"
+      GUIDEAI_PG_PASS_COMPLIANCE: "compliance_dev"
+      GUIDEAI_PG_DB_COMPLIANCE: "compliance"
+      # Agent Orchestrator
+      GUIDEAI_PG_HOST_AGENT_ORCHESTRATOR: "localhost"
+      GUIDEAI_PG_PORT_AGENT_ORCHESTRATOR: "5438"
+      GUIDEAI_PG_USER_AGENT_ORCHESTRATOR: "orchestrator"
+      GUIDEAI_PG_PASS_AGENT_ORCHESTRATOR: "orchestrator_dev"
+      GUIDEAI_PG_DB_AGENT_ORCHESTRATOR: "orchestrator"
+      # Redis
+      REDIS_HOST: "localhost"
+      REDIS_PORT: "6379"
+      REDIS_URL: "redis://localhost:6379/0"
+      # Kafka (optional - streaming tests skip gracefully if unavailable)
+      KAFKA_BOOTSTRAP_SERVERS: "localhost:10092"
+      KAFKA_EXTERNAL_PORT: "10092"
+
+  test:
+    name: "test"
+    description: "CI Amprealize environment"
+    default_compliance_tier: "dev"
+    default_lifetime: "90m"
+    active_modules: ["core"]  # Default: only core services. Use --module streaming for Kafka
+    runtime:
+      provider: "podman"
+      podman_machine: "guideai-ci"
+      auto_init: true
+      auto_start: true
+      memory_limit_mb: 4096  # Reduced from 8192 to leave headroom for pytest
+      cpu_limit: 4
+      network_mbps: 500
+    infrastructure:
+      blueprint_id: "local-test-suite"
+      teardown_on_exit: true
+    # Define exactly which endpoints to wait for (amprealize-driven health checks)
+    required_endpoints:
+      - host: "localhost"
+        port: 5432
+        label: "TimescaleDB Telemetry"
+      - host: "localhost"
+        port: 5433
+        label: "PostgreSQL Behavior"
+      - host: "localhost"
+        port: 5434
+        label: "PostgreSQL Workflow"
+      - host: "localhost"
+        port: 5435
+        label: "PostgreSQL Action"
+      - host: "localhost"
+        port: 5436
+        label: "PostgreSQL Run"
+      - host: "localhost"
+        port: 5437
+        label: "PostgreSQL Compliance"
+      - host: "localhost"
+        port: 5439
+        label: "TimescaleDB Metrics"
+      - host: "localhost"
+        port: 5440
+        label: "PostgreSQL Auth"
+      - host: "localhost"
+        port: 6379
+        label: "Redis"
+    # Embedding optimization for CI (behavior_curate_behavior_handbook)
+    embedding:
+      model_name: "sentence-transformers/all-MiniLM-L6-v2"
+      lazy_load: true
+      cache_size: 1000
+      rollout_percentage: 100  # Full new model for fast CI
+    variables:
+      GUIDEAI_ENV: "test"
+      # Embedding Configuration (behavior_instrument_metrics_pipeline)
+      EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
+      EMBEDDING_MODEL_LAZY_LOAD: "true"
+      EMBEDDING_CACHE_SIZE: "1000"
+      EMBEDDING_ROLLOUT_PERCENTAGE: "100"
+      # Telemetry
+      GUIDEAI_PG_HOST_TELEMETRY: "localhost"
+      GUIDEAI_PG_PORT_TELEMETRY: "5432"
+      GUIDEAI_PG_USER_TELEMETRY: "telemetry"
+      GUIDEAI_PG_PASS_TELEMETRY: "telemetry_dev"
+      GUIDEAI_PG_DB_TELEMETRY: "telemetry"
+      # Behavior
+      GUIDEAI_PG_HOST_BEHAVIOR: "localhost"
+      GUIDEAI_PG_PORT_BEHAVIOR: "5433"
+      GUIDEAI_PG_USER_BEHAVIOR: "behavior"
+      GUIDEAI_PG_PASS_BEHAVIOR: "behavior_dev"
+      GUIDEAI_PG_DB_BEHAVIOR: "behavior"
+      # Workflow
+      GUIDEAI_PG_HOST_WORKFLOW: "localhost"
+      GUIDEAI_PG_PORT_WORKFLOW: "5434"
+      GUIDEAI_PG_USER_WORKFLOW: "workflow"
+      GUIDEAI_PG_PASS_WORKFLOW: "workflow_dev"
+      GUIDEAI_PG_DB_WORKFLOW: "workflow"
+      # Action
+      GUIDEAI_PG_HOST_ACTION: "localhost"
+      GUIDEAI_PG_PORT_ACTION: "5435"
+      GUIDEAI_PG_USER_ACTION: "action"
+      GUIDEAI_PG_PASS_ACTION: "action_dev"
+      GUIDEAI_PG_DB_ACTION: "action"
+      # Run
+      GUIDEAI_PG_HOST_RUN: "localhost"
+      GUIDEAI_PG_PORT_RUN: "5436"
+      GUIDEAI_PG_USER_RUN: "run"
+      GUIDEAI_PG_PASS_RUN: "run_dev"
+      GUIDEAI_PG_DB_RUN: "run"
+      # Compliance
+      GUIDEAI_PG_HOST_COMPLIANCE: "localhost"
+      GUIDEAI_PG_PORT_COMPLIANCE: "5437"
+      GUIDEAI_PG_USER_COMPLIANCE: "compliance"
+      GUIDEAI_PG_PASS_COMPLIANCE: "compliance_dev"
+      GUIDEAI_PG_DB_COMPLIANCE: "compliance"
+      # Agent Orchestrator
+      GUIDEAI_PG_HOST_AGENT_ORCHESTRATOR: "localhost"
+      GUIDEAI_PG_PORT_AGENT_ORCHESTRATOR: "5438"
+      GUIDEAI_PG_USER_AGENT_ORCHESTRATOR: "orchestrator"
+      GUIDEAI_PG_PASS_AGENT_ORCHESTRATOR: "orchestrator_dev"
+      GUIDEAI_PG_DB_AGENT_ORCHESTRATOR: "orchestrator"
+      # Metrics
+      GUIDEAI_PG_HOST_METRICS: "localhost"
+      GUIDEAI_PG_PORT_METRICS: "5439"
+      GUIDEAI_PG_USER_METRICS: "guideai_metrics_user"
+      GUIDEAI_PG_PASS_METRICS: "local_metrics_dev_pw"
+      GUIDEAI_PG_DB_METRICS: "guideai_metrics"
+      # Auth
+      GUIDEAI_PG_HOST_AUTH: "localhost"
+      GUIDEAI_PG_PORT_AUTH: "5440"
+      GUIDEAI_PG_USER_AUTH: "guideai_auth"
+      GUIDEAI_PG_PASS_AUTH: "dev_auth_pass"
+      GUIDEAI_PG_DB_AUTH: "guideai_auth"
+      # Redis
+      REDIS_HOST: "localhost"
+      REDIS_PORT: "6379"
+      REDIS_URL: "redis://localhost:6379/0"
+      # Kafka (optional - streaming tests skip gracefully if unavailable)
+      KAFKA_BOOTSTRAP_SERVERS: "localhost:10092"
+      KAFKA_EXTERNAL_PORT: "10092"
+
+  # Minimal streaming test environment - only 3 containers (Kafka, Zookeeper, Telemetry DB)
+  # Uses ~1GB RAM instead of ~4GB for full test suite
+  # Usage: ./scripts/run_tests.sh --amprealize --env streaming-test -- tests/load/test_streaming_pipeline_load.py
+  streaming-test:
+    name: "streaming-test"
+    description: "Minimal environment for Kafka streaming tests only"
+    default_compliance_tier: "dev"
+    default_lifetime: "30m"
+    active_modules: ["streaming"]
+    runtime:
+      provider: "podman"
+      podman_machine: "guideai-ci"
+      auto_init: true
+      auto_start: true
+      memory_limit_mb: 4096  # Only 4GB needed for minimal stack
+      cpu_limit: 2
+      network_mbps: 500
+    infrastructure:
+      blueprint_id: "streaming-minimal"
+      teardown_on_exit: true
+    # Define exactly which endpoints to wait for (amprealize-driven health checks)
+    required_endpoints:
+      - host: "localhost"
+        port: 6432
+        label: "TimescaleDB Telemetry"
+      - host: "localhost"
+        port: 10092
+        label: "Kafka"
+    variables:
+      GUIDEAI_ENV: "streaming-test"
+      # Telemetry DB (the only PostgreSQL needed)
+      GUIDEAI_PG_HOST_TELEMETRY: "localhost"
+      GUIDEAI_PG_PORT_TELEMETRY: "6432"
+      GUIDEAI_PG_USER_TELEMETRY: "guideai_telemetry"
+      GUIDEAI_PG_PASS_TELEMETRY: "telemetry_test_pass"
+      GUIDEAI_PG_DB_TELEMETRY: "guideai_telemetry"
+      # Kafka
+      KAFKA_BOOTSTRAP_SERVERS: "localhost:10092"
+      KAFKA_EXTERNAL_PORT: "10092"
+
+  staging:
+    name: "staging"
+    description: "Pre-prod validation stack with optional streaming and monitoring"
+    default_compliance_tier: "prod-sim"
+    default_lifetime: "24h"
+    runtime:
+      provider: "podman"
+      podman_machine: "guideai-staging"
+      auto_init: true
+      auto_start: true
+      memory_limit_mb: 12288
+      cpu_limit: 6
+      network_mbps: 1000
+    infrastructure:
+      blueprint_id: "staging"  # Uses new dedicated staging blueprint
+      teardown_on_exit: false
+      # Module configuration for optional features
+      # Enable via: amprealize plan --modules core,streaming,monitoring
+      active_modules:
+        - core  # Always enabled: 7 PostgreSQL DBs + Redis
+        # - streaming  # Optional: Kafka + Zookeeper + Schema Registry
+        # - monitoring  # Optional: Prometheus + Grafana
+      module_profiles:
+        # Predefined profiles for common configurations
+        minimal:
+          modules: ["core"]
+          description: "Core datastores only (7 PostgreSQL + Redis)"
+        with-streaming:
+          modules: ["core", "streaming"]
+          description: "Core + Kafka streaming for telemetry events"
+        with-monitoring:
+          modules: ["core", "monitoring"]
+          description: "Core + Prometheus/Grafana observability"
+        full:
+          modules: ["core", "streaming", "monitoring"]
+          description: "Full staging stack with streaming and monitoring"
+    # Embedding optimization for staging (behavior_instrument_metrics_pipeline)
+    # Gradual rollout: 10% → 50% → 100% with A/B testing
+    embedding:
+      model_name: "sentence-transformers/all-MiniLM-L6-v2"
+      lazy_load: true
+      cache_size: 1000
+      rollout_percentage: 10  # 10% canary phase (Task 8.10.1 Task 8)
+    variables:
+      GUIDEAI_ENV: "staging"
+      # Embedding Configuration (behavior_instrument_metrics_pipeline)
+      EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
+      EMBEDDING_MODEL_LAZY_LOAD: "true"
+      EMBEDDING_CACHE_SIZE: "1000"
+      EMBEDDING_ROLLOUT_PERCENTAGE: "10"
+      # Telemetry (TimescaleDB)
+      GUIDEAI_PG_HOST_TELEMETRY: "localhost"
+      GUIDEAI_PG_PORT_TELEMETRY: "6432"
+      GUIDEAI_PG_USER_TELEMETRY: "guideai_telemetry"
+      GUIDEAI_PG_PASS_TELEMETRY: "telemetry_staging_pass"
+      GUIDEAI_PG_DB_TELEMETRY: "guideai_telemetry"
+      # Behavior (pgvector)
+      GUIDEAI_PG_HOST_BEHAVIOR: "localhost"
+      GUIDEAI_PG_PORT_BEHAVIOR: "5433"
+      GUIDEAI_PG_USER_BEHAVIOR: "guideai_behavior"
+      GUIDEAI_PG_PASS_BEHAVIOR: "behavior_staging_pass"
+      GUIDEAI_PG_DB_BEHAVIOR: "guideai_behavior"
+      # Workflow
+      GUIDEAI_PG_HOST_WORKFLOW: "localhost"
+      GUIDEAI_PG_PORT_WORKFLOW: "5434"
+      GUIDEAI_PG_USER_WORKFLOW: "guideai_workflow"
+      GUIDEAI_PG_PASS_WORKFLOW: "workflow_staging_pass"
+      GUIDEAI_PG_DB_WORKFLOW: "guideai_workflow"
+      # Action
+      GUIDEAI_PG_HOST_ACTION: "localhost"
+      GUIDEAI_PG_PORT_ACTION: "5435"
+      GUIDEAI_PG_USER_ACTION: "guideai_action"
+      GUIDEAI_PG_PASS_ACTION: "action_staging_pass"
+      GUIDEAI_PG_DB_ACTION: "guideai_action"
+      # Run
+      GUIDEAI_PG_HOST_RUN: "localhost"
+      GUIDEAI_PG_PORT_RUN: "5436"
+      GUIDEAI_PG_USER_RUN: "guideai_run"
+      GUIDEAI_PG_PASS_RUN: "run_staging_pass"
+      GUIDEAI_PG_DB_RUN: "guideai_run"
+      # Compliance
+      GUIDEAI_PG_HOST_COMPLIANCE: "localhost"
+      GUIDEAI_PG_PORT_COMPLIANCE: "5437"
+      GUIDEAI_PG_USER_COMPLIANCE: "guideai_compliance"
+      GUIDEAI_PG_PASS_COMPLIANCE: "compliance_staging_pass"
+      GUIDEAI_PG_DB_COMPLIANCE: "guideai_compliance"
+      # Agent Orchestrator
+      GUIDEAI_PG_HOST_AGENT_ORCHESTRATOR: "localhost"
+      GUIDEAI_PG_PORT_AGENT_ORCHESTRATOR: "5438"
+      GUIDEAI_PG_USER_AGENT_ORCHESTRATOR: "guideai_agent_orchestrator"
+      GUIDEAI_PG_PASS_AGENT_ORCHESTRATOR: "agent_orchestrator_staging_pass"
+      GUIDEAI_PG_DB_AGENT_ORCHESTRATOR: "guideai_agent_orchestrator"
+      # Redis
+      REDIS_HOST: "localhost"
+      REDIS_PORT: "6380"
+      REDIS_URL: "redis://localhost:6380/0"
+      # Kafka (when streaming module enabled)
+      KAFKA_BOOTSTRAP_SERVERS: "localhost:9092"
+      KAFKA_SCHEMA_REGISTRY_URL: "http://localhost:8081"
+      # Monitoring (when monitoring module enabled)
+      PROMETHEUS_URL: "http://localhost:9090"
+      GRAFANA_URL: "http://localhost:3001"
+
+  production:
+    name: "production"
+    description: "Long-lived customer workloads"
+    default_compliance_tier: "strict"
+    default_lifetime: "infinite"
+    runtime:
+      provider: "podman"
+      podman_machine: "guideai-prod"
+      auto_init: false
+      auto_start: false
+      memory_limit_mb: 16384
+      cpu_limit: 8
+      network_mbps: 2000
+    infrastructure:
+      blueprint_id: "core-data-plane"
+      teardown_on_exit: false
+    # Embedding optimization for production (behavior_instrument_metrics_pipeline)
+    # Production rollout follows staging validation
+    embedding:
+      model_name: "sentence-transformers/all-MiniLM-L6-v2"
+      lazy_load: true
+      cache_size: 2000  # Larger cache for production traffic
+      rollout_percentage: 0  # Start at 0% until staging validated
+    variables:
+      GUIDEAI_ENV: "production"
+      # Embedding Configuration (behavior_instrument_metrics_pipeline)
+      EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
+      EMBEDDING_MODEL_LAZY_LOAD: "true"
+      EMBEDDING_CACHE_SIZE: "2000"
+      EMBEDDING_ROLLOUT_PERCENTAGE: "0"
+
+  # ==========================================================================
+  # CI Environment (alias for 'test', backwards compatibility)
+  # ==========================================================================
+  # This environment is kept for backwards compatibility with scripts that
+  # reference 'ci' instead of 'test'. It uses the same configuration.
+  ci:
+    name: "ci"
+    description: "Ephemeral CI environment (alias for test)"
+    default_compliance_tier: "dev"
+    default_lifetime: "90m"
+    runtime:
+      provider: "podman"
+      podman_machine: "guideai-ci"
+      podman_connection: "guideai-ci"
+      auto_init: true
+      auto_start: true
+      memory_limit_mb: 8192
+      cpu_limit: 4
+      network_mbps: 500
+    infrastructure:
+      blueprint_id: "ci-test-stack"
+      teardown_on_exit: true
+    embedding:
+      model_name: "sentence-transformers/all-MiniLM-L6-v2"
+      lazy_load: true
+      cache_size: 1000
+      rollout_percentage: 100
+    variables:
+      GUIDEAI_ENV: "ci"
+      EMBEDDING_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
+      EMBEDDING_MODEL_LAZY_LOAD: "true"
+      EMBEDDING_CACHE_SIZE: "1000"
+      EMBEDDING_ROLLOUT_PERCENTAGE: "100"
+      # Telemetry
+      GUIDEAI_PG_HOST_TELEMETRY: "localhost"
+      GUIDEAI_PG_PORT_TELEMETRY: "6432"
+      GUIDEAI_PG_USER_TELEMETRY: "guideai_telemetry"
+      GUIDEAI_PG_PASS_TELEMETRY: "telemetry_test_pass"
+      GUIDEAI_PG_DB_TELEMETRY: "guideai_telemetry"
+      # Behavior
+      GUIDEAI_PG_HOST_BEHAVIOR: "localhost"
+      GUIDEAI_PG_PORT_BEHAVIOR: "6433"
+      GUIDEAI_PG_USER_BEHAVIOR: "guideai_behavior"
+      GUIDEAI_PG_PASS_BEHAVIOR: "behavior_test_pass"
+      GUIDEAI_PG_DB_BEHAVIOR: "guideai_behavior"
+      # Workflow
+      GUIDEAI_PG_HOST_WORKFLOW: "localhost"
+      GUIDEAI_PG_PORT_WORKFLOW: "6434"
+      GUIDEAI_PG_USER_WORKFLOW: "guideai_workflow"
+      GUIDEAI_PG_PASS_WORKFLOW: "workflow_test_pass"
+      GUIDEAI_PG_DB_WORKFLOW: "guideai_workflow"
+      # Action
+      GUIDEAI_PG_HOST_ACTION: "localhost"
+      GUIDEAI_PG_PORT_ACTION: "6435"
+      GUIDEAI_PG_USER_ACTION: "guideai_action"
+      GUIDEAI_PG_PASS_ACTION: "action_test_pass"
+      GUIDEAI_PG_DB_ACTION: "guideai_action"
+      # Run
+      GUIDEAI_PG_HOST_RUN: "localhost"
+      GUIDEAI_PG_PORT_RUN: "6436"
+      GUIDEAI_PG_USER_RUN: "guideai_run"
+      GUIDEAI_PG_PASS_RUN: "run_test_pass"
+      GUIDEAI_PG_DB_RUN: "guideai_run"
+      # Compliance
+      GUIDEAI_PG_HOST_COMPLIANCE: "localhost"
+      GUIDEAI_PG_PORT_COMPLIANCE: "6437"
+      GUIDEAI_PG_USER_COMPLIANCE: "guideai_compliance"
+      GUIDEAI_PG_PASS_COMPLIANCE: "compliance_test_pass"
+      GUIDEAI_PG_DB_COMPLIANCE: "guideai_compliance"
+      # Metrics (TimescaleDB)
+      GUIDEAI_PG_HOST_METRICS: "localhost"
+      GUIDEAI_PG_PORT_METRICS: "6439"
+      GUIDEAI_PG_USER_METRICS: "guideai_metrics_user"
+      GUIDEAI_PG_PASS_METRICS: "local_metrics_dev_pw"
+      GUIDEAI_PG_DB_METRICS: "guideai_metrics"
+      # Auth
+      GUIDEAI_PG_HOST_AUTH: "localhost"
+      GUIDEAI_PG_PORT_AUTH: "6440"
+      GUIDEAI_PG_USER_AUTH: "guideai_auth"
+      GUIDEAI_PG_PASS_AUTH: "auth_test_pass"
+      GUIDEAI_PG_DB_AUTH: "guideai_auth"
+      # Redis
+      REDIS_HOST: "localhost"
+      REDIS_PORT: "6479"
+      REDIS_URL: "redis://localhost:6479/0"
+      # Kafka
+      KAFKA_BOOTSTRAP_SERVERS: "localhost:10092"
+      KAFKA_EXTERNAL_PORT: "10092"
+
+# ==========================================================================
+# ==========================================================================
+# Defines resource requirements and configuration for supported embedding models
+# Used by Amprealize to provision appropriate resources for BehaviorService
+
+embedding_models:
+  # Lightweight model for resource-constrained environments (default)
+  all-MiniLM-L6-v2:
+    name: "sentence-transformers/all-MiniLM-L6-v2"
+    description: "Lightweight 80MB model, good for development and CI"
+    dimensions: 384
+    max_sequence_length: 256
+    resource_requirements:
+      memory_mb: 500
+      disk_mb: 100
+      gpu_required: false
+    performance:
+      throughput_qps: 500
+      latency_p50_ms: 5
+      latency_p99_ms: 15
+    recommended_for: ["development", "ci", "test"]
+
+  # High-quality model for production (BAAI/bge-m3)
+  bge-m3:
+    name: "BAAI/bge-m3"
+    description: "State-of-the-art 2.3GB multilingual model with superior retrieval quality"
+    dimensions: 1024
+    max_sequence_length: 8192
+    resource_requirements:
+      memory_mb: 6144  # ~6GB RAM needed
+      disk_mb: 2500    # 2.3GB model + cache
+      gpu_required: false  # CPU works, GPU recommended
+      gpu_vram_mb: 4096  # If GPU available
+    performance:
+      throughput_qps: 50   # Lower throughput due to size
+      latency_p50_ms: 50   # Higher latency
+      latency_p99_ms: 150
+    migration:
+      # Migration strategy from all-MiniLM-L6-v2 to bge-m3
+      requires_reindex: true
+      rollout_strategy: "canary"
+      canary_percentage: [10, 25, 50, 100]
+      fallback_model: "sentence-transformers/all-MiniLM-L6-v2"
+    recommended_for: ["staging", "production"]
+
+  # Fast embedding for real-time applications
+  bge-small-en-v1.5:
+    name: "BAAI/bge-small-en-v1.5"
+    description: "Balanced 130MB model with good quality/speed tradeoff"
+    dimensions: 384
+    max_sequence_length: 512
+    resource_requirements:
+      memory_mb: 800
+      disk_mb: 150
+      gpu_required: false
+    performance:
+      throughput_qps: 300
+      latency_p50_ms: 8
+      latency_p99_ms: 25
+    recommended_for: ["staging"]

@@ -49,11 +49,17 @@
           },
           "surface": {
             "type": "string",
-            "enum": ["CLI", "REST_API", "MCP", "WEB"]
+            "enum": ["CLI", "REST_API", "MCP", "WEB", "VSCODE"]
           }
         },
         "required": ["id", "role", "surface"],
         "description": "Actor launching replay (requires action.replay scope)"
+      },
+      "tier": {
+        "type": "string",
+        "enum": ["hot", "warm", "cold"],
+        "default": "hot",
+        "description": "Preferred storage tier for replayed actions. Determines data retrieval speed and retention policy."
       }
     },
     "required": ["action_ids", "actor"]

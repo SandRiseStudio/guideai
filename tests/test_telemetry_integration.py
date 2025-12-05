@@ -72,6 +72,8 @@ class TelemetryCLIEmitTests(unittest.TestCase):
     def test_cli_emit_persists_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "events.jsonl"
+            # Ensure we use the file sink by unsetting Postgres DSN
+            old_dsn = os.environ.pop("GUIDEAI_TELEMETRY_PG_DSN", None)
             os.environ["GUIDEAI_TELEMETRY_PATH"] = str(path)
             try:
                 args = argparse.Namespace(
@@ -103,6 +105,8 @@ class TelemetryCLIEmitTests(unittest.TestCase):
                 self.assertEqual(event["payload"]["result_count"], 1)
             finally:
                 os.environ.pop("GUIDEAI_TELEMETRY_PATH", None)
+                if old_dsn:
+                    os.environ["GUIDEAI_TELEMETRY_PG_DSN"] = old_dsn
 
 
 if __name__ == "__main__":

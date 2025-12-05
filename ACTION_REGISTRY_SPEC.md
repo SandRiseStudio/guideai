@@ -160,6 +160,52 @@ guideai record-action \
 4. **Progress Tracker Guardrail:** When `PROGRESS_TRACKER.md` changes, UI enforces action logging before allowing navigation away (ensures reproducibility of progress reporting).
 5. **Agent Review Scheduler:** Strategist can trigger Engineering/DX/Compliance/Product agents from the UI, which records a review action (`reviews.run`). Results summarize in a modal and link to `PRD_AGENT_REVIEWS.md` updates.
 
+## 6.1 VS Code Extension Integration
+The VS Code extension (`extension/`) provides full Action Registry parity via MCP:
+
+**Tree View (Action Tracker)**
+- Located in Explorer sidebar under "GuideAI" container
+- Displays actions grouped by replay status (Not Started, Running, Succeeded, Failed)
+- Context menu: Copy Action ID, Filter by Behavior, View Details, Replay Action
+
+**Commands**
+| Command ID | Title | Description |
+| --- | --- | --- |
+| `guideai.refreshActionTracker` | Refresh Action Tracker | Reload actions from server |
+| `guideai.openActionTimeline` | Open Action Timeline | Open timeline WebView panel |
+| `guideai.recordAction` | Record Action | Quick dialog to record new action |
+| `guideai.listActions` | List Actions | Quick pick to browse actions |
+| `guideai.replayAction` | Replay Action | Start replay with dry-run option |
+| `guideai.viewActionDetail` | View Action Details | Open action in timeline panel |
+| `guideai.actionTracker.copyActionId` | Copy Action ID | Copy ID to clipboard |
+| `guideai.actionTracker.filterByBehavior` | Filter by Behavior | Filter tree by behavior ID |
+| `guideai.actionTracker.clearFilters` | Clear Filters | Remove all filters |
+
+**WebView Panel (Action Timeline)**
+- Timeline visualization of actions with status indicators
+- Quick replay button with dry-run toggle
+- Polling for replay status updates
+- Artifact path and behaviors display
+
+**MCP Client Methods**
+```typescript
+mcpClient.actionCreate({ artifactPath, summary, behaviorsCited, tier? })
+mcpClient.actionList({ artifactPathFilter?, behaviorId?, limit? })
+mcpClient.actionGet({ actionId })
+mcpClient.actionReplay({ actionIds, strategy, options, tier? })
+mcpClient.actionReplayStatus({ replayId })
+```
+
+**Configuration**
+- `guideai.telemetryActorId`: Actor ID for action recording
+- `guideai.telemetryActorRole`: Actor role (STUDENT/TEACHER/STRATEGIST)
+
+**Files**
+- `src/providers/ActionTreeDataProvider.ts`: Tree view provider
+- `src/panels/ActionTimelinePanel.ts`: WebView panel
+- `src/styles/ActionTimelinePanel.css`: Panel styles
+- `src/client/McpClient.ts`: MCP action methods
+
 ## 7. Parity & Testing
 - Contract tests in CI hit REST endpoints and MCP tools using the same schema fixtures.
 - CLI snapshot tests validate command output for create/list/replay/scan flows against golden files.

@@ -1,5 +1,11 @@
 import json
+import os
 from pathlib import Path
+
+try:
+    import psycopg2  # type: ignore[import-not-found]
+except ImportError:
+    psycopg2 = None
 
 from pytest import CaptureFixture, MonkeyPatch, fixture
 
@@ -8,14 +14,66 @@ from guideai import cli
 
 @fixture(autouse=True)
 def reset_cli_state(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    # Use test PostgreSQL database from environment if available
+    # Falls back to SQLite if not configured
+    test_behavior_dsn = os.getenv("GUIDEAI_BEHAVIOR_PG_DSN")
+    if not test_behavior_dsn:
+        # Build DSN from test environment variables (set by run_tests.sh)
+        host = os.getenv("GUIDEAI_PG_HOST_BEHAVIOR", "localhost")
+        port = os.getenv("GUIDEAI_PG_PORT_BEHAVIOR", "6433")
+        user = os.getenv("GUIDEAI_PG_USER_BEHAVIOR", "guideai_behavior")
+        password = os.getenv("GUIDEAI_PG_PASS_BEHAVIOR", "behavior_test_pass")
+        db = os.getenv("GUIDEAI_PG_DB_BEHAVIOR", "guideai_behavior")
+        test_behavior_dsn = f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
+    monkeypatch.setenv("GUIDEAI_BEHAVIOR_PG_DSN", test_behavior_dsn)
     monkeypatch.setenv("GUIDEAI_BEHAVIOR_DB_PATH", str(tmp_path / "behaviors.db"))
     cli._reset_action_state_for_testing()
+
+    # Clean PostgreSQL tables if using PostgreSQL backend
+    if psycopg2 and test_behavior_dsn and test_behavior_dsn.startswith("postgresql://"):
+        try:
+            conn = psycopg2.connect(test_behavior_dsn)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE behavior_versions, behaviors RESTART IDENTITY CASCADE;")
+            conn.close()
+        except Exception:
+            # If truncation fails, tests may see stale data but will continue
+            pass
+
+
+def _filter_progress_bar_output(stderr: str) -> str:
+    """Filter out progress bar output from sentence-transformers/tqdm.
+
+    Progress bars write to stderr but are not errors. They contain patterns like:
+    - "Batches: 100%|..."
+    - ANSI escape sequences for cursor movement
+    - Percentage indicators
+    """
+    import re
+    lines = stderr.split('\n')
+    filtered = []
+    for line in lines:
+        # Skip progress bar lines (contain percentage or batch indicators)
+        if re.search(r'Batches?:?\s*\d*%|\|.*\||\[\d+/\d+\]', line):
+            continue
+        # Skip ANSI escape sequences used by progress bars
+        if re.search(r'\x1b\[[0-9;]*[mK]', line):
+            continue
+        # Skip empty lines that result from progress bar cleanup
+        if line.strip() == '':
+            continue
+        filtered.append(line)
+    return '\n'.join(filtered)
 
 
 def _run_cli(args: list[str], capsys: CaptureFixture[str]) -> tuple[int, str, str]:
     exit_code = cli.main(args)
     captured = capsys.readouterr()
-    return exit_code, captured.out, captured.err
+    # Filter progress bar output from stderr (not actual errors)
+    filtered_err = _filter_progress_bar_output(captured.err)
+    return exit_code, captured.out, filtered_err
 
 
 def test_behaviors_create_update_and_query(capsys: CaptureFixture[str]) -> None:

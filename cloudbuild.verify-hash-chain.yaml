@@ -1,0 +1,117 @@
+# Cloud Build configuration for Hash Chain Verification Job
+#
+# This builds and deploys the verification job to Cloud Run Jobs.
+#
+# Trigger this build:
+#   gcloud builds submit --config cloudbuild.verify-hash-chain.yaml
+#
+# Or set up a trigger for changes to:
+#   - scripts/verify_hash_chain.py
+#   - Dockerfile.verify-hash-chain
+#   - requirements-verify.txt
+
+substitutions:
+  _REGION: 'us-central1'
+  _SERVICE_ACCOUNT: 'guideai-verifier@${PROJECT_ID}.iam.gserviceaccount.com'
+  _SCHEDULE: '0 2 * * *'  # Daily at 2 AM UTC
+
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/guideai-verify-hash-chain:${SHORT_SHA}'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/guideai-verify-hash-chain:latest'
+      - '-f'
+      - 'Dockerfile.verify-hash-chain'
+      - '.'
+    id: 'build'
+
+  # Push the image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/${PROJECT_ID}/guideai-verify-hash-chain:${SHORT_SHA}'
+    id: 'push-sha'
+    waitFor: ['build']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/${PROJECT_ID}/guideai-verify-hash-chain:latest'
+    id: 'push-latest'
+    waitFor: ['build']
+
+  # Deploy to Cloud Run Jobs
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'jobs'
+      - 'deploy'
+      - 'guideai-verify-hash-chain'
+      - '--image=gcr.io/${PROJECT_ID}/guideai-verify-hash-chain:${SHORT_SHA}'
+      - '--region=${_REGION}'
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--task-timeout=15m'
+      - '--max-retries=2'
+      - '--parallelism=1'
+      - '--service-account=${_SERVICE_ACCOUNT}'
+      - '--set-secrets=GUIDEAI_AUDIT_PG_DSN=guideai-audit-pg-dsn:latest'
+      - '--set-secrets=OPENSEARCH_ENDPOINT=guideai-opensearch-endpoint:latest'
+      - '--set-secrets=OPENSEARCH_API_KEY=guideai-opensearch-api-key:latest'
+      - '--set-env-vars=VERIFICATION_WINDOW_HOURS=24'
+    id: 'deploy-job'
+    waitFor: ['push-sha']
+
+  # Create or update Cloud Scheduler trigger
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # Check if scheduler job exists
+        if gcloud scheduler jobs describe guideai-verify-hash-chain \
+            --location=${_REGION} 2>/dev/null; then
+          # Update existing job
+          gcloud scheduler jobs update http guideai-verify-hash-chain \
+            --location=${_REGION} \
+            --schedule="${_SCHEDULE}" \
+            --time-zone="UTC" \
+            --uri="https://${_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/guideai-verify-hash-chain:run" \
+            --http-method=POST \
+            --oauth-service-account-email=${_SERVICE_ACCOUNT}
+        else
+          # Create new scheduler job
+          gcloud scheduler jobs create http guideai-verify-hash-chain \
+            --location=${_REGION} \
+            --schedule="${_SCHEDULE}" \
+            --time-zone="UTC" \
+            --uri="https://${_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/guideai-verify-hash-chain:run" \
+            --http-method=POST \
+            --oauth-service-account-email=${_SERVICE_ACCOUNT}
+        fi
+    id: 'create-scheduler'
+    waitFor: ['deploy-job']
+
+# Store build artifacts
+images:
+  - 'gcr.io/${PROJECT_ID}/guideai-verify-hash-chain:${SHORT_SHA}'
+  - 'gcr.io/${PROJECT_ID}/guideai-verify-hash-chain:latest'
+
+# Build options
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_MEDIUM'
+
+# Build timeout
+timeout: '900s'
+
+# Tags for organization
+tags:
+  - 'guideai'
+  - 'verification'
+  - 'audit-log'

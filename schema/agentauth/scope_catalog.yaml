@@ -75,6 +75,28 @@ scopes:
     tools:
       - analytics.metrics
       - analytics.tokenSavings
+  consent.read:
+    description: "Look up consent status for authorization requests."
+    default_roles:
+      - Strategist
+      - Teacher
+      - Student
+      - Admin
+      - Compliance
+    tools:
+      - consent.lookup
+  consent.manage:
+    description: "Approve or deny consent requests on behalf of the user."
+    default_roles:
+      - Admin
+      - Compliance
+    tools:
+      - consent.approve
+      - consent.deny
+    risk_level: high
+    mfa_required: false
+    # Note: consent.approve/deny are typically user-initiated actions
+    # and don't require MFA since the user is already authenticated
 consent_triggers:
   - tool: auth.ensureGrant
     scopes:

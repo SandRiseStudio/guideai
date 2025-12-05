@@ -1,0 +1,55 @@
+# GuideAI Core API Service - Simplified Build
+# Single-stage for faster staging deployment
+# Last Updated: 2025-12-19
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash guideai && \
+    chown -R guideai:guideai /app
+
+# Copy application code
+COPY --chown=guideai:guideai guideai/ ./guideai/
+COPY --chown=guideai:guideai schema/ ./schema/
+COPY --chown=guideai:guideai pyproject.toml ./
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -e .[telemetry,postgres,redis]
+
+# Create necessary directories
+RUN mkdir -p data/behaviors data/workflows data/actions data/runs data/compliance && \
+    chown -R guideai:guideai data/
+
+# Switch to non-root user
+USER guideai
+
+# Environment configuration
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/home/guideai/.local/bin:$PATH" \
+    ENVIRONMENT=staging
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Expose API port
+EXPOSE 8000
+
+# Run uvicorn server
+CMD ["uvicorn", "guideai.api:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "2", \
+     "--log-level", "info"]

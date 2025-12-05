@@ -227,3 +227,57 @@ If you encounter issues:
 2. Review logs: `podman logs <container-name>`
 3. Consult [`deployment/README.md`](README.md) for general troubleshooting
 4. File issue with Podman-specific details
+
+## Environment Manifests
+
+Amprealize now discovers environments from YAML manifests instead of hardcoded CLI flags. The CLI and test harness automatically look for the repo-level `environments.yaml`, or any path supplied via `GUIDEAI_ENV_FILE`/`--env-file`.
+
+- **Runtime controls** live in the `runtime` section (provider, Podman machine name, auto-init/start, CPU+memory requirements).
+- **Infrastructure defaults** live in the `infrastructure` section (`blueprint_id`, `teardown_on_exit`).
+- **Variables** are merged with per-run overrides.
+
+> **Note**: Use `amprealize validate` to check your environments.yaml for errors.
+
+Example (`environments.yaml`):
+
+```yaml
+environments:
+    ci:
+        runtime:
+            provider: "podman"
+            podman_machine: "guideai-ci"
+            auto_init: true
+            auto_start: true
+            memory_limit_mb: 8192
+        infrastructure:
+            blueprint_id: "guideai/amprealize/blueprints/local-test-suite"
+            teardown_on_exit: true
+```
+
+Invoke with:
+
+```bash
+guideai amprealize plan \
+    --environment ci \
+    --force-podman
+```
+
+## Guardrails & Native Mode
+
+Amprealize is optimized for native AppleHV execution to maximize performance and minimize memory overhead. When an environment manifest sets `runtime.provider: "native"`, Amprealize will **block execution** if it detects a running Podman VM (which consumes significant RAM even when idle). Environments that explicitly set `runtime.provider: "podman"` allow Amprealize to auto-init and auto-start the requested Podman machine instead of blocking.
+
+### How to Resolve
+If you see the error: `Podman machine '...' is running. Amprealize requires native AppleHV...`
+
+1.  **Stop the VM (Recommended):**
+    ```bash
+    podman machine stop
+    ```
+    This frees up resources for the native containers.
+
+2.  **Force Execution (Use sparingly):**
+    If the manifest truly requires the VM and you need to bypass resource checks, override per command:
+    ```bash
+    guideai amprealize plan --force-podman ...
+    guideai amprealize apply --force-podman ...
+    ```

@@ -42,6 +42,7 @@ class AuthTokenBundle:
     issued_at: datetime
     expires_at: datetime
     refresh_expires_at: datetime
+    provider: str = "github"  # Provider name: github, internal, gitlab, etc.
 
     def as_dict(self) -> Dict[str, object]:
         data = asdict(self)
@@ -77,6 +78,7 @@ class AuthTokenBundle:
             issued_at=_parse("issued_at"),
             expires_at=_parse("expires_at"),
             refresh_expires_at=_parse("refresh_expires_at"),
+            provider=str(payload.get("provider", "github")),  # Default to github for backward compatibility
         )
 
     def access_expires_in(self) -> int:
@@ -114,50 +116,140 @@ class TokenStoreError(Exception):
 class TokenStore:
     """Interface for storing and retrieving auth token bundles."""
 
-    def save(self, bundle: AuthTokenBundle) -> None:  # pragma: no cover - interface
+    def save(self, bundle: AuthTokenBundle, provider: Optional[str] = None) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def load(self) -> Optional[AuthTokenBundle]:  # pragma: no cover - interface
+    def load(self, provider: Optional[str] = None) -> Optional[AuthTokenBundle]:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def clear(self) -> None:  # pragma: no cover - interface
+    def clear(self, provider: Optional[str] = None) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
 
 class FileTokenStore(TokenStore):
-    """Persist tokens to a JSON file under the user's guideAI directory."""
+    """Persist tokens to a JSON file under the user's guideAI directory.
 
-    def __init__(self, path: Optional[Path] = None) -> None:
+    Supports multi-provider storage with separate files per provider.
+    Default behavior stores to auth_tokens.json for backward compatibility.
+    Provider-specific storage uses auth_tokens_<provider>.json pattern.
+    """
+
+    def __init__(self, path: Optional[Path] = None, provider: Optional[str] = None) -> None:
+        """Initialize token store with optional provider-specific path.
+
+        Args:
+            path: Custom path to token file. If None, uses GUIDEAI_CONFIG_DIR or ~/.guideai/.
+            provider: Provider name for multi-provider storage. If specified, tokens
+                     are stored in auth_tokens_<provider>.json.
+        """
+
         configured_path = os.getenv("GUIDEAI_AUTH_TOKEN_PATH")
         if configured_path:
             path = Path(configured_path).expanduser()
-        self._path = path or (Path.home() / ".guideai" / "auth_tokens.json")
-        self._path = self._path.expanduser().resolve()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
 
-    def save(self, bundle: AuthTokenBundle) -> None:
+        resolved_path = Path(path).expanduser() if path else None
+
+        if resolved_path is not None:
+            base_dir = resolved_path.parent
+            default_filename = resolved_path.name
+        else:
+            config_dir = os.getenv("GUIDEAI_CONFIG_DIR")
+            base_dir = Path(config_dir).expanduser() if config_dir else (Path.home() / ".guideai")
+            default_filename = "auth_tokens.json"
+
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        if provider:
+            filename = f"auth_tokens_{provider}.json"
+        else:
+            filename = default_filename
+
+        self._path = (base_dir / filename).expanduser().resolve()
+        self._provider = provider
+
+    def save(self, bundle: AuthTokenBundle, provider: Optional[str] = None) -> None:
+        """Save token bundle to file.
+
+        Args:
+            bundle: Token bundle to save.
+            provider: Override provider name. If specified, saves to auth_tokens_<provider>.json.
+        """
         try:
             data = bundle.as_dict()
-            self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+            # Determine target path
+            if provider and provider != self._provider:
+                # Override provider, compute new path
+                target_path = self._path.parent / f"auth_tokens_{provider}.json"
+            else:
+                target_path = self._path
+
+            target_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError as exc:  # pragma: no cover - filesystem errors
             raise TokenStoreError(f"Failed to write token file: {exc}") from exc
 
-    def load(self) -> Optional[AuthTokenBundle]:
-        if not self._path.exists():
+    def load(self, provider: Optional[str] = None) -> Optional[AuthTokenBundle]:
+        """Load token bundle from file.
+
+        Args:
+            provider: Override provider name to load from auth_tokens_<provider>.json.
+
+        Returns:
+            Token bundle if found, None if file doesn't exist.
+        """
+        # Determine source path
+        if provider and provider != self._provider:
+            source_path = self._path.parent / f"auth_tokens_{provider}.json"
+        else:
+            source_path = self._path
+
+        if not source_path.exists():
             return None
         try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
             return AuthTokenBundle.from_dict(payload)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             raise TokenStoreError(f"Failed to read token file: {exc}") from exc
 
-    def clear(self) -> None:
-        if not self._path.exists():
+    def clear(self, provider: Optional[str] = None) -> None:
+        """Clear token file.
+
+        Args:
+            provider: Override provider name to clear auth_tokens_<provider>.json.
+        """
+        # Determine target path
+        if provider and provider != self._provider:
+            target_path = self._path.parent / f"auth_tokens_{provider}.json"
+        else:
+            target_path = self._path
+
+        if not target_path.exists():
             return
         try:
-            self._path.unlink()
+            target_path.unlink()
         except OSError as exc:  # pragma: no cover - filesystem errors
             raise TokenStoreError(f"Failed to delete token file: {exc}") from exc
+
+    def list_providers(self) -> List[str]:
+        """List all providers with stored tokens.
+
+        Returns:
+            List of provider names found in token files.
+        """
+        providers = []
+        token_dir = self._path.parent
+
+        # Check default file
+        if (token_dir / "auth_tokens.json").exists():
+            providers.append("default")
+
+        # Check provider-specific files
+        for token_file in token_dir.glob("auth_tokens_*.json"):
+            # Extract provider name from filename: auth_tokens_github.json -> github
+            provider = token_file.stem.replace("auth_tokens_", "")
+            providers.append(provider)
+
+        return sorted(providers)
 
 
 class KeychainTokenStore(TokenStore):
@@ -178,14 +270,24 @@ class KeychainTokenStore(TokenStore):
         self._service_name = service_name or os.getenv("GUIDEAI_KEYCHAIN_SERVICE", "guideai.auth")
         self._username = username or os.getenv("GUIDEAI_KEYCHAIN_USERNAME", "cli")
 
-    def save(self, bundle: AuthTokenBundle) -> None:
+    def save(self, bundle: AuthTokenBundle, provider: Optional[str] = None) -> None:
+        """Save token bundle to keychain.
+
+        Note: Keychain storage does not support multi-provider storage natively.
+        Provider parameter is accepted for interface compatibility but ignored.
+        Use FileTokenStore for multi-provider support.
+        """
         try:
             payload = json.dumps(bundle.as_dict())
             self._keyring.set_password(self._service_name, self._username, payload)
         except KeyringErrorType as exc:  # pragma: no cover - backend specific failures
             raise TokenStoreError(f"Failed to store tokens in keychain: {exc}") from exc
 
-    def load(self) -> Optional[AuthTokenBundle]:
+    def load(self, provider: Optional[str] = None) -> Optional[AuthTokenBundle]:
+        """Load token bundle from keychain.
+
+        Note: Provider parameter is accepted for interface compatibility but ignored.
+        """
         try:
             raw = self._keyring.get_password(self._service_name, self._username)
         except KeyringErrorType as exc:  # pragma: no cover - backend specific failures
@@ -198,7 +300,11 @@ class KeychainTokenStore(TokenStore):
         except (json.JSONDecodeError, ValueError) as exc:
             raise TokenStoreError(f"Keychain payload corrupted: {exc}") from exc
 
-    def clear(self) -> None:
+    def clear(self, provider: Optional[str] = None) -> None:
+        """Clear keychain entry.
+
+        Note: Provider parameter is accepted for interface compatibility but ignored.
+        """
         try:
             self._keyring.delete_password(self._service_name, self._username)
         except PasswordDeleteErrorType:  # pragma: no cover - already removed

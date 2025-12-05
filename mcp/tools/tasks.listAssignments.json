@@ -1,20 +1,45 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "tasks.listAssignments",
-  "description": "List remaining milestone tasks mapped to functions and agents for planning parity.",
+  "description": "List agent task assignments with optional filters (agent_id, status, task_type, behavior_id, run_id). Returns tasks ordered by priority (urgent first) and creation time.",
   "inputSchema": {
     "type": "object",
     "properties": {
-      "function": {
+      "agent_id": {
         "type": "string",
-        "description": "Optional function filter (engineering, developer-experience, devops, product, pm, product-analytics, copywriting, compliance)."
+        "description": "Optional agent ID filter (e.g., 'agent-engineering-01')"
+      },
+      "status": {
+        "type": "string",
+        "enum": ["pending", "in_progress", "completed", "failed", "blocked", "cancelled"],
+        "description": "Optional status filter"
+      },
+      "task_type": {
+        "type": "string",
+        "enum": ["behavior_review", "compliance_audit", "run_execution", "code_review", "documentation", "testing"],
+        "description": "Optional task type filter"
+      },
+      "behavior_id": {
+        "type": "string",
+        "description": "Optional behavior ID filter"
+      },
+      "run_id": {
+        "type": "string",
+        "description": "Optional run ID filter"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of tasks to return (default: 50)",
+        "default": 50,
+        "minimum": 1,
+        "maximum": 500
       }
     },
     "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
-    "required": ["tasks"],
+    "required": ["tasks", "total"],
     "properties": {
       "tasks": {
         "type": "array",
@@ -22,52 +47,34 @@
           "type": "object",
           "required": [
             "task_id",
-            "title",
-            "milestone",
+            "agent_id",
+            "task_type",
             "status",
-            "function",
-            "primary_agent",
-            "agent_playbook",
-            "surfaces"
+            "priority",
+            "title"
           ],
           "properties": {
             "task_id": {"type": "string"},
-            "title": {"type": "string"},
-            "milestone": {"type": "string"},
+            "agent_id": {"type": "string"},
+            "task_type": {"type": "string"},
             "status": {"type": "string"},
-            "description": {"type": "string"},
-            "function": {"type": "string"},
-            "primary_agent": {"type": "string"},
-            "agent_playbook": {"type": "string"},
-            "surfaces": {
-              "type": "array",
-              "items": {"type": "string", "enum": ["platform", "cli", "api", "mcp"]}
-            },
-            "dependencies": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "evidence_targets": {
-              "type": "array",
-              "items": {"type": "string"}
-            },
-            "supporting_agents": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": ["function", "primary_agent", "agent_playbook"],
-                "properties": {
-                  "function": {"type": "string"},
-                  "primary_agent": {"type": "string"},
-                  "agent_playbook": {"type": "string"},
-                  "notes": {"type": "string"}
-                },
-                "additionalProperties": false
-              }
-            }
+            "priority": {"type": "integer", "minimum": 1, "maximum": 4},
+            "title": {"type": "string"},
+            "description": {"type": ["string", "null"]},
+            "behavior_id": {"type": ["string", "null"]},
+            "run_id": {"type": ["string", "null"]},
+            "metadata": {"type": "object"},
+            "created_at": {"type": ["string", "null"], "format": "date-time"},
+            "updated_at": {"type": ["string", "null"], "format": "date-time"},
+            "completed_at": {"type": ["string", "null"], "format": "date-time"},
+            "deadline": {"type": ["string", "null"], "format": "date-time"}
           },
           "additionalProperties": false
         }
+      },
+      "total": {
+        "type": "integer",
+        "description": "Total number of tasks returned"
       }
     },
     "additionalProperties": false

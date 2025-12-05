@@ -15,6 +15,16 @@ from typing import Any, Dict, Iterable, List, Optional
 from .behavior_retriever import BehaviorRetriever
 from .behavior_service import BehaviorService, SearchBehaviorsRequest
 from .telemetry import TelemetryClient
+from .llm_provider import (
+    LLMConfig,
+    LLMMessage,
+    LLMProvider,
+    LLMRequest,
+    LLMResponse,
+    LLMProviderError,
+    TokenBudgetExceededError,
+    get_provider,
+)
 from .bci_contracts import (
     BatchComposePromptRequest,
     BatchComposePromptResponse,
@@ -147,6 +157,7 @@ class BCIService:
             role_focus=request.role_focus.value if request.role_focus else None,
             status="APPROVED",
             limit=search_limit,
+            namespace=request.namespace,
         )
         results = self._behavior_service.search_behaviors(search_request)
         matches: List[BehaviorMatch] = []
@@ -440,6 +451,320 @@ class BCIService:
         }
         self._telemetry.emit_event(event_type="bci.rebuild_index", payload=telemetry_payload)
         return result
+
+    # ------------------------------------------------------------------
+    # LLM Generation with BCI
+    # ------------------------------------------------------------------
+    def generate_response(
+        self,
+        query: str,
+        *,
+        behaviors: Optional[List[str]] = None,
+        top_k: int = 5,
+        llm_config: Optional[LLMConfig] = None,
+        system_prompt: Optional[str] = None,
+        role_focus: Optional[RoleFocus] = None,
+    ) -> Dict[str, Any]:
+        """Generate a behavior-conditioned LLM response.
+
+        Args:
+            query: The user query/task to solve.
+            behaviors: Optional explicit behavior names to use. If not provided, retrieves top_k.
+            top_k: Number of behaviors to retrieve if behaviors not provided.
+            llm_config: Optional LLM configuration. If not provided, loads from environment.
+            system_prompt: Optional custom system prompt. If not provided, uses default.
+            role_focus: Optional role focus for behavior retrieval.
+
+        Returns:
+            Dict with:
+                - response: LLMResponse with generated content
+                - behaviors_used: List of behavior names prepended to prompt
+                - token_savings: Dict with input_saved, output_saved, total_saved
+                - latency_ms: Generation latency
+        """
+        start = perf_counter()
+
+        # Retrieve behaviors if not explicitly provided
+        behavior_snippets: List[BehaviorSnippet] = []
+        if behaviors is None:
+            retrieve_req = RetrieveRequest(
+                query=query,
+                top_k=top_k,
+                strategy=RetrievalStrategy.HYBRID,
+                role_focus=role_focus,
+            )
+            retrieve_resp = self.retrieve(retrieve_req)
+            behavior_snippets = [
+                BehaviorSnippet(
+                    behavior_id=match.behavior_id,
+                    name=match.name,
+                    instruction=match.instruction,
+                    role_focus=match.role_focus,
+                )
+                for match in retrieve_resp.results
+            ]
+        else:
+            # Convert behavior names to snippets
+            for behavior_name in behaviors:
+                try:
+                    if self._behavior_service:
+                        behavior_data = self._behavior_service.get_behavior(behavior_name)
+                        if behavior_data:
+                            behavior_snippets.append(
+                                BehaviorSnippet(
+                                    behavior_id=behavior_data.get("id", behavior_name),
+                                    name=behavior_name,
+                                    instruction=behavior_data.get("instruction", ""),
+                                )
+                            )
+                        else:
+                            # BehaviorService returned None - use fallback
+                            behavior_snippets.append(
+                                BehaviorSnippet(
+                                    behavior_id=behavior_name,
+                                    name=behavior_name,
+                                    instruction=f"Follow the {behavior_name} behavior pattern.",
+                                )
+                            )
+                    else:
+                        # No BehaviorService available - use fallback
+                        behavior_snippets.append(
+                            BehaviorSnippet(
+                                behavior_id=behavior_name,
+                                name=behavior_name,
+                                instruction=f"Follow the {behavior_name} behavior pattern.",
+                            )
+                        )
+                except Exception as exc:
+                    # Skip behaviors that can't be loaded, but use fallback
+                    logger.warning(f"Failed to load behavior {behavior_name}: {exc}")
+                    behavior_snippets.append(
+                        BehaviorSnippet(
+                            behavior_id=behavior_name,
+                            name=behavior_name,
+                            instruction=f"Follow the {behavior_name} behavior pattern.",
+                        )
+                    )
+
+        # Compose BCI prompt
+        compose_req = ComposePromptRequest(
+            query=query,
+            behaviors=behavior_snippets,
+            citation_instruction=system_prompt,
+            format=PromptFormat.LIST,
+        )
+        compose_resp = self.compose_prompt(compose_req)
+
+        # Get LLM provider
+        provider: LLMProvider = get_provider(llm_config)
+
+        # Build messages
+        messages = [
+            LLMMessage(role="system", content=compose_resp.prompt),
+            LLMMessage(role="user", content=query),
+        ]
+
+        # Generate response (may raise TokenBudgetExceededError)
+        llm_req = LLMRequest(messages=messages)
+        try:
+            llm_resp: LLMResponse = provider.generate(llm_req)
+        except TokenBudgetExceededError as exc:
+            # Log the budget violation and re-raise with context
+            self._telemetry.emit_event(
+                event_type="bci.generate_response.budget_exceeded",
+                payload={
+                    "query_length": len(query),
+                    "behaviors_count": len(behavior_snippets),
+                    "budget": exc.budget,
+                    "estimated_tokens": exc.estimated_tokens,
+                    "provider": exc.provider.value if exc.provider else "unknown",
+                },
+            )
+            raise
+        except LLMProviderError as exc:
+            # Log provider errors for debugging
+            self._telemetry.emit_event(
+                event_type="bci.generate_response.error",
+                payload={
+                    "query_length": len(query),
+                    "behaviors_count": len(behavior_snippets),
+                    "error_type": type(exc).__name__,
+                    "provider": exc.provider.value if exc.provider else "unknown",
+                },
+            )
+            raise
+
+        latency_ms = (perf_counter() - start) * 1000.0
+
+        # Compute token savings (baseline = no behaviors prepended)
+        baseline_prompt_tokens = len(query.split())  # Rough estimate
+        actual_input_tokens = llm_resp.input_tokens
+        input_saved = max(0, actual_input_tokens - baseline_prompt_tokens)
+
+        # Get behavior names for telemetry
+        behavior_names = [b.name for b in behavior_snippets]
+
+        # Emit telemetry to Raze with token budget and cost info
+        telemetry_payload = {
+            "query_length": len(query),
+            "behaviors_count": len(behavior_snippets),
+            "behaviors": behavior_names,
+            "provider": llm_resp.provider.value,
+            "model": llm_resp.model,
+            "input_tokens": llm_resp.input_tokens,
+            "output_tokens": llm_resp.output_tokens,
+            "total_tokens": llm_resp.total_tokens,
+            "token_savings_input": input_saved,
+            "latency_ms": latency_ms,
+            "llm_latency_ms": llm_resp.latency_ms,
+            "finish_reason": llm_resp.finish_reason,
+            # Token budget tracking
+            "token_budget_used": llm_resp.token_budget_used,
+            "token_budget_remaining": llm_resp.token_budget_remaining,
+            "token_budget_warning": llm_resp.token_budget_warning,
+            # Cost estimation (USD)
+            "estimated_cost_usd": llm_resp.estimated_cost_usd,
+            "input_cost_usd": llm_resp.input_cost_usd,
+            "output_cost_usd": llm_resp.output_cost_usd,
+        }
+        self._telemetry.emit_event(event_type="bci.generate_response", payload=telemetry_payload)
+
+        return {
+            "response": llm_resp,
+            "behaviors_used": behavior_snippets,
+            "token_savings": {
+                "input_saved": input_saved,
+                "output_saved": 0,  # Hard to estimate without baseline
+                "total_saved": input_saved,
+            },
+            "token_budget": {
+                "used": llm_resp.token_budget_used,
+                "remaining": llm_resp.token_budget_remaining,
+                "warning": llm_resp.token_budget_warning,
+            },
+            "cost": {
+                "input_usd": llm_resp.input_cost_usd,
+                "output_usd": llm_resp.output_cost_usd,
+                "total_usd": llm_resp.estimated_cost_usd,
+            },
+            "latency_ms": latency_ms,
+        }
+
+    def improve_run(
+        self,
+        run_id: str,
+        *,
+        llm_config: Optional[LLMConfig] = None,
+        max_behaviors: int = 10,
+    ) -> Dict[str, Any]:
+        """Analyze a failed run and generate improvement suggestions using BCI.
+
+        Uses TraceAnalysisService to extract patterns from failed run,
+        retrieves relevant behaviors, and generates actionable suggestions.
+
+        Args:
+            run_id: The run ID to analyze.
+            llm_config: Optional LLM configuration.
+            max_behaviors: Maximum behaviors to extract from trace.
+
+        Returns:
+            Dict with:
+                - run_id: The analyzed run ID
+                - patterns: List of detected patterns
+                - suggestions: List of improvement suggestions
+                - behaviors_extracted: List of behavior names extracted
+                - latency_ms: Analysis latency
+        """
+        from .trace_analysis_service import TraceAnalysisService
+        from .run_service import RunService
+
+        start = perf_counter()
+
+        # Get run details
+        run_service = RunService()
+        run = run_service.get_run(run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+
+        # Analyze trace using TraceAnalysisService
+        trace_service = TraceAnalysisService(
+            behavior_service=self._behavior_service,
+            telemetry=self._telemetry,
+        )
+
+        # Detect patterns in failed run
+        detect_req = DetectPatternsRequest(
+            trace=TraceInput(content=json.dumps(run), format=TraceFormat.JSON),
+            min_frequency=1,  # Low threshold for single run analysis
+        )
+        detect_resp = self.detect_patterns(detect_req)
+
+        # Score reusability of detected patterns
+        score_req = ScoreReusabilityRequest(
+            candidates=[
+                PatternCandidate(
+                    name=f"pattern_{i}",
+                    description=pattern.description,
+                    example=pattern.example_usage,
+                )
+                for i, pattern in enumerate(detect_resp.patterns)
+            ]
+        )
+        score_resp = self.score_reusability(score_req)
+
+        # Extract top behaviors based on reusability scores
+        top_patterns = sorted(
+            zip(detect_resp.patterns, score_resp.scores),
+            key=lambda x: x[1].overall_score,
+            reverse=True,
+        )[:max_behaviors]
+
+        # Generate improvement suggestions using BCI
+        improvement_query = f"""Analyze this failed run and provide specific improvement suggestions.
+
+Run ID: {run_id}
+Status: {run.get('status', 'unknown')}
+
+Detected Patterns:
+{chr(10).join(f"- {p.description}" for p, _ in top_patterns)}
+
+Provide:
+1. Root cause analysis
+2. Specific code changes needed
+3. Preventive measures for future runs
+"""
+
+        # Use detected patterns as behavior hints
+        behavior_hints = [f"pattern_{i}" for i, (_, _) in enumerate(top_patterns)]
+
+        generate_result = self.generate_response(
+            query=improvement_query,
+            behaviors=behavior_hints,
+            llm_config=llm_config,
+            role_focus=RoleFocus.STRATEGIST,  # Strategist for root cause analysis
+        )
+
+        latency_ms = (perf_counter() - start) * 1000.0
+
+        # Emit telemetry
+        telemetry_payload = {
+            "run_id": run_id,
+            "patterns_detected": len(detect_resp.patterns),
+            "behaviors_extracted": len(behavior_hints),
+            "latency_ms": latency_ms,
+        }
+        self._telemetry.emit_event(event_type="bci.improve_run", payload=telemetry_payload)
+
+        return {
+            "run_id": run_id,
+            "patterns": [
+                {"description": p.description, "frequency": p.frequency, "score": s.overall_score}
+                for p, s in top_patterns
+            ],
+            "suggestions": generate_result["response"].content,
+            "behaviors_extracted": behavior_hints,
+            "latency_ms": latency_ms,
+        }
 
 
 __all__ = ["BCIService"]

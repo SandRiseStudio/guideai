@@ -4,7 +4,7 @@
 This script materialises the tables, indexes, and metric views described in
 ``TELEMETRY_SCHEMA.md``.  It is the canonical automation for bringing a fresh
 PostgreSQL instance in line with the warehouse contract defined in
-``schema/migrations/001_create_telemetry_warehouse.sql``.  The implementation
+``schema/migrations/014_create_telemetry_warehouse_timescale.sql``.  The implementation
 prioritises reproducibility and aligns with ``behavior_instrument_metrics_pipeline``
 by ensuring the telemetry pipeline is ready for KPI projection.
 
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MIGRATION = REPO_ROOT / "schema" / "migrations" / "001_create_telemetry_warehouse.sql"
+DEFAULT_MIGRATION = REPO_ROOT / "schema" / "migrations" / "014_create_telemetry_warehouse_timescale.sql"
 
 from _postgres_migration_utils import (
     discover_dsn,

@@ -34,3 +34,5 @@ htmlcov/
 .DS_Store
 Thumbs.db
 .idea/
+
+.env.github-oauth

@@ -2,11 +2,30 @@
 
 > **Purpose:** Deploy and configure Metabase for GuideAI PRD metrics visualization
 > **Owner:** Product Analytics + Engineering
-> **Last Updated:** 2025-10-20
+> **Last Updated:** 2025-10-30
+> **Database:** TimescaleDB 2.23.0 (postgres-telemetry container)
+
+---
+
+## ⚠️ **Migration Notice (2025-10-30)**
+
+**The telemetry warehouse has migrated from DuckDB to TimescaleDB.** This document has been updated to reflect the new connection process.
+
+**Key Changes:**
+- ✅ **Database:** DuckDB → TimescaleDB 2.23.0 (PostgreSQL 16)
+- ✅ **Connection:** File mount → Network connection to `postgres-telemetry` container
+- ✅ **Schema:** Migration 014 executed (2 hypertables, compression, retention policies)
+- ✅ **Data:** 11 rows migrated from DuckDB (100% integrity verified)
+- 📋 **Dashboard Queries:** Updated for TimescaleDB schema (see [Dashboard Query Migration](#dashboard-query-migration))
+- ✅ **Sprint 3:** High-volume streaming dashboards created (see `docs/analytics/STREAMING_DASHBOARDS.md`)
+
+**For DuckDB setup (legacy), see:** [Historical DuckDB Setup (Archive)](#historical-duckdb-setup-archive)
+
+---
 
 ## Overview
 
-Metabase is the visualization layer for GuideAI's analytics infrastructure, connecting to the DuckDB warehouse (`data/telemetry.duckdb`) to provide interactive dashboards tracking the four PRD success metrics:
+Metabase is the visualization layer for GuideAI's analytics infrastructure, connecting to the TimescaleDB telemetry warehouse to provide interactive dashboards tracking the four PRD success metrics:
 
 1. **Behavior Reuse Rate** (target: ≥70%)
 2. **Token Savings Rate** (target: ≥30%)
@@ -16,28 +35,60 @@ Metabase is the visualization layer for GuideAI's analytics infrastructure, conn
 ## Architecture
 
 ```
-┌─────────────┐      ┌──────────────┐      ┌────────────────┐
-│ Telemetry   │─────▶│ DuckDB       │◀────▶│ Metabase       │
-│ Events      │      │ Warehouse    │      │ (Port 3000)    │
-│ (Kafka/File)│      │ (Read-Only)  │      │                │
-└─────────────┘      └──────────────┘      └────────────────┘
+┌─────────────┐      ┌──────────────────┐      ┌────────────────┐
+│ Telemetry   │─────▶│ TimescaleDB      │◀────▶│ Metabase       │
+│ Events      │      │ (postgres-       │      │ (Port 3000)    │
+│ (Kafka/API) │      │  telemetry)      │      │                │
+└─────────────┘      └──────────────────┘      └────────────────┘
                             │
                             ▼
-                     ┌──────────────┐
-                     │ 4 KPI Views  │
-                     │ + 4 Fact     │
-                     │ Tables       │
-                     └──────────────┘
+                     ┌──────────────────┐
+                     │ 2 Hypertables    │
+                     │ • telemetry_     │
+                     │   events         │
+                     │ • execution_     │
+                     │   traces         │
+                     │                  │
+                     │ 3 Continuous     │
+                     │ Aggregates       │
+                     │ • hourly/daily/  │
+                     │   weekly rollups │
+                     └──────────────────┘
 ```
 
+**Key Components:**
+- **TimescaleDB Container:** `guideai-postgres-telemetry` (port 5432)
+- **Database:** `telemetry`
+- **User:** `guideai_telemetry` / `dev_telemetry_pass`
+- **Compression:** 7-day threshold, automatic background jobs
+- **Retention:** 90-day hot storage (configurable)
+
 ## Quick Start (Local Development)
+
+### Prerequisites
+
+1. **Start TimescaleDB container:**
+   ```bash
+   # Ensure Podman machine is running
+   podman machine start
+
+   # Start postgres-telemetry container
+   podman-compose -f docker-compose.postgres.yml up -d postgres-telemetry
+
+   # Verify container health
+   podman ps --filter "name=postgres-telemetry"
+   # Should show: Up X hours (healthy)
+   ```
+
+2. **Verify migration 014 is applied:**
+   ```bash
+   podman exec -it guideai-postgres-telemetry psql -U guideai_telemetry -d telemetry -c "\d telemetry_events"
+   # Should show hypertable with event_id, event_timestamp composite primary key
+   ```
 
 ### 1. Start Metabase
 
 ```bash
-# Ensure Podman machine is running
-podman machine start
-
 # From repository root
 podman-compose -f docker-compose.analytics-dashboard.yml up -d
 
@@ -47,7 +98,7 @@ podman-compose -f docker-compose.analytics-dashboard.yml logs -f metabase
 # Wait for "Metabase Initialization COMPLETE" (30-60 seconds)
 ```
 
-**Note:** GuideAI uses Podman instead of Docker for lighter resource usage and better security. If you have `docker-compose` aliased to `podman-compose`, the standard commands will work. See `deployment/PODMAN.md` for setup instructions.
+**Note:** The updated `docker-compose.analytics-dashboard.yml` connects Metabase to the `guideai-postgres-net` network, allowing direct communication with `postgres-telemetry` container.
 
 ### 2. Access Web Interface
 
@@ -59,60 +110,175 @@ Open browser: **http://localhost:3000**
 
 ⚠️ **Change password immediately after first login!**
 
-### 3. Connect to DuckDB Warehouse
+### 3. Connect to TimescaleDB Telemetry Warehouse
 
-**Important:** DuckDB files use a proprietary format that isn't directly readable by SQLite drivers. We export the DuckDB data to SQLite format for Metabase compatibility.
+**New Process (TimescaleDB):** Metabase connects directly via PostgreSQL protocol—no export scripts needed!
 
-#### Step 1: Export DuckDB to SQLite
-
-```bash
-# Export analytics data to SQLite format
-python scripts/export_duckdb_to_sqlite.py
-
-# Output: data/telemetry_sqlite.db (SQLite format, Metabase-compatible)
-```
-
-**Run this export:**
-- After DuckDB schema changes
-- When new telemetry data is added
-- Before creating/updating Metabase dashboards
-- Recommended: Daily cron job for production
-
-#### Step 2: Connect Metabase to SQLite Export
+#### Configure Database Connection
 
 1. Go to **Settings** (gear icon) → **Admin Settings** → **Databases** → **Add Database**
 2. Configure:
-   - **Database type:** SQLite
-   - **Display name:** GuideAI Analytics Warehouse
-   - **Filename:** `/duckdb/telemetry_sqlite.db`
+   - **Database type:** PostgreSQL
+   - **Display name:** GuideAI Telemetry Warehouse (TimescaleDB)
+   - **Host:** `postgres-telemetry` (container hostname on shared network)
+   - **Port:** `5432`
+   - **Database name:** `telemetry`
+   - **Username:** `guideai_telemetry`
+   - **Password:** `dev_telemetry_pass`
    - **Advanced options:**
-     - Read-only: ✅ (recommended)
-     - Sync schema: ✅
+     - Use a secure connection (SSL): ❌ (local dev only)
+     - Read-only: ✅ (recommended for analytics)
+     - Rerun queries for simple exploration: ✅
+     - Choose when Metabase syncs: Daily at midnight
 3. Click **Save**
-4. Wait for schema sync (should detect 8 tables/views)
+4. Wait for schema sync (should detect 2 hypertables + 3 continuous aggregates + 3 helper views)
 
-**Available Tables:**
-- `fact_behavior_usage` - Behavior citations per run
-- `fact_token_savings` - Token efficiency metrics
-- `fact_execution_status` - Run completion status
-- `fact_compliance_steps` - Checklist execution records
-- `view_behavior_reuse_rate` - Aggregated behavior reuse %
-- `view_token_savings_rate` - Aggregated token savings %
-- `view_completion_rate` - Aggregated task completion %
-- `view_compliance_coverage_rate` - Aggregated compliance coverage %
+**Available Tables & Views:**
+- `telemetry_events` - **Hypertable** (time-series partitioned on `event_timestamp`)
+- `execution_traces` - **Hypertable** (distributed tracing spans)
+- `telemetry_hourly` - Continuous aggregate (hourly rollups, 10-min refresh)
+- `telemetry_daily` - Continuous aggregate (daily rollups, 1-hour refresh)
+- `telemetry_weekly` - Continuous aggregate (weekly rollups, 1-day refresh)
+- `v_latest_events` - Helper view (last 1000 events)
+- `v_event_type_summary` - Helper view (event type counts)
+- `v_trace_overview` - Helper view (execution trace summaries)
 
-#### Alternative: Direct DuckDB Access (Future)
+**Connection Test Query:**
+```sql
+SELECT
+  event_type,
+  COUNT(*) as event_count,
+  MAX(event_timestamp) as latest_event
+FROM telemetry_events
+WHERE event_timestamp > NOW() - INTERVAL '7 days'
+GROUP BY event_type
+ORDER BY event_count DESC;
+```
+---
 
-When Metabase adds native DuckDB support, you can connect directly:
+## Dashboard Query Migration
 
-1. Download DuckDB JDBC driver: https://github.com/duckdb/duckdb/releases
-2. Place in Metabase plugins directory: `/metabase-data/plugins/`
-3. Configure:
-   - **Database type:** Other (Custom JDBC)
-   - **JDBC connection string:** `jdbc:duckdb:/duckdb/telemetry.duckdb`
-   - **Driver class:** `org.duckdb.DuckDBDriver`
+**Goal:** Update existing dashboard queries from DuckDB/SQLite schema to TimescaleDB schema.
 
-**Note:** This requires Metabase restart and manual JDBC driver installation.
+### Schema Mapping
+
+| DuckDB/SQLite Table | TimescaleDB Equivalent | Notes |
+|---------------------|------------------------|-------|
+| `fact_behavior_usage` | `telemetry_events` WHERE `event_type = 'behavior_usage'` | Parse `event_data` JSONB for behavior_id |
+| `fact_token_savings` | `telemetry_events` WHERE `event_type = 'token_usage'` | Parse `event_data` for token counts |
+| `fact_execution_status` | `telemetry_events` WHERE `event_type = 'run_completed'` | Parse `event_data` for status |
+| `fact_compliance_steps` | `telemetry_events` WHERE `event_type = 'compliance_check'` | Parse `event_data` for checklist steps |
+| `view_*` (KPI aggregates) | Use continuous aggregates or custom queries | See examples below |
+
+### Example Query Migrations
+
+#### Before (DuckDB/SQLite):
+```sql
+-- Behavior reuse rate (last 30 days)
+SELECT
+  DATE(run_timestamp) as date,
+  AVG(reuse_rate) as avg_reuse_rate
+FROM view_behavior_reuse_rate
+WHERE run_timestamp > CURRENT_DATE - INTERVAL '30 days'
+GROUP BY DATE(run_timestamp)
+ORDER BY date DESC;
+```
+
+#### After (TimescaleDB):
+```sql
+-- Behavior reuse rate (last 30 days) using telemetry_daily aggregate
+SELECT
+  bucket as date,
+  (total_behavior_citations::float / NULLIF(total_runs, 0)) * 100 as avg_reuse_rate
+FROM telemetry_daily
+WHERE bucket > NOW() - INTERVAL '30 days'
+  AND event_type = 'behavior_usage'
+GROUP BY bucket
+ORDER BY bucket DESC;
+```
+
+#### Token Savings Query (TimescaleDB):
+```sql
+-- Token savings % by behavior_id
+SELECT
+  event_data->>'behavior_id' as behavior_id,
+  SUM((event_data->>'tokens_saved')::int) as total_tokens_saved,
+  SUM((event_data->>'tokens_baseline')::int) as total_tokens_baseline,
+  (SUM((event_data->>'tokens_saved')::int)::float /
+   NULLIF(SUM((event_data->>'tokens_baseline')::int), 0)) * 100 as savings_pct
+FROM telemetry_events
+WHERE event_type = 'token_usage'
+  AND event_timestamp > NOW() - INTERVAL '7 days'
+  AND event_data ? 'behavior_id'
+GROUP BY event_data->>'behavior_id'
+ORDER BY savings_pct DESC
+LIMIT 20;
+```
+
+### Dashboard Update Checklist
+
+For each dashboard in `docs/analytics/dashboard-exports/`:
+
+- [ ] **prd_kpi_summary.json**
+  - [ ] Update behavior reuse rate query
+  - [ ] Update token savings rate query
+  - [ ] Update completion rate query
+  - [ ] Update compliance coverage query
+  - [ ] Test all filters (date range, run_id, agent_id)
+
+- [ ] **behavior_usage_trends.json**
+  - [ ] Replace fact_behavior_usage references with telemetry_events
+  - [ ] Update time-series aggregation to use telemetry_hourly/daily
+  - [ ] Verify behavior_id extraction from JSONB event_data
+
+- [ ] **token_savings_analysis.json**
+  - [ ] Replace fact_token_savings with telemetry_events
+  - [ ] Update token_saved/token_baseline calculations
+  - [ ] Add baseline vs. actual comparison charts
+
+- [ ] **compliance_coverage_breakdown.json**
+  - [ ] Replace fact_compliance_steps with telemetry_events
+  - [ ] Update checklist step parsing from event_data
+  - [ ] Verify coverage % formula matches PRD target (95%)
+
+**Status:** 🚧 **TODO** – Dashboard queries pending migration (estimated 2-3 hours)
+
+---
+
+## Sprint 3 Streaming Dashboards (NEW)
+
+**Purpose:** Real-time monitoring for the high-volume Kafka → Flink → TimescaleDB streaming pipeline.
+
+**Target:** 10,000 events/sec throughput, <30s end-to-end latency.
+
+### Quick Setup
+
+```bash
+# Ensure streaming infrastructure is running
+./scripts/start_streaming_pipeline.sh start
+
+# Create streaming-specific dashboards (4 dashboards, 18 cards)
+export METABASE_URL="http://localhost:3000"
+export METABASE_USERNAME="admin@guideai.local"
+export METABASE_PASSWORD="changeme123"
+python scripts/create_streaming_dashboards.py
+```
+
+**Dashboards Created:**
+1. **Streaming Pipeline Health** (5 cards): Events/min, unique actors, event type distribution, surface distribution, P95 latency
+2. **PRD Metrics Real-Time** (4 cards): Behavior reuse trend, token usage, completion rate by surface, run volume
+3. **Event Flow Analysis** (4 cards): Trace duration buckets, status distribution, service performance, token consumption
+4. **Operational Observability** (5 cards): Error events, error rate trend, activity by role, sessions, high-latency alerts
+
+**Data Sources:** TimescaleDB continuous aggregates (`telemetry_events_hourly`, `execution_traces_hourly`, `telemetry_events_daily`) with 10-minute refresh policies.
+
+**Access:**
+- Dashboard URLs: http://localhost:3000/dashboard/18-21 (adjust IDs based on creation order)
+- Collection: "Sprint 3 Streaming Dashboards"
+
+**Full Guide:** See `docs/analytics/STREAMING_DASHBOARDS.md` for detailed metric descriptions, troubleshooting, and optimization tips.
+
+---
 
 ### 4. Import Dashboard Definitions
 
@@ -480,3 +646,74 @@ conn.close()
 3. ⏳ Provision production Postgres for Metabase metadata
 4. ⏳ Configure SSO/SAML authentication (if Enterprise)
 5. ⏳ Set up alerting and scheduled email reports
+
+---
+
+## Additional Troubleshooting (TimescaleDB)
+
+### Metabase Can't Connect to TimescaleDB
+
+**Symptom:** "Unable to connect to postgres-telemetry:5432"
+
+**Solutions:**
+
+1. **Verify container network:**
+   ```bash
+   podman network inspect guideai-postgres-net
+   # Should list both postgres-telemetry and guideai-metabase containers
+   ```
+
+2. **Check postgres-telemetry is running:**
+   ```bash
+   podman ps --filter "name=postgres-telemetry"
+   # Should show: Up X hours (healthy)
+   ```
+
+3. **Test connection from Metabase container:**
+   ```bash
+   podman exec -it guideai-metabase sh
+   apk add --no-cache postgresql-client
+   psql -h postgres-telemetry -U guideai_telemetry -d telemetry -c "SELECT version();"
+   # Should return PostgreSQL + TimescaleDB version
+   exit
+   ```
+
+4. **Recreate Metabase with network access:**
+   ```bash
+   podman-compose -f docker-compose.analytics-dashboard.yml down
+   podman-compose -f docker-compose.analytics-dashboard.yml up -d
+   ```
+
+### Schema Sync Shows 0 Tables
+
+**Symptom:** Metabase connects successfully but shows no tables/views
+
+**Solutions:**
+
+1. **Verify migration 014 is applied:**
+   ```bash
+   podman exec -it guideai-postgres-telemetry psql -U guideai_telemetry -d telemetry -c "\dt"
+   # Should list: telemetry_events, execution_traces
+   ```
+
+2. **Force schema re-sync in Metabase:**
+   - Settings → Admin → Databases → GuideAI Telemetry Warehouse
+   - Click "Sync database schema now"
+   - Wait 30-60 seconds
+
+### Performance: Queries are Slow
+
+**Solution:** Use continuous aggregates (telemetry_daily, telemetry_hourly) instead of raw hypertables for dashboard queries.
+
+---
+
+## Historical DuckDB Setup (Archive)
+
+<details>
+<summary><b>⚠️ Legacy Documentation (Pre-2025-10-30)</b> – Click to expand</summary>
+
+**Note:** The telemetry warehouse migrated from DuckDB to TimescaleDB on 2025-10-30. This section is preserved for historical reference only.
+
+For DuckDB setup instructions, see git history at commit prior to migration 014.
+
+</details>

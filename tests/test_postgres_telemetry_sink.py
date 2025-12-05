@@ -1,5 +1,6 @@
 import sys
 import types
+from contextlib import contextmanager
 
 import pytest
 
@@ -15,6 +16,7 @@ from guideai.storage.postgres_telemetry import PostgresTelemetrySink
 class MockCursor:
     def __init__(self, connection):
         self._connection = connection
+        self.closed = False
 
     def __enter__(self):
         return self
@@ -25,6 +27,9 @@ class MockCursor:
     def execute(self, sql, params=None):
         normalised = " ".join(sql.split())
         self._connection.executed.append((normalised, params))
+
+    def close(self):
+        self.closed = True
 
 
 class MockConnection:
@@ -45,8 +50,10 @@ def fake_psycopg2(monkeypatch):
     connection = MockConnection()
 
     psycopg2_module = types.ModuleType("psycopg2")
+    setattr(psycopg2_module, "paramstyle", "pyformat")
+    setattr(psycopg2_module, "Error", Exception)
 
-    def connect(dsn, connect_timeout=None):
+    def connect(*args, **kwargs):
         return connection
 
     setattr(psycopg2_module, "connect", connect)
@@ -56,6 +63,18 @@ def fake_psycopg2(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "psycopg2", psycopg2_module)
     monkeypatch.setitem(sys.modules, "psycopg2.extras", extras_module)
+
+    class FakePool:
+        def __init__(self, dsn, service_name=None):
+            self.dsn = dsn
+            self.service_name = service_name
+
+        @contextmanager
+        def connection(self, autocommit=True):
+            connection.autocommit = autocommit
+            yield connection
+
+    monkeypatch.setattr("guideai.storage.postgres_pool.PostgresPool", FakePool)
 
     return connection
 
@@ -196,6 +215,7 @@ def test_create_sink_from_env_prefers_postgres(monkeypatch, fake_psycopg2, tmp_p
 def test_create_sink_from_env_falls_back_to_file(monkeypatch, tmp_path):
     path = tmp_path / "telemetry.jsonl"
     monkeypatch.setenv("GUIDEAI_TELEMETRY_PATH", str(path))
+    monkeypatch.delenv("GUIDEAI_TELEMETRY_PG_DSN", raising=False)
 
     sink = create_sink_from_env()
     assert isinstance(sink, FileTelemetrySink)

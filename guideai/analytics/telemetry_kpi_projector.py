@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from statistics import mean
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Union
+from uuid import uuid4
 
 from guideai.telemetry import TelemetryEvent
 
@@ -37,6 +38,8 @@ class TelemetryProjection:
     fact_token_savings: List[Dict[str, object]] = field(default_factory=list)
     fact_execution_status: List[Dict[str, object]] = field(default_factory=list)
     fact_compliance_steps: List[Dict[str, object]] = field(default_factory=list)
+    fact_resource_usage: List[Dict[str, object]] = field(default_factory=list)
+    fact_cost_allocation: List[Dict[str, object]] = field(default_factory=list)
     summary: Dict[str, object] = field(default_factory=dict)
 
 
@@ -55,6 +58,18 @@ class _RunAccumulator:
     actor_surface: Optional[str] = None
     actor_role: Optional[str] = None
     first_plan_timestamp: Optional[str] = None
+    estimated_cost_usd: Optional[float] = None
+    compliance_events: int = 0
+
+
+_SERVICE_COST_MODEL: Dict[str, Dict[str, float]] = {
+    "BehaviorService": {"cost_per_1k_tokens": 0.06, "cost_per_api_call": 0.0001},
+    "ActionService": {"cost_per_1k_tokens": 0.06, "cost_per_api_call": 0.00015},
+    "ComplianceService": {"cost_per_1k_tokens": 0.03, "cost_per_api_call": 0.00005},
+    "RunService": {"cost_per_1k_tokens": 0.03, "cost_per_api_call": 0.00005},
+}
+
+_DEFAULT_TIMESTAMP = "1970-01-01T00:00:00Z"
 
 
 class TelemetryKPIProjector:
@@ -105,6 +120,9 @@ class TelemetryKPIProjector:
                 accumulator.output_tokens = self._coerce_int(payload.get("output_tokens"))
                 token_savings_pct = self._coerce_float(payload.get("token_savings_pct"))
                 accumulator.token_savings_pct = token_savings_pct
+                estimated_cost = self._coerce_float(payload.get("estimated_cost_usd"))
+                if estimated_cost is not None:
+                    accumulator.estimated_cost_usd = estimated_cost
                 status = payload.get("status")
                 if isinstance(status, str):
                     accumulator.final_status = status
@@ -128,6 +146,9 @@ class TelemetryKPIProjector:
                 checklist_id = payload.get("checklist_id")
                 if coverage is not None and isinstance(checklist_id, str):
                     latest_compliance_scores[checklist_id] = coverage
+                if run_id:
+                    accumulator = runs.setdefault(run_id, _RunAccumulator(run_id=run_id))
+                    accumulator.compliance_events += 1
 
             elif event_type == "behavior_retrieved":
                 # Track behavior exposure even if run not yet created; this can
@@ -184,6 +205,12 @@ class TelemetryKPIProjector:
                 }
             )
 
+            resource_usage_facts = self._create_resource_usage_facts(accumulator)
+            projection.fact_resource_usage.extend(resource_usage_facts)
+            cost_allocation = self._create_cost_allocation_fact(accumulator, resource_usage_facts)
+            if cost_allocation:
+                projection.fact_cost_allocation.append(cost_allocation)
+
         projection.fact_compliance_steps = compliance_facts
 
         total_runs = len(runs)
@@ -207,7 +234,190 @@ class TelemetryKPIProjector:
             "average_compliance_coverage_pct": coverage_pct,
         }
 
+        cost_runs = len(projection.fact_cost_allocation)
+        total_cost = sum(
+            self._coerce_float(fact.get("total_cost_usd")) or 0.0 for fact in projection.fact_cost_allocation
+        )
+        total_savings = sum(
+            self._coerce_float(fact.get("savings_vs_baseline_usd")) or 0.0
+            for fact in projection.fact_cost_allocation
+        )
+        avg_cost = (total_cost / cost_runs) if cost_runs else None
+        avg_savings = (total_savings / cost_runs) if cost_runs else None
+        roi_ratio = (total_savings / total_cost) if total_cost else None
+
+        projection.summary.update(
+            {
+                "total_cost_usd": round(total_cost, 6) if total_cost else 0.0,
+                "average_cost_per_run_usd": round(avg_cost, 6) if avg_cost is not None else None,
+                "total_savings_vs_baseline_usd": round(total_savings, 6) if total_savings else 0.0,
+                "average_savings_vs_baseline_usd": round(avg_savings, 6) if avg_savings is not None else None,
+                "roi_ratio": round(roi_ratio, 4) if roi_ratio is not None else None,
+            }
+        )
+
         return projection
+
+    def _create_resource_usage_facts(self, accumulator: _RunAccumulator) -> List[Dict[str, object]]:
+        facts: List[Dict[str, object]] = []
+        baseline_tokens = accumulator.baseline_tokens or accumulator.output_tokens or 0
+        output_tokens = accumulator.output_tokens or accumulator.baseline_tokens or 0
+        behavior_tokens = self._estimate_behavior_tokens(baseline_tokens, len(accumulator.behaviors))
+        behavior_api_calls = max(1, len(accumulator.behaviors))
+
+        behavior_fact = self._build_usage_record(
+            run_id=accumulator.run_id,
+            service_name="BehaviorService",
+            operation_name="retrieve_behaviors",
+            token_count=behavior_tokens,
+            api_calls=behavior_api_calls,
+            execution_time_ms=max(100, behavior_tokens // 2 + behavior_api_calls * 20),
+            timestamp=accumulator.first_plan_timestamp or _DEFAULT_TIMESTAMP,
+        )
+        if behavior_fact:
+            facts.append(behavior_fact)
+
+        action_tokens = output_tokens
+        action_fact = self._build_usage_record(
+            run_id=accumulator.run_id,
+            service_name="ActionService",
+            operation_name="execute_action",
+            token_count=action_tokens,
+            api_calls=max(1, behavior_api_calls + 1),
+            execution_time_ms=max(250, action_tokens // 2 + 100),
+            timestamp=accumulator.first_plan_timestamp or _DEFAULT_TIMESTAMP,
+        )
+        if action_fact:
+            facts.append(action_fact)
+
+        run_overhead_tokens = self._estimate_runservice_tokens(baseline_tokens)
+        run_service_fact = self._build_usage_record(
+            run_id=accumulator.run_id,
+            service_name="RunService",
+            operation_name="orchestrate_run",
+            token_count=run_overhead_tokens,
+            api_calls=1,
+            execution_time_ms=200,
+            timestamp=accumulator.first_plan_timestamp or _DEFAULT_TIMESTAMP,
+        )
+        if run_service_fact:
+            facts.append(run_service_fact)
+
+        if accumulator.compliance_events:
+            compliance_tokens = accumulator.compliance_events * 50
+            compliance_fact = self._build_usage_record(
+                run_id=accumulator.run_id,
+                service_name="ComplianceService",
+                operation_name="record_step",
+                token_count=compliance_tokens,
+                api_calls=accumulator.compliance_events,
+                execution_time_ms=max(120, compliance_tokens),
+                timestamp=accumulator.first_plan_timestamp or _DEFAULT_TIMESTAMP,
+            )
+            if compliance_fact:
+                facts.append(compliance_fact)
+
+        return facts
+
+    def _create_cost_allocation_fact(
+        self,
+        accumulator: _RunAccumulator,
+        resource_usage_facts: List[Dict[str, object]],
+    ) -> Optional[Dict[str, object]]:
+        if not resource_usage_facts:
+            return None
+
+        service_costs: Dict[str, float] = {}
+        for fact in resource_usage_facts:
+            service_name = fact.get("service_name")
+            if not isinstance(service_name, str):
+                continue
+            cost_value = self._coerce_float(fact.get("estimated_cost_usd"))
+            if not service_name or cost_value is None:
+                continue
+            service_costs[service_name] = round(service_costs.get(service_name, 0.0) + cost_value, 6)
+
+        if not service_costs:
+            return None
+
+        total_cost = round(sum(service_costs.values()), 6)
+        if accumulator.estimated_cost_usd is not None and total_cost > 0:
+            scale = accumulator.estimated_cost_usd / total_cost
+            service_costs = {svc: round(cost * scale, 6) for svc, cost in service_costs.items()}
+            total_cost = round(accumulator.estimated_cost_usd, 6)
+
+        savings = self._calculate_savings(accumulator.baseline_tokens, accumulator.output_tokens)
+
+        return {
+            "run_id": accumulator.run_id,
+            "template_id": accumulator.template_id,
+            "service_costs": service_costs,
+            "total_cost_usd": total_cost,
+            "savings_vs_baseline_usd": savings,
+            "timestamp": accumulator.first_plan_timestamp or _DEFAULT_TIMESTAMP,
+        }
+
+    def _build_usage_record(
+        self,
+        *,
+        run_id: str,
+        service_name: str,
+        operation_name: str,
+        token_count: int,
+        api_calls: int,
+        execution_time_ms: int,
+        timestamp: Optional[str],
+    ) -> Optional[Dict[str, object]]:
+        if token_count <= 0 and api_calls <= 0:
+            return None
+
+        cost = self._calculate_service_cost(service_name, token_count, api_calls)
+        usage_id = f"{run_id}:{service_name}:{operation_name}:{uuid4().hex[:6]}"
+        return {
+            "usage_id": usage_id,
+            "run_id": run_id,
+            "service_name": service_name,
+            "operation_name": operation_name,
+            "token_count": token_count,
+            "api_calls": api_calls,
+            "execution_time_ms": execution_time_ms,
+            "estimated_cost_usd": cost if cost else None,
+            "timestamp": timestamp,
+        }
+
+    @staticmethod
+    def _estimate_behavior_tokens(baseline_tokens: int, behavior_count: int) -> int:
+        baseline = baseline_tokens if baseline_tokens > 0 else 1000
+        base_tokens = max(100, min(500, int(baseline * 0.15)))
+        behavior_bonus = behavior_count * 30
+        return min(base_tokens + behavior_bonus, 2000)
+
+    @staticmethod
+    def _estimate_runservice_tokens(baseline_tokens: int) -> int:
+        if baseline_tokens <= 0:
+            baseline_tokens = 800
+        return max(50, min(250, int(baseline_tokens * 0.02)))
+
+    def _calculate_service_cost(self, service_name: str, token_count: int, api_calls: int) -> float:
+        profile = _SERVICE_COST_MODEL.get(service_name, {})
+        token_rate = profile.get("cost_per_1k_tokens", 0.06)
+        call_rate = profile.get("cost_per_api_call", 0.0)
+        token_cost = ((token_count or 0) / 1000.0) * token_rate if token_count else 0.0
+        call_cost = (api_calls or 0) * call_rate
+        total = token_cost + call_cost
+        return round(total, 6) if total else 0.0
+
+    def _calculate_savings(
+        self, baseline_tokens: Optional[int], output_tokens: Optional[int]
+    ) -> Optional[float]:
+        if baseline_tokens is None or output_tokens is None:
+            return None
+        token_delta = baseline_tokens - output_tokens
+        if token_delta <= 0:
+            return 0.0
+        token_rate = _SERVICE_COST_MODEL.get("ActionService", {}).get("cost_per_1k_tokens", 0.06)
+        savings = (token_delta / 1000.0) * token_rate
+        return round(savings, 6)
 
     @staticmethod
     def _coerce_event(event: TelemetryInput) -> TelemetryEvent:

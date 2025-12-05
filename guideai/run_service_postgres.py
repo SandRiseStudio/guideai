@@ -90,7 +90,8 @@ class PostgresRunService:
         actor = request.actor
 
         metadata = self._build_metadata(request)
-        with self._connection(autocommit=False) as conn:
+
+        def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -136,6 +137,15 @@ class PostgresRunService:
                         self._extras.Json(metadata),
                     ),
                 )
+
+        self._pool.run_transaction(
+            operation="create_run",
+            service_prefix="run",
+            actor=asdict(actor),
+            metadata={"run_id": run_id, "workflow_id": request.workflow_id},
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
 
         run = self.get_run(run_id)
         self._telemetry.emit_event(
@@ -230,7 +240,7 @@ class PostgresRunService:
         if update.tokens_baseline is not None:
             metadata.setdefault("tokens", {})["baseline"] = update.tokens_baseline
 
-        with self._connection(autocommit=False) as conn:
+        def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -271,6 +281,15 @@ class PostgresRunService:
                         metadata=update.metadata,
                     )
 
+        self._pool.run_transaction(
+            operation="update_run",
+            service_prefix="run",
+            actor=asdict(run.actor),
+            metadata={"run_id": run_id, "status": new_status},
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
+
         updated_run = self.get_run(run_id)
         self._telemetry.emit_event(
             event_type="run.progress",
@@ -299,7 +318,7 @@ class PostgresRunService:
         progress_pct = 100.0 if status == RunStatus.COMPLETED else run.progress_pct
         merged_metadata = self._merge_metadata(run.metadata, completion.metadata)
 
-        with self._connection(autocommit=False) as conn:
+        def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -330,6 +349,15 @@ class PostgresRunService:
                     ),
                 )
 
+        self._pool.run_transaction(
+            operation="complete_run",
+            service_prefix="run",
+            actor=asdict(run.actor),
+            metadata={"run_id": run_id, "status": status},
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
+
         updated_run = self.get_run(run_id)
         self._telemetry.emit_event(
             event_type="run.completed",
@@ -353,11 +381,21 @@ class PostgresRunService:
 
     def delete_run(self, run_id: str) -> None:
         """Delete a run (CASCADE will remove run_steps)."""
-        with self._connection(autocommit=False) as conn:
+
+        def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
                 if cur.rowcount == 0:
                     raise RunNotFoundError(f"Run '{run_id}' not found")
+
+        self._pool.run_transaction(
+            operation="delete_run",
+            service_prefix="run",
+            actor={"id": "system", "role": "SYSTEM", "surface": "INTERNAL"},
+            metadata={"run_id": run_id},
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -377,7 +415,9 @@ class PostgresRunService:
             role=row["actor_role"],
             surface=row["actor_surface"],
         )
-        steps = self._fetch_steps(row["run_id"])
+        # Convert UUID to string before passing to _fetch_steps
+        run_id_str = str(row["run_id"])
+        steps = self._fetch_steps(run_id_str)
 
         # JSONB columns are already deserialized
         behavior_ids = row["behavior_ids"] if isinstance(row["behavior_ids"], list) else []
@@ -385,7 +425,7 @@ class PostgresRunService:
         metadata = row["metadata"] if isinstance(row["metadata"], dict) else {}
 
         return Run(
-            run_id=row["run_id"],
+            run_id=run_id_str,
             created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else row["created_at"],
             updated_at=row["updated_at"].isoformat() if hasattr(row["updated_at"], "isoformat") else row["updated_at"],
             actor=actor,
@@ -426,7 +466,7 @@ class PostgresRunService:
             metadata = row["metadata"] if isinstance(row["metadata"], dict) else {}
             steps.append(
                 RunStep(
-                    step_id=row["step_id"],
+                    step_id=str(row["step_id"]),
                     name=row["name"],
                     status=row["status"],
                     started_at=row["started_at"].isoformat() if row["started_at"] and hasattr(row["started_at"], "isoformat") else row["started_at"],

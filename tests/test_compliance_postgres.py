@@ -19,9 +19,10 @@ except ImportError:
 import pytest
 
 from guideai.action_contracts import Actor
-from guideai.compliance_service_postgres import (
+from guideai.compliance_service import (
     ChecklistNotFoundError,
-    PostgresComplianceService,
+    ComplianceService,
+    RecordStepRequest,
 )
 
 
@@ -42,6 +43,32 @@ def _truncate_compliance_tables(dsn: str) -> None:
         conn.close()
 
 
+def _create_checklist(service, **overrides):
+    """Helper to create checklists with sensible defaults."""
+    payload = {
+        "title": "Test Checklist",
+        "description": "",
+        "template_id": None,
+        "milestone": None,
+        "compliance_category": [],
+    }
+    payload.update(overrides)
+    return service.create_checklist(actor=TEST_ACTOR, **payload)
+
+
+def _record_step(service, checklist_id: str, *, title: str, status: str, **kwargs):
+    """Helper to record steps via RecordStepRequest."""
+    request = RecordStepRequest(
+        checklist_id=checklist_id,
+        title=title,
+        status=status,
+        evidence=kwargs.get("evidence"),
+        behaviors_cited=kwargs.get("behaviors_cited"),
+        related_run_id=kwargs.get("related_run_id"),
+    )
+    return service.record_step(request, actor=TEST_ACTOR)
+
+
 @pytest.fixture
 def postgres_dsn():
     """Discover PostgreSQL DSN from environment."""
@@ -53,15 +80,16 @@ def postgres_dsn():
 
 @pytest.fixture
 def service(postgres_dsn):
-    """Create a fresh PostgresComplianceService for each test."""
+    """Create a fresh ComplianceService for each test."""
     _truncate_compliance_tables(postgres_dsn)
-    svc = PostgresComplianceService(dsn=postgres_dsn)
+    svc = ComplianceService(dsn=postgres_dsn)
     yield svc
 
 
 def test_create_checklist(service):
     """Should create a checklist with all fields."""
-    checklist = service.create_checklist(
+    checklist = _create_checklist(
+        service,
         title="PRD Compliance",
         description="Ensure PRD complete",
         template_id="template-001",
@@ -81,18 +109,19 @@ def test_create_checklist(service):
 
 def test_get_checklist(service):
     """Should retrieve checklist with steps."""
-    checklist = service.create_checklist(
+    checklist = _create_checklist(
+        service,
         title="Test Checklist",
         description="Test",
         milestone="M1",
         compliance_category=["test"],
     )
 
-    service.record_step(
-        checklist_id=checklist.checklist_id,
+    _record_step(
+        service,
+        checklist.checklist_id,
         title="Step 1",
         status="COMPLETED",
-        actor=TEST_ACTOR,
         evidence={"url": "https://example.com"},
         behaviors_cited=["behavior-001"],
     )
@@ -115,9 +144,9 @@ def test_get_checklist_not_found(service):
 
 def test_list_checklists(service):
     """Should list all checklists."""
-    service.create_checklist(title="Checklist 1", description="", milestone="M1")
-    service.create_checklist(title="Checklist 2", description="", milestone="M2")
-    service.create_checklist(title="Checklist 3", description="", milestone="M1")
+    _create_checklist(service, title="Checklist 1", milestone="M1")
+    _create_checklist(service, title="Checklist 2", milestone="M2")
+    _create_checklist(service, title="Checklist 3", milestone="M1")
 
     all_checklists = service.list_checklists()
     assert len(all_checklists) == 3
@@ -125,8 +154,8 @@ def test_list_checklists(service):
 
 def test_list_checklists_filter_milestone(service):
     """Should filter checklists by milestone."""
-    service.create_checklist(title="M1 Checklist", description="", milestone="M1")
-    service.create_checklist(title="M2 Checklist", description="", milestone="M2")
+    _create_checklist(service, title="M1 Checklist", milestone="M1")
+    _create_checklist(service, title="M2 Checklist", milestone="M2")
 
     m1_checklists = service.list_checklists(milestone="M1")
     assert len(m1_checklists) == 1
@@ -135,14 +164,14 @@ def test_list_checklists_filter_milestone(service):
 
 def test_list_checklists_filter_category(service):
     """Should filter checklists by compliance category."""
-    service.create_checklist(
+    _create_checklist(
+        service,
         title="Doc Checklist",
-        description="",
         compliance_category=["documentation"],
     )
-    service.create_checklist(
+    _create_checklist(
+        service,
         title="Security Checklist",
-        description="",
         compliance_category=["security"],
     )
 
@@ -153,16 +182,11 @@ def test_list_checklists_filter_category(service):
 
 def test_list_checklists_filter_status_completed(service):
     """Should filter checklists by COMPLETED status."""
-    c1 = service.create_checklist(title="Active", description="")
-    c2 = service.create_checklist(title="Completed", description="")
+    c1 = _create_checklist(service, title="Active")
+    c2 = _create_checklist(service, title="Completed")
 
     # Complete c2 by adding a terminal step
-    service.record_step(
-        checklist_id=c2.checklist_id,
-        title="Final Step",
-        status="COMPLETED",
-        actor=TEST_ACTOR,
-    )
+    _record_step(service, c2.checklist_id, title="Final Step", status="COMPLETED")
 
     completed = service.list_checklists(status_filter="COMPLETED")
     assert len(completed) == 1
@@ -171,15 +195,10 @@ def test_list_checklists_filter_status_completed(service):
 
 def test_list_checklists_filter_status_active(service):
     """Should filter checklists by ACTIVE status."""
-    c1 = service.create_checklist(title="Active", description="")
-    c2 = service.create_checklist(title="Completed", description="")
+    c1 = _create_checklist(service, title="Active")
+    c2 = _create_checklist(service, title="Completed")
 
-    service.record_step(
-        checklist_id=c2.checklist_id,
-        title="Step",
-        status="COMPLETED",
-        actor=TEST_ACTOR,
-    )
+    _record_step(service, c2.checklist_id, title="Step", status="COMPLETED")
 
     active = service.list_checklists(status_filter="ACTIVE")
     assert len(active) == 1
@@ -188,13 +207,13 @@ def test_list_checklists_filter_status_active(service):
 
 def test_record_step(service):
     """Should record a step with all fields."""
-    checklist = service.create_checklist(title="Test", description="")
+    checklist = _create_checklist(service, title="Test")
 
-    step = service.record_step(
-        checklist_id=checklist.checklist_id,
+    step = _record_step(
+        service,
+        checklist.checklist_id,
         title="Step 1",
         status="IN_PROGRESS",
-        actor=TEST_ACTOR,
         evidence={"file": "test.py"},
         behaviors_cited=["behavior-001"],
         related_run_id="run-123",
@@ -209,12 +228,12 @@ def test_record_step(service):
 
 def test_record_step_coverage_calculation(service):
     """Should calculate coverage correctly."""
-    checklist = service.create_checklist(title="Test", description="")
+    checklist = _create_checklist(service, title="Test")
 
-    # 2 terminal out of 3 total = 0.666...
-    service.record_step(checklist_id=checklist.checklist_id, title="Step 1", status="COMPLETED", actor=TEST_ACTOR)
-    service.record_step(checklist_id=checklist.checklist_id, title="Step 2", status="FAILED", actor=TEST_ACTOR)
-    service.record_step(checklist_id=checklist.checklist_id, title="Step 3", status="PENDING", actor=TEST_ACTOR)
+    # 2 terminal (COMPLETED + SKIPPED) out of 3 total = 0.666...
+    _record_step(service, checklist.checklist_id, title="Step 1", status="COMPLETED")
+    _record_step(service, checklist.checklist_id, title="Step 2", status="SKIPPED")
+    _record_step(service, checklist.checklist_id, title="Step 3", status="PENDING")
 
     retrieved = service.get_checklist(checklist.checklist_id)
     assert abs(retrieved.coverage_score - 0.6666) < 0.01
@@ -222,10 +241,10 @@ def test_record_step_coverage_calculation(service):
 
 def test_record_step_auto_completion(service):
     """Should auto-complete checklist when all steps terminal."""
-    checklist = service.create_checklist(title="Test", description="")
+    checklist = _create_checklist(service, title="Test")
 
-    service.record_step(checklist_id=checklist.checklist_id, title="Step 1", status="COMPLETED", actor=TEST_ACTOR)
-    service.record_step(checklist_id=checklist.checklist_id, title="Step 2", status="COMPLETED", actor=TEST_ACTOR)
+    _record_step(service, checklist.checklist_id, title="Step 1", status="COMPLETED")
+    _record_step(service, checklist.checklist_id, title="Step 2", status="COMPLETED")
 
     retrieved = service.get_checklist(checklist.checklist_id)
     assert retrieved.completed_at is not None
@@ -234,30 +253,30 @@ def test_record_step_auto_completion(service):
 
 def test_validate_checklist(service):
     """Should validate checklist and return correct results."""
-    checklist = service.create_checklist(title="Test", description="")
+    checklist = _create_checklist(service, title="Test")
 
-    service.record_step(checklist_id=checklist.checklist_id, title="Completed", status="COMPLETED", actor=TEST_ACTOR)
-    service.record_step(checklist_id=checklist.checklist_id, title="Failed", status="FAILED", actor=TEST_ACTOR)
-    service.record_step(checklist_id=checklist.checklist_id, title="Pending", status="PENDING", actor=TEST_ACTOR)
-    service.record_step(checklist_id=checklist.checklist_id, title="Skipped", status="SKIPPED", actor=TEST_ACTOR)
+    _record_step(service, checklist.checklist_id, title="Completed", status="COMPLETED")
+    _record_step(service, checklist.checklist_id, title="Failed", status="FAILED")
+    _record_step(service, checklist.checklist_id, title="Pending", status="PENDING")
+    _record_step(service, checklist.checklist_id, title="Skipped", status="SKIPPED")
 
-    result = service.validate_checklist(checklist.checklist_id)
+    result = service.validate_checklist(checklist.checklist_id, TEST_ACTOR).to_dict()
 
     assert result["valid"] is False
-    assert abs(result["coverage_score"] - 0.75) < 0.01  # 3 terminal / 4 total
+    assert abs(result["coverage_score"] - 0.5) < 0.01  # 2 terminal / 4 total
     assert result["missing_steps"] == ["Pending"]
     assert result["failed_steps"] == ["Failed"]
-    assert result["warnings"] == ["Skipped"]
+    assert result["warnings"] == ["Step 'Skipped' was skipped without completion."]
 
 
 def test_validate_checklist_all_completed(service):
     """Should return valid=True when all steps COMPLETED."""
-    checklist = service.create_checklist(title="Test", description="")
+    checklist = _create_checklist(service, title="Test")
 
-    service.record_step(checklist_id=checklist.checklist_id, title="Step 1", status="COMPLETED", actor=TEST_ACTOR)
-    service.record_step(checklist_id=checklist.checklist_id, title="Step 2", status="COMPLETED", actor=TEST_ACTOR)
+    _record_step(service, checklist.checklist_id, title="Step 1", status="COMPLETED")
+    _record_step(service, checklist.checklist_id, title="Step 2", status="COMPLETED")
 
-    result = service.validate_checklist(checklist.checklist_id)
+    result = service.validate_checklist(checklist.checklist_id, TEST_ACTOR).to_dict()
 
     assert result["valid"] is True
     assert result["coverage_score"] == 1.0
@@ -269,4 +288,4 @@ def test_validate_checklist_all_completed(service):
 def test_validate_checklist_not_found(service):
     """Should raise ChecklistNotFoundError when validating missing checklist."""
     with pytest.raises(ChecklistNotFoundError):
-        service.validate_checklist(NONEXISTENT_CHECKLIST_ID)
+        service.validate_checklist(NONEXISTENT_CHECKLIST_ID, TEST_ACTOR)

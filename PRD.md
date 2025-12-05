@@ -187,8 +187,41 @@ Deliver a connected platform that captures procedural knowledge, guides agents t
 - **Audit Log Storage:** immutable evidence pipeline outlined in `AUDIT_LOG_STORAGE.md`.
 - **Secrets Management:** device login + rotation policies documented in `SECRETS_MANAGEMENT_PLAN.md`.
 - **Agent Auth Service:** centralized OAuth/OIDC broker with just-in-time consent, policy enforcement, and audit integration per `docs/AGENT_AUTH_ARCHITECTURE.md`.
+- **Amprealize Orchestrator:** single-front-door service that provisions, resumes, and retires all GuideAI test environments and data fixtures so clients never talk directly to pods, clusters, or queues.
 - **Client Integrations:** web app (Next.js), CLI (Python Typer), VS Code extension (TypeScript). Shared SDK for authentication and API calls; see `docs/SDK_SCOPE.md` for supported languages, versioning, and distribution roadmap.
 - **LLM Connectors:** plugable interface for OpenAI, Anthropic, local models; handles prompt templates for behavior-conditioned inference.
+
+### Amprealize Infrastructure Orchestration
+- **Purpose:** Amprealize replaces ad-hoc pod and cluster access with a documented, replayable API for provisioning, pausing, and disposing of all ephemeral testing and remediation environments. Every client surface (CLI, VS Code, MCP, API) must route infrastructure operations through Amprealize to keep audit evidence, quota tracking, and teardown guarantees consistent.
+- **Scope:** Manages sandbox lifecycles (create, hydrate data, attach secrets, run health checks, retire), coordinates long-running integration suites, and owns the catalog of reusable environment blueprints (PostgreSQL, TimescaleDB, Redis, Flink, vector stores, telemetry warehouse mirrors, etc.). Amprealize is also responsible for publishing cost, capacity, and utilization metrics back into MetricsService.
+- **Interfaces:**
+  - `amprealize.plan` – declares desired environment topology, compliance tier, and lifespan; returns a signed manifest recorded in ActionService for reproducibility.
+  - `amprealize.apply` – executes the manifest by calling Terraform runners, Kubernetes operators, or cloud APIs behind the scenes while streaming RunService status updates.
+  - `amprealize.status` / `amprealize.destroy` – report lifecycle events, issue teardown commands, and emit completion evidence to ComplianceService and PROGRESS_TRACKER.
+  - Device-flow friendly authentication so IDE users can request environments without having direct kubeconfig/cluster creds.
+- **Contract Requirements:** No caller is allowed to reach pods, nodes, or queues directly; Amprealize enforces configuration policy, injects secrets via `SECRETS_MANAGEMENT_PLAN.md`, and logs every infrastructure mutation to the audit pipeline. The service must expose parity across Web/API/CLI/MCP and honor the Strategist → Teacher → Student workflow (e.g., Strategist drafts an Amprealize plan, Student executes, Teacher reviews evidence).
+- **Telemetry:** Emits structured events (`amprealize.plan.created`, `amprealize.apply.started`, `amprealize.apply.duration_ms`, `amprealize.destroy.completed`) feeding the 70% behavior reuse / 30% token savings / 80% completion / 95% compliance metrics as well as new infrastructure KPIs (environment reuse %, average lifespan, teardown success rate).
+- **Documentation-First Directive:** All new capabilities must land in this PRD, `PRD_NEXT_STEPS.md`, and `PRD_ALIGNMENT_LOG.md` before code merges; Amprealize changes also require updates to `ACTION_REGISTRY_SPEC.md` and CLI/MCP help so Strategist agents can reference the behavior handbook entries that govern infrastructure operations.
+
+#### `scripts/run_tests.sh` Integration Requirements
+- The `scripts/run_tests.sh` harness must treat Amprealize as the authoritative provisioner whenever `GUIDEAI_TEST_INFRA_MODE=amprealize` (default once Phase 1 ships). In this mode the script:
+  - Calls `guideai amprealize plan --blueprint local-test-suite --lifetime ${RUN_TESTS_TTL:-90m}` before any Podman/Compose commands run, passing the checklist ID for the current run so ComplianceService can track evidence.
+  - Uses the signed manifest returned by `amprealize.plan` to invoke `guideai amprealize apply --manifest - --watch` instead of local `podman-compose` calls. Amprealize then stands up the telemetry warehouse, metrics DB, Redis, API server, and nginx stack that `run_tests.sh` previously started directly.
+  - Reads the emitted `environment_outputs` blob (JSON) to export DSNs and host/port pairs (`GUIDEAI_PG_HOST_*`, `GUIDEAI_REDIS_HOST`, `STAGING_API_URL`, etc.) so downstream pytest runs continue to work without modification.
+  - Polls `guideai amprealize status --run-id <amp_run_id>` until every dependency is healthy, mirroring the existing port checks, and streams status events into RunService for IDE/CLI parity.
+  - Calls `guideai amprealize destroy --run-id <amp_run_id>` in a `trap` if the script provisioned the environment, guaranteeing teardown of ephemeral resources even when pytest fails.
+- Because Amprealize replaces Podman-managed compose stacks, `run_tests.sh` must enforce the Podman memory guidance captured in `deployment/PODMAN.md`: stop any running Podman machine (`podman machine stop`) before provisioning to release the 4–8 GB Apple Virtualization (AppleHV) VM footprint, warn when `GUIDEAI_TEST_INFRA_MODE=amprealize` but Podman is still running, and document that engineers need to manually start the Podman VM (`podman machine start --cpus 4 --memory 4096`) only when opting into the legacy mode. This prevents macOS hosts from keeping two full stacks in memory and makes the AppleHV VM life cycle an explicit operator step rather than an implicit background process.
+- When `GUIDEAI_TEST_INFRA_MODE=legacy` (opt-in until Amprealize reaches GA), the script retains the current Podman bootstrap path. This provides backwards compatibility for engineers who cannot reach the orchestrator yet and satisfies the “standalone” requirement.
+- Integration must remain hermetic: `run_tests.sh` never talks to pods/clusters directly in Amprealize mode, and all side effects (plan/apply/destroy/status) are logged via ActionService entries so replay is possible.
+
+#### Standalone Amprealize CLI / Service Usage
+- `guideai amprealize plan|apply|status|destroy` must function without the rest of the GuideAI repo so external projects can reuse the orchestrator. Requirements:
+  - CLI accepts either inline JSON manifests (`--manifest -`) or file paths (`--manifest ./amprealize/local-dev.yaml`) describing blueprints, secrets, and compliance tiers. Manifests reference catalog items published from Phase 2 (e.g., `postgres.timescale.test`, `redis.cache.basic`).
+  - Authentication relies on the existing device flow from AgentAuthService; no local kube credentials are required. Token cache defaults to `~/.guideai/amprealize/credentials.json` for reuse across repos.
+  - Outputs are written to `~/.guideai/amprealize/environments/<run_id>.json` so other tools (including `scripts/run_tests.sh`) can source DSNs without the GuideAI codebase.
+  - REST, CLI, MCP, and upcoming VS Code panels expose identical parameters and status objects to maintain parity. Standalone users can therefore provision environments programmatically (CI pipelines, other repos) using the same manifests.
+  - Standalone docs must restate the Podman/AppleHV memory guidance so that engineers treating Amprealize as a portable orchestrator know to stop the Podman VM before provisioning, reclaim the 4–8 GB footprint after teardown, and only restart it for legacy Compose scenarios.
+- Action logging: every CLI invocation must emit `guideai record-action --artifact ACTION_REGISTRY_SPEC.md --summary "amprealize.{verb}" ...` entries referencing `behavior_wire_cli_to_orchestrator` and `behavior_update_docs_after_changes` so that infrastructure mutations remain auditable across standalone adopters.
 
 ## Data Model
 - **Behavior:** id, name, trigger keywords, instruction, role focus, status, version, embedding vector, usage stats. `version` follows semantic versioning with lifecycle rules defined in `docs/BEHAVIOR_VERSIONING.md`; every run stores `(behavior_id, version)` for reproducibility.
@@ -451,6 +484,13 @@ Deliver a connected platform that captures procedural knowledge, guides agents t
    - Week 15-16: Web console v1 MVP (behavior search, BCI monitoring dashboard, run explorer)
    - Deferred to Milestone 3: Production analytics warehouse (DuckDB sufficient for beta), AgentAuth production rollout (Phase 1 covers development/testing)
 
+  ### Amprealize Rollout Plan (Documentation-First)
+  - **Phase 0 – Documentation & Contracts (current):** Capture Amprealize vision, API shape, and audit requirements in PRD.md, `PRD_NEXT_STEPS.md`, and `PRD_ALIGNMENT_LOG.md` before writing code. Update `ACTION_REGISTRY_SPEC.md` and CLI/MCP help with placeholder commands (`guideai amprealize plan|apply|status|destroy`).
+  - **Phase 1 – Control Plane Implementation (Weeks 5-6 overlap):** Build the Amprealize service backing the `plan/apply/status/destroy` lifecycle. Integrate with RunService for status propagation, ComplianceService for evidence, and MetricsService for utilization KPIs. All infrastructure requests from Strategist/Student agents must traverse Amprealize.
+  - **Phase 2 – Environment Catalog (Weeks 7-8):** Ship blueprint library (PostgreSQL+Timescale bundle, Redis cache tier, telemetry stack, behavior retriever bench) with policy metadata (cost ceiling, lease duration, compliance tags). Surface catalog via CLI/VS Code pickers and expose API filters for automation.
+  - **Phase 3 – Observability & Quotas (Weeks 9-10):** Add telemetry streams for resource usage, enforce per-tenant quotas, and wire dashboards highlighting environment reuse %, teardown success rate, and token savings tied to infrastructure automation.
+  - **Exit Criteria:** No user or agent touches pods/infra directly; every environment is provisioned, audited, and destroyed through Amprealize with evidence recorded in ActionService and PROGRESS_TRACKER.
+
 4. **Milestone 3 – GA (6 weeks):** Scaling improvements, behavior lifecycle automation, SDK release, documentation, expanded provider connectors and advanced policy tooling.
 
 ## Risks & Mitigations
@@ -462,7 +502,7 @@ Deliver a connected platform that captures procedural knowledge, guides agents t
 
 ## Open Questions
 - Should we support multi-tenant behavior handbooks with shared/global behaviors?
-- How to price token savings; do we surface cost analytics to customers?
+- ~~How to price token savings; do we surface cost analytics to customers?~~ **RESOLVED** - Yes, cost analytics are customer-facing via VS Code extension Cost Tracker tree view. See [COST_MODEL.md](docs/COST_MODEL.md).
 - What is the minimum viable reflection quality to auto-suggest behaviors?
 - Do we offer on-prem deployments for regulated environments?
 

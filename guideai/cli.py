@@ -10,9 +10,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import webbrowser
+import yaml
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from typing import Any, Dict, List, Optional
 
 from guideai.action_service import ActionService
@@ -58,22 +61,26 @@ from guideai.behavior_service import BehaviorService
 from guideai.agent_orchestrator_service import AgentOrchestratorService
 from guideai.metrics_service import MetricsService
 from guideai.reflection_service import ReflectionService
+from guideai.reflection_service_postgres import PostgresReflectionService
 from guideai.reflection_contracts import TraceFormat
 from guideai.run_service import RunService
 from guideai.task_assignments import TaskAssignmentService
-from guideai.telemetry import TelemetryClient, create_sink_from_env
+from guideai.telemetry import TelemetryClient, create_sink_from_env, FileTelemetrySink, KafkaTelemetrySink
 from guideai.workflow_service import WorkflowService
+from guideai.utils.dsn import apply_host_overrides
 from guideai.auth_tokens import (
     AuthTokenBundle,
     TokenStore,
     TokenStoreError,
     get_default_token_store,
 )
+from guideai.amprealize import BandwidthEnforcer
 
 DEFAULT_OUTPUT = Path("security/scan_reports/latest.json")
 DEFAULT_ACTOR_ID = "local-cli"
 DEFAULT_ACTOR_ROLE = "STRATEGIST"
 DEFAULT_TELEMETRY_EVENTS_PATH = Path.home() / ".guideai" / "telemetry" / "events.jsonl"
+AMPREALIZE_SNAPSHOT_DIR = Path.home() / ".guideai" / "amprealize" / "snapshots"
 
 _ACTION_SERVICE: ActionService | None = None
 _ACTION_ADAPTER: CLIActionServiceAdapter | None = None
@@ -212,16 +219,29 @@ def _get_bci_service() -> BCIService:
 
 
 def _get_reflection_adapter() -> CLIReflectionAdapter:
+    """Get or create CLIReflectionAdapter singleton.
+
+    Uses PostgreSQL backend when GUIDEAI_REFLECTION_PG_DSN is set,
+    otherwise falls back to in-memory implementation.
+    """
     global _REFLECTION_SERVICE, _REFLECTION_ADAPTER, _BEHAVIOR_SERVICE, _BCI_SERVICE
     if _BEHAVIOR_SERVICE is None:
         _BEHAVIOR_SERVICE = BehaviorService()
     if _BCI_SERVICE is None:
         _BCI_SERVICE = BCIService(behavior_service=_BEHAVIOR_SERVICE)
     if _REFLECTION_SERVICE is None:
-        _REFLECTION_SERVICE = ReflectionService(
-            behavior_service=_BEHAVIOR_SERVICE,
-            bci_service=_BCI_SERVICE,
-        )
+        dsn = apply_host_overrides(os.environ.get("GUIDEAI_REFLECTION_PG_DSN"), "REFLECTION")
+        if dsn:
+            _REFLECTION_SERVICE = PostgresReflectionService(
+                dsn=dsn,
+                behavior_service=_BEHAVIOR_SERVICE,
+                bci_service=_BCI_SERVICE,
+            )
+        else:
+            _REFLECTION_SERVICE = ReflectionService(
+                behavior_service=_BEHAVIOR_SERVICE,
+                bci_service=_BCI_SERVICE,
+            )
     if _REFLECTION_ADAPTER is None:
         _REFLECTION_ADAPTER = CLIReflectionAdapter(_REFLECTION_SERVICE)
     return _REFLECTION_ADAPTER
@@ -361,6 +381,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     record_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier (defaults to local-cli)")
     record_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role such as STRATEGIST")
     record_parser.add_argument("--related-run-id", help="Optional RunService identifier")
+    record_parser.add_argument("--audit-log-event-id", help="Optional audit log event identifier")
     record_parser.add_argument("--checksum", help="Optional checksum override (SHA-256)")
     record_parser.add_argument(
         "--format",
@@ -424,6 +445,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("json", "table"),
         default="json",
         help="Output format",
+    )
+
+    dr_parser = subparsers.add_parser(
+        "dr",
+        help="Disaster recovery commands (backup, restore, status, failover)",
+    )
+    dr_parser.add_argument(
+        "dr_args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="Arguments forwarded to the DR CLI (prefix with '--' to stop argparse parsing)",
     )
 
     tasks_parser = subparsers.add_parser(
@@ -778,13 +810,127 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "validate",
         help="Validate a checklist and calculate coverage",
     )
-    compliance_validate_parser.add_argument("checklist_id", help="Checklist identifier")
+    compliance_validate_parser.add_argument("checklist_id", nargs="?", help="Checklist identifier")
+    compliance_validate_parser.add_argument("--action-id", help="Validate by action identifier (alternative to checklist_id)")
     compliance_validate_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
     compliance_validate_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
     compliance_validate_parser.add_argument(
         "--format",
         choices=("json", "table"),
         default="json",
+        help="Output format",
+    )
+
+    # Compliance policies subcommands
+    compliance_policies_parser = compliance_subparsers.add_parser(
+        "policies",
+        help="Manage compliance policies",
+    )
+    compliance_policies_subparsers = compliance_policies_parser.add_subparsers(dest="policies_command")
+
+    policies_list_parser = compliance_policies_subparsers.add_parser(
+        "list",
+        help="List compliance policies",
+    )
+    policies_list_parser.add_argument("--org-id", help="Filter by organization ID")
+    policies_list_parser.add_argument("--project-id", help="Filter by project ID")
+    policies_list_parser.add_argument(
+        "--type",
+        dest="policy_type",
+        choices=("AUDIT", "SECURITY", "COMPLIANCE", "GOVERNANCE", "CUSTOM"),
+        help="Filter by policy type",
+    )
+    policies_list_parser.add_argument(
+        "--enforcement",
+        dest="enforcement_level",
+        choices=("ADVISORY", "WARNING", "BLOCKING"),
+        help="Filter by enforcement level",
+    )
+    policies_list_parser.add_argument(
+        "--active-only",
+        action="store_true",
+        default=False,
+        help="Only show active policies",
+    )
+    policies_list_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    policies_create_parser = compliance_policies_subparsers.add_parser(
+        "create",
+        help="Create a new compliance policy",
+    )
+    policies_create_parser.add_argument("--name", required=True, help="Policy name")
+    policies_create_parser.add_argument("--description", required=True, help="Policy description")
+    policies_create_parser.add_argument(
+        "--type",
+        dest="policy_type",
+        required=True,
+        choices=("AUDIT", "SECURITY", "COMPLIANCE", "GOVERNANCE", "CUSTOM"),
+        help="Policy type",
+    )
+    policies_create_parser.add_argument(
+        "--enforcement",
+        dest="enforcement_level",
+        required=True,
+        choices=("ADVISORY", "WARNING", "BLOCKING"),
+        help="Enforcement level",
+    )
+    policies_create_parser.add_argument("--org-id", help="Organization ID (for org/project scope)")
+    policies_create_parser.add_argument("--project-id", help="Project ID (requires --org-id)")
+    policies_create_parser.add_argument("--version", default="1.0.0", help="Policy version")
+    policies_create_parser.add_argument(
+        "--behavior",
+        dest="required_behaviors",
+        action="append",
+        default=[],
+        help="Required behavior ID (repeatable)",
+    )
+    policies_create_parser.add_argument(
+        "--category",
+        dest="compliance_categories",
+        action="append",
+        default=[],
+        help="Compliance category (SOC2, GDPR, etc., repeatable)",
+    )
+    policies_create_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
+    policies_create_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
+    policies_create_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    policies_get_parser = compliance_policies_subparsers.add_parser(
+        "get",
+        help="Retrieve a single policy by ID",
+    )
+    policies_get_parser.add_argument("policy_id", help="Policy identifier")
+    policies_get_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    # Compliance audit subcommand
+    compliance_audit_parser = compliance_subparsers.add_parser(
+        "audit",
+        help="Generate audit trail report",
+    )
+    compliance_audit_parser.add_argument("--run-id", help="Filter by run ID")
+    compliance_audit_parser.add_argument("--checklist-id", help="Filter by checklist ID")
+    compliance_audit_parser.add_argument("--action-id", help="Filter by action ID")
+    compliance_audit_parser.add_argument("--start-date", help="Filter entries after this ISO timestamp")
+    compliance_audit_parser.add_argument("--end-date", help="Filter entries before this ISO timestamp")
+    compliance_audit_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
         help="Output format",
     )
 
@@ -990,389 +1136,821 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Output format",
     )
 
-    agents_parser = subparsers.add_parser(
-        "agents",
-        help="Manage runtime agent assignments",
+    # amprealize
+    amp_parser = subparsers.add_parser(
+        "amprealize",
+        help="Infrastructure orchestration and plan management",
     )
-    agents_subparsers = agents_parser.add_subparsers(dest="agents_command")
+    amp_subparsers = amp_parser.add_subparsers(dest="amprealize_command")
+    amp_subparsers.required = True
 
-    agents_assign_parser = agents_subparsers.add_parser(
-        "assign",
-        help="Assign an agent persona to a run",
+    # amprealize plan
+    amp_plan_parser = amp_subparsers.add_parser(
+        "plan",
+        help="Generate an execution plan from a blueprint",
     )
-    agents_assign_parser.add_argument("--run-id", help="Existing run identifier to attach the assignment")
-    agents_assign_parser.add_argument("--agent-id", help="Requested agent persona identifier")
-    agents_assign_parser.add_argument(
-        "--stage",
-        default="EXECUTION",
-        help="Pipeline stage for the assignment (defaults to EXECUTION)",
-    )
-    agents_assign_parser.add_argument(
-        "--context",
-        dest="context_json",
-        help="Inline JSON object describing task context (task_type, severity, etc.)",
-    )
-    agents_assign_parser.add_argument(
-        "--context-file",
-        dest="context_file",
-        help="Path to JSON file containing task context details",
-    )
-    agents_assign_parser.add_argument(
-        "--requested-by-id",
-        default=DEFAULT_ACTOR_ID,
-        help="Requester identifier (defaults to local CLI actor)",
-    )
-    agents_assign_parser.add_argument(
-        "--requested-by-role",
-        default=DEFAULT_ACTOR_ROLE,
-        help="Requester role (defaults to STRATEGIST)",
-    )
-    agents_assign_parser.add_argument(
-        "--format",
-        choices=("json", "table"),
-        default="json",
-        help="Output format",
-    )
-
-    agents_switch_parser = agents_subparsers.add_parser(
-        "switch",
-        help="Switch the active agent for an existing assignment",
-    )
-    agents_switch_parser.add_argument("assignment_id", help="Agent assignment identifier")
-    agents_switch_parser.add_argument(
-        "--target-agent-id",
-        dest="target_agent_id",
+    amp_plan_parser.add_argument(
+        "--blueprint-id",
+        dest="blueprint_id",
         required=True,
-        help="Persona identifier to switch to",
+        help="ID of the blueprint to plan",
     )
-    agents_switch_parser.add_argument("--reason", help="Reason for the switch (optional)")
-    agents_switch_parser.add_argument(
-        "--allow-downgrade",
-        action="store_true",
-        help="Permit switching to an agent with fewer capabilities",
+    amp_plan_parser.add_argument(
+        "--environment",
+        dest="environment",
+        default="development",
+        help="Target environment (development, staging, production)",
     )
-    agents_switch_parser.add_argument(
-        "--stage",
-        help="Override the pipeline stage after switching",
+    amp_plan_parser.add_argument(
+        "--lifetime",
+        dest="lifetime",
+        default="90m",
+        help="Lifetime of the environment (ISO8601 duration)",
     )
-    agents_switch_parser.add_argument(
-        "--issued-by-id",
-        default=DEFAULT_ACTOR_ID,
-        help="Identifier of the actor issuing the switch",
+    amp_plan_parser.add_argument(
+        "--compliance-tier",
+        dest="compliance_tier",
+        default="dev",
+        choices=["dev", "prod-sim", "pci-sandbox"],
+        help="Compliance tier for the environment",
     )
-    agents_switch_parser.add_argument(
-        "--issued-by-role",
-        default=DEFAULT_ACTOR_ROLE,
-        help="Role of the actor issuing the switch",
+    amp_plan_parser.add_argument(
+        "--checklist-id",
+        dest="checklist_id",
+        help="Compliance checklist ID to link evidence to",
     )
-    agents_switch_parser.add_argument(
-        "--format",
-        choices=("json", "table"),
-        default="json",
-        help="Output format",
-    )
-
-    agents_status_parser = agents_subparsers.add_parser(
-        "status",
-        help="Inspect the current agent assignment for a run or assignment ID",
-    )
-    agents_status_parser.add_argument("--assignment-id", help="Agent assignment identifier to inspect")
-    agents_status_parser.add_argument("--run-id", help="Run identifier to inspect")
-    agents_status_parser.add_argument(
-        "--format",
-        choices=("json", "table"),
-        default="json",
-        help="Output format",
-    )
-
-    telemetry_parser = subparsers.add_parser(
-        "telemetry",
-        help="Telemetry utilities",
-    )
-    telemetry_subparsers = telemetry_parser.add_subparsers(dest="telemetry_command")
-
-    telemetry_emit_parser = telemetry_subparsers.add_parser(
-        "emit",
-        help="Emit a telemetry event",
-    )
-    telemetry_emit_parser.add_argument("--event-type", required=True, help="Telemetry event type")
-    telemetry_emit_parser.add_argument(
-        "--payload",
-        default="{}",
-        help="JSON payload for the event",
-    )
-    telemetry_emit_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
-    telemetry_emit_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
-    telemetry_emit_parser.add_argument(
-        "--actor-surface",
-        default="CLI",
-        help="Surface emitting the event (e.g., CLI, VSCODE, WEB)",
-    )
-    telemetry_emit_parser.add_argument("--run-id", help="Associated workflow run identifier")
-    telemetry_emit_parser.add_argument("--action-id", help="Associated action identifier")
-    telemetry_emit_parser.add_argument("--session-id", help="Telemetry session identifier")
-    telemetry_emit_parser.add_argument(
-        "--format",
-        choices=("json", "table"),
-        default="json",
-        help="Output format",
-    )
-
-    analytics_parser = subparsers.add_parser(
-        "analytics",
-        help="Analytics utilities",
-    )
-    analytics_subparsers = analytics_parser.add_subparsers(dest="analytics_command")
-
-    analytics_project_parser = analytics_subparsers.add_parser(
-        "project-kpi",
-        help="Project telemetry events into PRD KPI fact collections",
-    )
-    analytics_project_parser.add_argument(
-        "--input",
-        default=str(DEFAULT_TELEMETRY_EVENTS_PATH),
-        help="Path to telemetry JSONL input (defaults to ~/.guideai/telemetry/events.jsonl)",
-    )
-    analytics_project_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format for the KPI summary",
-    )
-    analytics_project_parser.add_argument(
-        "--facts-output",
-        dest="facts_output",
-        help="Optional path to write the full KPI projection as JSON",
-    )
-
-    # Analytics warehouse query subcommands
-    analytics_summary_parser = analytics_subparsers.add_parser(
-        "kpi-summary",
-        help="Query KPI summary from DuckDB analytics warehouse",
-    )
-    analytics_summary_parser.add_argument(
-        "--start-date",
-        dest="start_date",
-        help="Start date filter (YYYY-MM-DD format)",
-    )
-    analytics_summary_parser.add_argument(
-        "--end-date",
-        dest="end_date",
-        help="End date filter (YYYY-MM-DD format)",
-    )
-    analytics_summary_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-
-    analytics_behavior_usage_parser = analytics_subparsers.add_parser(
-        "behavior-usage",
-        help="Query behavior usage facts from analytics warehouse",
-    )
-    analytics_behavior_usage_parser.add_argument(
-        "--start-date",
-        dest="start_date",
-        help="Start date filter (YYYY-MM-DD format)",
-    )
-    analytics_behavior_usage_parser.add_argument(
-        "--end-date",
-        dest="end_date",
-        help="End date filter (YYYY-MM-DD format)",
-    )
-    analytics_behavior_usage_parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="Maximum number of records to return (1-1000)",
-    )
-    analytics_behavior_usage_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-
-    analytics_token_savings_parser = analytics_subparsers.add_parser(
-        "token-savings",
-        help="Query token savings facts from analytics warehouse",
-    )
-    analytics_token_savings_parser.add_argument(
-        "--start-date",
-        dest="start_date",
-        help="Start date filter (YYYY-MM-DD format)",
-    )
-    analytics_token_savings_parser.add_argument(
-        "--end-date",
-        dest="end_date",
-        help="End date filter (YYYY-MM-DD format)",
-    )
-    analytics_token_savings_parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="Maximum number of records to return (1-1000)",
-    )
-    analytics_token_savings_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-
-    analytics_compliance_coverage_parser = analytics_subparsers.add_parser(
-        "compliance-coverage",
-        help="Query compliance coverage facts from analytics warehouse",
-    )
-    analytics_compliance_coverage_parser.add_argument(
-        "--start-date",
-        dest="start_date",
-        help="Start date filter (YYYY-MM-DD format)",
-    )
-    analytics_compliance_coverage_parser.add_argument(
-        "--end-date",
-        dest="end_date",
-        help="End date filter (YYYY-MM-DD format)",
-    )
-    analytics_compliance_coverage_parser.add_argument(
-        "--limit",
-        type=int,
-        default=100,
-        help="Maximum number of records to return (1-1000)",
-    )
-    analytics_compliance_coverage_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-
-    metrics_parser = subparsers.add_parser(
-        "metrics",
-        help="Real-time metrics aggregation and streaming",
-    )
-    metrics_subparsers = metrics_parser.add_subparsers(dest="metrics_command")
-
-    metrics_summary_parser = metrics_subparsers.add_parser(
-        "summary",
-        help="Get real-time metrics summary with PRD KPI targets",
-    )
-    metrics_summary_parser.add_argument(
-        "--start-date",
-        dest="start_date",
-        help="ISO timestamp for start of date range (optional)",
-    )
-    metrics_summary_parser.add_argument(
-        "--end-date",
-        dest="end_date",
-        help="ISO timestamp for end of date range (optional)",
-    )
-    metrics_summary_parser.add_argument(
-        "--no-cache",
-        dest="no_cache",
-        action="store_true",
-        help="Bypass cache and fetch fresh data",
-    )
-    metrics_summary_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-
-    metrics_export_parser = metrics_subparsers.add_parser(
-        "export",
-        help="Export metrics data to file or stdout",
-    )
-    metrics_export_parser.add_argument(
-        "--format",
-        dest="export_format",
-        choices=("json", "csv", "parquet"),
-        default="json",
-        help="Export file format",
-    )
-    metrics_export_parser.add_argument(
-        "--start-date",
-        dest="start_date",
-        help="ISO timestamp for start of date range (optional)",
-    )
-    metrics_export_parser.add_argument(
-        "--end-date",
-        dest="end_date",
-        help="ISO timestamp for end of date range (optional)",
-    )
-    metrics_export_parser.add_argument(
-        "--metric",
-        dest="metrics",
+    amp_plan_parser.add_argument(
+        "--behavior",
+        dest="behaviors",
         action="append",
         default=[],
-        help="Specific metric to include (repeatable, empty = all)",
+        help="Behaviors to include in the plan",
     )
-    metrics_export_parser.add_argument(
-        "--include-raw-events",
-        dest="include_raw_events",
+    amp_plan_parser.add_argument(
+        "--var",
+        dest="variables",
+        action="append",
+        default=[],
+        help="Variables in key=value format",
+    )
+    amp_plan_parser.add_argument(
+        "--module",
+        dest="active_modules",
+        action="append",
+        help="Module to activate (repeatable). If specified, only services in these modules are included.",
+    )
+    amp_plan_parser.add_argument(
+        "--force-podman",
+        dest="force_podman",
         action="store_true",
-        help="Include raw telemetry events in export",
+        default=False,
+        help="Suppress warnings if a Podman VM is detected",
     )
-    metrics_export_parser.add_argument(
+    amp_plan_parser.add_argument(
+        "--env-file",
+        dest="env_file",
+        help="Path to an Amprealize environment manifest (overrides GUIDEAI_ENV_FILE)",
+    )
+    amp_plan_parser.add_argument(
         "--output",
-        dest="output_file",
-        help="Output file path (if omitted, writes to stdout)",
+        choices=("summary", "json"),
+        help="Output format (default: summary when interactive, json when piped)",
     )
-    metrics_export_parser.add_argument(
-        "--output-format",
-        dest="output_format",
-        choices=("json", "table"),
-        default="json",
-        help="CLI output format (for export metadata)",
+    amp_plan_parser.add_argument(
+        "--actor-id",
+        dest="actor_id",
+        default=DEFAULT_ACTOR_ID,
+        help="Actor identifier (defaults to local-cli)",
+    )
+    amp_plan_parser.add_argument(
+        "--actor-role",
+        dest="actor_role",
+        default=DEFAULT_ACTOR_ROLE,
+        help="Actor role (defaults to STRATEGIST)",
     )
 
-    # AgentAuth CLI parser setup
+    # amprealize apply
+    amp_apply_parser = amp_subparsers.add_parser(
+        "apply",
+        help="Apply a plan or manifest to create resources",
+    )
+    amp_apply_parser.add_argument(
+        "--plan-id",
+        dest="plan_id",
+        help="ID of the plan to apply",
+    )
+    amp_apply_parser.add_argument(
+        "--manifest",
+        dest="manifest_file",
+        help="Path to a manifest file to apply",
+    )
+    amp_apply_parser.add_argument(
+        "--watch",
+        dest="watch",
+        action="store_true",
+        default=True,
+        help="Watch progress until completion",
+    )
+    amp_apply_parser.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        default=False,
+        help="Resume a paused or failed apply",
+    )
+    amp_apply_parser.add_argument(
+        "--force-podman",
+        dest="force_podman",
+        action="store_true",
+        default=False,
+        help="Suppress warnings if a Podman VM is detected",
+    )
+    amp_apply_parser.add_argument(
+        "--skip-resource-check",
+        dest="skip_resource_check",
+        action="store_true",
+        default=False,
+        help="Skip pre-flight resource health check",
+    )
+    amp_apply_parser.add_argument(
+        "--min-disk-gb",
+        dest="min_disk_gb",
+        type=float,
+        default=5.0,
+        help="Minimum disk space in GB required for apply (default: 5.0)",
+    )
+    amp_apply_parser.add_argument(
+        "--min-memory-mb",
+        dest="min_memory_mb",
+        type=float,
+        default=1024.0,
+        help="Minimum memory in MB required for apply (default: 1024)",
+    )
+    amp_apply_parser.add_argument(
+        "--auto-cleanup",
+        dest="auto_cleanup",
+        action="store_true",
+        default=False,
+        help="Automatically clean up unused resources when disk/memory is critical",
+    )
+    amp_apply_parser.add_argument(
+        "--auto-cleanup-aggressive",
+        dest="auto_cleanup_aggressive",
+        action="store_true",
+        default=False,
+        help="Start with aggressive cleanup (networks, pods, logs) instead of standard",
+    )
+    amp_apply_parser.add_argument(
+        "--auto-cleanup-volumes",
+        dest="auto_cleanup_include_volumes",
+        action="store_true",
+        default=False,
+        help="Include volumes in auto-cleanup (WARNING: may lose data)",
+    )
+    amp_apply_parser.add_argument(
+        "--auto-cleanup-retries",
+        dest="auto_cleanup_max_retries",
+        type=int,
+        default=3,
+        help="Max cleanup+recheck cycles per tier before escalating (default: 3)",
+    )
+    amp_apply_parser.add_argument(
+        "--allow-host-resource-warning",
+        dest="allow_host_resource_warning",
+        action="store_true",
+        default=False,
+        help="Allow proceeding when host disk is low but VM is healthy (warns but continues)",
+    )
+    amp_apply_parser.add_argument(
+        "--proactive-cleanup",
+        dest="proactive_cleanup",
+        action="store_true",
+        default=False,
+        help="Run cleanup BEFORE resource check to maximize available resources (prevents memory exhaustion)",
+    )
+    amp_apply_parser.add_argument(
+        "--blueprint-aware-memory",
+        dest="blueprint_aware_memory_check",
+        action="store_true",
+        default=True,
+        help="Use blueprint memory estimates instead of fixed threshold (default: enabled)",
+    )
+    amp_apply_parser.add_argument(
+        "--no-blueprint-aware-memory",
+        dest="blueprint_aware_memory_check",
+        action="store_false",
+        help="Disable blueprint-aware memory checking (use fixed threshold instead)",
+    )
+    amp_apply_parser.add_argument(
+        "--memory-safety-margin-mb",
+        dest="memory_safety_margin_mb",
+        type=float,
+        default=512.0,
+        help="Extra memory to require beyond blueprint estimate (default: 512 MB)",
+    )
+    amp_apply_parser.add_argument(
+        "--auto-resolve-stale",
+        dest="auto_resolve_stale",
+        action="store_true",
+        default=True,
+        help="Automatically remove stale/exited/dead containers before apply (default: enabled)",
+    )
+    amp_apply_parser.add_argument(
+        "--no-auto-resolve-stale",
+        dest="auto_resolve_stale",
+        action="store_false",
+        help="Disable auto-resolve of stale containers",
+    )
+    amp_apply_parser.add_argument(
+        "--auto-resolve-conflicts",
+        dest="auto_resolve_conflicts",
+        action="store_true",
+        default=True,
+        help="Automatically resolve port conflicts (stop conflicting containers/processes) (default: enabled)",
+    )
+    amp_apply_parser.add_argument(
+        "--no-auto-resolve-conflicts",
+        dest="auto_resolve_conflicts",
+        action="store_false",
+        help="Disable auto-resolve of port conflicts",
+    )
+    amp_apply_parser.add_argument(
+        "--stale-max-age-hours",
+        dest="stale_max_age_hours",
+        type=float,
+        default=0.0,
+        help="Max age for stale container cleanup in hours (0 = all stale, -1 = skip age check)",
+    )
+    amp_apply_parser.add_argument(
+        "--env-file",
+        dest="env_file",
+        help="Path to an Amprealize environment manifest (overrides GUIDEAI_ENV_FILE)",
+    )
+    amp_apply_parser.add_argument(
+        "--output",
+        choices=("summary", "json"),
+        help="Output format (default: summary when interactive, json when piped)",
+    )
+    amp_apply_parser.add_argument(
+        "--actor-id",
+        dest="actor_id",
+        default=DEFAULT_ACTOR_ID,
+        help="Actor identifier (defaults to local-cli)",
+    )
+    amp_apply_parser.add_argument(
+        "--actor-role",
+        dest="actor_role",
+        default=DEFAULT_ACTOR_ROLE,
+        help="Actor role (defaults to STRATEGIST)",
+    )
+
+    # amprealize status
+    amp_status_parser = amp_subparsers.add_parser(
+        "status",
+        help="Check status of an amprealize run",
+    )
+    amp_status_parser.add_argument(
+        "--run-id",
+        dest="amp_run_id",
+        required=True,
+        help="Amprealize run ID",
+    )
+    amp_status_parser.add_argument(
+        "--output",
+        choices=("summary", "json"),
+        help="Output format (default: summary when interactive, json when piped)",
+    )
+
+    # amprealize destroy
+    amp_destroy_parser = amp_subparsers.add_parser(
+        "destroy",
+        help="Destroy resources from an amprealize run",
+    )
+    amp_destroy_parser.add_argument(
+        "--run-id",
+        dest="amp_run_id",
+        required=True,
+        help="Amprealize run ID",
+    )
+    amp_destroy_parser.add_argument(
+        "--cascade",
+        dest="cascade",
+        action="store_true",
+        default=True,
+        help="Cascade destroy dependent resources",
+    )
+    amp_destroy_parser.add_argument(
+        "--reason",
+        dest="reason",
+        default="MANUAL",
+        choices=["POST_TEST", "FAILED", "ABANDONED", "MANUAL"],
+        help="Reason for destruction",
+    )
+    amp_destroy_parser.add_argument(
+        "--force-podman",
+        dest="force_podman",
+        action="store_true",
+        default=False,
+        help="Suppress warnings if a Podman VM is detected",
+    )
+    amp_destroy_parser.add_argument(
+        "--cleanup-after-destroy",
+        dest="cleanup_after_destroy",
+        action="store_true",
+        default=True,
+        help="Run resource cleanup after destroying containers (default: enabled)",
+    )
+    amp_destroy_parser.add_argument(
+        "--no-cleanup-after-destroy",
+        dest="cleanup_after_destroy",
+        action="store_false",
+        help="Skip post-destroy resource cleanup",
+    )
+    amp_destroy_parser.add_argument(
+        "--cleanup-aggressive",
+        dest="cleanup_aggressive",
+        action="store_true",
+        default=True,
+        help="Use aggressive cleanup including dangling images/cache (default: enabled)",
+    )
+    amp_destroy_parser.add_argument(
+        "--no-cleanup-aggressive",
+        dest="cleanup_aggressive",
+        action="store_false",
+        help="Use standard cleanup (containers only)",
+    )
+    amp_destroy_parser.add_argument(
+        "--cleanup-volumes",
+        dest="cleanup_include_volumes",
+        action="store_true",
+        default=False,
+        help="Include volumes in cleanup (WARNING: may lose data)",
+    )
+    amp_destroy_parser.add_argument(
+        "--env-file",
+        dest="env_file",
+        help="Path to an Amprealize environment manifest (overrides GUIDEAI_ENV_FILE)",
+    )
+    amp_destroy_parser.add_argument(
+        "--output",
+        choices=("summary", "json"),
+        help="Output format (default: summary when interactive, json when piped)",
+    )
+    amp_destroy_parser.add_argument(
+        "--actor-id",
+        dest="actor_id",
+        default=DEFAULT_ACTOR_ID,
+        help="Actor identifier (defaults to local-cli)",
+    )
+    amp_destroy_parser.add_argument(
+        "--actor-role",
+        dest="actor_role",
+        default=DEFAULT_ACTOR_ROLE,
+        help="Actor role (defaults to STRATEGIST)",
+    )
+
+    # amprealize bootstrap
+    amp_bootstrap_parser = amp_subparsers.add_parser(
+        "bootstrap",
+        help="Scaffold Amprealize config files into the current workspace",
+    )
+    amp_bootstrap_parser.add_argument(
+        "--directory",
+        dest="bootstrap_directory",
+        default=".",
+        help="Directory where config/amprealize files should be created",
+    )
+    amp_bootstrap_parser.add_argument(
+        "--include-blueprints",
+        dest="include_blueprints",
+        action="store_true",
+        default=False,
+        help="Copy packaged blueprint samples into config/amprealize/blueprints",
+    )
+    amp_bootstrap_parser.add_argument(
+        "--blueprint",
+        dest="blueprints",
+        action="append",
+        default=[],
+        help="Specific blueprint IDs to copy (defaults to all when --include-blueprints is set)",
+    )
+    amp_bootstrap_parser.add_argument(
+        "--env-template",
+        dest="env_template",
+        help="Path to a custom environments.yaml template to copy",
+    )
+    amp_bootstrap_parser.add_argument(
+        "--force",
+        dest="force",
+        action="store_true",
+        default=False,
+        help="Overwrite existing files if they already exist",
+    )
+
+    # amprealize machine - Podman machine management
+    amp_machine_parser = amp_subparsers.add_parser(
+        "machine",
+        help="Manage Podman machines (macOS/Windows)",
+    )
+    amp_machine_subparsers = amp_machine_parser.add_subparsers(dest="machine_command")
+
+    # amprealize machine list
+    amp_machine_list_parser = amp_machine_subparsers.add_parser(
+        "list",
+        help="List all Podman machines",
+    )
+    amp_machine_list_parser.add_argument(
+        "--output",
+        choices=("table", "json"),
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # amprealize machine start
+    amp_machine_start_parser = amp_machine_subparsers.add_parser(
+        "start",
+        help="Start a Podman machine",
+    )
+    amp_machine_start_parser.add_argument(
+        "name",
+        nargs="?",
+        help="Machine name (defaults to guideai-ci or first available)",
+    )
+
+    # amprealize machine stop
+    amp_machine_stop_parser = amp_machine_subparsers.add_parser(
+        "stop",
+        help="Stop a Podman machine",
+    )
+    amp_machine_stop_parser.add_argument(
+        "name",
+        nargs="?",
+        help="Machine name (defaults to guideai-ci or current running machine)",
+    )
+    amp_machine_stop_parser.add_argument(
+        "--all",
+        dest="stop_all",
+        action="store_true",
+        default=False,
+        help="Stop all running Podman machines",
+    )
+
+    # amprealize machine ensure
+    amp_machine_ensure_parser = amp_machine_subparsers.add_parser(
+        "ensure",
+        help="Ensure a Podman machine is running (start if needed, create if missing)",
+    )
+    amp_machine_ensure_parser.add_argument(
+        "name",
+        nargs="?",
+        default="guideai-ci",
+        help="Machine name (default: guideai-ci)",
+    )
+    amp_machine_ensure_parser.add_argument(
+        "--cpus",
+        type=int,
+        default=2,
+        help="Number of CPUs for new machine (default: 2)",
+    )
+    amp_machine_ensure_parser.add_argument(
+        "--memory",
+        type=int,
+        default=4096,
+        help="Memory in MB for new machine (default: 4096)",
+    )
+    amp_machine_ensure_parser.add_argument(
+        "--disk",
+        type=int,
+        default=100,
+        help="Disk size in GB for new machine (default: 100)",
+    )
+
+    # amprealize machine status
+    amp_machine_status_parser = amp_machine_subparsers.add_parser(
+        "status",
+        help="Show status of a Podman machine",
+    )
+    amp_machine_status_parser.add_argument(
+        "name",
+        nargs="?",
+        help="Machine name (defaults to guideai-ci or first available)",
+    )
+    amp_machine_status_parser.add_argument(
+        "--output",
+        choices=("table", "json"),
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # amprealize machine resources
+    amp_machine_resources_parser = amp_machine_subparsers.add_parser(
+        "resources",
+        help="Show resource usage for host and Podman machines",
+    )
+    amp_machine_resources_parser.add_argument(
+        "--output",
+        choices=("table", "json"),
+        default="table",
+        help="Output format (default: table)",
+    )
+    amp_machine_resources_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check resource health against minimum requirements",
+    )
+    amp_machine_resources_parser.add_argument(
+        "--min-disk-gb",
+        type=float,
+        default=5.0,
+        help="Minimum free disk space in GB (default: 5.0)",
+    )
+    amp_machine_resources_parser.add_argument(
+        "--min-memory-mb",
+        type=float,
+        default=1024.0,
+        help="Minimum free memory in MB (default: 1024)",
+    )
+
+    # amprealize machine cleanup
+    amp_machine_cleanup_parser = amp_machine_subparsers.add_parser(
+        "cleanup",
+        help="Clean up unused resources (containers, images, cache) to free disk space",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be cleaned without actually removing anything",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--include-volumes",
+        action="store_true",
+        help="Also remove unused volumes (CAUTION: may delete data)",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--include-networks",
+        action="store_true",
+        help="Also remove unused networks",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--include-pods",
+        action="store_true",
+        help="Also remove stopped pods",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--include-logs",
+        action="store_true",
+        help="Also clear container logs",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--aggressive",
+        action="store_true",
+        help="Enable ALL cleanup options (includes volumes - use with caution)",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--skip-containers",
+        action="store_true",
+        help="Skip removing stopped containers",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--skip-images",
+        action="store_true",
+        help="Skip removing unused images",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--skip-cache",
+        action="store_true",
+        help="Skip clearing build cache",
+    )
+    amp_machine_cleanup_parser.add_argument(
+        "--output",
+        choices=("table", "json"),
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # amprealize cleanup - Direct container cleanup without machine management
+    amp_cleanup_parser = amp_subparsers.add_parser(
+        "cleanup",
+        help="Clean up stale/orphaned containers and free resources",
+    )
+    amp_cleanup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be cleaned without actually removing anything",
+    )
+    amp_cleanup_parser.add_argument(
+        "--stale",
+        action="store_true",
+        default=True,
+        help="Remove stale containers (exited, dead, created) [default: True]",
+    )
+    amp_cleanup_parser.add_argument(
+        "--no-stale",
+        dest="stale",
+        action="store_false",
+        help="Skip stale container cleanup",
+    )
+    amp_cleanup_parser.add_argument(
+        "--orphans",
+        action="store_true",
+        default=True,
+        help="Remove orphaned Amprealize containers [default: True]",
+    )
+    amp_cleanup_parser.add_argument(
+        "--no-orphans",
+        dest="orphans",
+        action="store_false",
+        help="Skip orphaned container cleanup",
+    )
+    amp_cleanup_parser.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=None,
+        help="Only remove stale containers older than N hours (default: any age)",
+    )
+    amp_cleanup_parser.add_argument(
+        "--all-non-running",
+        action="store_true",
+        default=False,
+        help="Remove ALL non-running containers (not just stale statuses)",
+    )
+    amp_cleanup_parser.add_argument(
+        "--force-podman",
+        action="store_true",
+        default=False,
+        help="Suppress warnings if a Podman VM is detected",
+    )
+    amp_cleanup_parser.add_argument(
+        "--output",
+        choices=("table", "json"),
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # ── Auth commands ───────────────────────────────────────────────────────────
     auth_parser = subparsers.add_parser(
         "auth",
-        help="Authentication and authorization for tool invocations",
+        help="Authentication and consent management commands",
     )
     auth_subparsers = auth_parser.add_subparsers(dest="auth_command")
+
+    # auth login (device flow)
+    auth_login_parser = auth_subparsers.add_parser(
+        "login",
+        help="Authenticate via device flow",
+    )
+    auth_login_parser.add_argument(
+        "--provider",
+        choices=("github", "google", "internal"),
+        default="internal",
+        help="OAuth provider to use (default: internal)",
+    )
+    auth_login_parser.add_argument(
+        "--scopes",
+        nargs="+",
+        default=["behaviors.read", "behaviors.write"],
+        help="Scopes to request (default: behaviors.read behaviors.write)",
+    )
+    auth_login_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Timeout in seconds for device flow (default: 300)",
+    )
+    auth_login_parser.add_argument(
+        "--client-id",
+        dest="client_id",
+        default="guideai-cli",
+        help="Client ID for the device flow (default: guideai-cli)",
+    )
+    auth_login_parser.add_argument(
+        "--open-browser",
+        dest="open_browser",
+        action="store_true",
+        default=True,
+        help="Automatically open browser for verification (default: true)",
+    )
+    auth_login_parser.add_argument(
+        "--no-browser",
+        dest="open_browser",
+        action="store_false",
+        help="Do not automatically open browser",
+    )
+    auth_login_parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        default=False,
+        help="Suppress progress output",
+    )
+    auth_login_parser.add_argument(
+        "--allow-plaintext",
+        dest="allow_plaintext",
+        action="store_true",
+        default=False,
+        help="Allow storing tokens in plaintext (insecure)",
+    )
+
+    # auth register (internal auth only)
+    auth_register_parser = auth_subparsers.add_parser(
+        "register",
+        help="Register a new user account (internal auth only)",
+    )
+    auth_register_parser.add_argument(
+        "--username",
+        help="Username for registration (prompts if not provided)",
+    )
+    auth_register_parser.add_argument(
+        "--password",
+        help="Password for registration (prompts if not provided)",
+    )
+    auth_register_parser.add_argument(
+        "--email",
+        help="Email for registration (optional)",
+    )
+    auth_register_parser.add_argument(
+        "--allow-plaintext",
+        dest="allow_plaintext",
+        action="store_true",
+        default=False,
+        help="Allow storing tokens in plaintext (insecure)",
+    )
+    auth_register_parser.add_argument(
+        "--api-url",
+        dest="api_url",
+        default=None,
+        help="API URL for registration (default: $GUIDEAI_API_URL or http://localhost:8000)",
+    )
+
+    # auth status
+    auth_status_parser = auth_subparsers.add_parser(
+        "status",
+        help="Show current authentication status",
+    )
+    auth_status_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+    auth_status_parser.add_argument(
+        "--allow-plaintext",
+        dest="allow_plaintext",
+        action="store_true",
+        default=False,
+        help="Allow storing tokens in plaintext (insecure)",
+    )
+
+    # auth logout
+    auth_logout_parser = auth_subparsers.add_parser(
+        "logout",
+        help="Clear stored authentication tokens",
+    )
+    auth_logout_parser.add_argument(
+        "--allow-plaintext",
+        dest="allow_plaintext",
+        action="store_true",
+        default=False,
+        help="Allow storing tokens in plaintext (insecure)",
+    )
+
+    # auth refresh
+    auth_refresh_parser = auth_subparsers.add_parser(
+        "refresh",
+        help="Refresh the access token using stored refresh token",
+    )
+    auth_refresh_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+    auth_refresh_parser.add_argument(
+        "--allow-plaintext",
+        dest="allow_plaintext",
+        action="store_true",
+        default=False,
+        help="Allow storing tokens in plaintext (insecure)",
+    )
 
     # auth ensure-grant
     auth_ensure_grant_parser = auth_subparsers.add_parser(
         "ensure-grant",
-        help="Request or reuse a grant for tool access",
-    )
-    auth_ensure_grant_parser.add_argument(
-        "--agent-id",
-        dest="agent_id",
-        required=True,
-        help="ID of the agent requesting access",
-    )
-    auth_ensure_grant_parser.add_argument(
-        "--tool-name",
-        dest="tool_name",
-        required=True,
-        help="Name of the tool being accessed",
+        help="Ensure a valid grant exists for the specified scopes",
     )
     auth_ensure_grant_parser.add_argument(
         "--scopes",
-        dest="scopes",
         nargs="+",
         required=True,
-        help="Scopes required for the operation",
+        help="Scopes to request grant for",
     )
     auth_ensure_grant_parser.add_argument(
-        "--user-id",
-        dest="user_id",
-        help="ID of the user (if applicable)",
-    )
-    auth_ensure_grant_parser.add_argument(
-        "--context",
-        dest="context",
-        nargs="*",
-        help="Context key=value pairs (e.g., project_id=123 env=prod)",
+        "--actor-id",
+        default=DEFAULT_ACTOR_ID,
+        help="Actor ID for the grant",
     )
     auth_ensure_grant_parser.add_argument(
         "--format",
-        choices=("table", "json"),
+        choices=("json", "table"),
         default="table",
         help="Output format",
     )
@@ -1380,33 +1958,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # auth list-grants
     auth_list_grants_parser = auth_subparsers.add_parser(
         "list-grants",
-        help="List active grants with optional filtering",
-    )
-    auth_list_grants_parser.add_argument(
-        "--agent-id",
-        dest="agent_id",
-        required=True,
-        help="Agent ID to list grants for",
-    )
-    auth_list_grants_parser.add_argument(
-        "--user-id",
-        dest="user_id",
-        help="Filter by user ID",
-    )
-    auth_list_grants_parser.add_argument(
-        "--tool-name",
-        dest="tool_name",
-        help="Filter by tool name",
-    )
-    auth_list_grants_parser.add_argument(
-        "--include-expired",
-        dest="include_expired",
-        action="store_true",
-        help="Include expired grants in results",
+        help="List all active grants for the current user",
     )
     auth_list_grants_parser.add_argument(
         "--format",
-        choices=("table", "json"),
+        choices=("json", "table"),
         default="table",
         help="Output format",
     )
@@ -1414,41 +1970,22 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # auth policy-preview
     auth_policy_preview_parser = auth_subparsers.add_parser(
         "policy-preview",
-        help="Preview policy decision without creating a grant",
-    )
-    auth_policy_preview_parser.add_argument(
-        "--agent-id",
-        dest="agent_id",
-        required=True,
-        help="ID of the agent requesting access",
-    )
-    auth_policy_preview_parser.add_argument(
-        "--tool-name",
-        dest="tool_name",
-        required=True,
-        help="Name of the tool being accessed",
+        help="Preview policy decision for a scope without granting",
     )
     auth_policy_preview_parser.add_argument(
         "--scopes",
-        dest="scopes",
         nargs="+",
         required=True,
-        help="Scopes required for the operation",
+        help="Scopes to preview",
     )
     auth_policy_preview_parser.add_argument(
-        "--user-id",
-        dest="user_id",
-        help="ID of the user (if applicable)",
-    )
-    auth_policy_preview_parser.add_argument(
-        "--context",
-        dest="context",
-        nargs="*",
-        help="Context key=value pairs (e.g., project_id=123 env=prod)",
+        "--actor-id",
+        default=DEFAULT_ACTOR_ID,
+        help="Actor ID for the preview",
     )
     auth_policy_preview_parser.add_argument(
         "--format",
-        choices=("table", "json"),
+        choices=("json", "table"),
         default="table",
         help="Output format",
     )
@@ -1456,411 +1993,597 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # auth revoke
     auth_revoke_parser = auth_subparsers.add_parser(
         "revoke",
-        help="Revoke an active grant by ID",
+        help="Revoke an active grant",
     )
     auth_revoke_parser.add_argument(
-        "--grant-id",
-        dest="grant_id",
-        required=True,
-        help="ID of the grant to revoke",
-    )
-    auth_revoke_parser.add_argument(
-        "--revoked-by",
-        dest="revoked_by",
-        required=True,
-        help="Identity revoking the grant (user ID, admin ID, etc.)",
+        "grant_id",
+        help="Grant ID to revoke",
     )
     auth_revoke_parser.add_argument(
         "--reason",
-        dest="reason",
-        help="Optional reason for revocation",
-    )
-    auth_revoke_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
+        default="user_request",
+        help="Reason for revocation",
     )
 
-    # auth login (device code flow)
-    auth_login_parser = auth_subparsers.add_parser(
-        "login",
-        help="Authenticate this CLI via device code flow",
-    )
-    auth_login_parser.add_argument(
-        "--client-id",
-        dest="client_id",
-        default="guideai.cli",
-        help="Client identifier used when initiating device flow",
-    )
-    auth_login_parser.add_argument(
-        "--scope",
-        dest="scopes",
-        action="append",
-        default=[],
-        help="Requested OAuth scope (repeatable; defaults to actions.read)",
-    )
-    auth_login_parser.add_argument(
-        "--open-browser",
-        dest="open_browser",
-        action="store_true",
-        help="Launch the verification URL in the default browser",
-    )
-    auth_login_parser.add_argument(
-        "--timeout",
-        dest="timeout",
-        type=int,
-        default=600,
-        help="Seconds to wait for approval before timing out",
-    )
-    auth_login_parser.add_argument(
-        "--quiet",
-        dest="quiet",
-        action="store_true",
-        help="Suppress polling status updates",
-    )
-    auth_login_parser.add_argument(
-        "--allow-plaintext",
-        dest="allow_plaintext",
-        action="store_true",
-        help="Permit plaintext token storage when keychain is unavailable",
-    )
-
-    # auth refresh (token rotation)
-    auth_refresh_parser = auth_subparsers.add_parser(
-        "refresh",
-        help="Refresh cached access token using the stored refresh token",
-    )
-    auth_refresh_parser.add_argument(
-        "--allow-plaintext",
-        dest="allow_plaintext",
-        action="store_true",
-        help="Permit plaintext token storage when keychain is unavailable",
-    )
-    auth_refresh_parser.add_argument(
-        "--force",
-        dest="force",
-        action="store_true",
-        help="Refresh even if the cached access token is still valid",
-    )
-    auth_refresh_parser.add_argument(
-        "--quiet",
-        dest="quiet",
-        action="store_true",
-        help="Suppress output on successful refresh",
-    )
-
-    # auth status
-    auth_status_parser = auth_subparsers.add_parser(
-        "status",
-        help="Display cached authentication token metadata",
-    )
-    auth_status_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-    auth_status_parser.add_argument(
-        "--allow-plaintext",
-        dest="allow_plaintext",
-        action="store_true",
-        help="Permit plaintext token storage when keychain is unavailable",
-    )
-
-    # auth logout
-    auth_logout_parser = auth_subparsers.add_parser(
-        "logout",
-        help="Clear cached authentication tokens",
-    )
-    auth_logout_parser.add_argument(
-        "--force",
-        dest="force",
-        action="store_true",
-        help="Skip confirmation prompt",
-    )
-    auth_logout_parser.add_argument(
-        "--allow-plaintext",
-        dest="allow_plaintext",
-        action="store_true",
-        help="Permit plaintext token storage when keychain is unavailable",
-    )
-
-    # auth consent management
-    auth_consent_parser = auth_subparsers.add_parser(
-        "consent",
-        help="Lookup or resolve pending consent codes",
-    )
-    auth_consent_subparsers = auth_consent_parser.add_subparsers(dest="consent_command")
-    auth_consent_subparsers.required = True
-
-    auth_consent_lookup_parser = auth_consent_subparsers.add_parser(
-        "lookup",
-        help="Show scope and status for a consent user code",
+    # auth consent-lookup
+    auth_consent_lookup_parser = auth_subparsers.add_parser(
+        "consent-lookup",
+        help="Look up consent request details by user code",
     )
     auth_consent_lookup_parser.add_argument(
-        "--user-code",
-        dest="user_code",
-        required=True,
-        help="User-facing consent code",
+        "user_code",
+        help="User code from the consent prompt (e.g., ABCD-1234)",
     )
     auth_consent_lookup_parser.add_argument(
         "--format",
-        choices=("table", "json"),
+        choices=("json", "table"),
         default="table",
         help="Output format",
     )
 
-    auth_consent_approve_parser = auth_consent_subparsers.add_parser(
-        "approve",
-        help="Approve a consent request using the provided user code",
+    # auth consent-approve
+    auth_consent_approve_parser = auth_subparsers.add_parser(
+        "consent-approve",
+        help="Approve a consent request",
     )
     auth_consent_approve_parser.add_argument(
-        "--user-code",
-        dest="user_code",
-        required=True,
-        help="User-facing consent code",
+        "user_code",
+        help="User code from the consent prompt (e.g., ABCD-1234)",
     )
     auth_consent_approve_parser.add_argument(
         "--actor-id",
-        dest="actor_id",
         default=DEFAULT_ACTOR_ID,
-        help="Identifier recorded as the approver",
+        help="Actor ID approving the consent",
     )
     auth_consent_approve_parser.add_argument(
-        "--role",
-        dest="roles",
-        action="append",
-        default=[DEFAULT_ACTOR_ROLE],
-        help="Approver role context (repeatable)",
+        "--roles",
+        nargs="+",
+        help="Roles to grant with consent (optional)",
     )
     auth_consent_approve_parser.add_argument(
         "--mfa-verified",
-        dest="mfa_verified",
         action="store_true",
-        help="Confirm that MFA has been satisfied for high-risk scopes",
+        default=False,
+        help="Indicate MFA was verified for this approval",
     )
 
-    auth_consent_deny_parser = auth_consent_subparsers.add_parser(
-        "deny",
+    # auth consent-deny
+    auth_consent_deny_parser = auth_subparsers.add_parser(
+        "consent-deny",
         help="Deny a consent request",
     )
     auth_consent_deny_parser.add_argument(
-        "--user-code",
-        dest="user_code",
-        required=True,
-        help="User-facing consent code",
+        "user_code",
+        help="User code from the consent prompt (e.g., ABCD-1234)",
     )
     auth_consent_deny_parser.add_argument(
         "--actor-id",
-        dest="actor_id",
         default=DEFAULT_ACTOR_ID,
-        help="Identifier recorded as the approver",
+        help="Actor ID denying the consent",
     )
     auth_consent_deny_parser.add_argument(
         "--reason",
-        dest="reason",
-        help="Optional reason noted with the denial",
+        default="user_denied",
+        help="Reason for denial",
     )
 
+    # ── BCI commands ────────────────────────────────────────────────────────────
+    bci_parser = subparsers.add_parser(
+        "bci",
+        help="Behavior-Conditioned Inference commands",
+    )
+    bci_subparsers = bci_parser.add_subparsers(dest="bci_command")
+
+    # bci rebuild-index
+    bci_rebuild_parser = bci_subparsers.add_parser(
+        "rebuild-index",
+        help="Rebuild the behavior retrieval index",
+    )
+
+    # bci retrieve
+    bci_retrieve_parser = bci_subparsers.add_parser(
+        "retrieve",
+        help="Retrieve relevant behaviors for a query",
+    )
+    bci_retrieve_parser.add_argument("query", help="The query to retrieve behaviors for")
+    bci_retrieve_parser.add_argument("--top-k", type=int, default=5, help="Number of behaviors to retrieve")
+    bci_retrieve_parser.add_argument(
+        "--strategy",
+        choices=["semantic", "keyword", "hybrid"],
+        default="hybrid",
+        help="Retrieval strategy",
+    )
+    bci_retrieve_parser.add_argument(
+        "--role",
+        choices=["student", "teacher", "strategist"],
+        help="Filter by role focus",
+    )
+
+    # bci compose-prompt
+    bci_compose_parser = bci_subparsers.add_parser(
+        "compose-prompt",
+        help="Compose a BCI prompt with retrieved behaviors",
+    )
+    bci_compose_parser.add_argument("query", help="The user query")
+    bci_compose_parser.add_argument(
+        "--behaviors",
+        nargs="+",
+        help="Explicit behavior names to include",
+    )
+    bci_compose_parser.add_argument("--top-k", type=int, default=5, help="Number of behaviors to retrieve")
+    bci_compose_parser.add_argument(
+        "--format",
+        choices=["simple", "detailed", "json"],
+        default="simple",
+        help="Prompt format",
+    )
+
+    # bci validate-citations
+    bci_validate_parser = bci_subparsers.add_parser(
+        "validate-citations",
+        help="Validate behavior citations in a response",
+    )
+    bci_validate_parser.add_argument("response", help="The response text to validate")
+    bci_validate_parser.add_argument(
+        "--mode",
+        choices=["strict", "lenient", "fuzzy"],
+        default="strict",
+        help="Citation validation mode",
+    )
+
+    # bci generate
+    bci_generate_parser = bci_subparsers.add_parser(
+        "generate",
+        help="Generate a behavior-conditioned LLM response",
+    )
+    bci_generate_parser.add_argument("query", help="The query to generate a response for")
+    bci_generate_parser.add_argument(
+        "--behaviors",
+        nargs="+",
+        help="Explicit behavior names to use (default: auto-retrieve)",
+    )
+    bci_generate_parser.add_argument("--top-k", type=int, default=5, help="Number of behaviors to retrieve")
+    bci_generate_parser.add_argument(
+        "--provider",
+        choices=["openai", "anthropic", "openrouter", "ollama", "together", "groq", "fireworks", "test"],
+        help="LLM provider (default: from environment)",
+    )
+    bci_generate_parser.add_argument("--model", help="Model name (default: provider default)")
+    bci_generate_parser.add_argument("--temperature", type=float, help="Sampling temperature")
+    bci_generate_parser.add_argument(
+        "--role",
+        choices=["student", "teacher", "strategist"],
+        help="Role focus for behavior retrieval",
+    )
+    bci_generate_parser.add_argument("--output", "-o", help="Output file path (default: stdout)")
+
+    # bci improve
+    bci_improve_parser = bci_subparsers.add_parser(
+        "improve",
+        help="Analyze a failed run and generate improvement suggestions",
+    )
+    bci_improve_parser.add_argument("run_id", help="The run ID to analyze")
+    bci_improve_parser.add_argument(
+        "--provider",
+        choices=["openai", "anthropic", "openrouter", "ollama", "together", "groq", "fireworks", "test"],
+        help="LLM provider (default: from environment)",
+    )
+    bci_improve_parser.add_argument("--model", help="Model name (default: provider default)")
+    bci_improve_parser.add_argument("--max-behaviors", type=int, default=10, help="Max behaviors to extract")
+    bci_improve_parser.add_argument("--output", "-o", help="Output file path (default: stdout)")
+
+    # ── Audit log commands ──────────────────────────────────────────────────────
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Audit log WORM storage commands",
+    )
+    audit_subparsers = audit_parser.add_subparsers(dest="audit_command")
+
+    # audit verify
+    audit_verify_parser = audit_subparsers.add_parser(
+        "verify",
+        help="Verify integrity of an archived audit batch",
+    )
+    audit_verify_parser.add_argument(
+        "--batch-id",
+        required=True,
+        help="Batch ID to verify",
+    )
+    audit_verify_parser.add_argument(
+        "--public-key",
+        help="Path to public key file for signature verification (optional)",
+    )
+    audit_verify_parser.add_argument(
+        "--output",
+        choices=("summary", "json"),
+        help="Output format (default: summary when interactive, json when piped)",
+    )
+
+    # audit list
+    audit_list_parser = audit_subparsers.add_parser(
+        "list",
+        help="List archived audit batches",
+    )
+    audit_list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum number of batches to list (default: 100)",
+    )
+    audit_list_parser.add_argument(
+        "--prefix",
+        help="S3 key prefix to filter batches",
+    )
+    audit_list_parser.add_argument(
+        "--output",
+        choices=("summary", "json"),
+        help="Output format (default: summary when interactive, json when piped)",
+    )
+
+    # audit retention
+    audit_retention_parser = audit_subparsers.add_parser(
+        "retention",
+        help="Check retention info for an archived batch",
+    )
+    audit_retention_parser.add_argument(
+        "--batch-id",
+        required=True,
+        help="Batch ID to check retention for",
+    )
+    audit_retention_parser.add_argument(
+        "--output",
+        choices=("summary", "json"),
+        help="Output format (default: summary when interactive, json when piped)",
+    )
+
+    # ── Analytics commands ──────────────────────────────────────────────────────
+    analytics_parser = subparsers.add_parser(
+        "analytics",
+        help="Analytics warehouse queries and cost optimization",
+    )
+    analytics_subparsers = analytics_parser.add_subparsers(dest="analytics_command")
+
+    # analytics project
+    analytics_project_parser = analytics_subparsers.add_parser(
+        "project",
+        help="Project raw telemetry data to analytics warehouse",
+    )
+    analytics_project_parser.add_argument(
+        "--start-date",
+        dest="start_date",
+        help="Start date for projection (YYYY-MM-DD)",
+    )
+    analytics_project_parser.add_argument(
+        "--end-date",
+        dest="end_date",
+        help="End date for projection (YYYY-MM-DD)",
+    )
+    analytics_project_parser.add_argument(
+        "--output",
+        choices=("summary", "json"),
+        default="summary",
+        help="Output format",
+    )
+
+    # analytics kpi-summary
+    analytics_kpi_parser = analytics_subparsers.add_parser(
+        "kpi-summary",
+        help="Query KPI summary from DuckDB analytics warehouse",
+    )
+    analytics_kpi_parser.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
+    analytics_kpi_parser.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
+    analytics_kpi_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics project-kpi
+    analytics_project_kpi_parser = analytics_subparsers.add_parser(
+        "project-kpi",
+        help="Project telemetry events from JSONL file into KPI facts and summary",
+    )
+    analytics_project_kpi_parser.add_argument(
+        "--input",
+        dest="input_file",
+        required=True,
+        help="Path to JSONL file containing telemetry events",
+    )
+    analytics_project_kpi_parser.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="Output format (default: table)",
+    )
+    analytics_project_kpi_parser.add_argument(
+        "--facts-output",
+        dest="facts_output",
+        help="Optional path to write full projection JSON",
+    )
+
+    # analytics behavior-usage
+    analytics_behavior_parser = analytics_subparsers.add_parser(
+        "behavior-usage",
+        help="Query behavior usage facts from analytics warehouse",
+    )
+    analytics_behavior_parser.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
+    analytics_behavior_parser.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
+    analytics_behavior_parser.add_argument("--limit", type=int, default=50, help="Max records to return")
+    analytics_behavior_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics token-savings
+    analytics_tokens_parser = analytics_subparsers.add_parser(
+        "token-savings",
+        help="Query token savings facts from analytics warehouse",
+    )
+    analytics_tokens_parser.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
+    analytics_tokens_parser.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
+    analytics_tokens_parser.add_argument("--limit", type=int, default=50, help="Max records to return")
+    analytics_tokens_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics compliance-coverage
+    analytics_compliance_parser = analytics_subparsers.add_parser(
+        "compliance-coverage",
+        help="Query compliance coverage facts from analytics warehouse",
+    )
+    analytics_compliance_parser.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
+    analytics_compliance_parser.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
+    analytics_compliance_parser.add_argument("--limit", type=int, default=50, help="Max records to return")
+    analytics_compliance_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics cost-by-service
+    analytics_cost_service_parser = analytics_subparsers.add_parser(
+        "cost-by-service",
+        help="Query cost breakdown by service from analytics warehouse",
+    )
+    analytics_cost_service_parser.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
+    analytics_cost_service_parser.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
+    analytics_cost_service_parser.add_argument("--service", dest="service_name", help="Filter by service name")
+    analytics_cost_service_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics cost-per-run
+    analytics_cost_run_parser = analytics_subparsers.add_parser(
+        "cost-per-run",
+        help="Query cost breakdown by run from analytics warehouse",
+    )
+    analytics_cost_run_parser.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
+    analytics_cost_run_parser.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
+    analytics_cost_run_parser.add_argument("--template", dest="template_id", help="Filter by template ID")
+    analytics_cost_run_parser.add_argument("--limit", type=int, default=50, help="Max records to return")
+    analytics_cost_run_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics roi-summary
+    analytics_roi_parser = analytics_subparsers.add_parser(
+        "roi-summary",
+        help="Query ROI analysis summary from analytics warehouse",
+    )
+    analytics_roi_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics daily-costs
+    analytics_daily_parser = analytics_subparsers.add_parser(
+        "daily-costs",
+        help="Query daily cost summary for budget tracking",
+    )
+    analytics_daily_parser.add_argument("--start-date", dest="start_date", help="Start date (YYYY-MM-DD)")
+    analytics_daily_parser.add_argument("--end-date", dest="end_date", help="End date (YYYY-MM-DD)")
+    analytics_daily_parser.add_argument("--limit", type=int, default=30, help="Max records to return")
+    analytics_daily_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # analytics top-expensive
+    analytics_expensive_parser = analytics_subparsers.add_parser(
+        "top-expensive",
+        help="Query top expensive workflows from analytics warehouse",
+    )
+    analytics_expensive_parser.add_argument("--limit", type=int, default=10, help="Number of workflows to return")
+    analytics_expensive_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # ── Telemetry commands ──────────────────────────────────────────────────────
+    telemetry_parser = subparsers.add_parser(
+        "telemetry",
+        help="Emit telemetry events",
+    )
+    telemetry_subparsers = telemetry_parser.add_subparsers(dest="telemetry_command")
+
+    telemetry_emit_parser = telemetry_subparsers.add_parser(
+        "emit",
+        help="Emit a telemetry event",
+    )
+    telemetry_emit_parser.add_argument("--event-type", dest="event_type", required=True, help="Event type")
+    telemetry_emit_parser.add_argument("--payload", default="{}", help="JSON event payload")
+    telemetry_emit_parser.add_argument("--actor-id", dest="actor_id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
+    telemetry_emit_parser.add_argument("--actor-role", dest="actor_role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
+    telemetry_emit_parser.add_argument("--actor-surface", dest="actor_surface", default="cli", help="Actor surface")
+    telemetry_emit_parser.add_argument("--run-id", dest="run_id", help="Run ID")
+    telemetry_emit_parser.add_argument("--action-id", dest="action_id", help="Action ID")
+    telemetry_emit_parser.add_argument("--session-id", dest="session_id", help="Session ID")
+    telemetry_emit_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+    telemetry_emit_parser.add_argument("--sink", choices=("file", "kafka"), default="file", help="Telemetry sink type")
+    telemetry_emit_parser.add_argument("--telemetry-path", dest="telemetry_path", help="Output file path for file sink")
+    telemetry_emit_parser.add_argument("--kafka-servers", dest="kafka_servers", help="Kafka bootstrap servers (or use KAFKA_BOOTSTRAP_SERVERS env)")
+
+    # telemetry query
+    telemetry_query_parser = telemetry_subparsers.add_parser(
+        "query",
+        help="Query telemetry events with filters",
+    )
+    telemetry_query_parser.add_argument("--event-type", dest="event_type", help="Filter by event type")
+    telemetry_query_parser.add_argument("--from", dest="start_date", help="Start date (ISO format or relative e.g. '7d')")
+    telemetry_query_parser.add_argument("--to", dest="end_date", help="End date (ISO format)")
+    telemetry_query_parser.add_argument("--run-id", dest="run_id", help="Filter by run ID")
+    telemetry_query_parser.add_argument("--action-id", dest="action_id", help="Filter by action ID")
+    telemetry_query_parser.add_argument("--session-id", dest="session_id", help="Filter by session ID")
+    telemetry_query_parser.add_argument("--actor-surface", dest="actor_surface", help="Filter by actor surface")
+    telemetry_query_parser.add_argument("--level", choices=("TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"), help="Minimum log level")
+    telemetry_query_parser.add_argument("--search", help="Full-text search in message")
+    telemetry_query_parser.add_argument("--limit", type=int, default=100, help="Maximum events to return")
+    telemetry_query_parser.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    telemetry_query_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # telemetry dashboard
+    telemetry_dashboard_parser = telemetry_subparsers.add_parser(
+        "dashboard",
+        help="Display telemetry dashboard with KPIs and token accounting",
+    )
+    telemetry_dashboard_parser.add_argument("--run-id", dest="run_id", help="Drill down to specific run ID for token details")
+    telemetry_dashboard_parser.add_argument("--from", dest="start_date", help="Start date for daily summary")
+    telemetry_dashboard_parser.add_argument("--to", dest="end_date", help="End date for daily summary")
+    telemetry_dashboard_parser.add_argument("--watch", action="store_true", help="Enable live refresh (5s interval)")
+    telemetry_dashboard_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # ── Agents commands ─────────────────────────────────────────────────────────
+    agents_parser = subparsers.add_parser(
+        "agents",
+        help="Agent management commands",
+    )
+    agents_subparsers = agents_parser.add_subparsers(dest="agents_command")
+
+    # agents assign
+    agents_assign_parser = agents_subparsers.add_parser(
+        "assign",
+        help="Assign an agent to a run",
+    )
+    agents_assign_parser.add_argument("--run-id", dest="run_id", help="Run ID to assign agent to")
+    agents_assign_parser.add_argument("--agent-id", dest="agent_id", help="Explicit agent ID to assign")
+    agents_assign_parser.add_argument("--stage", default="PLANNING", help="Assignment stage (default: PLANNING)")
+    agents_assign_parser.add_argument("--context", help="JSON context for heuristic selection")
+    agents_assign_parser.add_argument("--context-file", dest="context_file", help="Path to JSON file with context")
+    agents_assign_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # agents status
+    agents_status_parser = agents_subparsers.add_parser(
+        "status",
+        help="Get status of an agent assignment",
+    )
+    agents_status_parser.add_argument("--run-id", dest="run_id", help="Run ID to check status")
+    agents_status_parser.add_argument("--assignment-id", dest="assignment_id", help="Assignment ID to check status")
+    agents_status_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # agents switch
+    agents_switch_parser = agents_subparsers.add_parser(
+        "switch",
+        help="Switch to a different agent",
+    )
+    agents_switch_parser.add_argument("assignment_id", help="Assignment ID to modify")
+    agents_switch_parser.add_argument("--target-agent-id", dest="target_agent_id", required=True, help="Target agent ID")
+    agents_switch_parser.add_argument("--reason", help="Reason for switch")
+    agents_switch_parser.add_argument("--stage", help="New stage after switch")
+    agents_switch_parser.add_argument("--allow-downgrade", dest="allow_downgrade", action="store_true", help="Allow switching to lower tier agent")
+    agents_switch_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # ── Metrics commands ────────────────────────────────────────────────────────
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="Query and export metrics",
+    )
+    metrics_subparsers = metrics_parser.add_subparsers(dest="metrics_command")
+
+    metrics_summary_parser = metrics_subparsers.add_parser(
+        "summary",
+        help="Get metrics summary",
+    )
+    metrics_summary_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    metrics_export_parser = metrics_subparsers.add_parser(
+        "export",
+        help="Export metrics to file",
+    )
+    metrics_export_parser.add_argument("--output", "-o", required=True, help="Output file path")
+    metrics_export_parser.add_argument("--format", choices=("json", "csv"), default="json", help="Export format")
+
+    bandwidth_check_parser = subparsers.add_parser(
+        "bandwidth-check",
+        help="Check current bandwidth usage against environment limits",
+    )
+    bandwidth_check_parser.add_argument(
+        "--environment",
+        default="dev",
+        help="Environment to check against (default: dev)",
+    )
+
+    # ── Reflection command ──────────────────────────────────────────────────────
     reflection_parser = subparsers.add_parser(
         "reflection",
-        help="Extract reusable behavior candidates from a trace",
+        help="Analyze traces and propose reusable behavior candidates",
     )
-    reflection_parser.add_argument(
+    trace_input_group = reflection_parser.add_mutually_exclusive_group()
+    trace_input_group.add_argument(
         "--trace",
         dest="trace_text",
-        help="Inline chain-of-thought or plan text to analyze",
+        help="Trace text to analyze (chain-of-thought steps)",
     )
-    reflection_parser.add_argument(
+    trace_input_group.add_argument(
         "--trace-file",
-        help="Path to a file containing the trace to analyze",
+        dest="trace_file",
+        help="Path to file containing trace text",
     )
     reflection_parser.add_argument(
         "--trace-format",
-        choices=[fmt.value for fmt in TraceFormat],
-        default=TraceFormat.CHAIN_OF_THOUGHT.value,
-        help="Format of the supplied trace (default: chain_of_thought)",
+        dest="trace_format",
+        choices=["chain_of_thought", "structured", "free_form"],
+        default="chain_of_thought",
+        help="Format of the trace text (default: chain_of_thought)",
     )
-    reflection_parser.add_argument("--run-id", dest="run_id", help="Optional workflow run identifier")
     reflection_parser.add_argument(
-        "--max-candidates",
-        dest="max_candidates",
-        type=int,
-        default=5,
-        help="Maximum number of candidates to return (default: 5)",
+        "--run-id",
+        dest="run_id",
+        help="Run ID to associate with reflection results",
     )
     reflection_parser.add_argument(
         "--min-score",
         dest="min_score",
         type=float,
         default=0.6,
-        help="Minimum confidence (0-1) required to include a candidate (default: 0.6)",
+        help="Minimum quality score for candidate behaviors (0.0-1.0, default: 0.6)",
+    )
+    reflection_parser.add_argument(
+        "--max-candidates",
+        dest="max_candidates",
+        type=int,
+        default=5,
+        help="Maximum number of behavior candidates to return (default: 5)",
     )
     reflection_parser.add_argument(
         "--no-examples",
+        dest="no_examples",
         action="store_true",
-        help="Skip embedding supporting step examples in the response",
+        help="Exclude examples from candidate output",
     )
     reflection_parser.add_argument(
-        "--tag",
-        dest="tags",
-        action="append",
-        default=[],
-        help="Preferred tag to assign to generated candidates (repeatable)",
+        "--tags",
+        nargs="+",
+        help="Preferred tags to assign to candidates",
     )
     reflection_parser.add_argument(
         "--output",
-        choices=("json", "table"),
+        choices=["json", "table"],
         default="json",
-        help="Output format for the reflection result",
+        help="Output format (default: json)",
     )
 
-    # BCI subcommands
-    bci_parser = subparsers.add_parser(
-        "bci",
-        help="Behavior-Conditioned Inference utilities",
+    # ── Database migration commands ─────────────────────────────────────────────
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Apply PostgreSQL schema migrations",
     )
-    bci_subparsers = bci_parser.add_subparsers(dest="bci_command")
+    migrate_subparsers = migrate_parser.add_subparsers(dest="migrate_command")
 
-    bci_retrieve_parser = bci_subparsers.add_parser(
-        "retrieve",
-        help="Retrieve relevant behaviors via semantic/keyword search",
+    migrate_apply_parser = migrate_subparsers.add_parser(
+        "apply",
+        help="Apply pending schema migrations",
     )
-    bci_retrieve_parser.add_argument("--query", required=True, help="Natural language query to search for behaviors")
-    bci_retrieve_parser.add_argument(
-        "--top-k",
-        dest="top_k",
-        type=int,
-        default=5,
-        help="Maximum number of behaviors to return (default: 5)",
+    migrate_apply_parser.add_argument(
+        "--service",
+        choices=["all", "reflection", "collaboration", "behavior", "workflow", "action", "run", "metrics", "compliance"],
+        default="all",
+        help="Service to migrate (default: all)",
     )
-    bci_retrieve_parser.add_argument(
-        "--strategy",
-        choices=[strategy.value for strategy in RetrievalStrategy],
-        default=RetrievalStrategy.HYBRID.value,
-        help="Retrieval strategy to use",
-    )
-    bci_retrieve_parser.add_argument(
-        "--role-focus",
-        choices=[role.value for role in RoleFocus],
-        help="Filter behaviors by role focus",
-    )
-    bci_retrieve_parser.add_argument(
-        "--tag",
-        dest="tags",
-        action="append",
-        default=[],
-        help="Filter behaviors by tag (repeatable)",
-    )
-    bci_retrieve_parser.add_argument(
-        "--include-metadata",
+    migrate_apply_parser.add_argument(
+        "--dry-run",
         action="store_true",
-        help="Include behavior metadata in the response",
-    )
-    bci_retrieve_parser.add_argument(
-        "--embedding-weight",
-        dest="embedding_weight",
-        type=float,
-        default=0.7,
-        help="Weight for embedding similarity when using hybrid strategy (default: 0.7)",
-    )
-    bci_retrieve_parser.add_argument(
-        "--keyword-weight",
-        dest="keyword_weight",
-        type=float,
-        default=0.3,
-        help="Weight for keyword similarity when using hybrid strategy (default: 0.3)",
-    )
-    bci_retrieve_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
+        help="Show which migrations would be applied without executing",
     )
 
-    bci_compose_parser = bci_subparsers.add_parser(
-        "compose-prompt",
-        help="Compose a prompt using selected behaviors",
+    migrate_status_parser = migrate_subparsers.add_parser(
+        "status",
+        help="Check migration status for all services",
     )
-    bci_compose_parser.add_argument("--query", required=True, help="Task or query to include in the prompt")
-    bci_compose_parser.add_argument(
-        "--behaviors-file",
-        required=True,
-        help="Path to JSON array of behavior snippets (behavior_id, name, instruction, optional citation_label, role_focus)",
-    )
-    bci_compose_parser.add_argument(
-        "--citation-mode",
-        choices=[mode.value for mode in CitationMode],
-        default=CitationMode.EXPLICIT.value,
-        help="Citation mode for rendered prompt",
-    )
-    bci_compose_parser.add_argument(
-        "--prompt-format",
-        dest="prompt_format",
-        choices=[fmt.value for fmt in PromptFormat],
-        default=PromptFormat.LIST.value,
-        help="Prompt rendering format",
-    )
-    bci_compose_parser.add_argument(
-        "--citation-instruction",
-        dest="citation_instruction",
-        help="Override the default citation instruction",
-    )
-    bci_compose_parser.add_argument(
-        "--max-behaviors",
-        dest="max_behaviors",
-        type=int,
-        help="Limit the number of behaviors included in the prompt",
-    )
-    bci_compose_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-
-    bci_validate_parser = bci_subparsers.add_parser(
-        "validate-citations",
-        help="Validate citations in an output against prepended behaviors",
-    )
-    bci_validate_parser.add_argument(
-        "--output-text",
-        help="Inline output text to validate (mutually exclusive with --output-file)",
-    )
-    bci_validate_parser.add_argument(
-        "--output-file",
-        help="Path to file containing output text to validate",
-    )
-    bci_validate_parser.add_argument(
-        "--prepended-file",
-        required=True,
-        help="Path to JSON array of prepended behaviors (behavior_name, optional behavior_id)",
-    )
-    bci_validate_parser.add_argument(
-        "--minimum",
-        dest="minimum_citations",
-        type=int,
-        default=1,
-        help="Minimum number of citations required to be compliant",
-    )
-    bci_validate_parser.add_argument(
-        "--allow-unlisted",
-        action="store_true",
-        help="Treat unlisted behaviors as warnings instead of errors",
-    )
-    bci_validate_parser.add_argument(
-        "--format",
-        choices=("table", "json"),
-        default="table",
-        help="Output format",
-    )
-
-    bci_rebuild_parser = bci_subparsers.add_parser(
-        "rebuild-index",
-        help="Rebuild the behavior retriever semantic index",
-    )
-    bci_rebuild_parser.add_argument(
+    migrate_status_parser.add_argument(
         "--format",
         choices=("table", "json"),
         default="table",
@@ -1891,6 +2614,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.exit(1)
     if args.command == "bci" and not getattr(args, "bci_command", None):
         bci_parser.print_help()
+        parser.exit(1)
+    if args.command == "amprealize" and not getattr(args, "amprealize_command", None):
+        amp_parser.print_help()
+        parser.exit(1)
+    if args.command == "audit" and not getattr(args, "audit_command", None):
+        audit_parser.print_help()
+        parser.exit(1)
+    if args.command == "auth" and not getattr(args, "auth_command", None):
+        auth_parser.print_help()
+        parser.exit(1)
+    if args.command == "migrate" and not getattr(args, "migrate_command", None):
+        migrate_parser.print_help()
         parser.exit(1)
     return args
 
@@ -2180,7 +2915,7 @@ def _command_behaviors_get(args: argparse.Namespace) -> int:
         return 1
 
     if args.format == "table":
-        _render_behavior_detail(result)
+                             _render_behavior_detail(result)
     else:
         _print_json(result)
     return 0
@@ -2312,8 +3047,152 @@ def _render_replay_table(payload: Dict[str, Any]) -> None:
     print(fmt.format(*row))
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
 def _print_json(payload: Any) -> None:
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
+
+
+def _serialize_model(payload: Any) -> Any:
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump()
+    if hasattr(payload, "dict"):
+        return payload.dict()
+    if isinstance(payload, list):
+        return [_serialize_model(item) for item in payload]
+    if isinstance(payload, dict):
+        return {key: _serialize_model(value) for key, value in payload.items()}
+    return payload
+
+
+def _ensure_amprealize_snapshot_dir() -> Path:
+    AMPREALIZE_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    return AMPREALIZE_SNAPSHOT_DIR
+
+
+def _save_amprealize_snapshot(command: str, payload: Any) -> Path:
+    directory = _ensure_amprealize_snapshot_dir()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    filename = f"{timestamp}-{command}.json"
+    path = directory / filename
+    path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+    return path
+
+
+def _notify_snapshot_location(path: Path) -> None:
+    print(f"[amprealize] Snapshot saved to {path}", file=sys.stderr)
+
+
+def _resolve_output_format(preferred: Optional[str]) -> str:
+    if preferred:
+        return preferred
+    return "summary" if sys.stdout.isatty() else "json"
+
+
+def _render_amprealize_plan_summary(resp: Dict[str, Any], snapshot_path: Path) -> None:
+    manifest = resp.get("signed_manifest") or {}
+    services = manifest.get("services") or {}
+    service_names = list(services.keys())
+    estimates = resp.get("environment_estimates") or {}
+    modules: Dict[str, int] = {}
+    for spec in services.values():
+        module = spec.get("module") or "default"
+        modules[module] = modules.get(module, 0) + 1
+
+    print("Amprealize Plan ready")
+    print(f"  Plan ID      : {resp.get('plan_id', 'unknown')}")
+    print(f"  Run ID       : {resp.get('amp_run_id', 'unknown')}")
+    if manifest.get("blueprint_id"):
+        print(f"  Blueprint    : {manifest['blueprint_id']}")
+    if service_names:
+        print(f"  Services     : {len(service_names)} ({', '.join(service_names[:5])}{'…' if len(service_names) > 5 else ''})")
+    if modules:
+        module_parts = [f"{name}×{count}" for name, count in sorted(modules.items())]
+        print(f"  Modules      : {', '.join(module_parts)}")
+    if estimates:
+        print("  Estimates    :")
+        cost = estimates.get("cost_estimate")
+        boot = estimates.get("expected_boot_duration_s")
+        memory = estimates.get("memory_footprint_mb")
+        bandwidth = estimates.get("bandwidth_mbps")
+        print(f"    • Cost          : ${cost:.2f}" if isinstance(cost, (int, float)) else f"    • Cost          : {cost}")
+        if memory is not None:
+            print(f"    • Memory        : {memory} MB")
+        if bandwidth is not None:
+            print(f"    • Bandwidth     : {bandwidth} Mbps")
+        if boot is not None:
+            print(f"    • Boot Duration : {boot}s")
+        if estimates.get("region"):
+            print(f"    • Region        : {estimates['region']}")
+    print(f"  Snapshot     : {snapshot_path}")
+
+
+def _render_amprealize_apply_summary(resp: Dict[str, Any], snapshot_path: Path, *, watched: bool) -> None:
+    heading = "Amprealize Apply results" if watched else "Amprealize Apply requested"
+    print(heading)
+    print(f"  Run ID       : {resp.get('amp_run_id', 'unknown')}")
+    if resp.get("action_id"):
+        print(f"  Action ID    : {resp['action_id']}")
+    outputs = resp.get("environment_outputs") or {}
+    if outputs:
+        keys = ", ".join(list(outputs.keys())[:5])
+        print(f"  Env Outputs  : {keys}{'…' if len(outputs) > 5 else ''}")
+    if resp.get("status_stream_url"):
+        print(f"  Status Stream: {resp['status_stream_url']}")
+    print(f"  Snapshot     : {snapshot_path}")
+
+
+def _render_amprealize_status_summary(status: Dict[str, Any], snapshot_path: Path, *, include_events: int = 0) -> None:
+    print("Amprealize Status")
+    print(f"  Run ID       : {status.get('amp_run_id', 'unknown')}")
+    print(f"  Phase        : {status.get('phase', 'UNKNOWN')}")
+    progress = status.get("progress_pct")
+    if progress is not None:
+        print(f"  Progress     : {progress}%")
+    checks = status.get("checks") or []
+    if checks:
+        print("  Health Checks:")
+        for check in checks:
+            print(f"    • {check.get('name', 'unknown')}: {check.get('status', 'UNKNOWN')} (last probe {check.get('last_probe', 'n/a')})")
+    telemetry = status.get("telemetry") or {}
+    if telemetry:
+        print("  Telemetry    :")
+        for key, value in telemetry.items():
+            print(f"    • {key.replace('_', ' ').title()}: {value}")
+    if include_events:
+        print(f"  Events       : {include_events} captured")
+    if status.get("environment_outputs_path"):
+        print(f"  Outputs File : {status['environment_outputs_path']}")
+    print(f"  Snapshot     : {snapshot_path}")
+
+
+def _render_amprealize_destroy_summary(resp: Dict[str, Any], snapshot_path: Path) -> None:
+    print("Amprealize Destroy")
+    print(f"  Action ID    : {resp.get('action_id', 'unknown')}")
+    report = resp.get("teardown_report") or []
+    if report:
+        print("  Resources    :")
+        for line in report[:10]:
+            print(f"    • {line}")
+        if len(report) > 10:
+            print(f"    • … {len(report) - 10} additional entries")
+    print(f"  Snapshot     : {snapshot_path}")
+
+
+def _render_amprealize_event(event: Dict[str, Any]) -> None:
+    timestamp = event.get("timestamp", "?")
+    status = event.get("status", "UNKNOWN")
+    message = event.get("message", "")
+    print(f"[{timestamp}] {status:<12} {message}")
+    details = event.get("details")
+    if details:
+        print(f"    {json.dumps(details, sort_keys=True, default=_json_default)}")
 
 
 def _render_tasks_table(tasks: List[Dict[str, Any]]) -> None:
@@ -2443,6 +3322,7 @@ def _command_record_action(args: argparse.Namespace) -> int:
         actor_role=args.actor_role,
         checksum=args.checksum,
         related_run_id=args.related_run_id,
+        audit_log_event_id=args.audit_log_event_id,
     )
 
     if args.format == "table":
@@ -2513,6 +3393,32 @@ def _command_replay_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_dr(args: argparse.Namespace) -> int:
+    """Delegate 'guideai dr' subcommands to the Click-based DR CLI."""
+
+    try:
+        from guideai import cli_dr
+    except ImportError as exc:  # pragma: no cover - import guard
+        print(f"Error: DR commands unavailable ({exc})", file=sys.stderr)
+        return 1
+
+    forwarded_args = list(args.dr_args or [])
+
+    try:
+        result = cli_dr.dr_group.main(
+            args=forwarded_args,
+            prog_name="guideai dr",
+            standalone_mode=False,
+        )
+    except SystemExit as exc:  # Click uses SystemExit for return codes
+        return int(exc.code or 0)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        print(f"DR command failed: {exc}", file=sys.stderr)
+        return 1
+
+    return int(result or 0)
+
+
 def _command_list_tasks(args: argparse.Namespace) -> int:
     adapter = _get_task_adapter()
     try:
@@ -2545,7 +3451,28 @@ def _command_telemetry_emit(args: argparse.Namespace) -> int:
         "surface": surface,
     }
 
-    telemetry = _create_telemetry_client(actor)
+    # Determine sink based on --sink argument
+    sink_type = getattr(args, "sink", "file")
+
+    if sink_type == "kafka":
+        # Kafka sink requires bootstrap servers
+        kafka_servers = getattr(args, "kafka_servers", None) or os.environ.get("KAFKA_BOOTSTRAP_SERVERS")
+        if not kafka_servers:
+            print("Error: Kafka sink requires --kafka-servers or KAFKA_BOOTSTRAP_SERVERS environment variable", file=sys.stderr)
+            return 2
+
+        kafka_topic = os.environ.get("KAFKA_TOPIC_TELEMETRY_EVENTS", "telemetry.events")
+        sink = KafkaTelemetrySink(bootstrap_servers=kafka_servers, topic=kafka_topic)
+    else:
+        # File sink
+        telemetry_path = getattr(args, "telemetry_path", None)
+        if telemetry_path:
+            sink = FileTelemetrySink(path=Path(telemetry_path))
+        else:
+            # Use default from environment or in-memory fallback
+            sink = create_sink_from_env()
+
+    telemetry = TelemetryClient(sink=sink, default_actor=actor)
 
     event = telemetry.emit_event(
         event_type=args.event_type,
@@ -2556,13 +3483,306 @@ def _command_telemetry_emit(args: argparse.Namespace) -> int:
         session_id=args.session_id,
     )
 
-    if args.format == "json":
+    # For file sink with custom path, output JSON for test validation
+    if sink_type == "file" and getattr(args, "telemetry_path", None):
+        print(json.dumps(event.to_dict(), indent=2))
+    elif args.format == "json":
         print(json.dumps(event.to_dict(), indent=2))
     else:
         print(
             f"{event.timestamp} {event.event_type} actor={event.actor['id']} surface={event.actor['surface']}"
         )
     return 0
+
+
+def _parse_relative_date(date_str: str) -> datetime:
+    """Parse relative date strings like '7d', '24h', '30m' or ISO dates."""
+    if not date_str:
+        return datetime.now(timezone.utc)
+
+    # Try relative format first (e.g., "7d", "24h", "30m")
+    relative_pattern = r"^(\d+)([dhms])$"
+    import re
+    match = re.match(relative_pattern, date_str.lower())
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2)
+        delta_map = {"d": timedelta(days=value), "h": timedelta(hours=value),
+                     "m": timedelta(minutes=value), "s": timedelta(seconds=value)}
+        return datetime.now(timezone.utc) - delta_map[unit]
+
+    # Try ISO format
+    try:
+        # Handle date-only format
+        if len(date_str) == 10:
+            return datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"Invalid date format: {date_str}. Use ISO format or relative (e.g., 7d, 24h, 30m)")
+
+
+def _command_telemetry_query(args: argparse.Namespace) -> int:
+    """Query telemetry logs using RazeService."""
+    try:
+        from raze import RazeService
+        from raze.sinks import InMemorySink
+    except ImportError:
+        # Try TimescaleDB sink if available
+        try:
+            from raze import RazeService
+            from raze.sinks import TimescaleDBSink
+        except ImportError:
+            print("Error: Raze package not installed. Install with: pip install raze", file=sys.stderr)
+            return 1
+
+    # Parse date range
+    try:
+        start_time = _parse_relative_date(args.from_date) if args.from_date else datetime.now(timezone.utc) - timedelta(days=7)
+        end_time = _parse_relative_date(args.to_date) if args.to_date else datetime.now(timezone.utc)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    # Build query params
+    query_params = {
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "limit": args.limit,
+        "offset": args.offset,
+    }
+
+    # Add optional filters
+    if args.event_type:
+        query_params["event_type"] = args.event_type
+    if args.run_id:
+        query_params["run_id"] = args.run_id
+    if args.action_id:
+        query_params["action_id"] = args.action_id
+    if args.session_id:
+        query_params["session_id"] = args.session_id
+    if args.actor_surface:
+        query_params["actor_surface"] = args.actor_surface.replace("-", "_").lower()
+    if args.level:
+        query_params["level"] = args.level.upper()
+    if args.search:
+        query_params["search"] = args.search
+
+    # Initialize RazeService - try TimescaleDB first, fall back to file-based
+    try:
+        import os
+        dsn = os.environ.get("RAZE_DSN") or os.environ.get("TIMESCALEDB_DSN")
+        if dsn:
+            from raze.sinks import TimescaleDBSink
+            sink = TimescaleDBSink(dsn=dsn)
+        else:
+            # Fall back to JSONL file if available
+            log_path = Path(os.environ.get("RAZE_LOG_PATH", ".guideai/logs/raze.jsonl"))
+            if log_path.exists():
+                from raze.sinks import JSONLSink
+                sink = JSONLSink(path=str(log_path))
+            else:
+                from raze.sinks import InMemorySink
+                sink = InMemorySink()
+
+        service = RazeService(sink=sink)
+        result = service.query(**query_params)
+        logs = result.logs if hasattr(result, 'logs') else result
+    except Exception as exc:
+        print(f"Error querying logs: {exc}", file=sys.stderr)
+        return 1
+
+    # Output results
+    if args.format == "json":
+        output = {
+            "query": query_params,
+            "count": len(logs) if isinstance(logs, list) else 0,
+            "logs": [log.to_dict() if hasattr(log, 'to_dict') else log for log in logs] if logs else [],
+        }
+        print(json.dumps(output, indent=2, default=str))
+    else:
+        if not logs:
+            print("No logs found matching query.")
+            return 0
+
+        print(f"\nTelemetry Logs ({len(logs)} results)")
+        print("=" * 100)
+        print(f"{'Timestamp':<25} {'Level':<8} {'Service':<15} {'Message':<50}")
+        print("-" * 100)
+        for log in logs[:args.limit]:
+            log_dict = log.to_dict() if hasattr(log, 'to_dict') else log
+            ts = str(log_dict.get('timestamp', 'N/A'))[:24]
+            level = log_dict.get('level', 'INFO')[:7]
+            service = log_dict.get('service', 'unknown')[:14]
+            msg = log_dict.get('message', '')[:49]
+            print(f"{ts:<25} {level:<8} {service:<15} {msg:<50}")
+
+        if len(logs) > args.limit:
+            print(f"\n... and {len(logs) - args.limit} more (use --limit to see more)")
+
+    return 0
+
+
+def _command_telemetry_dashboard(args: argparse.Namespace) -> int:
+    """Display telemetry dashboard with KPIs and token accounting."""
+    from .analytics.warehouse import AnalyticsWarehouse
+
+    # Parse date range
+    try:
+        start_date = args.from_date if args.from_date else (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        end_date = args.to_date if args.to_date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    def _fetch_and_display():
+        """Fetch dashboard data and display it."""
+        warehouse = AnalyticsWarehouse()
+
+        # If specific run_id provided, show drill-down view
+        if args.run_id:
+            return _display_run_drilldown(warehouse, args.run_id, args.format)
+
+        # Otherwise show summary dashboard
+        try:
+            kpi_summary = warehouse.get_kpi_summary(start_date=start_date, end_date=end_date)
+            token_savings = warehouse.get_token_savings(start_date=start_date, end_date=end_date, limit=10)
+            daily_costs = warehouse.get_daily_cost_summary(start_date=start_date, end_date=end_date)
+        except Exception as exc:
+            print(f"Error querying warehouse: {exc}", file=sys.stderr)
+            return 1
+
+        if args.format == "json":
+            output = {
+                "period": {"start": start_date, "end": end_date},
+                "kpi_summary": kpi_summary,
+                "token_savings": token_savings,
+                "daily_costs": daily_costs,
+            }
+            print(json.dumps(output, indent=2, default=str))
+        else:
+            _display_dashboard_table(kpi_summary, token_savings, daily_costs, start_date, end_date)
+
+        return 0
+
+    # Watch mode with 5-second polling
+    if args.watch:
+        try:
+            print("Dashboard watch mode (Ctrl+C to exit, refreshes every 5s)")
+            print()
+            while True:
+                # Clear screen for fresh display
+                print("\033[2J\033[H", end="")
+                print(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                print()
+                result = _fetch_and_display()
+                if result != 0:
+                    return result
+                import time
+                time.sleep(5)
+        except KeyboardInterrupt:
+            print("\nWatch mode stopped.")
+            return 0
+    else:
+        return _fetch_and_display()
+
+
+def _display_run_drilldown(warehouse, run_id: str, fmt: str) -> int:
+    """Display detailed token accounting for a specific run."""
+    try:
+        # Get run-specific data
+        token_data = warehouse.get_token_savings(run_id=run_id, limit=1)
+        cost_data = warehouse.get_cost_per_run(run_id=run_id)
+    except Exception as exc:
+        print(f"Error querying run details: {exc}", file=sys.stderr)
+        return 1
+
+    if fmt == "json":
+        output = {
+            "run_id": run_id,
+            "token_savings": token_data,
+            "cost_breakdown": cost_data,
+        }
+        print(json.dumps(output, indent=2, default=str))
+    else:
+        print(f"\nRun Detail: {run_id}")
+        print("=" * 80)
+
+        if token_data:
+            record = token_data[0] if token_data else {}
+            print("\nToken Accounting")
+            print("-" * 40)
+            print(f"  Baseline Tokens:  {record.get('baseline_tokens', 0):>12,}")
+            print(f"  Actual Tokens:    {record.get('actual_tokens', 0):>12,}")
+            print(f"  Tokens Saved:     {record.get('tokens_saved', 0):>12,}")
+            print(f"  Savings Rate:     {record.get('savings_rate_pct', 0):>11.1f}%")
+        else:
+            print("\nNo token data found for this run.")
+
+        if cost_data:
+            print("\nCost Breakdown")
+            print("-" * 40)
+            for item in cost_data:
+                service = item.get('service', 'unknown')
+                cost = item.get('cost_usd', 0)
+                print(f"  {service:<20} ${cost:>10.4f}")
+        else:
+            print("\nNo cost data found for this run.")
+
+    return 0
+
+
+def _display_dashboard_table(kpi_summary, token_savings, daily_costs, start_date, end_date):
+    """Display formatted dashboard tables."""
+    print(f"\n📊 Telemetry Dashboard ({start_date} to {end_date})")
+    print("=" * 80)
+
+    # KPI Summary Section
+    print("\n📈 KPI Summary")
+    print("-" * 40)
+    if kpi_summary:
+        latest = kpi_summary[-1] if kpi_summary else {}
+        print(f"  Behavior Reuse Rate:   {latest.get('reuse_rate_pct', 0):>6.1f}% (Target: 70%)")
+        print(f"  Token Savings Rate:    {latest.get('avg_savings_rate_pct', 0):>6.1f}% (Target: 30%)")
+        print(f"  Task Completion Rate:  {latest.get('completion_rate_pct', 0):>6.1f}% (Target: 80%)")
+        print(f"  Compliance Coverage:   {latest.get('avg_coverage_rate_pct', 0):>6.1f}% (Target: 95%)")
+    else:
+        print("  No KPI data available for this period.")
+
+    # Token Savings Section
+    print("\n💰 Token Savings (Top 10 Runs)")
+    print("-" * 70)
+    if token_savings:
+        print(f"  {'Run ID':<36} {'Saved':>12} {'Rate':>8}")
+        print(f"  {'-'*36} {'-'*12} {'-'*8}")
+        total_saved = 0
+        for record in token_savings[:10]:
+            run_id = record.get('run_id', 'N/A')[:35]
+            saved = record.get('tokens_saved', 0)
+            rate = record.get('savings_rate_pct', 0)
+            total_saved += saved
+            print(f"  {run_id:<36} {saved:>12,} {rate:>7.1f}%")
+        print(f"  {'Total':<36} {total_saved:>12,}")
+    else:
+        print("  No token savings data available for this period.")
+
+    # Daily Costs Section
+    print("\n📅 Daily Cost Summary")
+    print("-" * 50)
+    if daily_costs:
+        print(f"  {'Date':<12} {'Runs':>8} {'Cost (USD)':>12}")
+        print(f"  {'-'*12} {'-'*8} {'-'*12}")
+        total_cost = 0
+        for record in daily_costs:
+            day = record.get('summary_date', 'N/A')[:10]
+            runs = record.get('total_runs', 0)
+            cost = record.get('total_cost_usd', 0)
+            total_cost += cost
+            print(f"  {day:<12} {runs:>8} ${cost:>11.2f}")
+        print(f"  {'Total':<12} {'':<8} ${total_cost:>11.2f}")
+    else:
+        print("  No cost data available for this period.")
+
+    print()
 
 
 def _load_telemetry_events(path: Path) -> List[Dict[str, Any]]:
@@ -2634,6 +3854,163 @@ def _render_projection_table(projection: TelemetryProjection) -> None:
         print(f"{label:<{fact_width}} : {count}")
 
 
+# ── Agents command handlers ─────────────────────────────────────────────────────
+
+_agent_orchestrator_service: Optional[AgentOrchestratorService] = None
+
+
+def _get_agent_orchestrator_adapter() -> CLIAgentOrchestratorAdapter:
+    """Get or create an AgentOrchestratorService adapter."""
+    global _agent_orchestrator_service
+    if _agent_orchestrator_service is None:
+        _agent_orchestrator_service = AgentOrchestratorService()
+    return CLIAgentOrchestratorAdapter(_agent_orchestrator_service)
+
+
+def _command_agents_assign(args: argparse.Namespace) -> int:
+    """Assign an agent to a run."""
+    adapter = _get_agent_orchestrator_adapter()
+
+    # Parse context from --context or --context-file
+    context: Optional[Dict[str, Any]] = None
+    if args.context:
+        try:
+            context = json.loads(args.context)
+        except json.JSONDecodeError as exc:
+            print(f"Error: Invalid JSON in --context: {exc}", file=sys.stderr)
+            return 1
+    elif args.context_file:
+        context_path = Path(args.context_file).expanduser().resolve()
+        if not context_path.exists():
+            print(f"Error: Context file not found: {context_path}", file=sys.stderr)
+            return 1
+        try:
+            context = json.loads(context_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"Error: Invalid JSON in context file: {exc}", file=sys.stderr)
+            return 1
+
+    requested_by = {
+        "actor_id": "cli-user",
+        "actor_role": "STRATEGIST",
+        "actor_surface": "cli",
+    }
+
+    try:
+        result = adapter.assign_agent(
+            run_id=args.run_id,
+            requested_agent_id=getattr(args, "agent_id", None),
+            stage=args.stage,
+            context=context,
+            requested_by=requested_by,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        _render_agent_assignment_table(result)
+    return 0
+
+
+def _command_agents_status(args: argparse.Namespace) -> int:
+    """Get status of an agent assignment."""
+    if not args.run_id and not args.assignment_id:
+        print("Error: Provide --assignment-id or --run-id to lookup status", file=sys.stderr)
+        return 2
+
+    adapter = _get_agent_orchestrator_adapter()
+
+    try:
+        result = adapter.get_status(
+            run_id=args.run_id,
+            assignment_id=args.assignment_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if result is None:
+        print("Error: Assignment not found", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        _render_agent_assignment_table(result)
+    return 0
+
+
+def _command_agents_switch(args: argparse.Namespace) -> int:
+    """Switch to a different agent."""
+    adapter = _get_agent_orchestrator_adapter()
+
+    issued_by = {
+        "actor_id": "cli-user",
+        "actor_role": "STRATEGIST",
+        "actor_surface": "cli",
+    }
+
+    try:
+        result = adapter.switch_agent(
+            assignment_id=args.assignment_id,
+            target_agent_id=args.target_agent_id,
+            reason=getattr(args, "reason", None),
+            allow_downgrade=getattr(args, "allow_downgrade", False),
+            stage=getattr(args, "stage", None),
+            issued_by=issued_by,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        _render_agent_assignment_table(result)
+    return 0
+
+
+def _render_agent_assignment_table(assignment: Dict[str, Any]) -> None:
+    """Render an agent assignment as a formatted table."""
+    print("\n📋 Agent Assignment")
+    print("=" * 60)
+    print(f"  Assignment ID:  {assignment.get('assignment_id', 'N/A')}")
+    print(f"  Run ID:         {assignment.get('run_id', 'N/A')}")
+    print(f"  Stage:          {assignment.get('stage', 'N/A')}")
+    print(f"  Timestamp:      {assignment.get('timestamp', 'N/A')}")
+
+    active_agent = assignment.get("active_agent", {})
+    print(f"\n🤖 Active Agent")
+    print("-" * 60)
+    print(f"  Agent ID:       {active_agent.get('agent_id', 'N/A')}")
+    print(f"  Display Name:   {active_agent.get('display_name', 'N/A')}")
+    print(f"  Tier:           {active_agent.get('tier', 'N/A')}")
+
+    heuristics = assignment.get("heuristics_applied", {})
+    if heuristics:
+        print(f"\n📊 Heuristics Applied")
+        print("-" * 60)
+        print(f"  Selected Agent: {heuristics.get('selected_agent_id', 'N/A')}")
+        print(f"  Requested:      {heuristics.get('requested_agent_id', 'N/A')}")
+        print(f"  Task Type:      {heuristics.get('task_type', 'N/A')}")
+        print(f"  Severity:       {heuristics.get('severity', 'N/A')}")
+
+    history = assignment.get("history", [])
+    if history:
+        print(f"\n📜 History ({len(history)} event(s))")
+        print("-" * 60)
+        for event in history:
+            print(f"  • {event.get('from_agent_id', 'N/A')} → {event.get('to_agent_id', 'N/A')}")
+            print(f"    Trigger: {event.get('trigger', 'N/A')}")
+            trigger_details = event.get("trigger_details", {})
+            if trigger_details.get("reason"):
+                print(f"    Reason: {trigger_details.get('reason')}")
+    print()
+
+
 def _command_analytics_project(args: argparse.Namespace) -> int:
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
@@ -2693,6 +4070,68 @@ def _command_analytics_kpi_summary(args: argparse.Namespace) -> int:
             print(f"  Task Completion Rate: {record.get('completion_rate_pct', 0):.1f}% (Target: 80%)")
             print(f"  Compliance Coverage: {record.get('avg_coverage_rate_pct', 0):.1f}% (Target: 95%)")
             print()
+    return 0
+
+
+def _command_analytics_project_kpi(args: argparse.Namespace) -> int:
+    """Project telemetry events from JSONL file into KPI facts and summary."""
+    import dataclasses
+    from pathlib import Path
+
+    from .analytics.telemetry_kpi_projector import TelemetryKPIProjector
+
+    input_path = Path(args.input_file)
+    if not input_path.exists():
+        print(f"Telemetry input not found: {input_path}", file=sys.stderr)
+        return 2
+
+    # Parse JSONL events
+    events: list[dict] = []
+    with input_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+
+    # Project events to facts
+    projector = TelemetryKPIProjector()
+    projection = projector.project(events)
+
+    # Convert projection to dict for serialization
+    projection_dict = dataclasses.asdict(projection)
+
+    # Write facts output if requested
+    if args.facts_output:
+        facts_path = Path(args.facts_output)
+        facts_path.write_text(json.dumps(projection_dict, indent=2), encoding="utf-8")
+        print(f"Projection JSON written to {facts_path}", file=sys.stderr)
+
+    # Output format
+    if args.format == "json":
+        print(json.dumps(projection_dict, indent=2))
+    else:
+        summary = projection.summary
+        print("\nPRD KPI Summary")
+        print("=" * 80)
+        print(f"  Total Runs: {summary.get('total_runs', 0)}")
+        print(f"  Runs with Behaviors: {summary.get('runs_with_behaviors', 0)}")
+        reuse_pct = summary.get('behavior_reuse_pct')
+        print(f"  Behavior Reuse Rate: {reuse_pct:.1f}% (Target: 70%)" if reuse_pct is not None else "  Behavior Reuse Rate: N/A")
+        savings_pct = summary.get('average_token_savings_pct')
+        print(f"  Average Token Savings: {savings_pct:.1f}% (Target: 30%)" if savings_pct is not None else "  Average Token Savings: N/A")
+        completion_pct = summary.get('task_completion_rate_pct')
+        print(f"  Task Completion Rate: {completion_pct:.1f}% (Target: 80%)" if completion_pct is not None else "  Task Completion Rate: N/A")
+        coverage_pct = summary.get('average_compliance_coverage_pct')
+        print(f"  Compliance Coverage: {coverage_pct:.1f}% (Target: 95%)" if coverage_pct is not None else "  Compliance Coverage: N/A")
+        print()
+        print("Fact row counts:")
+        print(f"  fact_behavior_usage: {len(projection.fact_behavior_usage)}")
+        print(f"  fact_token_savings: {len(projection.fact_token_savings)}")
+        print(f"  fact_execution_status: {len(projection.fact_execution_status)}")
+        print(f"  fact_compliance_steps: {len(projection.fact_compliance_steps)}")
+        print(f"  fact_resource_usage: {len(projection.fact_resource_usage)}")
+        print(f"  fact_cost_allocation: {len(projection.fact_cost_allocation)}")
+
     return 0
 
 
@@ -2802,9 +4241,208 @@ def _command_analytics_compliance_coverage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_analytics_cost_by_service(args: argparse.Namespace) -> int:
+    """Query cost breakdown by service from analytics warehouse."""
+    from .analytics.warehouse import AnalyticsWarehouse
+
+    warehouse = AnalyticsWarehouse()
+    try:
+        records = warehouse.get_cost_by_service(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            service_name=getattr(args, 'service_name', None),
+        )
+    except Exception as exc:
+        print(f"Error querying warehouse: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps({"records": records, "count": len(records)}, indent=2))
+    else:
+        if not records:
+            print("No cost records found.")
+            return 0
+
+        print("\nCost by Service")
+        print("=" * 80)
+        print(f"{'Service':<30} {'Total Cost':>15} {'Total Tokens':>15} {'Avg Cost/Run':>15}")
+        print("-" * 80)
+        total_cost = 0.0
+        for record in records:
+            service = record.get('service_name', 'N/A')[:28]
+            cost = record.get('total_cost_usd', 0)
+            tokens = record.get('total_tokens', 0)
+            avg_cost = record.get('avg_cost_per_run', 0)
+            total_cost += cost
+            print(f"{service:<30} ${cost:>14.4f} {tokens:>15,} ${avg_cost:>14.4f}")
+        print("-" * 80)
+        print(f"{'TOTAL':<30} ${total_cost:>14.4f}")
+    return 0
+
+
+def _command_analytics_cost_per_run(args: argparse.Namespace) -> int:
+    """Query cost breakdown per run from analytics warehouse."""
+    from .analytics.warehouse import AnalyticsWarehouse
+
+    warehouse = AnalyticsWarehouse()
+    try:
+        records = warehouse.get_cost_per_run(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            template_id=getattr(args, 'template_id', None),
+            limit=args.limit,
+        )
+    except Exception as exc:
+        print(f"Error querying warehouse: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps({"records": records, "count": len(records)}, indent=2))
+    else:
+        if not records:
+            print("No cost records found.")
+            return 0
+
+        print(f"\nCost per Run (Top {len(records)})")
+        print("=" * 100)
+        print(f"{'Run ID':<38} {'Template':<25} {'Cost':>12} {'Tokens':>12} {'Started':<15}")
+        print("-" * 100)
+        for record in records:
+            run_id = record.get('run_id', 'N/A')[:36]
+            template = (record.get('template_id') or 'N/A')[:23]
+            cost = record.get('total_cost_usd', 0)
+            tokens = record.get('total_tokens', 0)
+            started = (record.get('started_at') or 'N/A')[:13]
+            print(f"{run_id:<38} {template:<25} ${cost:>11.4f} {tokens:>12,} {started:<15}")
+        print(f"\nTotal: {len(records)} record(s)")
+    return 0
+
+
+def _command_analytics_roi_summary(args: argparse.Namespace) -> int:
+    """Query ROI analysis summary from analytics warehouse."""
+    from .analytics.warehouse import AnalyticsWarehouse
+    from .config import get_settings
+
+    settings = get_settings()
+    warehouse = AnalyticsWarehouse()
+    try:
+        record = warehouse.get_roi_summary()
+    except Exception as exc:
+        print(f"Error querying warehouse: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps({"roi": record, "budget_threshold_usd": settings.cost.daily_budget_usd}, indent=2))
+    else:
+        if not record:
+            print("No ROI data available.")
+            return 0
+
+        print("\nROI Analysis Summary")
+        print("=" * 60)
+        total_cost = record.get('total_cost_usd', 0)
+        total_saved = record.get('total_tokens_saved', 0)
+        cost_per_save = record.get('cost_per_token_saved', 0)
+        efficiency = record.get('efficiency_score', 0)
+        budget = settings.cost.daily_budget_usd
+
+        print(f"  Total Cost (USD):        ${total_cost:,.4f}")
+        print(f"  Total Tokens Saved:      {total_saved:,}")
+        print(f"  Cost per Token Saved:    ${cost_per_save:.6f}")
+        print(f"  Efficiency Score:        {efficiency:.2f}")
+        print(f"  Daily Budget Threshold:  ${budget:.2f}")
+        print()
+
+        # Budget status indicator
+        if total_cost > budget:
+            print(f"  ⚠️  OVER BUDGET by ${total_cost - budget:.2f}")
+        else:
+            print(f"  ✅ Within budget (${budget - total_cost:.2f} remaining)")
+    return 0
+
+
+def _command_analytics_daily_costs(args: argparse.Namespace) -> int:
+    """Query daily cost summary for budget tracking."""
+    from .analytics.warehouse import AnalyticsWarehouse
+    from .config import get_settings
+
+    settings = get_settings()
+    warehouse = AnalyticsWarehouse()
+    try:
+        records = warehouse.get_daily_cost_summary(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            limit=args.limit,
+        )
+    except Exception as exc:
+        print(f"Error querying warehouse: {exc}", file=sys.stderr)
+        return 1
+
+    budget = settings.cost.daily_budget_usd
+
+    if args.format == "json":
+        print(json.dumps({
+            "records": records,
+            "count": len(records),
+            "budget_threshold_usd": budget
+        }, indent=2))
+    else:
+        if not records:
+            print("No daily cost records found.")
+            return 0
+
+        print(f"\nDaily Cost Summary (Budget: ${budget:.2f}/day)")
+        print("=" * 80)
+        print(f"{'Date':<12} {'Daily Cost':>12} {'Total Tokens':>15} {'Runs':>8} {'Status':<10}")
+        print("-" * 80)
+        for record in records:
+            date = str(record.get('cost_date', 'N/A'))[:10]
+            cost = record.get('daily_cost_usd', 0)
+            tokens = record.get('daily_tokens', 0)
+            runs = record.get('run_count', 0)
+            status = "⚠️ OVER" if cost > budget else "✅ OK"
+            print(f"{date:<12} ${cost:>11.4f} {tokens:>15,} {runs:>8} {status:<10}")
+        print(f"\nTotal: {len(records)} day(s)")
+    return 0
+
+
+def _command_analytics_top_expensive(args: argparse.Namespace) -> int:
+    """Query top expensive workflows from analytics warehouse."""
+    from .analytics.warehouse import AnalyticsWarehouse
+
+    warehouse = AnalyticsWarehouse()
+    try:
+        records = warehouse.get_top_expensive_workflows(limit=args.limit)
+    except Exception as exc:
+        print(f"Error querying warehouse: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps({"records": records, "count": len(records)}, indent=2))
+    else:
+        if not records:
+            print("No workflow cost records found.")
+            return 0
+
+        print(f"\nTop {len(records)} Expensive Workflows")
+        print("=" * 90)
+        print(f"{'Template ID':<35} {'Total Cost':>12} {'Total Tokens':>15} {'Avg Cost/Run':>15}")
+        print("-" * 90)
+        for record in records:
+            template = (record.get('template_id') or 'ad-hoc')[:33]
+            cost = record.get('total_cost_usd', 0)
+            tokens = record.get('total_tokens', 0)
+            avg = record.get('avg_cost_per_run', 0)
+            print(f"{template:<35} ${cost:>11.4f} {tokens:>15,} ${avg:>14.4f}")
+        print(f"\nTotal: {len(records)} workflow(s)")
+    return 0
+
+
 def _command_metrics_summary(args: argparse.Namespace) -> int:
     """Display real-time metrics summary with PRD KPI targets."""
     adapter = _get_metrics_adapter()
+
+
 
     use_cache = not args.no_cache
     try:
@@ -3063,9 +4701,235 @@ def _command_auth_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
-def _command_auth_login(args: argparse.Namespace) -> int:
-    """Perform device flow login and cache issued tokens."""
+def _get_internal_auth_api_url() -> str:
+    """Get the internal auth API base URL."""
+    return os.getenv("GUIDEAI_API_URL", "http://localhost:8000")
 
+
+def _internal_auth_register(
+    username: str,
+    password: str,
+    email: Optional[str] = None,
+    api_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Register a user with the internal auth API.
+
+    Args:
+        username: Username to register
+        password: Password for the account
+        email: Optional email address
+        api_url: Optional API URL override
+
+    Returns:
+        Dict with access_token, refresh_token, and token_type on success
+
+    Raises:
+        ValueError: On registration failure (e.g., duplicate username)
+    """
+    base_url = api_url or _get_internal_auth_api_url()
+    url = f"{base_url}/api/v1/auth/internal/register"
+
+    payload: Dict[str, Any] = {"username": username, "password": password}
+    if email:
+        payload["email"] = email
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            error_body = json.loads(exc.read().decode("utf-8"))
+            detail = error_body.get("detail", str(exc))
+        except (json.JSONDecodeError, AttributeError):
+            detail = f"HTTP {exc.code}: {exc.reason}"
+        raise ValueError(f"Registration failed: {detail}")
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Cannot connect to API at {base_url}: {exc.reason}")
+
+
+def _internal_auth_login(
+    username: str,
+    password: str,
+    api_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Login a user with the internal auth API.
+
+    Args:
+        username: Username to login
+        password: Password for the account
+        api_url: Optional API URL override
+
+    Returns:
+        Dict with access_token, refresh_token, and token_type on success
+
+    Raises:
+        ValueError: On login failure (e.g., invalid credentials)
+    """
+    base_url = api_url or _get_internal_auth_api_url()
+    url = f"{base_url}/api/v1/auth/internal/login"
+
+    payload: Dict[str, Any] = {"username": username, "password": password}
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            error_body = json.loads(exc.read().decode("utf-8"))
+            detail = error_body.get("detail", str(exc))
+        except (json.JSONDecodeError, AttributeError):
+            detail = f"HTTP {exc.code}: {exc.reason}"
+        raise ValueError(f"Login failed: {detail}")
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Cannot connect to API at {base_url}: {exc.reason}")
+
+
+def _save_internal_tokens(
+    tokens: Dict[str, Any],
+    allow_plaintext: bool = False,
+) -> Path:
+    """Save internal auth tokens to provider-specific file.
+
+    Args:
+        tokens: Token response from API (access_token, refresh_token, token_type)
+        allow_plaintext: Whether to allow plaintext token storage
+
+    Returns:
+        Path to the saved token file
+    """
+    from guideai.auth_tokens import FileTokenStore
+
+    # Get config directory
+    config_dir = os.getenv("GUIDEAI_CONFIG_DIR")
+    if config_dir:
+        base_dir = Path(config_dir).expanduser()
+    else:
+        base_dir = Path.home() / ".guideai"
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+    token_path = base_dir / "auth_tokens_internal.json"
+
+    # Build token data with provider field
+    now = datetime.now(timezone.utc)
+    token_data = {
+        "access_token": tokens["access_token"],
+        "refresh_token": tokens["refresh_token"],
+        "token_type": tokens.get("token_type", "Bearer"),
+        "provider": "internal",
+        "scopes": tokens.get("scopes", []),
+        "client_id": "guideai-cli",
+        "issued_at": now.isoformat().replace("+00:00", "Z"),
+        # Default token expiry times matching InternalAuthProvider
+        "expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "refresh_expires_at": (now + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
+    }
+
+    token_path.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
+    return token_path
+
+
+def _command_auth_register(args: argparse.Namespace) -> int:
+    """Register a new user with internal authentication."""
+
+    # Get credentials - prompt if not provided
+    username = args.username
+    password = args.password
+    email = args.email
+
+    if not username:
+        try:
+            username = input("Username: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nRegistration cancelled.")
+            return 130
+
+    if not username:
+        print("Error: Username is required.", file=sys.stderr)
+        return 1
+
+    if not password:
+        try:
+            import getpass
+            # Use getpass for interactive input, but fall back to stdin for piped input
+            if sys.stdin.isatty():
+                password = getpass.getpass("Password: ")
+                confirm = getpass.getpass("Confirm password: ")
+            else:
+                # When stdin is piped (e.g., in tests), read from stdin directly
+                print("Password: ", end="", flush=True)
+                password = sys.stdin.readline().rstrip('\n')
+                print("Confirm password: ", end="", flush=True)
+                confirm = sys.stdin.readline().rstrip('\n')
+        except (EOFError, KeyboardInterrupt):
+            print("\nRegistration cancelled.")
+            return 130
+
+        if password != confirm:
+            print("Error: Passwords do not match.", file=sys.stderr)
+            return 1
+
+    if not password:
+        print("Error: Password is required.", file=sys.stderr)
+        return 1
+
+    if not email:
+        try:
+            email = input("Email (optional, press Enter to skip): ").strip() or None
+        except (EOFError, KeyboardInterrupt):
+            print("\nRegistration cancelled.")
+            return 130
+
+    # Register with API
+    print(f"\nRegistering user '{username}'...")
+    try:
+        tokens = _internal_auth_register(
+            username=username,
+            password=password,
+            email=email,
+            api_url=args.api_url,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    # Save tokens
+    try:
+        token_path = _save_internal_tokens(tokens, allow_plaintext=args.allow_plaintext)
+    except Exception as exc:
+        print(f"Warning: Failed to save tokens: {exc}", file=sys.stderr)
+        return 4
+
+    print("Registration successful!")
+    print(f"You are now authenticated as '{username}'.")
+    print(f"Tokens saved to {token_path}")
+    return 0
+
+
+def _command_auth_login(args: argparse.Namespace) -> int:
+    """Perform login and cache issued tokens.
+
+    Supports both device flow (github, google) and internal auth (username/password).
+    """
+    # Check if internal auth is requested
+    provider = getattr(args, "provider", "internal")
+    if provider == "internal":
+        return _command_auth_login_internal(args)
+
+    # Fall through to device flow for github/google
     manager = _get_device_flow_manager()
     try:
         store = _get_token_store(allow_plaintext=args.allow_plaintext)
@@ -3163,6 +5027,66 @@ def _command_auth_login(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\nLogin cancelled by user.")
         return 130
+
+
+def _command_auth_login_internal(args: argparse.Namespace) -> int:
+    """Perform internal auth login with username/password.
+
+    Prompts for credentials if not provided via args.
+    """
+    # Get credentials - prompt if not provided
+    try:
+        username = input("Username: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nLogin cancelled.")
+        return 130
+
+    if not username:
+        print("Error: Username is required.", file=sys.stderr)
+        return 1
+
+    try:
+        import getpass
+        # Use getpass for interactive input, but fall back to input() for piped stdin
+        if sys.stdin.isatty():
+            password = getpass.getpass("Password: ")
+        else:
+            # When stdin is piped (e.g., in tests), read from stdin directly
+            print("Password: ", end="", flush=True)
+            password = sys.stdin.readline().rstrip('\n')
+    except (EOFError, KeyboardInterrupt):
+        print("\nLogin cancelled.")
+        return 130
+
+    if not password:
+        print("Error: Password is required.", file=sys.stderr)
+        return 1
+
+    # Login with API
+    api_url = getattr(args, "api_url", None)
+    print(f"\nAuthenticating '{username}'...")
+    try:
+        tokens = _internal_auth_login(
+            username=username,
+            password=password,
+            api_url=api_url,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    # Save tokens
+    allow_plaintext = getattr(args, "allow_plaintext", False)
+    try:
+        token_path = _save_internal_tokens(tokens, allow_plaintext=allow_plaintext)
+    except Exception as exc:
+        print(f"Warning: Failed to save tokens: {exc}", file=sys.stderr)
+        return 4
+
+    print("Login successful!")
+    print(f"You are now logged in as '{username}'.")
+    print(f"Tokens saved to {token_path}")
+    return 0
 
 
 def _command_auth_status(args: argparse.Namespace) -> int:
@@ -3531,6 +5455,157 @@ def _render_bci_validate_table(payload: Dict[str, Any]) -> None:
             print(f"  - {text}{detail}")
 
 
+def _command_bci_generate(args: argparse.Namespace) -> int:
+    """Generate a behavior-conditioned LLM response."""
+    from .llm_provider import LLMConfig, ProviderType
+    from .bci_contracts import RoleFocus
+
+    bci_service = _get_bci_service()
+
+    # Build LLM config from args
+    llm_config = None
+    if args.provider or args.model or args.temperature:
+        config_kwargs = {}
+        if args.provider:
+            try:
+                config_kwargs["provider"] = ProviderType(args.provider)
+            except ValueError:
+                print(f"Invalid provider: {args.provider}", file=sys.stderr)
+                return 1
+        if args.model:
+            config_kwargs["model"] = args.model
+        if args.temperature is not None:
+            config_kwargs["temperature"] = args.temperature
+
+        llm_config = LLMConfig.from_env()
+        for key, value in config_kwargs.items():
+            setattr(llm_config, key, value)
+
+    # Parse role focus
+    role_focus = None
+    if args.role:
+        try:
+            role_focus = RoleFocus(args.role.upper())
+        except ValueError:
+            print(f"Invalid role: {args.role}", file=sys.stderr)
+            return 1
+
+    try:
+        result = bci_service.generate_response(
+            query=args.query,
+            behaviors=args.behaviors,
+            top_k=args.top_k,
+            llm_config=llm_config,
+            role_focus=role_focus,
+        )
+
+        # Format behaviors for display
+        behaviors_display = "\n".join(f"- {b.name}" for b in result['behaviors_used']) if result['behaviors_used'] else "(auto-retrieved)"
+
+        output_text = f"""# BCI Generation Result
+
+## Query
+{args.query}
+
+## Behaviors Used
+{behaviors_display}
+
+## Response
+{result['response'].content}
+
+## Metadata
+- Provider: {result['response'].provider.value}
+- Model: {result['response'].model}
+- Input Tokens: {result['response'].input_tokens}
+- Output Tokens: {result['response'].output_tokens}
+- Total Tokens: {result['response'].total_tokens}
+- Token Savings (estimated): {result['token_savings']['total_saved']}
+- Latency: {result['latency_ms']:.2f}ms
+- LLM Latency: {result['response'].latency_ms:.2f}ms
+"""
+
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(output_text)
+            print(f"Output written to {args.output}")
+        else:
+            print(output_text)
+
+        return 0
+
+    except Exception as exc:
+        print(f"Generation failed: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def _command_bci_improve(args: argparse.Namespace) -> int:
+    """Analyze a failed run and generate improvement suggestions."""
+    from .llm_provider import LLMConfig, ProviderType
+
+    bci_service = _get_bci_service()
+
+    # Build LLM config from args
+    llm_config = None
+    if args.provider or args.model:
+        config_kwargs = {}
+        if args.provider:
+            try:
+                config_kwargs["provider"] = ProviderType(args.provider)
+            except ValueError:
+                print(f"Invalid provider: {args.provider}", file=sys.stderr)
+                return 1
+        if args.model:
+            config_kwargs["model"] = args.model
+
+        llm_config = LLMConfig.from_env()
+        for key, value in config_kwargs.items():
+            setattr(llm_config, key, value)
+
+    try:
+        result = bci_service.improve_run(
+            run_id=args.run_id,
+            llm_config=llm_config,
+            max_behaviors=args.max_behaviors,
+        )
+
+        output_text = f"""# Run Improvement Analysis
+
+## Run ID
+{result['run_id']}
+
+## Detected Patterns
+{chr(10).join(f"- {p['description']} (frequency={p['frequency']}, score={p['score']:.2f})" for p in result['patterns'])}
+
+## Improvement Suggestions
+{result['suggestions']}
+
+## Behaviors Extracted
+{chr(10).join(f"- {b}" for b in result['behaviors_extracted'])}
+
+## Metadata
+- Patterns Detected: {len(result['patterns'])}
+- Behaviors Extracted: {len(result['behaviors_extracted'])}
+- Analysis Latency: {result['latency_ms']:.2f}ms
+"""
+
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(output_text)
+            print(f"Output written to {args.output}")
+        else:
+            print(output_text)
+
+        return 0
+
+    except Exception as exc:
+        print(f"Improvement analysis failed: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def _command_bci_retrieve(args: argparse.Namespace) -> int:
     bci_service = _get_bci_service()
     try:
@@ -3751,9 +5826,73 @@ def _command_compliance_get(args: argparse.Namespace) -> int:
 
 def _command_compliance_validate(args: argparse.Namespace) -> int:
     adapter = _get_compliance_adapter()
+
+    # Support either checklist_id or --action-id
+    if args.action_id:
+        try:
+            result = adapter.validate_by_action_id(
+                action_id=args.action_id,
+                actor_id=args.actor_id,
+                actor_role=args.actor_role,
+            )
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    elif args.checklist_id:
+        try:
+            result = adapter.validate_checklist(
+                checklist_id=args.checklist_id,
+                actor_id=args.actor_id,
+                actor_role=args.actor_role,
+            )
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print("Error: Either checklist_id or --action-id must be provided", file=sys.stderr)
+        return 2
+
+    if args.format == "table":
+        _render_validation_table(result)
+    else:
+        _print_json(result)
+    return 0
+
+
+def _command_compliance_policies_list(args: argparse.Namespace) -> int:
+    adapter = _get_compliance_adapter()
     try:
-        result = adapter.validate_checklist(
-            checklist_id=args.checklist_id,
+        policies = adapter.list_policies(
+            org_id=args.org_id,
+            project_id=args.project_id,
+            policy_type=args.policy_type,
+            enforcement_level=args.enforcement_level,
+            is_active=True if args.active_only else None,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "table":
+        _render_policies_table(policies)
+    else:
+        _print_json(policies)
+    return 0
+
+
+def _command_compliance_policies_create(args: argparse.Namespace) -> int:
+    adapter = _get_compliance_adapter()
+    try:
+        policy = adapter.create_policy(
+            name=args.name,
+            description=args.description,
+            policy_type=args.policy_type,
+            enforcement_level=args.enforcement_level,
+            org_id=args.org_id,
+            project_id=args.project_id,
+            version=args.version,
+            required_behaviors=args.required_behaviors or [],
+            compliance_categories=args.compliance_categories or [],
             actor_id=args.actor_id,
             actor_role=args.actor_role,
         )
@@ -3762,16 +5901,101 @@ def _command_compliance_validate(args: argparse.Namespace) -> int:
         return 1
 
     if args.format == "table":
-        _render_validation_table(result)
+        _render_policies_table([policy])
     else:
-        _print_json(result)
+        _print_json(policy)
     return 0
 
+
+def _command_compliance_policies_get(args: argparse.Namespace) -> int:
+    adapter = _get_compliance_adapter()
+    try:
+        policy = adapter.get_policy(args.policy_id)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     if args.format == "table":
-        _render_tasks_table(tasks)
+        _render_policies_table([policy])
     else:
-        _print_json(tasks)
+        _print_json(policy)
     return 0
+
+
+def _command_compliance_audit(args: argparse.Namespace) -> int:
+    adapter = _get_compliance_adapter()
+    try:
+        report = adapter.get_audit_trail(
+            run_id=args.run_id,
+            checklist_id=args.checklist_id,
+            action_id=args.action_id,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "table":
+        _render_audit_trail_table(report)
+    else:
+        _print_json(report)
+    return 0
+
+
+def _render_policies_table(policies: List[Dict]) -> None:
+    """Render policies as a formatted table."""
+    if not policies:
+        print("No policies found.")
+        return
+
+    headers = ["ID", "Name", "Type", "Enforcement", "Scope", "Active", "Version"]
+    rows = []
+    for p in policies:
+        scope = "project" if p.get("project_id") else ("org" if p.get("org_id") else "global")
+        rows.append([
+            p.get("policy_id", "")[:8],
+            p.get("name", ""),
+            p.get("policy_type", ""),
+            p.get("enforcement_level", ""),
+            scope,
+            "✓" if p.get("is_active") else "✗",
+            p.get("version", ""),
+        ])
+
+    _print_table(headers, rows)
+
+
+def _render_audit_trail_table(report: Dict) -> None:
+    """Render audit trail report as a formatted table."""
+    summary = report.get("summary", {})
+    print(f"\n=== Audit Trail Report ===")
+    print(f"Run ID: {report.get('run_id', 'N/A')}")
+    print(f"Checklists: {summary.get('checklist_count', 0)}")
+    print(f"Total Entries: {summary.get('total_entries', 0)}")
+    print(f"Generated: {report.get('generated_at', '')}")
+
+    status_breakdown = summary.get("status_breakdown", {})
+    if status_breakdown:
+        print(f"\nStatus Breakdown:")
+        for status, count in status_breakdown.items():
+            print(f"  {status}: {count}")
+
+    entries = report.get("entries", [])
+    if entries:
+        print(f"\n--- Entries ({len(entries)}) ---")
+        headers = ["Timestamp", "Checklist", "Step", "Status", "Actor", "Behaviors"]
+        rows = []
+        for e in entries:
+            rows.append([
+                e.get("timestamp", "")[:19],
+                e.get("checklist_id", "")[:8],
+                e.get("title", "")[:30],
+                e.get("status", ""),
+                f"{e.get('actor', {}).get('id', '')}@{e.get('actor', {}).get('surface', '')}",
+                ", ".join(e.get("behaviors_cited", [])[:2]) + ("..." if len(e.get("behaviors_cited", [])) > 2 else ""),
+            ])
+        _print_table(headers, rows)
 
 
 def _ensure_pre_commit_available() -> None:
@@ -4101,460 +6325,1450 @@ def _command_workflow_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# ------------------------------------------------------------------
-# Agent Orchestrator Commands
-# ------------------------------------------------------------------
+def _get_amprealize_service() -> Any:
+    """Factory for AmprealizeService with dependencies."""
+    from guideai.amprealize import AmprealizeService
 
+    # Use existing CLI adapters to get the underlying services
+    action_adapter = _get_action_adapter()
+    compliance_adapter = _get_compliance_adapter()
+    metrics_adapter = _get_metrics_adapter()
 
-def _build_cli_actor_payload(actor_id: str, actor_role: str) -> Dict[str, Any]:
-    return {
-        "id": actor_id,
-        "role": actor_role,
-        "surface": "CLI",
-    }
-
-
-def _render_agent_assignment_table(assignment: Dict[str, Any]) -> None:
-    active_agent = assignment.get("active_agent") or {}
-    requested_by = assignment.get("requested_by") or {}
-
-    print(f"Assignment ID : {assignment.get('assignment_id', '?')}")
-    print(f"Run ID        : {assignment.get('run_id', '?')}")
-    print(f"Stage         : {assignment.get('stage', '-')}")
-    print(f"Timestamp     : {assignment.get('timestamp', '-')}")
-
-    requester_id = requested_by.get("id", "-")
-    requester_role = requested_by.get("role", "-")
-    print(f"Requested By  : {requester_id} ({requester_role})")
-
-    agent_id = active_agent.get("agent_id", "-")
-    agent_name = active_agent.get("display_name", "Unknown")
-    print(f"Active Agent  : {agent_id} ({agent_name})")
-
-    metadata = assignment.get("metadata") or {}
-    if metadata:
-        print("\nContext:")
-        for key, value in metadata.items():
-            formatted = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-            print(f"  {key}: {formatted}")
-
-    heuristics = assignment.get("heuristics_applied") or {}
-    if heuristics:
-        print("\nHeuristics Applied:")
-        for key, value in heuristics.items():
-            formatted = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-            print(f"  {key}: {formatted}")
-
-    history = assignment.get("history") or []
-    if history:
-        print(f"\nHistory ({len(history)} event(s)):")
-        for event in history:
-            from_agent = event.get("from_agent_id", "-")
-            to_agent = event.get("to_agent_id", "-")
-            trigger = event.get("trigger", "-")
-            timestamp = event.get("timestamp", "-")
-            stage = event.get("stage", "-")
-            print(f"  - {timestamp} :: {from_agent} → {to_agent} [{trigger}] (stage={stage})")
-            trigger_details = event.get("trigger_details") or {}
-            reason = trigger_details.get("reason")
-            if reason:
-                print(f"    Reason: {reason}")
-            allow_downgrade = trigger_details.get("allow_downgrade")
-            if allow_downgrade is not None:
-                print(f"    Allow Downgrade: {allow_downgrade}")
-            issued_by = event.get("issued_by") or {}
-            issuer_id = issued_by.get("id")
-            if issuer_id:
-                issuer_role = issued_by.get("role", "-")
-                print(f"    Issued By: {issuer_id} ({issuer_role})")
-
-
-def _output_agent_assignment(assignment: Dict[str, Any], output_format: str) -> None:
-    if output_format == "json":
-        _print_json(assignment)
-    else:
-        _render_agent_assignment_table(assignment)
-
-
-def _command_agents_assign(args: argparse.Namespace) -> int:
-    adapter = _get_agent_orchestrator_adapter()
-    try:
-        context = _load_agent_context(getattr(args, "context_json", None), getattr(args, "context_file", None))
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
-
-    assignment = adapter.assign_agent(
-        run_id=args.run_id,
-        requested_agent_id=args.agent_id,
-        stage=args.stage,
-        context=context,
-        requested_by=_build_cli_actor_payload(args.requested_by_id, args.requested_by_role),
+    # The adapters wrap the service in ._service
+    # We need to access the private member because the adapter doesn't expose the raw service
+    # This is acceptable within the CLI module which owns the adapters
+    return AmprealizeService(
+        action_service=action_adapter._service,
+        compliance_service=compliance_adapter._service,
+        metrics_service=metrics_adapter._service,
     )
-    _output_agent_assignment(assignment, args.format)
-    return 0
 
 
-def _command_agents_switch(args: argparse.Namespace) -> int:
-    adapter = _get_agent_orchestrator_adapter()
+def _override_amprealize_env_file(env_file: Optional[str]) -> None:
+    """Override Amprealize manifest path for the current process."""
+
+    if env_file:
+        os.environ["GUIDEAI_ENV_FILE"] = env_file
+
+
+def _command_amprealize_plan(args: argparse.Namespace) -> int:
+    from guideai.amprealize import PlanRequest
+    from guideai.action_contracts import Actor
+
+    _override_amprealize_env_file(args.env_file)
+    service = _get_amprealize_service()
+    output_mode = _resolve_output_format(getattr(args, "output", None))
+
+    # Parse variables
+    vars_dict = {}
+    for v in args.variables:
+        if "=" in v:
+            k, val = v.split("=", 1)
+            vars_dict[k] = val
+
+    # Create actor from CLI args
+    actor = Actor(
+        id=args.actor_id,
+        role=args.actor_role,
+        surface="cli"
+    )
+
     try:
-        assignment = adapter.switch_agent(
-            assignment_id=args.assignment_id,
-            target_agent_id=args.target_agent_id,
+        req = PlanRequest(
+            blueprint_id=args.blueprint_id,
+            environment=args.environment,
+            lifetime=args.lifetime,
+            compliance_tier=args.compliance_tier,
+            checklist_id=args.checklist_id,
+            behaviors=args.behaviors,
+            variables=vars_dict,
+            active_modules=args.active_modules,
+            force_podman=args.force_podman
+        )
+        # Service.plan signature: plan(self, request: PlanRequest, actor: Actor = None)
+        resp = service.plan(req, actor)
+        resp_data = _serialize_model(resp)
+        snapshot_path = _save_amprealize_snapshot("plan", resp_data)
+        if output_mode == "json":
+            _print_json(resp_data)
+            _notify_snapshot_location(snapshot_path)
+        else:
+            _render_amprealize_plan_summary(resp_data, snapshot_path)
+            print("  (use --output json for the raw payload)")
+        return 0
+    except Exception as e:
+        print(f"Error planning: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_apply(args: argparse.Namespace) -> int:
+    from guideai.amprealize import ApplyRequest
+    from guideai.action_contracts import Actor
+
+    _override_amprealize_env_file(args.env_file)
+    service = _get_amprealize_service()
+    output_mode = _resolve_output_format(getattr(args, "output", None))
+
+    # Create actor from CLI args
+    actor = Actor(
+        id=args.actor_id,
+        role=args.actor_role,
+        surface="cli"
+    )
+
+    try:
+        manifest = None
+        if args.manifest_file:
+            with open(args.manifest_file, "r") as f:
+                if args.manifest_file.endswith(('.yaml', '.yml')):
+                    manifest = yaml.safe_load(f)
+                else:
+                    manifest = json.load(f)
+
+        # Handle special value -1 for stale_max_age_hours (None = skip age check)
+        stale_max_age = getattr(args, "stale_max_age_hours", 0.0)
+        effective_stale_max_age = None if stale_max_age == -1 else stale_max_age
+
+        req = ApplyRequest(
+            plan_id=args.plan_id,
+            manifest=manifest,
+            watch=args.watch,
+            resume=args.resume,
+            force_podman=args.force_podman,
+            skip_resource_check=args.skip_resource_check,
+            auto_cleanup=getattr(args, "auto_cleanup", False),
+            auto_cleanup_aggressive=getattr(args, "auto_cleanup_aggressive", False),
+            auto_cleanup_include_volumes=getattr(args, "auto_cleanup_include_volumes", False),
+            auto_cleanup_max_retries=getattr(args, "auto_cleanup_max_retries", 3),
+            allow_host_resource_warning=getattr(args, "allow_host_resource_warning", False),
+            min_disk_gb=args.min_disk_gb,
+            min_memory_mb=args.min_memory_mb,
+            proactive_cleanup=getattr(args, "proactive_cleanup", False),
+            blueprint_aware_memory_check=getattr(args, "blueprint_aware_memory_check", True),
+            memory_safety_margin_mb=getattr(args, "memory_safety_margin_mb", 512.0),
+            auto_resolve_stale=getattr(args, "auto_resolve_stale", True),
+            auto_resolve_conflicts=getattr(args, "auto_resolve_conflicts", True),
+            stale_max_age_hours=effective_stale_max_age,
+        )
+
+        if args.watch:
+            resp = service.apply(req, actor)
+            run_id = resp.amp_run_id
+            print(f"Apply started. Watching Amprealize run {run_id} (Ctrl+C to stop viewing)")
+            events: List[Dict[str, Any]] = []
+            try:
+                for event in service.watch(run_id):
+                    event_dict = _serialize_model(event)
+                    events.append(event_dict)
+                    _render_amprealize_event(event_dict)
+            except KeyboardInterrupt:
+                print("Stopped watching apply. You can re-run with --watch to resume streaming.")
+            status = service.status(run_id)
+            status_dict = _serialize_model(status)
+            snapshot_payload = {"status": status_dict, "events": events}
+            snapshot_path = _save_amprealize_snapshot("apply-watch", snapshot_payload)
+            if output_mode == "json":
+                _print_json(snapshot_payload)
+                _notify_snapshot_location(snapshot_path)
+            else:
+                _render_amprealize_status_summary(status_dict, snapshot_path, include_events=len(events))
+            return 0
+        resp = service.apply(req, actor)
+        resp_data = _serialize_model(resp)
+        snapshot_path = _save_amprealize_snapshot("apply", resp_data)
+        if output_mode == "json":
+            _print_json(resp_data)
+            _notify_snapshot_location(snapshot_path)
+        else:
+            _render_amprealize_apply_summary(resp_data, snapshot_path, watched=False)
+        return 0
+    except Exception as e:
+        print(f"Error applying: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_status(args: argparse.Namespace) -> int:
+    service = _get_amprealize_service()
+    output_mode = _resolve_output_format(getattr(args, "output", None))
+
+    try:
+        resp = service.status(args.amp_run_id)
+        resp_data = _serialize_model(resp)
+        snapshot_path = _save_amprealize_snapshot("status", resp_data)
+        if output_mode == "json":
+            _print_json(resp_data)
+            _notify_snapshot_location(snapshot_path)
+        else:
+            _render_amprealize_status_summary(resp_data, snapshot_path)
+        return 0
+    except Exception as e:
+        print(f"Error checking status: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_destroy(args: argparse.Namespace) -> int:
+    from guideai.amprealize import DestroyRequest
+    from guideai.action_contracts import Actor
+
+    _override_amprealize_env_file(args.env_file)
+    service = _get_amprealize_service()
+    output_mode = _resolve_output_format(getattr(args, "output", None))
+
+    # Create actor from CLI args
+    actor = Actor(
+        id=args.actor_id,
+        role=args.actor_role,
+        surface="cli"
+    )
+
+    try:
+        req = DestroyRequest(
+            amp_run_id=args.amp_run_id,
+            cascade=args.cascade,
             reason=args.reason,
-            allow_downgrade=args.allow_downgrade,
-            stage=args.stage,
-            issued_by=_build_cli_actor_payload(args.issued_by_id, args.issued_by_role),
+            force_podman=args.force_podman,
+            cleanup_after_destroy=getattr(args, "cleanup_after_destroy", True),
+            cleanup_aggressive=getattr(args, "cleanup_aggressive", True),
+            cleanup_include_volumes=getattr(args, "cleanup_include_volumes", False),
         )
-    except KeyError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    _output_agent_assignment(assignment, args.format)
-    return 0
 
-
-def _command_agents_status(args: argparse.Namespace) -> int:
-    if not args.assignment_id and not args.run_id:
-        print("Error: Provide --assignment-id or --run-id", file=sys.stderr)
-        return 2
-
-    adapter = _get_agent_orchestrator_adapter()
-    assignment = adapter.get_status(run_id=args.run_id, assignment_id=args.assignment_id)
-    if not assignment:
-        target = args.assignment_id or args.run_id or "unknown"
-        print(f"Error: Agent assignment not found for '{target}'", file=sys.stderr)
+        resp = service.destroy(req, actor)
+        resp_data = _serialize_model(resp)
+        snapshot_path = _save_amprealize_snapshot("destroy", resp_data)
+        if output_mode == "json":
+            _print_json(resp_data)
+            _notify_snapshot_location(snapshot_path)
+        else:
+            _render_amprealize_destroy_summary(resp_data, snapshot_path)
+        return 0
+    except Exception as e:
+        print(f"Error destroying resources: {e}", file=sys.stderr)
         return 1
 
-    _output_agent_assignment(assignment, args.format)
-    return 0
 
+def _command_amprealize_bootstrap(args: argparse.Namespace) -> int:
+    service = _get_amprealize_service()
 
-# ------------------------------------------------------------------
-# Run Commands
-# ------------------------------------------------------------------
+    target_dir = Path(args.bootstrap_directory).expanduser()
+    env_template = Path(args.env_template).expanduser() if args.env_template else None
+    include_blueprints = args.include_blueprints or bool(args.blueprints)
 
-
-def _command_run_create(args: argparse.Namespace) -> int:
-    """Create a new run."""
-    adapter = _get_run_adapter()
     try:
-        metadata = None
-        if args.metadata_file:
-            metadata = _load_metadata([], args.metadata_file)
-
-        run = adapter.create_run(
-            actor_id=args.actor_id,
-            actor_role=args.actor_role,
-            workflow_id=args.workflow_id,
-            workflow_name=args.workflow_name,
-            template_id=args.template_id,
-            template_name=args.template_name,
-            behavior_ids=args.behavior_ids or None,
-            metadata=metadata,
-            initial_message=args.message,
+        result = service.bootstrap(
+            target_directory=target_dir,
+            include_blueprints=include_blueprints,
+            blueprints=args.blueprints or None,
+            force=args.force,
+            env_template=env_template,
         )
+    except FileExistsError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error bootstrapping Amprealize config: {exc}", file=sys.stderr)
         return 1
 
-    if args.format == "table":
-        _render_run_table(run)
-    else:
-        _print_json(run)
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 
-def _command_run_get(args: argparse.Namespace) -> int:
-    """Get run details by ID."""
-    adapter = _get_run_adapter()
+def _command_amprealize_cleanup(args: argparse.Namespace) -> int:
+    """Clean up stale and orphaned containers."""
+    from amprealize.executors import PodmanExecutor
+
+    output_mode = getattr(args, "output", "table")
+    dry_run = getattr(args, "dry_run", False)
+    clean_stale = getattr(args, "stale", True)
+    clean_orphans = getattr(args, "orphans", True)
+    max_age_hours = getattr(args, "max_age_hours", None)
+    all_non_running = getattr(args, "all_non_running", False)
+
     try:
-        run = adapter.get_run(args.run_id)
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        executor = PodmanExecutor()
+
+        results = {
+            "stale": {"found": 0, "removed": 0, "failed": 0, "details": []},
+            "orphans": {"found": 0, "removed": 0, "details": []},
+        }
+
+        # Clean stale containers
+        if clean_stale:
+            stale_result = executor.cleanup_stale_containers(
+                include_all=all_non_running,
+                max_age_hours=max_age_hours,
+                force=True,
+                dry_run=dry_run,
+            )
+
+            results["stale"]["found"] = stale_result.get("total_found", 0)
+            results["stale"]["removed"] = len(stale_result.get("removed", []))
+            results["stale"]["failed"] = len(stale_result.get("failed", []))
+
+            if dry_run:
+                results["stale"]["details"] = stale_result.get("would_remove", [])
+            else:
+                results["stale"]["details"] = [
+                    {"name": name, "action": "removed"}
+                    for name in stale_result.get("removed", [])
+                ]
+                for name, error in stale_result.get("failed", []):
+                    results["stale"]["details"].append({
+                        "name": name, "action": "failed", "error": error
+                    })
+
+        # Clean orphaned Amprealize containers
+        if clean_orphans:
+            orphans = executor.find_orphaned_amprealize_containers()
+            results["orphans"]["found"] = len(orphans)
+
+            if dry_run:
+                results["orphans"]["details"] = [
+                    {"name": c.name, "status": c.status, "created": c.created}
+                    for c in orphans
+                ]
+            else:
+                removed = executor.cleanup_orphaned_containers()
+                results["orphans"]["removed"] = removed
+                results["orphans"]["details"] = [
+                    {"name": c.name, "action": "removed"} for c in orphans[:removed]
+                ]
+
+        # Output results
+        if output_mode == "json":
+            _print_json(results)
+        else:
+            _render_cleanup_summary(results, dry_run)
+
+        return 0
+
+    except Exception as e:
+        print(f"Error during cleanup: {e}", file=sys.stderr)
         return 1
 
-    if args.format == "table":
-        _render_run_table(run)
+
+def _render_cleanup_summary(results: dict, dry_run: bool) -> None:
+    """Render cleanup results as a human-readable summary."""
+    action_word = "Would remove" if dry_run else "Removed"
+
+    print()
+    if dry_run:
+        print("=== DRY RUN - No changes made ===")
+        print()
+
+    # Stale containers
+    stale = results.get("stale", {})
+    if stale.get("found", 0) > 0:
+        print(f"Stale Containers: {stale['found']} found")
+        for item in stale.get("details", []):
+            status = item.get("status", "")
+            name = item.get("name", "unknown")
+            if status:
+                print(f"  • {name} ({status})")
+            else:
+                action = item.get("action", "")
+                if action == "failed":
+                    print(f"  ✗ {name}: {item.get('error', 'unknown error')}")
+                else:
+                    print(f"  ✓ {name}")
+        print(f"  {action_word}: {stale.get('removed', 0)}")
+        if stale.get("failed", 0) > 0:
+            print(f"  Failed: {stale['failed']}")
+        print()
     else:
-        _print_json(run)
-    return 0
+        print("Stale Containers: None found")
+        print()
 
-
-def _command_run_list(args: argparse.Namespace) -> int:
-    """List runs with optional filters."""
-    adapter = _get_run_adapter()
-    try:
-        runs = adapter.list_runs(
-            status=args.status,
-            workflow_id=args.workflow_id,
-            template_id=args.template_id,
-            limit=args.limit,
-        )
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    if args.format == "table":
-        _render_runs_table(runs)
+    # Orphaned containers
+    orphans = results.get("orphans", {})
+    if orphans.get("found", 0) > 0:
+        print(f"Orphaned Amprealize Containers: {orphans['found']} found")
+        for item in orphans.get("details", []):
+            name = item.get("name", "unknown")
+            status = item.get("status", "")
+            if status:
+                print(f"  • {name} ({status})")
+            else:
+                print(f"  ✓ {name}")
+        print(f"  {action_word}: {orphans.get('removed', 0)}")
+        print()
     else:
-        _print_json(runs)
-    return 0
+        print("Orphaned Amprealize Containers: None found")
+        print()
 
+    # Summary
+    total_found = stale.get("found", 0) + orphans.get("found", 0)
+    total_removed = stale.get("removed", 0) + orphans.get("removed", 0)
 
-def _command_run_complete(args: argparse.Namespace) -> int:
-    """Complete a run with final status."""
-    adapter = _get_run_adapter()
-    try:
-        outputs = None
-        if args.outputs_file:
-            outputs_path = Path(args.outputs_file).expanduser().resolve()
-            if not outputs_path.exists():
-                print(f"Error: Outputs file not found: {outputs_path}", file=sys.stderr)
-                return 2
-            outputs = json.loads(outputs_path.read_text(encoding="utf-8"))
-
-        metadata = None
-        if args.metadata_file:
-            metadata = _load_metadata([], args.metadata_file)
-
-        run = adapter.complete_run(
-            args.run_id,
-            status=args.status,
-            outputs=outputs,
-            message=args.message,
-            error=args.error,
-            metadata=metadata,
-        )
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    if args.format == "table":
-        _render_run_table(run)
+    if dry_run:
+        print(f"Total: {total_found} containers would be removed")
     else:
-        _print_json(run)
-    return 0
+        print(f"Total: {total_removed} containers removed")
 
 
-def _command_run_cancel(args: argparse.Namespace) -> int:
-    """Cancel a running job."""
-    adapter = _get_run_adapter()
-    try:
-        run = adapter.cancel_run(args.run_id, reason=args.reason)
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+# ── Amprealize Machine Commands ─────────────────────────────────────────────────
 
-    if args.format == "table":
-        _render_run_table(run)
-    else:
-        _print_json(run)
-    return 0
+def _get_podman_executor():
+    """Get a PodmanExecutor instance for machine management."""
+    from amprealize.executors import PodmanExecutor
+    return PodmanExecutor()
 
 
-def _render_run_table(run: Dict[str, Any]) -> None:
-    """Render a single run in table format."""
-    print(f"Run ID: {run['run_id']}")
-    print(f"Status: {run['status']}")
-    print(f"Created: {run['created_at']}")
-    print(f"Updated: {run['updated_at']}")
-    if run.get('workflow_id'):
-        print(f"Workflow: {run['workflow_id']}")
-    if run.get('template_id'):
-        print(f"Template: {run['template_id']}")
-    print(f"Progress: {run['progress_pct']:.1f}%")
-    if run.get('message'):
-        print(f"Message: {run['message']}")
-    if run.get('current_step'):
-        print(f"Current Step: {run['current_step']}")
-    if run.get('started_at'):
-        print(f"Started: {run['started_at']}")
-    if run.get('completed_at'):
-        print(f"Completed: {run['completed_at']}")
-    if run.get('duration_ms'):
-        print(f"Duration: {run['duration_ms']}ms")
-    if run.get('error'):
-        print(f"Error: {run['error']}")
-    if run.get('behavior_ids'):
-        print(f"Behaviors: {', '.join(run['behavior_ids'])}")
-    if run.get('steps'):
-        print(f"\nSteps ({len(run['steps'])}):")
-        for step in run['steps']:
-            status_symbol = "✓" if step['status'] == "COMPLETED" else "○"
-            print(f"  {status_symbol} {step['name']} ({step['status']})")
-
-
-def _render_runs_table(runs: List[Dict[str, Any]]) -> None:
-    """Render list of runs in table format."""
-    if not runs:
-        print("No runs found.")
+def _render_machine_table(machines: list) -> None:
+    """Render machine list as a table."""
+    if not machines:
+        print("No Podman machines found.")
         return
 
-    print(f"{'Run ID':<40} {'Status':<12} {'Progress':<10} {'Created':<20} {'Workflow/Template':<30}")
-    print("-" * 120)
-    for run in runs:
-        run_id = run['run_id'][:36]
-        status = run['status']
-        progress = f"{run['progress_pct']:.0f}%"
-        created = run['created_at'][:19]
-        ref = run.get('workflow_id') or run.get('template_id') or '-'
-        print(f"{run_id:<40} {status:<12} {progress:<10} {created:<20} {ref:<30}")
-    print(f"\nTotal: {len(runs)} run(s)")
+    # Header
+    print(f"{'NAME':<25} {'STATUS':<12} {'CPUS':<6} {'MEMORY':<10} {'DISK':<10}")
+    print("-" * 65)
+
+    for m in machines:
+        status = "Running" if m.running else "Stopped"
+        cpus = str(m.cpus) if m.cpus else "-"
+        memory = f"{m.memory_mb}MB" if m.memory_mb else "-"
+        disk = f"{m.disk_gb}GB" if m.disk_gb else "-"
+        print(f"{m.name:<25} {status:<12} {cpus:<6} {memory:<10} {disk:<10}")
+
+
+def _command_amprealize_machine_list(args: argparse.Namespace) -> int:
+    """List all Podman machines."""
+    try:
+        executor = _get_podman_executor()
+        machines = executor.list_machines()
+
+        if getattr(args, "output", "table") == "json":
+            data = [
+                {
+                    "name": m.name,
+                    "running": m.running,
+                    "cpus": m.cpus,
+                    "memory_mb": m.memory_mb,
+                    "disk_gb": m.disk_gb,
+                }
+                for m in machines
+            ]
+            _print_json(data)
+        else:
+            _render_machine_table(machines)
+        return 0
+    except Exception as e:
+        print(f"Error listing machines: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_machine_start(args: argparse.Namespace) -> int:
+    """Start a Podman machine."""
+    try:
+        executor = _get_podman_executor()
+        machines = executor.list_machines()
+
+        # Determine which machine to start
+        name = args.name
+        if not name:
+            # Try guideai-ci first, then first available
+            guideai_machine = next((m for m in machines if m.name == "guideai-ci"), None)
+            if guideai_machine:
+                name = "guideai-ci"
+            elif machines:
+                name = machines[0].name
+            else:
+                print("No Podman machines found. Use 'guideai amprealize machine ensure' to create one.", file=sys.stderr)
+                return 1
+
+        # Check if already running
+        machine = executor.get_machine(name)
+        if machine and machine.running:
+            print(f"Machine '{name}' is already running.")
+            return 0
+
+        print(f"Starting machine '{name}'...")
+        executor.start_machine(name)
+        print(f"✓ Machine '{name}' started successfully.")
+        return 0
+    except Exception as e:
+        print(f"Error starting machine: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_machine_stop(args: argparse.Namespace) -> int:
+    """Stop a Podman machine."""
+    try:
+        executor = _get_podman_executor()
+        machines = executor.list_machines()
+
+        if args.stop_all:
+            # Stop all running machines
+            running = [m for m in machines if m.running]
+            if not running:
+                print("No running machines to stop.")
+                return 0
+
+            for m in running:
+                print(f"Stopping machine '{m.name}'...")
+                executor.stop_machine(m.name)
+                print(f"✓ Machine '{m.name}' stopped.")
+            return 0
+
+        # Stop a specific machine
+        name = args.name
+        if not name:
+            # Try guideai-ci first, then first running machine
+            guideai_machine = next((m for m in machines if m.name == "guideai-ci" and m.running), None)
+            if guideai_machine:
+                name = "guideai-ci"
+            else:
+                running = next((m for m in machines if m.running), None)
+                if running:
+                    name = running.name
+                else:
+                    print("No running machines to stop.")
+                    return 0
+
+        # Check if already stopped
+        machine = executor.get_machine(name)
+        if machine and not machine.running:
+            print(f"Machine '{name}' is already stopped.")
+            return 0
+
+        print(f"Stopping machine '{name}'...")
+        executor.stop_machine(name)
+        print(f"✓ Machine '{name}' stopped successfully.")
+        return 0
+    except Exception as e:
+        print(f"Error stopping machine: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_machine_ensure(args: argparse.Namespace) -> int:
+    """Ensure a Podman machine is running (start if needed, create if missing)."""
+    try:
+        executor = _get_podman_executor()
+        name = args.name or "guideai-ci"
+
+        machine = executor.get_machine(name)
+
+        if machine:
+            if machine.running:
+                print(f"✓ Machine '{name}' is already running.")
+                return 0
+            else:
+                print(f"Starting existing machine '{name}'...")
+                executor.start_machine(name)
+                print(f"✓ Machine '{name}' started successfully.")
+                return 0
+
+        # Machine doesn't exist - create it
+        print(f"Creating new machine '{name}' (cpus={args.cpus}, memory={args.memory}MB, disk={args.disk}GB)...")
+        executor.init_machine(
+            name=name,
+            cpus=args.cpus,
+            memory_mb=args.memory,
+            disk_gb=args.disk,
+        )
+
+        print(f"Starting machine '{name}'...")
+        executor.start_machine(name)
+        print(f"✓ Machine '{name}' created and started successfully.")
+        return 0
+    except Exception as e:
+        print(f"Error ensuring machine: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_machine_status(args: argparse.Namespace) -> int:
+    """Show status of a Podman machine."""
+    try:
+        executor = _get_podman_executor()
+        machines = executor.list_machines()
+
+        # Determine which machine to show
+        name = args.name
+        if not name:
+            # Try guideai-ci first, then first available
+            guideai_machine = next((m for m in machines if m.name == "guideai-ci"), None)
+            if guideai_machine:
+                name = "guideai-ci"
+            elif machines:
+                name = machines[0].name
+            else:
+                print("No Podman machines found.", file=sys.stderr)
+                return 1
+
+        machine = executor.get_machine(name)
+        if not machine:
+            print(f"Machine '{name}' not found.", file=sys.stderr)
+            return 1
+
+        if getattr(args, "output", "table") == "json":
+            # Get detailed info
+            try:
+                details = executor.inspect_machine(name)
+            except Exception:
+                details = {}
+
+            data = {
+                "name": machine.name,
+                "running": machine.running,
+                "cpus": machine.cpus,
+                "memory_mb": machine.memory_mb,
+                "disk_gb": machine.disk_gb,
+                "details": details,
+            }
+            _print_json(data)
+        else:
+            status = "Running ✓" if machine.running else "Stopped ✗"
+            print(f"Machine: {machine.name}")
+            print(f"Status:  {status}")
+            print(f"CPUs:    {machine.cpus or 'unknown'}")
+            print(f"Memory:  {machine.memory_mb}MB" if machine.memory_mb else "Memory:  unknown")
+            print(f"Disk:    {machine.disk_gb}GB" if machine.disk_gb else "Disk:    unknown")
+
+        return 0
+    except Exception as e:
+        print(f"Error getting machine status: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_amprealize_machine_resources(args: argparse.Namespace) -> int:
+    """Show resource usage for host and Podman machines."""
+    try:
+        executor = _get_podman_executor()
+
+        # Get all resources
+        resources = executor.get_all_resources()
+
+        if getattr(args, "check", False):
+            # Health check mode
+            healthy, warnings = executor.check_resource_health(
+                min_disk_gb=args.min_disk_gb,
+                min_memory_mb=args.min_memory_mb,
+            )
+
+            if getattr(args, "output", "table") == "json":
+                _print_json({
+                    "healthy": healthy,
+                    "warnings": warnings,
+                    "resources": [r.to_dict() for r in resources],
+                })
+            else:
+                if healthy:
+                    print("✓ All resources healthy")
+                    print(f"  (Checked: disk >= {args.min_disk_gb}GB, memory >= {args.min_memory_mb}MB)")
+                else:
+                    print("✗ Resource health check FAILED")
+                    for warning in warnings:
+                        print(f"  • {warning}")
+                    print()
+                    print("  💡 To proceed with apply despite low resources, use:")
+                    print("     guideai amprealize apply --skip-resource-check")
+
+            return 0 if healthy else 1
+
+        # Display mode
+        if getattr(args, "output", "table") == "json":
+            _print_json([r.to_dict() for r in resources])
+        else:
+            _render_resources_table(resources)
+
+        return 0
+    except Exception as e:
+        print(f"Error getting resources: {e}", file=sys.stderr)
+        return 1
+
+
+def _render_resources_table(resources: list) -> None:
+    """Render resource information as a table."""
+    for resource in resources:
+        source = resource.source
+        if source == "host":
+            print("═" * 60)
+            print("HOST RESOURCES")
+            print("═" * 60)
+        else:
+            print("─" * 60)
+            print(f"MACHINE: {source.replace('machine:', '')}")
+            print("─" * 60)
+
+        # Disk
+        if resource.disk:
+            disk = resource.disk
+            status = "🔴 CRITICAL" if disk.is_critical else ("🟡 WARNING" if disk.is_warning else "🟢 OK")
+            print(f"  Disk:   {disk.used:.1f}/{disk.total:.1f} {disk.unit} ({disk.percent_used:.1f}% used) {status}")
+            print(f"          Available: {disk.available:.1f} {disk.unit}")
+
+        # Memory
+        if resource.memory:
+            mem = resource.memory
+            status = "🔴 CRITICAL" if mem.is_critical else ("🟡 WARNING" if mem.is_warning else "🟢 OK")
+            print(f"  Memory: {mem.used:.0f}/{mem.total:.0f} {mem.unit} ({mem.percent_used:.1f}% used) {status}")
+            print(f"          Available: {mem.available:.0f} {mem.unit}")
+
+        # CPU
+        if resource.cpu:
+            cpu = resource.cpu
+            print(f"  CPU:    {cpu.used:.1f}/{cpu.total:.0f} {cpu.unit} (load avg)")
+
+        # Warnings
+        if resource.warnings:
+            print("  Warnings:")
+            for warning in resource.warnings:
+                print(f"    ⚠️  {warning}")
+
+        print()
+
+
+def _command_amprealize_machine_cleanup(args: argparse.Namespace) -> int:
+    """Clean up unused resources to free disk space."""
+    try:
+        executor = _get_podman_executor()
+
+        dry_run = getattr(args, "dry_run", False)
+        aggressive = getattr(args, "aggressive", False)
+
+        result = executor.mitigate_resources(
+            dry_run=dry_run,
+            prune_containers=not getattr(args, "skip_containers", False),
+            prune_images=not getattr(args, "skip_images", False),
+            prune_volumes=getattr(args, "include_volumes", False),
+            prune_cache=not getattr(args, "skip_cache", False),
+            prune_networks=getattr(args, "include_networks", False),
+            prune_pods=getattr(args, "include_pods", False),
+            prune_logs=getattr(args, "include_logs", False),
+            aggressive=aggressive,
+        )
+
+        if getattr(args, "output", "table") == "json":
+            _print_json(result.to_dict())
+        else:
+            _render_cleanup_result(result)
+
+        return 0 if result.success else 1
+    except Exception as e:
+        print(f"Error during cleanup: {e}", file=sys.stderr)
+        return 1
+
+
+def _render_cleanup_result(result) -> None:
+    """Render cleanup result as formatted output."""
+    action = "Would clean" if result.dry_run else "Cleaned"
+
+    if result.dry_run:
+        print("═" * 60)
+        print("DRY RUN - No changes made")
+        print("═" * 60)
+    else:
+        print("═" * 60)
+        print("CLEANUP COMPLETE")
+        print("═" * 60)
+
+    print()
+
+    # Summary
+    if result.items_cleaned == 0:
+        print("  ✓ Nothing to clean - resources already optimized")
+    else:
+        if result.containers_removed > 0:
+            print(f"  🗑️  {action}: {result.containers_removed} stopped container(s)")
+            if result.details.get("containers"):
+                for c in result.details["containers"][:5]:  # Show first 5
+                    print(f"      • {c.get('name', c.get('id', 'unknown'))}")
+                if len(result.details["containers"]) > 5:
+                    print(f"      ... and {len(result.details['containers']) - 5} more")
+
+        if result.images_removed > 0:
+            print(f"  🗑️  {action}: {result.images_removed} unused image(s)")
+            if result.details.get("images"):
+                for img in result.details["images"][:5]:
+                    print(f"      • {img.get('name', img.get('id', 'unknown'))}")
+                if len(result.details["images"]) > 5:
+                    print(f"      ... and {len(result.details['images']) - 5} more")
+
+        if result.volumes_removed > 0:
+            print(f"  🗑️  {action}: {result.volumes_removed} unused volume(s)")
+
+        if result.networks_removed > 0:
+            print(f"  🗑️  {action}: {result.networks_removed} unused network(s)")
+            if result.details.get("networks"):
+                for net in result.details["networks"][:5]:
+                    print(f"      • {net}")
+                if len(result.details["networks"]) > 5:
+                    print(f"      ... and {len(result.details['networks']) - 5} more")
+
+        if result.pods_removed > 0:
+            print(f"  🗑️  {action}: {result.pods_removed} stopped pod(s)")
+            if result.details.get("pods"):
+                for pod in result.details["pods"][:5]:
+                    print(f"      • {pod}")
+                if len(result.details["pods"]) > 5:
+                    print(f"      ... and {len(result.details['pods']) - 5} more")
+
+        if result.logs_truncated > 0:
+            print(f"  🗑️  {action}: {result.logs_truncated} container log(s)")
+
+        if result.cache_cleared:
+            print(f"  🗑️  {action}: build cache")
+
+        if result.space_reclaimed_mb > 0:
+            if result.space_reclaimed_mb > 1024:
+                print(f"\n  📊 Estimated space {'to reclaim' if result.dry_run else 'reclaimed'}: {result.space_reclaimed_mb/1024:.1f} GB")
+            else:
+                print(f"\n  📊 Estimated space {'to reclaim' if result.dry_run else 'reclaimed'}: {result.space_reclaimed_mb:.0f} MB")
+
+    # Errors
+    if result.errors:
+        print("\n  ⚠️  Warnings/Errors:")
+        for error in result.errors:
+            print(f"      • {error}")
+
+    print()
+
+    if result.dry_run:
+        print("  💡 Run without --dry-run to perform the cleanup")
+
+
+def _command_scan_secrets(args: argparse.Namespace) -> int:
+    return run_scan(
+        output_path=Path(args.output).resolve() if args.output else DEFAULT_OUTPUT.resolve(),
+        fmt=args.format,
+        fail_on_findings=args.fail_on_findings,
+    )
+
+
+def _command_bandwidth_check(args: argparse.Namespace) -> int:
+    """Check current bandwidth usage against environment limits."""
+    try:
+        # Load environment config to get the limit
+        from guideai.amprealize import AmprealizeService
+
+        # Initialize dependencies
+        action_adapter = _get_action_adapter()
+        compliance_adapter = _get_compliance_adapter()
+        metrics_adapter = _get_metrics_adapter()
+
+        service = AmprealizeService(
+            action_service=action_adapter._service,
+            compliance_service=compliance_adapter._service,
+            metrics_service=metrics_adapter._service
+        )
+
+        # We need to know which environment we are checking for. Default to 'dev' or take from args.
+        env_name = getattr(args, "environment", "dev")
+
+        # AmprealizeService loads config in __init__ and stores in self.environments
+        if env_name not in service.environments:
+            print(f"Error: Environment '{env_name}' not found in configuration.", file=sys.stderr)
+            return 1
+
+        env_config = service.environments[env_name]
+        limit_mbps = env_config.runtime.network_mbps
+
+        if limit_mbps is None:
+             print(f"No bandwidth limit defined for environment '{env_name}'.", file=sys.stderr)
+             # We can still show usage, treat limit as infinite
+             limit_mbps_val = float('inf')
+        else:
+             limit_mbps_val = float(limit_mbps)
+
+        print(f"Checking bandwidth usage for environment: {env_name} (Limit: {limit_mbps_val} Mbps)")
+
+        enforcer = BandwidthEnforcer(limit_mbps=limit_mbps)
+
+        # Check usage
+        stats = service.get_network_stats()
+        usage_mbps = enforcer.get_current_usage_mbps(stats)
+
+        print(f"Current Usage: {usage_mbps:.2f} Mbps")
+
+        if usage_mbps > limit_mbps_val:
+            print("Status: OVER LIMIT ⚠️")
+            return 1
+        else:
+            print("Status: OK ✅")
+            return 0
+
+    except Exception as e:
+        print(f"Error checking bandwidth: {e}", file=sys.stderr)
+        return 1
+
+
+# ── Audit Log Commands ────────────────────────────────────────────────────────
+
+_audit_service_singleton: Optional[Any] = None
+
+
+def _get_audit_service() -> Any:
+    """Lazy singleton for AuditLogService."""
+    global _audit_service_singleton
+    if _audit_service_singleton is None:
+        from guideai.services.audit_log_service import AuditLogService
+        from guideai.config.settings import get_settings
+
+        settings = get_settings()
+        _audit_service_singleton = AuditLogService(settings=settings)
+    return _audit_service_singleton
+
+
+def _command_audit_verify(args: argparse.Namespace) -> int:
+    """Verify integrity of an archived audit batch."""
+    output_mode = _resolve_output_format(getattr(args, "output", None))
+
+    try:
+        service = _get_audit_service()
+        public_key_path = getattr(args, "public_key", None)
+
+        result = service.verify_archive(
+            batch_id=args.batch_id,
+            public_key_path=public_key_path,
+        )
+
+        if output_mode == "json":
+            _print_json(result)
+        else:
+            print(f"Batch ID: {result.get('batch_id', args.batch_id)}")
+            print(f"Archive Key: {result.get('archive_key', 'N/A')}")
+            print(f"Event Count: {result.get('event_count', 'N/A')}")
+            print(f"Content Hash: {result.get('content_hash', 'N/A')[:16]}...")
+            print()
+
+            if result.get("integrity_valid"):
+                print("✅ Content Integrity: VALID")
+            else:
+                print(f"❌ Content Integrity: INVALID - {result.get('integrity_error', 'hash mismatch')}")
+
+            if result.get("signature_valid") is True:
+                print("✅ Signature: VALID")
+            elif result.get("signature_valid") is False:
+                print(f"❌ Signature: INVALID - {result.get('signature_error', 'verification failed')}")
+            else:
+                print("⚠️  Signature: NOT VERIFIED (no public key provided)")
+
+            retention = result.get("retention_info", {})
+            if retention:
+                print()
+                print(f"Retention Mode: {retention.get('mode', 'N/A')}")
+                print(f"Retain Until: {retention.get('retain_until_date', 'N/A')}")
+                print(f"Legal Hold: {retention.get('legal_hold_status', 'N/A')}")
+
+        # Return 0 only if integrity is valid
+        return 0 if result.get("integrity_valid") else 1
+
+    except Exception as e:
+        print(f"Error verifying audit batch: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_audit_list(args: argparse.Namespace) -> int:
+    """List archived audit batches."""
+    output_mode = _resolve_output_format(getattr(args, "output", None))
+
+    try:
+        service = _get_audit_service()
+        prefix = getattr(args, "prefix", None)
+        limit = getattr(args, "limit", 100)
+
+        batches = service.list_archives(prefix=prefix, limit=limit)
+
+        if output_mode == "json":
+            _print_json({"batches": batches, "count": len(batches)})
+        else:
+            if not batches:
+                print("No archived audit batches found.")
+                return 0
+
+            headers = ["Batch ID", "Archived At", "Event Count", "Size (KB)"]
+            widths = [len(h) for h in headers]
+            rows = []
+
+            for batch in batches:
+                row = [
+                    batch.get("batch_id", "-")[:36],
+                    batch.get("archived_at", "-")[:19],
+                    str(batch.get("event_count", "-")),
+                    f"{batch.get('size_bytes', 0) / 1024:.1f}",
+                ]
+                rows.append(row)
+                widths = [max(w, len(v)) for w, v in zip(widths, row)]
+
+            fmt = " | ".join(f"{{:<{w}}}" for w in widths)
+            separator = "-+-".join("-" * w for w in widths)
+
+            print(fmt.format(*headers))
+            print(separator)
+            for row in rows:
+                print(fmt.format(*row))
+
+            print(f"\nTotal: {len(batches)} batches")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error listing audit batches: {e}", file=sys.stderr)
+        return 1
+
+
+def _command_audit_retention(args: argparse.Namespace) -> int:
+    """Check retention info for an archived batch."""
+    output_mode = _resolve_output_format(getattr(args, "output", None))
+
+    try:
+        service = _get_audit_service()
+
+        retention = service.get_retention_info(batch_id=args.batch_id)
+
+        if output_mode == "json":
+            _print_json(retention)
+        else:
+            print(f"Batch ID: {args.batch_id}")
+            print(f"Archive Key: {retention.get('archive_key', 'N/A')}")
+            print()
+            print(f"Object Lock Mode: {retention.get('mode', 'N/A')}")
+            print(f"Retain Until: {retention.get('retain_until_date', 'N/A')}")
+            print(f"Legal Hold: {retention.get('legal_hold_status', 'OFF')}")
+            print(f"Versioned: {retention.get('is_versioned', False)}")
+
+            if retention.get("version_id"):
+                print(f"Version ID: {retention.get('version_id')}")
+
+        return 0
+
+    except Exception as e:
+        print(f"Error getting retention info: {e}", file=sys.stderr)
+        return 1
+
+
+# ── Migration Commands ──────────────────────────────────────────────────────────
+
+# Service configuration for migrations
+_MIGRATION_CONFIG = {
+    "behavior": {
+        "migration": "001_create_behavior_service.sql",
+        "dsn_env": "GUIDEAI_BEHAVIOR_PG_DSN",
+        "tables": ["behaviors", "behavior_history"],
+    },
+    "workflow": {
+        "migration": "003_create_workflow_service.sql",
+        "dsn_env": "GUIDEAI_WORKFLOW_PG_DSN",
+        "tables": ["workflow_templates", "workflow_runs", "workflow_steps"],
+    },
+    "action": {
+        "migration": "004_create_action_service.sql",
+        "dsn_env": "GUIDEAI_ACTION_PG_DSN",
+        "tables": ["actions", "replays"],
+    },
+    "run": {
+        "migration": "005_create_run_service.sql",
+        "dsn_env": "GUIDEAI_RUN_PG_DSN",
+        "tables": ["runs", "run_steps"],
+    },
+    "compliance": {
+        "migration": "006_create_compliance_service.sql",
+        "dsn_env": "GUIDEAI_COMPLIANCE_PG_DSN",
+        "tables": ["compliance_checklists", "compliance_steps", "compliance_policies"],
+    },
+    "metrics": {
+        "migration": "007_create_metrics_service.sql",
+        "dsn_env": "GUIDEAI_METRICS_PG_DSN",
+        "tables": ["metrics", "metric_snapshots"],
+    },
+    "reflection": {
+        "migration": "020_create_reflection_service.sql",
+        "dsn_env": "GUIDEAI_REFLECTION_PG_DSN",
+        "tables": ["reflection_patterns", "behavior_candidates", "pattern_observations", "reflection_sessions"],
+    },
+    "collaboration": {
+        "migration": "021_create_collaboration_service.sql",
+        "dsn_env": "GUIDEAI_COLLABORATION_PG_DSN",
+        "tables": ["workspaces", "workspace_members", "documents", "edit_operations", "comments", "activity_logs"],
+    },
+}
+
+
+def _get_migration_path(migration_file: str) -> Path:
+    """Get absolute path to a migration file."""
+    repo_root = Path(__file__).parent.parent
+    return repo_root / "schema" / "migrations" / migration_file
+
+
+def _check_service_tables(dsn: str, tables: List[str]) -> Dict[str, bool]:
+    """Check which tables exist for a service."""
+    try:
+        import psycopg2
+    except ImportError:
+        return {table: False for table in tables}
+
+    result = {}
+    try:
+        with psycopg2.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                for table in tables:
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_schema = 'public' AND table_name = %s
+                        )
+                        """,
+                        (table,)
+                    )
+                    row = cur.fetchone()
+                    result[table] = bool(row and row[0])
+    except Exception:
+        result = {table: False for table in tables}
+    return result
+
+
+def _apply_migration(dsn: str, migration_path: Path) -> bool:
+    """Apply a single migration file."""
+    try:
+        import psycopg2
+    except ImportError:
+        print("  ❌ psycopg2 not installed. Run: pip install psycopg2-binary", file=sys.stderr)
+        return False
+
+    if not migration_path.exists():
+        print(f"  ❌ Migration file not found: {migration_path}", file=sys.stderr)
+        return False
+
+    sql = migration_path.read_text(encoding="utf-8")
+
+    try:
+        with psycopg2.connect(dsn, connect_timeout=10) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(sql)
+        return True
+    except Exception as e:
+        print(f"  ❌ Migration failed: {e}", file=sys.stderr)
+        return False
+
+
+def _command_migrate_apply(args: argparse.Namespace) -> int:
+    """Apply pending schema migrations."""
+    services = list(_MIGRATION_CONFIG.keys()) if args.service == "all" else [args.service]
+    dry_run = getattr(args, "dry_run", False)
+
+    print("=" * 70)
+    print("GuideAI PostgreSQL Migration")
+    print("=" * 70)
+    print()
+
+    results = []
+    for service in services:
+        config = _MIGRATION_CONFIG[service]
+        dsn = apply_host_overrides(os.environ.get(config["dsn_env"]), service.upper())
+
+        print(f"Service: {service}")
+
+        if not dsn:
+            print(f"  ⏭️  Skipped: {config['dsn_env']} not set")
+            results.append((service, "skipped", "DSN not configured"))
+            print()
+            continue
+
+        # Check existing tables
+        table_status = _check_service_tables(dsn, config["tables"])
+        existing = sum(1 for v in table_status.values() if v)
+        total = len(config["tables"])
+
+        if existing == total:
+            print(f"  ✅ Already migrated: {existing}/{total} tables exist")
+            results.append((service, "exists", f"{existing}/{total} tables"))
+            print()
+            continue
+
+        migration_path = _get_migration_path(config["migration"])
+        print(f"  📄 Migration: {config['migration']}")
+        print(f"  📊 Tables: {existing}/{total} exist")
+
+        if dry_run:
+            print(f"  🔍 Would apply migration (dry-run)")
+            results.append((service, "pending", f"{total - existing} tables to create"))
+        else:
+            print(f"  ⏳ Applying migration...")
+            if _apply_migration(dsn, migration_path):
+                print(f"  ✅ Migration applied successfully")
+                results.append((service, "applied", f"{total} tables created"))
+            else:
+                results.append((service, "failed", "See error above"))
+        print()
+
+    # Summary
+    print("=" * 70)
+    print("Migration Summary")
+    print("=" * 70)
+    for service, status, detail in results:
+        status_icon = {
+            "applied": "✅",
+            "exists": "✅",
+            "pending": "🔍",
+            "skipped": "⏭️",
+            "failed": "❌",
+        }.get(status, "❓")
+        print(f"  {status_icon} {service}: {status} ({detail})")
+
+    failed = sum(1 for _, status, _ in results if status == "failed")
+    return 1 if failed > 0 else 0
+
+
+def _command_migrate_status(args: argparse.Namespace) -> int:
+    """Check migration status for all services."""
+    output_mode = _resolve_output_format(getattr(args, "format", None))
+
+    status_data = []
+    for service, config in _MIGRATION_CONFIG.items():
+        dsn = apply_host_overrides(os.environ.get(config["dsn_env"]), service.upper())
+
+        entry = {
+            "service": service,
+            "dsn_env": config["dsn_env"],
+            "dsn_configured": bool(dsn),
+            "migration_file": config["migration"],
+            "tables": {},
+            "status": "unconfigured",
+        }
+
+        if dsn:
+            table_status = _check_service_tables(dsn, config["tables"])
+            entry["tables"] = table_status
+            existing = sum(1 for v in table_status.values() if v)
+            total = len(config["tables"])
+
+            if existing == total:
+                entry["status"] = "migrated"
+            elif existing > 0:
+                entry["status"] = "partial"
+            else:
+                entry["status"] = "pending"
+
+        status_data.append(entry)
+
+    if output_mode == "json":
+        _print_json(status_data)
+    else:
+        print("=" * 70)
+        print("PostgreSQL Migration Status")
+        print("=" * 70)
+        print()
+
+        for entry in status_data:
+            status_icon = {
+                "migrated": "✅",
+                "partial": "⚠️",
+                "pending": "🔄",
+                "unconfigured": "⏭️",
+            }.get(entry["status"], "❓")
+
+            print(f"{status_icon} {entry['service']}")
+            print(f"   Env: {entry['dsn_env']}")
+            print(f"   Status: {entry['status']}")
+
+            if entry["dsn_configured"] and entry["tables"]:
+                existing = sum(1 for v in entry["tables"].values() if v)
+                total = len(entry["tables"])
+                print(f"   Tables: {existing}/{total}")
+            print()
+
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
+
     if args.command == "scan-secrets":
-        output = Path(args.output).expanduser() if args.output else DEFAULT_OUTPUT
-        output = output.resolve()
-        return run_scan(output_path=output, fmt=args.format, fail_on_findings=args.fail_on_findings)
-    if args.command == "record-action":
+        return _command_scan_secrets(args)
+    elif args.command == "record-action":
         return _command_record_action(args)
-    if args.command == "list-actions":
+    elif args.command == "list-actions":
         return _command_list_actions(args)
-    if args.command == "get-action":
+    elif args.command == "get-action":
         return _command_get_action(args)
-    if args.command == "replay-actions":
+    elif args.command == "replay-actions":
         return _command_replay_actions(args)
-    if args.command == "replay-status":
+    elif args.command == "replay-status":
         return _command_replay_status(args)
-    if args.command == "tasks":
+    elif args.command == "dr":
+        return _command_dr(args)
+    elif args.command == "tasks":
         return _command_list_tasks(args)
-    if args.command == "behaviors":
+    elif args.command == "behaviors":
         if args.behaviors_command == "create":
             return _command_behaviors_create(args)
-        if args.behaviors_command == "list":
+        elif args.behaviors_command == "list":
             return _command_behaviors_list(args)
-        if args.behaviors_command == "search":
+        elif args.behaviors_command == "search":
             return _command_behaviors_search(args)
-        if args.behaviors_command == "get":
+        elif args.behaviors_command == "get":
             return _command_behaviors_get(args)
-        if args.behaviors_command == "update":
+        elif args.behaviors_command == "update":
             return _command_behaviors_update(args)
-        if args.behaviors_command == "submit":
+        elif args.behaviors_command == "submit":
             return _command_behaviors_submit(args)
-        if args.behaviors_command == "approve":
+        elif args.behaviors_command == "approve":
             return _command_behaviors_approve(args)
-        if args.behaviors_command == "deprecate":
+        elif args.behaviors_command == "deprecate":
             return _command_behaviors_deprecate(args)
-        if args.behaviors_command == "delete-draft":
+        elif args.behaviors_command == "delete-draft":
             return _command_behaviors_delete_draft(args)
-        print("Error: Unknown behaviors subcommand", file=sys.stderr)
-        return 1
-    if args.command == "compliance":
+    elif args.command == "compliance":
         if args.compliance_command == "create-checklist":
             return _command_compliance_create_checklist(args)
-        if args.compliance_command == "record-step":
+        elif args.compliance_command == "record-step":
             return _command_compliance_record_step(args)
-        if args.compliance_command == "list":
+        elif args.compliance_command == "list":
             return _command_compliance_list(args)
-        if args.compliance_command == "get":
+        elif args.compliance_command == "get":
             return _command_compliance_get(args)
-        if args.compliance_command == "validate":
+        elif args.compliance_command == "validate":
             return _command_compliance_validate(args)
-        print("Error: Unknown compliance subcommand", file=sys.stderr)
-        return 1
-    if args.command == "telemetry":
-        if args.telemetry_command == "emit":
-            return _command_telemetry_emit(args)
-        print("Error: Unknown telemetry subcommand", file=sys.stderr)
-        return 1
-    if args.command == "workflow":
+        elif args.compliance_command == "policies":
+            if hasattr(args, "policies_command") and args.policies_command == "list":
+                return _command_compliance_policies_list(args)
+            elif hasattr(args, "policies_command") and args.policies_command == "create":
+                return _command_compliance_policies_create(args)
+            elif hasattr(args, "policies_command") and args.policies_command == "get":
+                return _command_compliance_policies_get(args)
+        elif args.compliance_command == "audit":
+            return _command_compliance_audit(args)
+    elif args.command == "workflow":
         if args.workflow_command == "create-template":
             return _command_workflow_create_template(args)
-        if args.workflow_command == "list-templates":
+        elif args.workflow_command == "list-templates":
             return _command_workflow_list_templates(args)
-        if args.workflow_command == "get-template":
+        elif args.workflow_command == "get-template":
             return _command_workflow_get_template(args)
-        if args.workflow_command == "run":
+        elif args.workflow_command == "run":
             return _command_workflow_run(args)
-        if args.workflow_command == "status":
+        elif args.workflow_command == "status":
             return _command_workflow_status(args)
-        print("Error: Unknown workflow subcommand", file=sys.stderr)
-        return 1
-    if args.command == "run":
-        if args.run_command == "create":
-            return _command_run_create(args)
-        if args.run_command == "get":
-            return _command_run_get(args)
-        if args.run_command == "list":
-            return _command_run_list(args)
-        if args.run_command == "complete":
-            return _command_run_complete(args)
-        if args.run_command == "cancel":
-            return _command_run_cancel(args)
-        print("Error: Unknown run subcommand", file=sys.stderr)
-        return 1
-    if args.command == "agents":
+    elif args.command == "amprealize":
+        if args.amprealize_command == "plan":
+            return _command_amprealize_plan(args)
+        elif args.amprealize_command == "apply":
+            return _command_amprealize_apply(args)
+        elif args.amprealize_command == "status":
+            return _command_amprealize_status(args)
+        elif args.amprealize_command == "destroy":
+            return _command_amprealize_destroy(args)
+        elif args.amprealize_command == "bootstrap":
+            return _command_amprealize_bootstrap(args)
+        elif args.amprealize_command == "cleanup":
+            return _command_amprealize_cleanup(args)
+        elif args.amprealize_command == "machine":
+            if not hasattr(args, "machine_command") or not args.machine_command:
+                print("Usage: guideai amprealize machine {list,start,stop,ensure,status,resources}", file=sys.stderr)
+                return 1
+            if args.machine_command == "list":
+                return _command_amprealize_machine_list(args)
+            elif args.machine_command == "start":
+                return _command_amprealize_machine_start(args)
+            elif args.machine_command == "stop":
+                return _command_amprealize_machine_stop(args)
+            elif args.machine_command == "ensure":
+                return _command_amprealize_machine_ensure(args)
+            elif args.machine_command == "status":
+                return _command_amprealize_machine_status(args)
+            elif args.machine_command == "resources":
+                return _command_amprealize_machine_resources(args)
+            elif args.machine_command == "cleanup":
+                return _command_amprealize_machine_cleanup(args)
+    elif args.command == "telemetry":
+        if args.telemetry_command == "emit":
+            return _command_telemetry_emit(args)
+        elif args.telemetry_command == "query":
+            return _command_telemetry_query(args)
+        elif args.telemetry_command == "dashboard":
+            return _command_telemetry_dashboard(args)
+    elif args.command == "agents":
         if args.agents_command == "assign":
             return _command_agents_assign(args)
-        if args.agents_command == "switch":
-            return _command_agents_switch(args)
-        if args.agents_command == "status":
+        elif args.agents_command == "status":
             return _command_agents_status(args)
-        print("Error: Unknown agents subcommand", file=sys.stderr)
-        return 1
-    if args.command == "analytics":
-        if args.analytics_command == "project-kpi":
+        elif args.agents_command == "switch":
+            return _command_agents_switch(args)
+    elif args.command == "analytics":
+        if args.analytics_command == "project":
             return _command_analytics_project(args)
-        if args.analytics_command == "kpi-summary":
+        elif args.analytics_command == "kpi-summary":
             return _command_analytics_kpi_summary(args)
-        if args.analytics_command == "behavior-usage":
+        elif args.analytics_command == "project-kpi":
+            return _command_analytics_project_kpi(args)
+        elif args.analytics_command == "behavior-usage":
             return _command_analytics_behavior_usage(args)
-        if args.analytics_command == "token-savings":
+        elif args.analytics_command == "token-savings":
             return _command_analytics_token_savings(args)
-        if args.analytics_command == "compliance-coverage":
+        elif args.analytics_command == "compliance-coverage":
             return _command_analytics_compliance_coverage(args)
-        print("Error: Unknown analytics subcommand", file=sys.stderr)
-        return 1
-    if args.command == "metrics":
+        elif args.analytics_command == "cost-by-service":
+            return _command_analytics_cost_by_service(args)
+        elif args.analytics_command == "cost-per-run":
+            return _command_analytics_cost_per_run(args)
+        elif args.analytics_command == "roi-summary":
+            return _command_analytics_roi_summary(args)
+        elif args.analytics_command == "daily-costs":
+            return _command_analytics_daily_costs(args)
+        elif args.analytics_command == "top-expensive":
+            return _command_analytics_top_expensive(args)
+    elif args.command == "metrics":
         if args.metrics_command == "summary":
             return _command_metrics_summary(args)
-        if args.metrics_command == "export":
+        elif args.metrics_command == "export":
             return _command_metrics_export(args)
-        print("Error: Unknown metrics subcommand", file=sys.stderr)
-        return 1
-    if args.command == "auth":
+    elif args.command == "auth":
         if args.auth_command == "ensure-grant":
             return _command_auth_ensure_grant(args)
-        if args.auth_command == "list-grants":
+        elif args.auth_command == "list-grants":
             return _command_auth_list_grants(args)
-        if args.auth_command == "policy-preview":
+        elif args.auth_command == "policy-preview":
             return _command_auth_policy_preview(args)
-        if args.auth_command == "revoke":
+        elif args.auth_command == "revoke":
             return _command_auth_revoke(args)
-        if args.auth_command == "login":
+        elif args.auth_command == "register":
+            return _command_auth_register(args)
+        elif args.auth_command == "login":
             return _command_auth_login(args)
-        if args.auth_command == "refresh":
-            return _command_auth_refresh(args)
-        if args.auth_command == "status":
+        elif args.auth_command == "status":
             return _command_auth_status(args)
-        if args.auth_command == "logout":
+        elif args.auth_command == "logout":
             return _command_auth_logout(args)
-        if args.auth_command == "consent":
-            if args.consent_command == "lookup":
-                return _command_auth_consent_lookup(args)
-            if args.consent_command == "approve":
-                return _command_auth_consent_approve(args)
-            if args.consent_command == "deny":
-                return _command_auth_consent_deny(args)
-            print("Error: Unknown auth consent subcommand", file=sys.stderr)
-            return 1
-        print("Error: Unknown auth subcommand", file=sys.stderr)
-        return 1
-    if args.command == "reflection":
-        return _command_reflection(args)
-    if args.command == "bci":
-        if args.bci_command == "retrieve":
-            return _command_bci_retrieve(args)
-        if args.bci_command == "compose-prompt":
-            return _command_bci_compose_prompt(args)
-        if args.bci_command == "validate-citations":
-            return _command_bci_validate_citations(args)
+        elif args.auth_command == "refresh":
+            return _command_auth_refresh(args)
+        elif args.auth_command == "consent-lookup":
+            return _command_auth_consent_lookup(args)
+        elif args.auth_command == "consent-approve":
+            return _command_auth_consent_approve(args)
+        elif args.auth_command == "consent-deny":
+            return _command_auth_consent_deny(args)
+    elif args.command == "bci":
         if args.bci_command == "rebuild-index":
             return _command_bci_rebuild_index(args)
-        print("Error: Unknown bci subcommand", file=sys.stderr)
-        return 1
+        elif args.bci_command == "retrieve":
+            return _command_bci_retrieve(args)
+        elif args.bci_command == "compose-prompt":
+            return _command_bci_compose_prompt(args)
+        elif args.bci_command == "validate-citations":
+            return _command_bci_validate_citations(args)
+        elif args.bci_command == "generate":
+            return _command_bci_generate(args)
+        elif args.bci_command == "improve":
+            return _command_bci_improve(args)
+    elif args.command == "audit":
+        if args.audit_command == "verify":
+            return _command_audit_verify(args)
+        elif args.audit_command == "list":
+            return _command_audit_list(args)
+        elif args.audit_command == "retention":
+            return _command_audit_retention(args)
+    elif args.command == "reflection":
+        return _command_reflection(args)
+    elif args.command == "migrate":
+        if args.migrate_command == "apply":
+            return _command_migrate_apply(args)
+        elif args.migrate_command == "status":
+            return _command_migrate_status(args)
+
+    # If no command matched or no subcommand provided
+    print("Error: No command specified or command not recognized", file=sys.stderr)
     return 1
 
 

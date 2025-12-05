@@ -15,6 +15,20 @@ import pytest
 from guideai.analytics.warehouse import AnalyticsWarehouse
 
 
+@pytest.fixture(scope="module")
+def api_app():
+    """Create FastAPI app once for all tests in this module (caches model loading)."""
+    from guideai.api import create_app
+    return create_app()
+
+
+@pytest.fixture(scope="module")
+def api_client(api_app):
+    """Create FastAPI test client once for all tests."""
+    from fastapi.testclient import TestClient
+    return TestClient(api_app)
+
+
 class TestAnalyticsParity:
     """Test suite ensuring analytics data consistency across surfaces."""
 
@@ -91,16 +105,9 @@ class TestAnalyticsParity:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pytest.skip("CLI command not yet implemented or not in PATH")
 
-    def test_rest_api_kpi_summary_endpoint(self) -> None:
+    def test_rest_api_kpi_summary_endpoint(self, api_client) -> None:
         """Verify REST API /v1/analytics/kpi-summary endpoint structure."""
-        # Import here to avoid circular dependencies
-        from guideai.api import create_app
-        from fastapi.testclient import TestClient
-
-        app = create_app()
-        client = TestClient(app)
-
-        response = client.get("/v1/analytics/kpi-summary")
+        response = api_client.get("/v1/analytics/kpi-summary?limit=10")
         assert response.status_code == 200
 
         data = response.json()
@@ -115,15 +122,9 @@ class TestAnalyticsParity:
             assert "average_token_savings_pct" in record
             assert "task_completion_rate_pct" in record
 
-    def test_rest_api_behavior_usage_endpoint(self) -> None:
+    def test_rest_api_behavior_usage_endpoint(self, api_client) -> None:
         """Verify REST API /v1/analytics/behavior-usage endpoint structure."""
-        from guideai.api import create_app
-        from fastapi.testclient import TestClient
-
-        app = create_app()
-        client = TestClient(app)
-
-        response = client.get("/v1/analytics/behavior-usage?limit=10")
+        response = api_client.get("/v1/analytics/behavior-usage?limit=10")
         assert response.status_code == 200
 
         data = response.json()
@@ -131,15 +132,9 @@ class TestAnalyticsParity:
         assert "count" in data
         assert isinstance(data["records"], list)
 
-    def test_rest_api_token_savings_endpoint(self) -> None:
+    def test_rest_api_token_savings_endpoint(self, api_client) -> None:
         """Verify REST API /v1/analytics/token-savings endpoint structure."""
-        from guideai.api import create_app
-        from fastapi.testclient import TestClient
-
-        app = create_app()
-        client = TestClient(app)
-
-        response = client.get("/v1/analytics/token-savings?limit=10")
+        response = api_client.get("/v1/analytics/token-savings?limit=10")
         assert response.status_code == 200
 
         data = response.json()
@@ -147,15 +142,10 @@ class TestAnalyticsParity:
         assert "count" in data
         assert isinstance(data["records"], list)
 
-    def test_rest_api_compliance_coverage_endpoint(self) -> None:
+    @pytest.mark.timeout(180)  # Model loading can take > 60s
+    def test_rest_api_compliance_coverage_endpoint(self, api_client) -> None:
         """Verify REST API /v1/analytics/compliance-coverage endpoint structure."""
-        from guideai.api import create_app
-        from fastapi.testclient import TestClient
-
-        app = create_app()
-        client = TestClient(app)
-
-        response = client.get("/v1/analytics/compliance-coverage?limit=10")
+        response = api_client.get("/v1/analytics/compliance-coverage?limit=10")
         assert response.status_code == 200
 
         data = response.json()

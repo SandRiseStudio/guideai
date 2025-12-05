@@ -158,8 +158,10 @@ GUIDEAI_MIGRATION_BATCH_SIZE=1000
 2. `guideai/workflow_service.py` - Backup created (pending conversion)
 
 ### Backup Files Created
-1. `guideai/behavior_service_sqlite_backup.py` - Original SQLite implementation
-2. `guideai/workflow_service_sqlite_backup.py` - Original SQLite implementation
+> **Note:** Backup files have been archived to `guideai/_archive/` as of 2025-12-02.
+
+1. `guideai/_archive/behavior_service_sqlite_backup.py` - Original SQLite implementation
+2. `guideai/_archive/workflow_service_sqlite_backup.py` - Original SQLite implementation
 
 ### Key API Changes
 

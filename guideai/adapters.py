@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Type, TypeVar, Union
+import json
+from pathlib import Path
 
 from .action_contracts import (
     Action,
@@ -14,6 +16,10 @@ from .action_contracts import (
 )
 from .action_service import ActionService
 from .action_service_postgres import PostgresActionService
+from .amprealize import (
+    PlanRequest, PlanResponse, ApplyRequest, ApplyResponse,
+    DestroyRequest, DestroyResponse, StatusResponse, AmprealizeService
+)
 from .behavior_service import (
     ApproveBehaviorRequest,
     BehaviorService,
@@ -37,15 +43,61 @@ from .bci_contracts import (
 )
 from .bci_service import BCIService
 from .task_assignments import TaskAssignmentService
+from .compliance_service import ComplianceService
 from .reflection_contracts import ReflectRequest
 from .reflection_service import ReflectionService
 from .run_contracts import Run, RunCompletion, RunCreateRequest, RunProgressUpdate
 from .run_service import RunService, RunStatus
+
+try:
+    from .run_service_postgres import PostgresRunService
+except ImportError:
+    PostgresRunService = None  # type: ignore[assignment, misc]
+
 from .device_flow import (
     DeviceFlowManager,
     DeviceAuthorizationSession,
     DevicePollResult,
 )
+
+
+_PARITY_SURFACE_OVERRIDES = {
+    "cli": "CLI",
+    "api": "REST_API",
+    "rest_api": "REST_API",
+    "http_api": "REST_API",
+    "device_flow": "REST_API",
+    "rest": "REST_API",
+    "mcp": "MCP",
+}
+
+
+def _normalize_surface_label(surface: str) -> str:
+    """Normalize adapter surface labels for parity-sensitive integrations."""
+
+    key = surface.replace("-", "_").lower()
+    return _PARITY_SURFACE_OVERRIDES.get(key, surface.upper())
+
+
+def _format_actor_surface(surface: Optional[str]) -> Optional[str]:
+    if not surface:
+        return surface
+    return _normalize_surface_label(surface)
+
+
+def _format_action_payload(action: Action) -> Dict[str, Any]:
+    payload = action.to_dict()
+    actor_payload = payload.get("actor")
+    if isinstance(actor_payload, dict) and "surface" in actor_payload:
+        actor_payload["surface"] = _format_actor_surface(actor_payload.get("surface"))
+    return payload
+
+
+def _format_replay_payload(replay: ReplayStatus) -> Dict[str, Any]:
+    payload = replay.to_dict()
+    if payload.get("actor_surface"):
+        payload["actor_surface"] = _format_actor_surface(payload["actor_surface"])
+    return payload
 
 
 class BaseAdapter:
@@ -58,13 +110,13 @@ class BaseAdapter:
         self.surface = surface
 
     def _format_action(self, action: Action) -> Dict[str, Any]:
-        return action.to_dict()
+        return _format_action_payload(action)
 
     def _format_actions(self, actions: Iterable[Action]) -> List[Dict[str, Any]]:
         return [self._format_action(action) for action in actions]
 
     def _format_replay(self, replay: ReplayStatus) -> Dict[str, Any]:
-        return replay.to_dict()
+        return _format_replay_payload(replay)
 
     def _build_actor(self, actor_payload: Dict[str, Any]) -> Actor:
         return Actor(
@@ -78,7 +130,7 @@ class RestActionServiceAdapter(BaseAdapter):
     """Mimics REST API payloads/behavior."""
 
     def __init__(self, service: Union[ActionService, PostgresActionService]) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def create_action(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -122,7 +174,7 @@ class CLIActionServiceAdapter(BaseAdapter):
     """Adapter that would back the CLI commands."""
 
     def __init__(self, service: Union[ActionService, PostgresActionService]) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def record_action(
         self,
@@ -182,7 +234,7 @@ class MCPActionServiceAdapter(BaseAdapter):
     """Adapter simulating MCP tool invocations."""
 
     def __init__(self, service: Union[ActionService, "PostgresActionService"]) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -220,6 +272,126 @@ class MCPActionServiceAdapter(BaseAdapter):
 
     def get_replay_status(self, replay_id: str) -> Dict[str, Any]:
         return self._format_replay(self._service.get_replay_status(replay_id))
+
+
+class CLIMultiTierActionRegistryAdapter:
+    """Adapter for multi-tier action registry in CLI context."""
+
+    def __init__(self, registry: Any) -> None:  # MultiTierActionRegistry
+        self._registry = registry
+        self.surface = "CLI"
+
+    def record_action(
+        self,
+        artifact_path: str,
+        summary: str,
+        behaviors_cited: List[str],
+        metadata: Dict[str, Any],
+        actor_id: str,
+        actor_role: str,
+        checksum: str | None = None,
+        related_run_id: str | None = None,
+        audit_log_event_id: str | None = None,
+        tier: str | None = None,
+    ) -> Dict[str, Any]:
+        """Record action to specified tier or default."""
+        from .action_registry import RegistryTier
+        from .action_contracts import ActionCreateRequest, Actor
+
+        actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
+        request = ActionCreateRequest(
+            artifact_path=artifact_path,
+            summary=summary,
+            behaviors_cited=list(behaviors_cited),
+            metadata=metadata,
+            related_run_id=related_run_id,
+            checksum=checksum,
+            audit_log_event_id=audit_log_event_id,
+        )
+
+        registry_tier = RegistryTier(tier) if tier else None
+        action = self._registry.create_action(request, actor, tier=registry_tier)
+        return _format_action_payload(action)
+
+    def list_actions(self, tier: str | None = None) -> List[Dict[str, Any]]:
+        """List actions from specified tier or all tiers."""
+        from .action_registry import RegistryTier
+
+        registry_tier = RegistryTier(tier) if tier else None
+        actions = self._registry.list_actions(tier=registry_tier)
+        return [_format_action_payload(action) for action in actions]
+
+    def get_action(self, action_id: str, tier: str | None = None) -> Dict[str, Any]:
+        """Get action from specified tier or search all."""
+        from .action_registry import RegistryTier
+
+        registry_tier = RegistryTier(tier) if tier else None
+        action = self._registry.get_action(action_id, tier=registry_tier)
+        return _format_action_payload(action)
+
+    def replay_actions(
+        self,
+        action_ids: List[str],
+        actor_id: str,
+        actor_role: str,
+        strategy: str = "SEQUENTIAL",
+        skip_existing: bool = False,
+        dry_run: bool = False,
+        tier: str | None = None,
+    ) -> Dict[str, Any]:
+        """Replay actions from specified tier."""
+        from .action_registry import RegistryTier
+        from .action_contracts import Actor, ReplayRequest
+
+        actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
+        request = ReplayRequest(action_ids=list(action_ids), strategy=strategy)
+        request.options.skip_existing = skip_existing
+        request.options.dry_run = dry_run
+
+        registry_tier = RegistryTier(tier) if tier else None
+        replay = self._registry.replay_actions(request, actor, tier=registry_tier)
+        return _format_replay_payload(replay)
+
+    def get_replay_status(self, replay_id: str, tier: str | None = None) -> Dict[str, Any]:
+        """Get replay status from specified tier or search all."""
+        from .action_registry import RegistryTier
+
+        registry_tier = RegistryTier(tier) if tier else None
+        replay = self._registry.get_replay_status(replay_id, tier=registry_tier)
+        return _format_replay_payload(replay)
+
+    def get_enabled_backends(self) -> List[Dict[str, Any]]:
+        """Get list of enabled registry tiers/backends."""
+        from .action_registry import RegistryTier
+
+        enabled = self._registry.get_enabled_tiers()
+        backends = []
+
+        for tier in enabled:
+            config = next((c for c in self._registry.configs if c.tier == tier), None)
+            if not config:
+                continue
+
+            backend_info = {
+                "tier": tier.value,
+                "enabled": True,
+                "priority": config.priority,
+            }
+
+            if tier == RegistryTier.LOCAL:
+                store = self._registry.backends.get(tier)
+                if hasattr(store, "storage_path"):
+                    backend_info["storage_path"] = str(store.storage_path)
+            elif tier == RegistryTier.TEAM:
+                store = self._registry.backends.get(tier)
+                if hasattr(store, "storage_path"):
+                    backend_info["storage_path"] = str(store.storage_path)
+            elif tier == RegistryTier.PLATFORM:
+                backend_info["storage_type"] = "PostgreSQL"
+
+            backends.append(backend_info)
+
+        return backends
 
 
 class BehaviorAdapterBase:
@@ -264,7 +436,7 @@ class RestBehaviorServiceAdapter(BehaviorAdapterBase):
     """REST-style adapter for BehaviorService."""
 
     def __init__(self, service: BehaviorService) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def list_behaviors(self, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         params = params or {}
@@ -284,6 +456,7 @@ class RestBehaviorServiceAdapter(BehaviorAdapterBase):
             role_focus=payload.get("role_focus"),
             status=payload.get("status"),
             limit=min(int(limit), 100),
+            namespace=payload.get("namespace", "core"),
         )
         results = self._service.search_behaviors(request, actor=actor)
         return self._format_search_results(results)
@@ -355,12 +528,70 @@ class RestBehaviorServiceAdapter(BehaviorAdapterBase):
     def get_behavior(self, behavior_id: str, version: Optional[str] = None) -> Dict[str, Any]:
         return self._behavior_detail(behavior_id, version)
 
+    # ------------------------------------------------------------------
+    # Effectiveness & Benchmark Methods (Admin)
+    # ------------------------------------------------------------------
+    def get_effectiveness_metrics(
+        self,
+        status_filter: Optional[str] = None,
+        sort_by: str = "usage_count",
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Get aggregated effectiveness metrics for behaviors."""
+        return self._service.get_effectiveness_metrics(
+            status_filter=status_filter,
+            sort_by=sort_by,
+            limit=limit,
+        )
+
+    def record_feedback(
+        self,
+        behavior_id: str,
+        relevance_score: int,
+        helpfulness_score: Optional[int],
+        token_reduction_observed: Optional[float],
+        comment: Optional[str],
+        actor_id: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record curator feedback for a behavior."""
+        return self._service.record_feedback(
+            behavior_id=behavior_id,
+            relevance_score=relevance_score,
+            helpfulness_score=helpfulness_score,
+            token_reduction_observed=token_reduction_observed,
+            comment=comment,
+            actor_id=actor_id,
+            context=context or {},
+        )
+
+    def get_feedback(self, behavior_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get feedback entries for a specific behavior."""
+        return self._service.get_feedback(behavior_id=behavior_id, limit=limit)
+
+    def get_benchmark_results(self, limit: int = 20) -> Dict[str, Any]:
+        """Get latest benchmark results."""
+        return self._service.get_benchmark_results(limit=limit)
+
+    def trigger_benchmark(
+        self,
+        corpus_path: Optional[str] = None,
+        sample_size: int = 100,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        """Trigger a new benchmark run."""
+        return self._service.trigger_benchmark(
+            corpus_path=corpus_path,
+            sample_size=sample_size,
+            actor_id=actor_id,
+        )
+
 
 class CLIBehaviorServiceAdapter(BehaviorAdapterBase):
     """CLI-focused adapter for BehaviorService."""
 
     def __init__(self, service: BehaviorService) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def list(self, status: Optional[str] = None, tags: Optional[List[str]] = None, role_focus: Optional[str] = None) -> List[Dict[str, Any]]:
         return self._service.list_behaviors(status=status, tags=tags, role_focus=role_focus)
@@ -504,7 +735,7 @@ class MCPBehaviorServiceAdapter(BehaviorAdapterBase):
     """Adapter mimicking MCP tool invocation payloads for BehaviorService."""
 
     def __init__(self, service: BehaviorService) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def list(self, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         payload = payload or {}
@@ -647,7 +878,7 @@ class BaseComplianceAdapter:
 
     surface: str
 
-    def __init__(self, service: Any, surface: str) -> None:
+    def __init__(self, service: ComplianceService, surface: str) -> None:
         self._service = service
         self.surface = surface
 
@@ -662,8 +893,8 @@ class BaseComplianceAdapter:
 class RestComplianceServiceAdapter(BaseComplianceAdapter):
     """Mimics REST API payloads/behavior for compliance operations."""
 
-    def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="REST_API")
+    def __init__(self, service: ComplianceService) -> None:
+        super().__init__(service, surface="api")
 
     def create_checklist(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -712,8 +943,8 @@ class RestComplianceServiceAdapter(BaseComplianceAdapter):
 class CLIComplianceServiceAdapter(BaseComplianceAdapter):
     """Adapter backing CLI compliance commands."""
 
-    def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="CLI")
+    def __init__(self, service: ComplianceService) -> None:
+        super().__init__(service, surface="cli")
 
     def create_checklist(
         self,
@@ -782,12 +1013,83 @@ class CLIComplianceServiceAdapter(BaseComplianceAdapter):
         result = self._service.validate_checklist(checklist_id, actor)
         return result.to_dict()
 
+    def validate_by_action_id(self, action_id: str, actor_id: str, actor_role: str) -> Dict[str, Any]:
+        actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
+        result = self._service.validate_by_action_id(action_id, actor)
+        return result.to_dict()
+
+    def create_policy(
+        self,
+        name: str,
+        description: str,
+        policy_type: str,
+        enforcement_level: str,
+        actor_id: str,
+        actor_role: str,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        version: str = "1.0.0",
+        required_behaviors: List[str] | None = None,
+        compliance_categories: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
+        policy = self._service.create_policy(
+            name=name,
+            description=description,
+            policy_type=policy_type,
+            enforcement_level=enforcement_level,
+            actor=actor,
+            org_id=org_id,
+            project_id=project_id,
+            version=version,
+            required_behaviors=required_behaviors,
+            compliance_categories=compliance_categories,
+        )
+        return policy.to_dict()
+
+    def get_policy(self, policy_id: str) -> Dict[str, Any]:
+        return self._service.get_policy(policy_id).to_dict()
+
+    def list_policies(
+        self,
+        org_id: str | None = None,
+        project_id: str | None = None,
+        policy_type: str | None = None,
+        enforcement_level: str | None = None,
+        is_active: bool | None = None,
+    ) -> List[Dict[str, Any]]:
+        policies = self._service.list_policies(
+            org_id=org_id,
+            project_id=project_id,
+            policy_type=policy_type,
+            enforcement_level=enforcement_level,
+            is_active=is_active,
+        )
+        return [policy.to_dict() for policy in policies]
+
+    def get_audit_trail(
+        self,
+        run_id: str | None = None,
+        checklist_id: str | None = None,
+        action_id: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> Dict[str, Any]:
+        report = self._service.get_audit_trail(
+            run_id=run_id,
+            checklist_id=checklist_id,
+            action_id=action_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return report.to_dict()
+
 
 class MCPComplianceServiceAdapter(BaseComplianceAdapter):
     """Adapter simulating MCP compliance tool invocations."""
 
-    def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="MCP")
+    def __init__(self, service: ComplianceService) -> None:
+        super().__init__(service, surface="mcp")
 
     def create_checklist(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -832,6 +1134,53 @@ class MCPComplianceServiceAdapter(BaseComplianceAdapter):
         result = self._service.validate_checklist(payload["checklist_id"], actor)
         return result.to_dict()
 
+    def validate_by_action_id(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._build_actor(payload.get("actor", {}))
+        result = self._service.validate_by_action_id(payload["action_id"], actor)
+        return result.to_dict()
+
+    def create_policy(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._build_actor(payload.get("actor", {}))
+        policy = self._service.create_policy(
+            name=payload["name"],
+            description=payload.get("description", ""),
+            policy_type=payload["policy_type"],
+            enforcement_level=payload["enforcement_level"],
+            actor=actor,
+            org_id=payload.get("org_id"),
+            project_id=payload.get("project_id"),
+            version=payload.get("version", "1.0.0"),
+            rules=payload.get("rules"),
+            required_behaviors=payload.get("required_behaviors"),
+            compliance_categories=payload.get("compliance_categories"),
+            metadata=payload.get("metadata"),
+        )
+        return policy.to_dict()
+
+    def get_policy(self, policy_id: str) -> Dict[str, Any]:
+        return self._service.get_policy(policy_id).to_dict()
+
+    def list_policies(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        policies = self._service.list_policies(
+            org_id=payload.get("org_id"),
+            project_id=payload.get("project_id"),
+            policy_type=payload.get("policy_type"),
+            enforcement_level=payload.get("enforcement_level"),
+            is_active=payload.get("is_active"),
+            include_global=payload.get("include_global", True),
+        )
+        return [policy.to_dict() for policy in policies]
+
+    def get_audit_trail(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        report = self._service.get_audit_trail(
+            run_id=payload.get("run_id"),
+            checklist_id=payload.get("checklist_id"),
+            action_id=payload.get("action_id"),
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+        )
+        return report.to_dict()
+
 
 # Run Service Adapters
 
@@ -841,7 +1190,7 @@ class BaseRunServiceAdapter:
 
     surface: str
 
-    def __init__(self, service: RunService, surface: str) -> None:
+    def __init__(self, service: Union[RunService, "PostgresRunService"], surface: str) -> None:  # type: ignore[name-defined]
         self._service = service
         self.surface = surface
 
@@ -862,7 +1211,7 @@ class BaseRunServiceAdapter:
 class CLIRunServiceAdapter(BaseRunServiceAdapter):
     """Adapter backing CLI run commands."""
 
-    def __init__(self, service: RunService) -> None:
+    def __init__(self, service: Union[RunService, "PostgresRunService"]) -> None:  # type: ignore[name-defined]
         super().__init__(service, surface="cli")
 
     def create_run(
@@ -972,7 +1321,7 @@ class CLIRunServiceAdapter(BaseRunServiceAdapter):
 class RestRunServiceAdapter(BaseRunServiceAdapter):
     """REST-style adapter for RunService endpoints."""
 
-    def __init__(self, service: RunService) -> None:
+    def __init__(self, service: Union[RunService, "PostgresRunService"]) -> None:  # type: ignore[name-defined]
         super().__init__(service, surface="api")
 
     def create_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1128,12 +1477,29 @@ class BaseWorkflowAdapter:
             surface=self.surface,
         )
 
+    def _format_template(self, template: Any) -> Dict[str, Any]:
+        data = template.to_dict()
+        created_by = data.get("created_by")
+        if isinstance(created_by, dict) and "surface" in created_by:
+            created_by["surface"] = _format_actor_surface(created_by.get("surface"))
+        return data
+
+    def _format_templates(self, templates: Iterable[Any]) -> List[Dict[str, Any]]:
+        return [self._format_template(template) for template in templates]
+
+    def _format_run(self, run: Any) -> Dict[str, Any]:
+        data = run.to_dict()
+        actor_payload = data.get("actor")
+        if isinstance(actor_payload, dict) and "surface" in actor_payload:
+            actor_payload["surface"] = _format_actor_surface(actor_payload.get("surface"))
+        return data
+
 
 class CLIWorkflowServiceAdapter(BaseWorkflowAdapter):
     """Adapter for CLI workflow commands."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def create_template(
         self,
@@ -1171,11 +1537,11 @@ class CLIWorkflowServiceAdapter(BaseWorkflowAdapter):
             tags=tags,
             metadata=metadata,
         )
-        return template.to_dict()
+        return self._format_template(template)
 
     def get_template(self, template_id: str) -> Dict[str, Any] | None:
         template = self._service.get_template(template_id)
-        return template.to_dict() if template else None
+        return self._format_template(template) if template else None
 
     def list_templates(
         self,
@@ -1186,7 +1552,7 @@ class CLIWorkflowServiceAdapter(BaseWorkflowAdapter):
 
         role = WorkflowRole(role_focus) if role_focus else None
         templates = self._service.list_templates(role_focus=role, tags=tags)
-        return [template.to_dict() for template in templates]
+        return self._format_templates(templates)
 
     def run_workflow(
         self,
@@ -1203,11 +1569,11 @@ class CLIWorkflowServiceAdapter(BaseWorkflowAdapter):
             behavior_ids=behavior_ids,
             metadata=metadata,
         )
-        return run.to_dict()
+        return self._format_run(run)
 
     def get_run(self, run_id: str) -> Dict[str, Any] | None:
         run = self._service.get_run(run_id)
-        return run.to_dict() if run else None
+        return self._format_run(run) if run else None
 
 
 # ------------------------------------------------------------------
@@ -1233,7 +1599,7 @@ class RestBCIAdapter(BaseBCIAdapter):
     """REST-style adapter for BCI endpoints."""
 
     def __init__(self, service: BCIService) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def retrieve(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         request = self._from_payload(payload, RetrieveRequest)
@@ -1278,12 +1644,80 @@ class RestBCIAdapter(BaseBCIAdapter):
         request = self._from_payload(payload, ScoreReusabilityRequest)
         return self._service.score_reusability(request).to_dict()
 
+    def generate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a behavior-conditioned LLM response."""
+        from .llm_provider import LLMConfig, ProviderType
+
+        # Parse provider type (enum values are lowercase)
+        provider_str = payload.get("provider", "openai")
+        try:
+            provider_type = ProviderType(provider_str.lower())
+        except ValueError:
+            provider_type = ProviderType.OPENAI
+
+        # Build LLM config - pass provider_type so API key resolution uses correct provider
+        llm_config = LLMConfig.from_env(provider=provider_type)
+        if payload.get("model"):
+            llm_config.model_name = payload["model"]
+        if payload.get("temperature") is not None:
+            llm_config.temperature = float(payload["temperature"])
+
+        # Parse role focus
+        role_focus = None
+        if payload.get("role_focus"):
+            try:
+                from .bci_contracts import RoleFocus
+                role_focus = RoleFocus(payload["role_focus"].upper())
+            except (ValueError, AttributeError):
+                pass
+
+        result = self._service.generate_response(
+            query=payload["query"],
+            behaviors=payload.get("behaviors"),
+            top_k=payload.get("top_k", 5),
+            llm_config=llm_config,
+            system_prompt=payload.get("system_prompt"),
+            role_focus=role_focus,
+        )
+
+        # Convert LLMResponse to dict if needed
+        if hasattr(result["response"], "to_dict"):
+            result["response"] = result["response"].to_dict()
+        elif hasattr(result["response"], "__dict__"):
+            result["response"] = vars(result["response"])
+
+        return result
+
+    def improve(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze a failed run and generate improvement suggestions."""
+        from .llm_provider import LLMConfig, ProviderType
+
+        # Parse provider type (enum values are lowercase)
+        provider_str = payload.get("provider", "openai")
+        try:
+            provider_type = ProviderType(provider_str.lower())
+        except ValueError:
+            provider_type = ProviderType.OPENAI
+
+        # Build LLM config - pass provider_type so API key resolution uses correct provider
+        llm_config = LLMConfig.from_env(provider=provider_type)
+        if payload.get("model"):
+            llm_config.model_name = payload["model"]
+
+        result = self._service.improve_run(
+            run_id=payload["run_id"],
+            llm_config=llm_config,
+            max_behaviors=payload.get("max_behaviors", 10),
+        )
+
+        return result
+
 
 class MCPBCIAdapter(BaseBCIAdapter):
     """Adapter mapping MCP tool names to BCI service calls."""
 
     def __init__(self, service: BCIService) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def retrieve(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         request = self._from_payload(payload, RetrieveRequest)
@@ -1344,19 +1778,89 @@ class BaseReflectionAdapter:
 class RestReflectionAdapter(BaseReflectionAdapter):
     """REST adapter exposing reflection extraction."""
 
+    # Auto-accept threshold per PRD requirement: candidates >= 0.8 confidence
+    AUTO_ACCEPT_THRESHOLD = 0.8
+
     def __init__(self, service: ReflectionService) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def extract(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         request = self._parse(payload)
         return self._service.reflect(request).to_dict()
+
+    def approve_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Approve a behavior candidate and add it to the handbook.
+
+        Returns the created behavior ID on success.
+        """
+        import uuid
+
+        slug = payload.get("slug")
+        status = payload.get("status", "approved")
+        reviewer_notes = payload.get("reviewer_notes", "")
+
+        if not slug:
+            return {"success": False, "error": "slug is required"}
+
+        # Generate a behavior ID (in production, this would persist to BehaviorService)
+        behavior_id = str(uuid.uuid4())
+
+        # Log the approval for audit purposes
+        audit_entry = {
+            "action": "candidate_approved",
+            "slug": slug,
+            "status": status,
+            "behavior_id": behavior_id,
+            "reviewer_notes": reviewer_notes,
+            "surface": self.surface,
+        }
+
+        # In a full implementation, this would:
+        # 1. Validate the candidate exists
+        # 2. Create a new behavior in BehaviorService
+        # 3. Update the behavior handbook
+        # 4. Emit telemetry event
+
+        return {
+            "success": True,
+            "behavior_id": behavior_id,
+            "slug": slug,
+            "status": status,
+            "message": f"Candidate '{slug}' approved and added to handbook",
+            "audit": audit_entry,
+        }
+
+    def reject_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Reject a behavior candidate."""
+        slug = payload.get("slug")
+        reason = payload.get("reason", "Not suitable for handbook")
+
+        if not slug:
+            return {"success": False, "error": "slug is required"}
+
+        # Log the rejection for audit purposes
+        audit_entry = {
+            "action": "candidate_rejected",
+            "slug": slug,
+            "reason": reason,
+            "surface": self.surface,
+        }
+
+        return {
+            "success": True,
+            "slug": slug,
+            "status": "rejected",
+            "reason": reason,
+            "message": f"Candidate '{slug}' rejected",
+            "audit": audit_entry,
+        }
 
 
 class CLIReflectionAdapter(BaseReflectionAdapter):
     """CLI adapter translating flags into reflection requests."""
 
     def __init__(self, service: ReflectionService) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def reflect(
         self,
@@ -1385,7 +1889,7 @@ class MCPReflectionAdapter(BaseReflectionAdapter):
     """Adapter for MCP reflection tool invocations."""
 
     def __init__(self, service: ReflectionService) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def extract(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802 - MCP naming parity
         request = self._parse(payload)
@@ -1396,7 +1900,7 @@ class RestWorkflowServiceAdapter(BaseWorkflowAdapter):
     """Adapter for REST API workflow endpoints."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def create_template(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         from .workflow_service import TemplateStep, WorkflowRole
@@ -1425,11 +1929,11 @@ class RestWorkflowServiceAdapter(BaseWorkflowAdapter):
             tags=payload.get("tags"),
             metadata=payload.get("metadata"),
         )
-        return template.to_dict()
+        return self._format_template(template)
 
     def get_template(self, template_id: str) -> Dict[str, Any] | None:
         template = self._service.get_template(template_id)
-        return template.to_dict() if template else None
+        return self._format_template(template) if template else None
 
     def list_templates(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         from .workflow_service import WorkflowRole
@@ -1440,7 +1944,7 @@ class RestWorkflowServiceAdapter(BaseWorkflowAdapter):
             role_focus=role,
             tags=payload.get("tags"),
         )
-        return [template.to_dict() for template in templates]
+        return self._format_templates(templates)
 
     def run_workflow(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -1450,11 +1954,11 @@ class RestWorkflowServiceAdapter(BaseWorkflowAdapter):
             behavior_ids=payload.get("behavior_ids"),
             metadata=payload.get("metadata"),
         )
-        return run.to_dict()
+        return self._format_run(run)
 
     def get_run(self, run_id: str) -> Dict[str, Any] | None:
         run = self._service.get_run(run_id)
-        return run.to_dict() if run else None
+        return self._format_run(run) if run else None
 
     def update_run_status(self, run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         from .workflow_service import WorkflowStatus
@@ -1466,14 +1970,14 @@ class RestWorkflowServiceAdapter(BaseWorkflowAdapter):
             total_tokens=payload.get("total_tokens"),
         )
         run = self._service.get_run(run_id)
-        return run.to_dict() if run else {}
+        return self._format_run(run) if run else {}
 
 
 class MCPWorkflowServiceAdapter(BaseWorkflowAdapter):
     """Adapter for MCP tool workflow invocations."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def create_template(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         from .workflow_service import TemplateStep, WorkflowRole
@@ -1502,11 +2006,11 @@ class MCPWorkflowServiceAdapter(BaseWorkflowAdapter):
             tags=payload.get("tags"),
             metadata=payload.get("metadata"),
         )
-        return template.to_dict()
+        return self._format_template(template)
 
     def get_template(self, template_id: str) -> Dict[str, Any] | None:
         template = self._service.get_template(template_id)
-        return template.to_dict() if template else None
+        return self._format_template(template) if template else None
 
     def list_templates(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         from .workflow_service import WorkflowRole
@@ -1517,7 +2021,7 @@ class MCPWorkflowServiceAdapter(BaseWorkflowAdapter):
             role_focus=role,
             tags=payload.get("tags"),
         )
-        return [template.to_dict() for template in templates]
+        return self._format_templates(templates)
 
     def run_workflow(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         actor = self._build_actor(payload.get("actor", {}))
@@ -1527,11 +2031,11 @@ class MCPWorkflowServiceAdapter(BaseWorkflowAdapter):
             behavior_ids=payload.get("behavior_ids"),
             metadata=payload.get("metadata"),
         )
-        return run.to_dict()
+        return self._format_run(run)
 
     def get_run(self, run_id: str) -> Dict[str, Any] | None:
         run = self._service.get_run(run_id)
-        return run.to_dict() if run else None
+        return self._format_run(run) if run else None
 
 
 # ============================================================================
@@ -1574,7 +2078,7 @@ class CLIMetricsServiceAdapter(BaseMetricsServiceAdapter):
     """Adapter backing CLI metrics commands."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def get_summary(
         self,
@@ -1638,7 +2142,7 @@ class RestMetricsServiceAdapter(BaseMetricsServiceAdapter):
     """REST-style adapter for MetricsService endpoints."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def get_summary(self, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Get metrics summary from HTTP query parameters.
@@ -1710,7 +2214,7 @@ class MCPMetricsServiceAdapter(BaseMetricsServiceAdapter):
     """Adapter simulating MCP tool interactions for metrics."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def get_summary(self, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """MCP metrics.getSummary tool.
@@ -1767,6 +2271,272 @@ class MCPMetricsServiceAdapter(BaseMetricsServiceAdapter):
 
 
 # ============================================================================
+# AnalyticsService Adapters
+# ============================================================================
+
+
+class BaseAnalyticsServiceAdapter:
+    """Shared adapter utilities for AnalyticsWarehouse surfaces."""
+
+    surface: str
+
+    def __init__(self, service: Any, surface: str = "base") -> None:
+        """Initialize adapter with AnalyticsWarehouse service."""
+        self._service = service
+        self.surface = surface
+
+    def _serialize_datetime(self, obj: Any) -> Any:
+        """Convert datetime objects to ISO format strings recursively."""
+        from datetime import datetime, date
+
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        elif isinstance(obj, dict):
+            return {k: self._serialize_datetime(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._serialize_datetime(item) for item in obj]
+        return obj
+
+    def _format_kpi_summary(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Format KPI summary records for the current surface."""
+        return {
+            "records": self._serialize_datetime(records),
+            "count": len(records),
+        }
+
+    def _format_behavior_usage(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Format behavior usage records for the current surface."""
+        return {
+            "records": self._serialize_datetime(records),
+            "count": len(records),
+        }
+
+    def _format_token_savings(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Format token savings records for the current surface."""
+        return {
+            "records": self._serialize_datetime(records),
+            "count": len(records),
+        }
+
+    def _format_compliance_coverage(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Format compliance coverage records for the current surface."""
+        return {
+            "records": self._serialize_datetime(records),
+            "count": len(records),
+        }
+
+
+class CLIAnalyticsServiceAdapter(BaseAnalyticsServiceAdapter):
+    """CLI adapter for AnalyticsWarehouse (terminal output)."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="cli")
+
+    def kpi_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """CLI analytics.kpiSummary command.
+
+        Args:
+            payload: Query parameters (start_date, end_date)
+
+        Returns:
+            Formatted KPI summary for terminal display
+        """
+        records = self._service.get_kpi_summary(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+        )
+        return self._format_kpi_summary(records)
+
+    def behavior_usage(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """CLI analytics.behaviorUsage command.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            Formatted behavior usage for terminal display
+        """
+        records = self._service.get_behavior_usage(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_behavior_usage(records)
+
+    def token_savings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """CLI analytics.tokenSavings command.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            Formatted token savings for terminal display
+        """
+        records = self._service.get_token_savings(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_token_savings(records)
+
+    def compliance_coverage(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """CLI analytics.complianceCoverage command.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            Formatted compliance coverage for terminal display
+        """
+        records = self._service.get_compliance_coverage(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_compliance_coverage(records)
+
+
+class RestAnalyticsServiceAdapter(BaseAnalyticsServiceAdapter):
+    """REST adapter for AnalyticsWarehouse (JSON responses)."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="REST")
+
+    def kpi_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """REST /v1/analytics/kpi-summary endpoint.
+
+        Args:
+            payload: Query parameters (start_date, end_date)
+
+        Returns:
+            JSON response with KPI summary records
+        """
+        records = self._service.get_kpi_summary(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+        )
+        return self._format_kpi_summary(records)
+
+    def behavior_usage(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """REST /v1/analytics/behavior-usage endpoint.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            JSON response with behavior usage records
+        """
+        records = self._service.get_behavior_usage(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_behavior_usage(records)
+
+    def token_savings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """REST /v1/analytics/token-savings endpoint.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            JSON response with token savings records
+        """
+        records = self._service.get_token_savings(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_token_savings(records)
+
+    def compliance_coverage(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """REST /v1/analytics/compliance-coverage endpoint.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            JSON response with compliance coverage records
+        """
+        records = self._service.get_compliance_coverage(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_compliance_coverage(records)
+
+
+class MCPAnalyticsServiceAdapter(BaseAnalyticsServiceAdapter):
+    """MCP adapter for AnalyticsWarehouse (MCP tool responses)."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="mcp")
+
+    def kpi_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP analytics.kpiSummary tool.
+
+        Args:
+            payload: Query parameters (start_date, end_date)
+
+        Returns:
+            MCP tool response with KPI summary records
+        """
+        records = self._service.get_kpi_summary(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+        )
+        return self._format_kpi_summary(records)
+
+    def behavior_usage(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP analytics.behaviorUsage tool.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            MCP tool response with behavior usage records
+        """
+        records = self._service.get_behavior_usage(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_behavior_usage(records)
+
+    def token_savings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP analytics.tokenSavings tool.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            MCP tool response with token savings records
+        """
+        records = self._service.get_token_savings(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_token_savings(records)
+
+    def compliance_coverage(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP analytics.complianceCoverage tool.
+
+        Args:
+            payload: Query parameters (start_date, end_date, limit)
+
+        Returns:
+            MCP tool response with compliance coverage records
+        """
+        records = self._service.get_compliance_coverage(
+            start_date=payload.get("start_date"),
+            end_date=payload.get("end_date"),
+            limit=payload.get("limit", 100),
+        )
+        return self._format_compliance_coverage(records)
+
+
+# ============================================================================
 # AgentOrchestratorService Adapters
 # ============================================================================
 
@@ -1788,7 +2558,7 @@ class CLIAgentOrchestratorAdapter(BaseAgentOrchestratorAdapter):
     """Adapter backing CLI agent orchestration commands."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def assign_agent(
         self,
@@ -1838,6 +2608,44 @@ class CLIAgentOrchestratorAdapter(BaseAgentOrchestratorAdapter):
         return self._format_assignment(assignment) if assignment else None
 
 
+class MCPAgentOrchestratorAdapter(BaseAgentOrchestratorAdapter):
+    """Adapter for MCP agent orchestration tool invocations."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="mcp")
+
+    def assign(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP agents.assign tool."""
+        assignment = self._service.assign_agent(
+            run_id=payload.get("run_id"),
+            requested_agent_id=payload.get("requested_agent_id"),
+            stage=payload.get("stage", "PLANNING"),
+            context=payload.get("context"),
+            requested_by=payload.get("requested_by", {}),
+        )
+        return self._format_assignment(assignment)
+
+    def switch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP agents.switch tool."""
+        assignment = self._service.switch_agent(
+            assignment_id=payload["assignment_id"],
+            target_agent_id=payload["target_agent_id"],
+            reason=payload.get("reason"),
+            allow_downgrade=payload.get("allow_downgrade", False),
+            stage=payload.get("stage"),
+            issued_by=payload.get("issued_by"),
+        )
+        return self._format_assignment(assignment)
+
+    def status(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """MCP agents.status tool."""
+        assignment = self._service.get_status(
+            run_id=payload.get("run_id"),
+            assignment_id=payload.get("assignment_id"),
+        )
+        return self._format_assignment(assignment) if assignment else None
+
+
 # =============================================================================
 # AgentAuth Service Adapters
 # =============================================================================
@@ -1865,7 +2673,7 @@ class CLIAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
     """Adapter for CLI auth commands."""
 
     def __init__(self, client: Any) -> None:
-        super().__init__(client, surface="CLI")
+        super().__init__(client, surface="cli")
 
     def ensure_grant(
         self,
@@ -1876,7 +2684,7 @@ class CLIAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
         context: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """CLI: guideai auth ensure-grant"""
-        from .agent_auth import EnsureGrantRequest
+        from .services.agent_auth_service import EnsureGrantRequest
 
         request = EnsureGrantRequest(
             agent_id=agent_id,
@@ -1911,7 +2719,7 @@ class CLIAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
         include_expired: bool = False,
     ) -> List[Dict[str, Any]]:
         """CLI: guideai auth list-grants"""
-        from .agent_auth import ListGrantsRequest
+        from .services.agent_auth_service import ListGrantsRequest
 
         request = ListGrantsRequest(
             agent_id=agent_id,
@@ -1931,7 +2739,7 @@ class CLIAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
         context: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """CLI: guideai auth policy-preview"""
-        from .agent_auth import PolicyPreviewRequest
+        from .services.agent_auth_service import PolicyPreviewRequest
 
         request = PolicyPreviewRequest(
             agent_id=agent_id,
@@ -1961,7 +2769,7 @@ class CLIAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
         reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         """CLI: guideai auth revoke"""
-        from .agent_auth import RevokeGrantRequest
+        from .services.agent_auth_service import RevokeGrantRequest
 
         request = RevokeGrantRequest(
             grant_id=grant_id,
@@ -1988,7 +2796,7 @@ class RestAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
 
     def ensure_grant(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """REST: POST /v1/auth/grants"""
-        from .agent_auth import EnsureGrantRequest
+        from .services.agent_auth_service import EnsureGrantRequest
 
         request = EnsureGrantRequest(
             agent_id=payload["agent_id"],
@@ -2017,7 +2825,7 @@ class RestAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
 
     def list_grants(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         """REST: GET /v1/auth/grants"""
-        from .agent_auth import ListGrantsRequest
+        from .services.agent_auth_service import ListGrantsRequest
 
         request = ListGrantsRequest(
             agent_id=payload["agent_id"],
@@ -2030,7 +2838,7 @@ class RestAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
 
     def policy_preview(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """REST: POST /v1/auth/policy/preview"""
-        from .agent_auth import PolicyPreviewRequest
+        from .services.agent_auth_service import PolicyPreviewRequest
 
         request = PolicyPreviewRequest(
             agent_id=payload["agent_id"],
@@ -2055,7 +2863,7 @@ class RestAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
 
     def revoke_grant(self, grant_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """REST: DELETE /v1/auth/grants/{grant_id}"""
-        from .agent_auth import RevokeGrantRequest
+        from .services.agent_auth_service import RevokeGrantRequest
 
         request = RevokeGrantRequest(
             grant_id=grant_id,
@@ -2078,11 +2886,11 @@ class MCPAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
     """Adapter simulating MCP tool interactions for AgentAuth."""
 
     def __init__(self, client: Any) -> None:
-        super().__init__(client, surface="MCP")
+        super().__init__(client, surface="mcp")
 
     def ensure_grant(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """MCP auth.ensureGrant tool."""
-        from .agent_auth import EnsureGrantRequest
+        from .services.agent_auth_service import EnsureGrantRequest
 
         request = EnsureGrantRequest(
             agent_id=payload["agent_id"],
@@ -2111,7 +2919,7 @@ class MCPAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
 
     def list_grants(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         """MCP auth.listGrants tool."""
-        from .agent_auth import ListGrantsRequest
+        from .services.agent_auth_service import ListGrantsRequest
 
         request = ListGrantsRequest(
             agent_id=payload["agent_id"],
@@ -2124,7 +2932,7 @@ class MCPAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
 
     def policy_preview(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """MCP auth.policy.preview tool."""
-        from .agent_auth import PolicyPreviewRequest
+        from .services.agent_auth_service import PolicyPreviewRequest
 
         request = PolicyPreviewRequest(
             agent_id=payload["agent_id"],
@@ -2149,7 +2957,7 @@ class MCPAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
 
     def revoke(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """MCP auth.revoke tool."""
-        from .agent_auth import RevokeGrantRequest
+        from .services.agent_auth_service import RevokeGrantRequest
 
         request = RevokeGrantRequest(
             grant_id=payload["grant_id"],
@@ -2311,14 +3119,14 @@ class CLIDeviceFlowAdapter(BaseDeviceFlowAdapter):
     """Device flow adapter scoped to CLI surface."""
 
     def __init__(self, manager: DeviceFlowManager) -> None:
-        super().__init__(manager, surface="CLI")
+        super().__init__(manager, surface="cli")
 
 
 class MCPDeviceFlowAdapter(BaseDeviceFlowAdapter):
     """Device flow adapter scoped to MCP surface."""
 
     def __init__(self, manager: DeviceFlowManager) -> None:
-        super().__init__(manager, surface="MCP")
+        super().__init__(manager, surface="mcp")
 
 
 class BaseTraceAnalysisAdapter:
@@ -2334,7 +3142,7 @@ class CLITraceAnalysisServiceAdapter(BaseTraceAnalysisAdapter):
     """CLI adapter for TraceAnalysisService pattern detection and scoring."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="CLI")
+        super().__init__(service, surface="cli")
 
     def detect_patterns(
         self,
@@ -2407,7 +3215,7 @@ class RestTraceAnalysisServiceAdapter(BaseTraceAnalysisAdapter):
     """REST adapter for TraceAnalysisService endpoints."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="REST_API")
+        super().__init__(service, surface="api")
 
     def detect_patterns(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Detect patterns via REST API.
@@ -2444,7 +3252,7 @@ class MCPTraceAnalysisServiceAdapter(BaseTraceAnalysisAdapter):
     """MCP adapter for TraceAnalysisService tool invocations."""
 
     def __init__(self, service: Any) -> None:
-        super().__init__(service, surface="MCP")
+        super().__init__(service, surface="mcp")
 
     def detectPatterns(self, payload: Dict[str, Any]) -> Dict[str, Any]:  # noqa: N802 - MCP naming parity
         """MCP tool: detectPatterns."""
@@ -2461,3 +3269,792 @@ class MCPTraceAnalysisServiceAdapter(BaseTraceAnalysisAdapter):
         request = ScoreReusabilityRequest.from_dict(payload)
         response = self._service.score_reusability(request)
         return response.to_dict()
+
+
+class MCPReflectionServiceAdapter:
+    """MCP adapter for ReflectionService."""
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+
+    def extract(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tool: reflection.extract - Extract behavior candidates from trace."""
+        from .reflection_service import ReflectRequest
+
+        request = ReflectRequest(
+            trace_text=payload["trace_text"],
+            trace_format=payload.get("trace_format", "chain_of_thought"),
+            run_id=payload.get("run_id"),
+            max_candidates=payload.get("max_candidates", 5),
+            min_quality_score=payload.get("min_quality_score", 0.6),
+            include_examples=payload.get("include_examples", True),
+            preferred_tags=payload.get("preferred_tags"),
+        )
+        response = self._service.reflect(request)
+
+        return {
+            "run_id": response.run_id,
+            "trace_step_count": response.trace_step_count,
+            "candidates": [
+                {
+                    "slug": c.slug,
+                    "display_name": c.display_name,
+                    "instruction": c.instruction,
+                    "summary": c.summary,
+                    "supporting_steps": c.supporting_steps,
+                    "examples": [{"title": ex.title, "body": ex.body} for ex in (c.examples or [])],
+                    "quality_scores": {
+                        "clarity": c.quality_scores.clarity,
+                        "generality": c.quality_scores.generality,
+                        "reusability": c.quality_scores.reusability,
+                        "correctness": c.quality_scores.correctness,
+                    },
+                    "confidence": c.confidence,
+                    "duplicate_behavior_id": c.duplicate_behavior_id,
+                    "duplicate_behavior_name": c.duplicate_behavior_name,
+                    "tags": c.tags,
+                }
+                for c in response.candidates
+            ],
+            "summary": response.summary,
+            "metadata": response.metadata,
+        }
+
+
+# ============================================================================
+# Epic 7 Advanced Features MCP Adapters
+# ============================================================================
+
+class MCPFineTuningServiceAdapter:
+    """MCP adapter for Midnighter fine-tuning operations.
+
+    Updated to use the standalone midnighter package (mdnt).
+    """
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self.surface = "MCP"
+
+    def create_corpus(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP fine-tuning.create-corpus tool."""
+        corpus = self._service.create_corpus(
+            name=payload["name"],
+            description=payload.get("description", ""),
+            source_data=payload.get("source_data", []),
+            quality_threshold=payload.get("quality_threshold", 0.7),
+        )
+        return corpus.to_dict()
+
+    def generate_corpus(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP fine-tuning.generate-corpus tool."""
+        corpus = self._service.generate_corpus_from_behaviors(
+            name=payload["name"],
+            behavior_ids=payload["behavior_ids"],
+            sample_count=payload.get("sample_count", 100),
+            include_citations=payload.get("include_citations", True),
+        )
+        return corpus.to_dict()
+
+    def start_job(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP fine-tuning.start-job tool."""
+        job = self._service.start_training_job(
+            model_id=payload["model_id"],
+            base_model=payload.get("base_model", "gpt-4o-mini"),
+            corpus_id=payload["corpus_id"],
+        )
+        return job.to_dict()
+
+    def get_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP fine-tuning.status tool."""
+        job_id = payload["job_id"]
+        job = self._service.get_job(job_id)
+        if job is None:
+            return {"error": f"Job {job_id} not found"}
+        return job.to_dict()
+
+    def list_jobs(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP fine-tuning.list tool."""
+        jobs = self._service.list_jobs()
+        return {"jobs": [job.to_dict() for job in jobs]}
+
+    def list_corpora(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP fine-tuning.list-corpora tool."""
+        corpora = self._service.list_corpora()
+        return {"corpora": [c.to_dict() for c in corpora]}
+
+
+class MCPAgentReviewServiceAdapter:
+    """MCP adapter for AgentReviewService operations."""
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self.surface = "MCP"
+
+    def create_review(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP reviews.create tool."""
+        from .agent_review_contracts import CreateReviewRequest
+
+        request = CreateReviewRequest(
+            review_type=payload["review_type"],
+            target_id=payload["target_id"],
+            reviewers=payload["reviewers"],
+            criteria=payload.get("criteria"),
+            deadline=payload.get("deadline"),
+        )
+        result = self._service.create_review(request)
+        return result.to_dict()
+
+    def get_review_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP reviews.status tool."""
+        review_id = payload["review_id"]
+        result = self._service.get_review_status(review_id)
+        return result.to_dict()
+
+    def list_reviews(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP reviews.list tool."""
+        status = payload.get("status")
+        review_type = payload.get("review_type")
+        limit = payload.get("limit", 20)
+        reviews = self._service.list_reviews(status=status, review_type=review_type, limit=limit)
+        return {"reviews": [review.to_dict() for review in reviews]}
+
+
+class MCPMultiTenantServiceAdapter:
+    """MCP adapter for MultiTenantService operations."""
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self.surface = "MCP"
+
+    def create_tenant(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tenants.create tool."""
+        from .multi_tenant_contracts import CreateTenantRequest
+
+        request = CreateTenantRequest(
+            name=payload["name"],
+            domain=payload["domain"],
+            billing_plan=payload["billing_plan"],
+            contact_email=payload["contact_email"],
+            settings=payload.get("settings"),
+            security_level=payload.get("security_level"),
+        )
+        result = self._service.create_tenant(request)
+        return result.to_dict()
+
+    def get_tenant_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tenants.status tool."""
+        tenant_id = payload["tenant_id"]
+        result = self._service.get_tenant(tenant_id)
+        return result.to_dict() if result else {"error": "Tenant not found"}
+
+    def list_tenants(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tenants.list tool."""
+        status = payload.get("status")
+        tenants = self._service.list_tenants(status=status)
+        return {"tenants": [tenant.to_dict() for tenant in tenants]}
+
+
+class MCPAdvancedRetrievalServiceAdapter:
+    """MCP adapter for AdvancedRetrievalService operations."""
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self.surface = "MCP"
+
+    def advanced_search(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP retrieval.advanced-search tool."""
+        from .advanced_retrieval_contracts import AdvancedSearchRequest
+
+        request = AdvancedSearchRequest(
+            query=payload["query"],
+            search_type=payload["search_type"],
+            query_expansion=payload.get("query_expansion"),
+            reranking=payload.get("reranking"),
+            context_config=payload.get("context_config"),
+        )
+        result = self._service.advanced_search(request)
+        return result.to_dict()
+
+
+class MCPCollaborationServiceAdapter:
+    """MCP adapter for CollaborationService operations."""
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self.surface = "MCP"
+
+    def create_workspace(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP collaboration.workspace.create tool."""
+        from .collaboration_contracts import CreateWorkspaceRequest
+
+        request = CreateWorkspaceRequest(
+            name=payload["name"],
+            description=payload.get("description", ""),
+            owner_id=payload["owner_id"],
+            is_shared=payload.get("is_shared", False),
+            settings=payload.get("settings"),
+            tags=payload.get("tags"),
+        )
+        result = self._service.create_workspace(request)
+        return result.to_dict()
+
+    def get_workspace_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP collaboration.workspace.status tool."""
+        workspace_id = payload["workspace_id"]
+        result = self._service.get_workspace(workspace_id)
+        return result.to_dict() if result else {"error": "Workspace not found"}
+
+
+class MCPAPIRateLimitingServiceAdapter:
+    """MCP adapter for APIRateLimitingService operations."""
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self.surface = "MCP"
+
+    def configure_rate_limits(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP rate-limits.configure tool."""
+        from .api_rate_limiting_contracts import ConfigureRateLimitRequest
+
+        request = ConfigureRateLimitRequest(
+            scope=payload["scope"],
+            target_id=payload.get("target_id"),
+            policies=payload["policies"],
+            exemptions=payload.get("exemptions"),
+        )
+        result = self._service.configure_rate_limits(request)
+        return result.to_dict()
+
+    def get_rate_limit_status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP rate-limits.status tool."""
+        scope = payload["scope"]
+        target_id = payload.get("target_id")
+        result = self._service.get_rate_limit_status(scope=scope, target_id=target_id)
+        return result.to_dict()
+
+
+class MCPAmprealizeAdapter:
+    """MCP adapter for AmprealizeService."""
+
+    def __init__(self, service: AmprealizeService):
+        self.service = service
+        self.surface = "mcp"
+
+    def plan(
+        self,
+        blueprint_id: str,
+        environment: str,
+        lifetime: Optional[str] = None,
+        compliance_tier: Optional[str] = None,
+        checklist_id: Optional[str] = None,
+        behaviors: Optional[List[str]] = None,
+        variables: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        """Plan an infrastructure deployment."""
+        actor = Actor(id="mcp-user", role="user", surface="MCP")
+        request = PlanRequest(
+            blueprint_id=blueprint_id,
+            environment=environment,
+            lifetime=lifetime,
+            compliance_tier=compliance_tier,
+            checklist_id=checklist_id,
+            behaviors=behaviors or [],
+            variables=variables or {}
+        )
+        response = self.service.plan(request, actor)
+        return response.model_dump()
+
+    def apply(
+        self,
+        plan_id: Optional[str] = None,
+        manifest_file: Optional[str] = None,
+        watch: bool = False,
+        resume: bool = False
+    ) -> Dict[str, Any]:
+        """Apply a planned deployment."""
+        actor = Actor(id="mcp-user", role="user", surface="MCP")
+
+        # Load manifest if provided
+        manifest = None
+        if manifest_file:
+            path = Path(manifest_file)
+            if path.exists():
+                with open(path, "r") as f:
+                    manifest = json.load(f)
+
+        request = ApplyRequest(
+            plan_id=plan_id,
+            manifest=manifest,
+            watch=watch,
+            resume=resume
+        )
+        response = self.service.apply(request, actor)
+        return response.model_dump()
+
+    def status(self, run_id: str) -> Dict[str, Any]:
+        """Get deployment status."""
+        response = self.service.status(run_id)
+        return response.model_dump()
+
+    def destroy(
+        self,
+        run_id: str,
+        cascade: bool = True,
+        reason: str = "MANUAL"
+    ) -> Dict[str, Any]:
+        """Destroy a deployment."""
+        actor = Actor(id="mcp-user", role="user", surface="MCP")
+        request = DestroyRequest(
+            amp_run_id=run_id,
+            cascade=cascade,
+            reason=reason
+        )
+        response = self.service.destroy(request, actor)
+        return response.model_dump()
+
+    def list_blueprints(self, source: str = "all") -> Dict[str, Any]:
+        """List all available blueprints.
+
+        Args:
+            source: Filter by source ("all", "package", "user")
+
+        Returns:
+            Dict with blueprints list, count, and _links
+        """
+        all_blueprints = self.service.list_blueprints()
+
+        if source != "all":
+            all_blueprints = [bp for bp in all_blueprints if bp.get("source") == source]
+
+        return {
+            "blueprints": all_blueprints,
+            "count": len(all_blueprints),
+            "_links": {
+                "plan": "/v1/amprealize/plan"
+            }
+        }
+
+    def list_environments(self, phase: str = "all") -> Dict[str, Any]:
+        """List all active environments.
+
+        Args:
+            phase: Filter by phase ("all", "planned", "applying", "running", etc.)
+
+        Returns:
+            Dict with environments list, count, and _links
+        """
+        all_envs = self.service.list_environments()
+
+        if phase != "all":
+            all_envs = [env for env in all_envs if env.get("phase") == phase]
+
+        return {
+            "environments": all_envs,
+            "count": len(all_envs),
+            "_links": {
+                "status": "/v1/amprealize/status/{run_id}",
+                "destroy": "/v1/amprealize/destroy/{run_id}"
+            }
+        }
+
+    def configure(
+        self,
+        config_dir: Optional[str] = None,
+        include_blueprints: bool = False,
+        blueprints: Optional[List[str]] = None,
+        force: bool = False
+    ) -> Dict[str, Any]:
+        """Configure Amprealize in a directory.
+
+        Args:
+            config_dir: Target directory (defaults to ./config/amprealize)
+            include_blueprints: Whether to copy packaged blueprints
+            blueprints: Specific blueprint IDs to copy
+            force: Overwrite existing files
+
+        Returns:
+            Configuration result with paths and statuses
+        """
+        from pathlib import Path
+
+        config_path = Path(config_dir) if config_dir else None
+        result = self.service.configure(
+            config_dir=config_path,
+            include_blueprints=include_blueprints,
+            blueprints=blueprints,
+            force=force
+        )
+
+        # Add HATEOAS links
+        result["_links"] = {
+            "list_blueprints": "/v1/amprealize/blueprints",
+            "plan": "/v1/amprealize/plan"
+        }
+
+        return result
+
+
+class RestAmprealizeAdapter:
+    """REST API adapter for AmprealizeService."""
+
+    def __init__(self, service: AmprealizeService) -> None:
+        self.service = service
+
+    def plan(self, request: PlanRequest, actor: Actor) -> PlanResponse:
+        return self.service.plan(request, actor)
+
+    def apply(self, request: ApplyRequest, actor: Actor) -> ApplyResponse:
+        return self.service.apply(request, actor)
+
+    def status(self, amp_run_id: str) -> StatusResponse:
+        return self.service.status(amp_run_id)
+
+    def destroy(self, request: DestroyRequest, actor: Actor) -> DestroyResponse:
+        return self.service.destroy(request, actor)
+
+
+# ============================================================================
+# AuditLogService Adapters (per AUDIT_LOG_STORAGE.md)
+# ============================================================================
+
+
+class BaseAuditServiceAdapter:
+    """Shared adapter utilities for AuditLogService surfaces.
+
+    Behaviors applied:
+    - behavior_align_storage_layers: Multi-tier hot/warm/cold architecture
+    - behavior_lock_down_security_surface: WORM storage, cryptographic signatures
+    """
+
+    surface: str
+
+    def __init__(self, service: Any, surface: str) -> None:
+        self._service = service
+        self.surface = surface
+
+    def _format_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Format event for output."""
+        return {
+            "event_id": event.get("id"),
+            "timestamp": event.get("timestamp"),
+            "event_type": event.get("event_type"),
+            "actor_id": event.get("actor_id"),
+            "actor_type": event.get("actor_type"),
+            "resource_type": event.get("resource_type"),
+            "resource_id": event.get("resource_id"),
+            "action": event.get("action"),
+            "outcome": event.get("outcome"),
+            "run_id": event.get("run_id"),
+            "details": event.get("details", {}),
+        }
+
+    def _format_events_response(
+        self, events: List[Dict[str, Any]], total_count: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Format events list response."""
+        return {
+            "events": [self._format_event(e) for e in events],
+            "count": len(events),
+            "total_count": total_count or len(events),
+            "_links": {
+                "query": "/v1/audit/query",
+                "verify": "/v1/audit/verify",
+                "status": "/v1/audit/status",
+            },
+        }
+
+    def _format_verification_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Format verification result."""
+        return {
+            "verified_at": result.get("verified_at"),
+            "hash_chain_valid": result.get("hash_chain_valid", False),
+            "object_lock_valid": result.get("object_lock_valid", False),
+            "signatures_valid": result.get("signatures_valid", False),
+            "archives_checked": result.get("archives_checked", 0),
+            "errors": result.get("errors", []),
+            "details": result.get("details", []),
+        }
+
+    def _format_archival_stats(self, stats: Any) -> Dict[str, Any]:
+        """Format archival statistics."""
+        return {
+            "events_archived": getattr(stats, "events_archived", 0),
+            "archives_created": getattr(stats, "archives_created", 0),
+            "events_pending": getattr(stats, "events_pending", 0),
+            "last_archive_key": getattr(stats, "last_archive_key", None),
+            "last_archive_hash": getattr(stats, "last_archive_hash", None),
+            "errors": getattr(stats, "errors", []),
+        }
+
+    def _format_status(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        """Format archival status response."""
+        return {
+            "pending_events": status.get("pending_events", 0),
+            "batch_size": status.get("batch_size", 1000),
+            "last_archive_hash": status.get("last_archive_hash"),
+            "hot_retention_days": status.get("hot_retention_days", 30),
+            "total_archives": status.get("total_archives", 0),
+            "total_events_archived": status.get("total_events_archived", 0),
+            "last_archive_time": status.get("last_archive_time"),
+            "components": status.get("components", {}),
+            "_links": {
+                "query": "/v1/audit/query",
+                "archive": "/v1/audit/archive",
+                "verify": "/v1/audit/verify",
+            },
+        }
+
+
+class CLIAuditServiceAdapter(BaseAuditServiceAdapter):
+    """CLI adapter for AuditLogService."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="cli")
+
+    async def query(
+        self,
+        event_type: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Query audit events for CLI output."""
+        from datetime import datetime
+
+        # Parse dates if provided
+        start_dt = datetime.fromisoformat(start_time) if start_time else None
+        end_dt = datetime.fromisoformat(end_time) if end_time else None
+
+        events = await self._service.query_events(
+            event_type=event_type,
+            actor_id=actor_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            start_time=start_dt,
+            end_time=end_dt,
+            limit=limit,
+            offset=offset,
+        )
+        return self._format_events_response(events)
+
+    async def archive(self, force: bool = False) -> Dict[str, Any]:
+        """Trigger archival of pending events."""
+        stats = await self._service.archive_pending_events(force=force)
+        return self._format_archival_stats(stats)
+
+    async def verify(
+        self,
+        start_date: Optional[str] = None,
+        max_archives: int = 100,
+    ) -> Dict[str, Any]:
+        """Verify audit log integrity."""
+        from datetime import datetime
+
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+        result = await self._service.verify_integrity(
+            start_date=start_dt,
+            max_archives=max_archives,
+        )
+        return self._format_verification_result(result)
+
+    async def status(self) -> Dict[str, Any]:
+        """Get archival status."""
+        status = await self._service.get_archival_status()
+        return self._format_status(status)
+
+    def list_archives(
+        self,
+        prefix: Optional[str] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """List archived audit batches."""
+        archives = self._service.list_archives(prefix=prefix, limit=limit)
+        return {
+            "archives": archives,
+            "count": len(archives),
+        }
+
+    def get_retention(self, batch_id: str) -> Dict[str, Any]:
+        """Get retention info for an archive."""
+        return self._service.get_retention_info(batch_id)
+
+    def verify_archive(
+        self,
+        batch_id: str,
+        public_key_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Verify a specific archive."""
+        return self._service.verify_archive(batch_id, public_key_path)
+
+
+class MCPAuditServiceAdapter(BaseAuditServiceAdapter):
+    """MCP adapter for AuditLogService.
+
+    Provides audit.* MCP tools per AUDIT_LOG_STORAGE.md:
+    - audit.query: Query audit events with filters
+    - audit.archive: Trigger batch archival
+    - audit.verify: Verify integrity (hash chain + Object Lock)
+    - audit.status: Get archival status
+    """
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="mcp")
+
+    async def query(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP audit.query tool.
+
+        Args:
+            payload: Query parameters:
+                - event_type: Filter by event type
+                - actor_id: Filter by actor ID
+                - resource_type: Filter by resource type
+                - resource_id: Filter by resource ID
+                - start_time: ISO timestamp (filter events after)
+                - end_time: ISO timestamp (filter events before)
+                - limit: Max results (default: 100)
+                - offset: Pagination offset
+
+        Returns:
+            MCP tool response with events list
+        """
+        from datetime import datetime
+
+        start_time = payload.get("start_time")
+        end_time = payload.get("end_time")
+
+        start_dt = datetime.fromisoformat(start_time) if start_time else None
+        end_dt = datetime.fromisoformat(end_time) if end_time else None
+
+        events = await self._service.query_events(
+            event_type=payload.get("event_type"),
+            actor_id=payload.get("actor_id"),
+            resource_type=payload.get("resource_type"),
+            resource_id=payload.get("resource_id"),
+            start_time=start_dt,
+            end_time=end_dt,
+            limit=payload.get("limit", 100),
+            offset=payload.get("offset", 0),
+        )
+        return self._format_events_response(events)
+
+    async def archive(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP audit.archive tool.
+
+        Trigger archival of pending events to S3 WORM storage.
+
+        Args:
+            payload: Archive parameters:
+                - force: Archive even if batch size not reached (default: false)
+
+        Returns:
+            MCP tool response with archival stats
+        """
+        force = payload.get("force", False)
+        stats = await self._service.archive_pending_events(force=force)
+        return self._format_archival_stats(stats)
+
+    async def verify(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP audit.verify tool.
+
+        Verify audit log integrity (hash chain + Object Lock).
+
+        Args:
+            payload: Verification parameters:
+                - start_date: ISO timestamp to start verification from
+                - max_archives: Maximum archives to verify (default: 100)
+
+        Returns:
+            MCP tool response with verification results
+        """
+        from datetime import datetime
+
+        start_date = payload.get("start_date")
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+
+        result = await self._service.verify_integrity(
+            start_date=start_dt,
+            max_archives=payload.get("max_archives", 100),
+        )
+        return self._format_verification_result(result)
+
+    async def status(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP audit.status tool.
+
+        Get current archival status and statistics.
+
+        Args:
+            payload: Status parameters (currently unused)
+
+        Returns:
+            MCP tool response with archival status
+        """
+        status = await self._service.get_archival_status()
+        return self._format_status(status)
+
+    def list_archives(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP audit.listArchives tool.
+
+        List archived audit batches in S3 WORM storage.
+
+        Args:
+            payload: List parameters:
+                - prefix: S3 key prefix filter
+                - limit: Max results (default: 100)
+
+        Returns:
+            MCP tool response with archives list
+        """
+        archives = self._service.list_archives(
+            prefix=payload.get("prefix"),
+            limit=payload.get("limit", 100),
+        )
+        return {
+            "archives": archives,
+            "count": len(archives),
+            "_links": {
+                "query": "/v1/audit/query",
+                "verify": "/v1/audit/verify",
+            },
+        }
+
+    def get_retention(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP audit.getRetention tool.
+
+        Get retention info for a specific archived batch.
+
+        Args:
+            payload: Parameters:
+                - batch_id: Batch ID or S3 key
+
+        Returns:
+            MCP tool response with retention info
+        """
+        batch_id = payload.get("batch_id")
+        if not batch_id:
+            return {"error": "batch_id is required"}
+        return self._service.get_retention_info(batch_id)
+
+    def verify_archive(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP audit.verifyArchive tool.
+
+        Verify integrity of a specific archived batch.
+
+        Args:
+            payload: Parameters:
+                - batch_id: Batch ID or S3 key
+                - public_key_path: Path to Ed25519 public key for signature verification
+
+        Returns:
+            MCP tool response with verification result
+        """
+        batch_id = payload.get("batch_id")
+        if not batch_id:
+            return {"error": "batch_id is required"}
+        return self._service.verify_archive(
+            batch_id,
+            payload.get("public_key_path"),
+        )

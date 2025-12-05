@@ -38,7 +38,7 @@
           },
           "surface": {
             "type": "string",
-            "enum": ["CLI", "REST_API", "MCP", "WEB"]
+            "enum": ["CLI", "REST_API", "MCP", "WEB", "VSCODE"]
           }
         },
         "required": ["id", "role", "surface"],

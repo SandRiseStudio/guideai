@@ -6,6 +6,7 @@ import {
   parseAlignmentLog,
   parseConsentSnapshot,
   parseOnboardingSnapshot,
+  parseStreamingMetrics,
   ProgressItem,
   TimelineEntry,
   AlignmentEntry,
@@ -21,6 +22,8 @@ import { Timeline } from './components/Timeline';
 import { AlignmentUpdates } from './components/AlignmentUpdates';
 import { ConsentDashboard } from './components/ConsentDashboard';
 import { OnboardingDashboard } from './components/OnboardingDashboard';
+import { StreamingMetrics } from './components/StreamingMetrics';
+import { BehaviorAccuracyDashboard } from './components/BehaviorAccuracyDashboard';
 import { emitTelemetry, ensureTelemetrySession } from './telemetry';
 import { useConsentTelemetry } from './hooks/useConsentTelemetry';
 import { useOnboardingTelemetry } from './hooks/useOnboardingTelemetry';
@@ -63,6 +66,7 @@ export const App: FunctionalComponent = () => {
     () => parseAlignmentLog(AlignmentLogMarkdown),
     []
   );
+  const streamingMetrics = useMemo(() => parseStreamingMetrics(ProgressTrackerMarkdown), []);
   const initialConsentSnapshot = useMemo(() => parseConsentSnapshot(ConsentSnapshotMarkdown), []);
   const initialOnboardingSnapshot = useMemo(() => parseOnboardingSnapshot(OnboardingSnapshotMarkdown), []);
   const { metrics: consentMetrics, updatedAt: consentUpdatedAt } = useConsentTelemetry(initialConsentSnapshot);
@@ -138,13 +142,15 @@ export const App: FunctionalComponent = () => {
       { label: 'Completion', value: `${completion}%` },
       { label: 'Active Tracks', value: inFlight.toString() },
       { label: 'Contributors', value: owners.toString() },
+      { label: 'Sprint 3 Progress', value: streamingMetrics ? `${streamingMetrics.completion}%` : 'N/A' },
+      { label: 'Kafka Throughput', value: streamingMetrics ? `${streamingMetrics.kafkaBurstRate.toLocaleString()}/s` : 'N/A' },
       { label: 'Consent Approval', value: `${consentApprovalRate.toFixed(1)}%` },
       { label: 'MFA Completion', value: `${consentMfaCompletion.toFixed(1)}%` },
       { label: 'Avg Time→Behavior', value: `${onboardingAvgTime.toFixed(1)}m` },
       { label: 'Behavior Reuse', value: `${onboardingBehaviorReuse.toFixed(1)}%` },
       { label: 'Compliance Coverage', value: `${onboardingCompliance.toFixed(1)}%` },
     ];
-  }, [progressData.sections, consentApprovalRate, consentMfaCompletion, onboardingMetrics]);
+  }, [progressData.sections, streamingMetrics, consentApprovalRate, consentMfaCompletion, onboardingMetrics]);
 
   const isDark = theme === 'dark';
 
@@ -239,6 +245,8 @@ export const App: FunctionalComponent = () => {
 
       <section class="stats-grid">{stats.map(renderStat)}</section>
 
+      {streamingMetrics && <StreamingMetrics metrics={streamingMetrics} />}
+
       <main class="layout-grid">
         <SectionCard
           title="Milestone Progress"
@@ -273,6 +281,13 @@ export const App: FunctionalComponent = () => {
           subtitle="Telemetry-backed metrics seeded from docs/analytics/onboarding_adoption_snapshot.md"
         >
           <OnboardingDashboard metrics={onboardingMetrics} updatedAt={onboardingUpdatedAt} />
+        </SectionCard>
+
+        <SectionCard
+          title="Behavior Accuracy & Effectiveness"
+          subtitle="Track behavior retrieval accuracy, token reduction, and curator feedback"
+        >
+          <BehaviorAccuracyDashboard />
         </SectionCard>
       </main>
     </div>

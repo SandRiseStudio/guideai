@@ -160,6 +160,8 @@ class RetrieveRequest(SerializableDataclass):
     embedding_weight: float = 0.7
     keyword_weight: float = 0.3
     trace_context: Optional[Dict[str, Any]] = None
+    user_id: Optional[str] = None  # Phase 2: For gradual rollout A/B cohort routing
+    namespace: Optional[str] = "core"
 
 
 @dataclass

@@ -1,6 +1,11 @@
 """GuideAI core package providing service stubs used across parity surfaces."""
 
-from .action_service import ActionService
+from .action_service import (
+    ActionService,
+    ActionServiceError,
+    ActionNotFoundError,
+    ReplayNotFoundError,
+)
 from .action_service_postgres import PostgresActionService
 from .action_contracts import Action, ActionCreateRequest, ReplayRequest, ReplayStatus, Actor
 from . import bci_contracts
@@ -21,12 +26,14 @@ from .agent_auth import (
 )
 from .run_service import RunService
 from .run_service_postgres import PostgresRunService
-from .compliance_service_postgres import PostgresComplianceService
 from .telemetry import InMemoryTelemetrySink, TelemetryClient, TelemetryEvent
 from .task_assignments import TaskAssignmentService
 
 __all__ = [
     "ActionService",
+    "ActionServiceError",
+    "ActionNotFoundError",
+    "ReplayNotFoundError",
     "PostgresActionService",
     "Action",
     "ActionCreateRequest",
@@ -47,7 +54,6 @@ __all__ = [
     "PolicyPreviewResponse",
     "RunService",
     "PostgresRunService",
-    "PostgresComplianceService",
     "TelemetryClient",
     "TelemetryEvent",
     "InMemoryTelemetrySink",

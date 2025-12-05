@@ -85,6 +85,25 @@ class MetricsService:
         # Active subscriptions for SSE streaming
         self._subscriptions: Dict[str, MetricsSubscription] = {}
 
+    def emit_event(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        actor: Optional[Any] = None,
+    ) -> None:
+        """Stub method for compatibility with AmprealizeService.
+
+        MetricsService is primarily for querying/aggregating metrics, not emitting events.
+        Event emission is handled by TelemetryClient. This method exists for backwards
+        compatibility and does nothing.
+
+        Args:
+            event_type: Type of event (ignored)
+            payload: Event payload (ignored)
+            actor: Actor context (ignored)
+        """
+        pass  # No-op for now; telemetry should use TelemetryClient
+
     def _init_cache_db(self) -> None:
         """Initialize SQLite cache schema."""
         conn = sqlite3.connect(self.db_path)

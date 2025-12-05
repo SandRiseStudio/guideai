@@ -22,6 +22,8 @@ from uuid import uuid4
 from guideai.action_contracts import Actor, utc_now_iso
 from guideai.telemetry import TelemetryClient
 from guideai.storage.postgres_pool import PostgresPool
+from guideai.storage.redis_cache import get_cache
+from .utils.dsn import resolve_postgres_dsn
 
 _WORKFLOW_PG_DSN_ENV = "GUIDEAI_WORKFLOW_PG_DSN"
 _DEFAULT_PG_DSN = "postgresql://guideai_workflow:dev_workflow_pass@localhost:5434/workflows"
@@ -96,6 +98,9 @@ class WorkflowTemplate:
         data["role_focus"] = self.role_focus.value
         data["created_by"] = asdict(self.created_by)
         data["steps"] = [asdict(step) for step in self.steps]
+        # Convert datetime objects to ISO format strings for JSON serialization
+        if isinstance(self.created_at, datetime):
+            data["created_at"] = self.created_at.isoformat()
         return data
 
 
@@ -141,6 +146,11 @@ class WorkflowRun:
             {**asdict(step), "status": step.status.value}
             for step in self.steps
         ]
+        # Convert datetime objects to ISO format strings for JSON serialization
+        if isinstance(self.started_at, datetime):
+            data["started_at"] = self.started_at.isoformat()
+        if self.completed_at and isinstance(self.completed_at, datetime):
+            data["completed_at"] = self.completed_at.isoformat()
         return data
 
 
@@ -154,7 +164,12 @@ class WorkflowService:
             dsn: PostgreSQL DSN connection string
             behavior_service: Optional BehaviorService instance for behavior retrieval
         """
-        self.dsn = dsn or os.getenv(_WORKFLOW_PG_DSN_ENV, _DEFAULT_PG_DSN)
+        self.dsn = resolve_postgres_dsn(
+            service="WORKFLOW",
+            explicit_dsn=dsn,
+            env_var=_WORKFLOW_PG_DSN_ENV,
+            default_dsn=os.getenv(_WORKFLOW_PG_DSN_ENV, _DEFAULT_PG_DSN),
+        )
         self.behavior_service = behavior_service
         self._pool = PostgresPool(self.dsn)
 
@@ -188,6 +203,7 @@ class WorkflowService:
         """
         template_id = f"wf-{uuid4().hex[:12]}"
         created_at = utc_now_iso()
+        version = "1.0.0"
 
         template = WorkflowTemplate(
             template_id=template_id,
@@ -197,34 +213,76 @@ class WorkflowService:
             steps=steps,
             created_at=created_at,
             created_by=actor,
+            version=version,
             tags=tags or [],
             metadata=metadata or {},
         )
 
-        conn = self._ensure_connection()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO workflow_templates (
-                    template_id, name, description, role_focus, version,
-                    created_at, created_by_id, created_by_role, created_by_surface,
-                    template_data, tags
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    template_id,
-                    name,
-                    description,
-                    role_focus.value,
-                    template.version,
-                    created_at,
-                    actor.id,
-                    actor.role,
-                    actor.surface,
-                    json.dumps(template.to_dict()),
-                    json.dumps(tags or []),
-                ),
-            )
+        def _execute(conn: Any) -> None:
+            with conn.cursor() as cur:
+                # Insert into workflow_templates header table
+                cur.execute(
+                    """
+                    INSERT INTO workflow_templates (
+                        template_id, name, description, role_focus, version,
+                        created_at, created_by_id, created_by_role, created_by_surface,
+                        template_data, tags, status, latest_version, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        template_id,
+                        name,
+                        description,
+                        role_focus.value,
+                        version,  # Old version column (kept for compatibility)
+                        created_at,
+                        actor.id,
+                        actor.role,
+                        actor.surface,
+                        json.dumps({}),  # Empty template_data (deprecated, kept for schema compat)
+                        json.dumps(tags or []),
+                        'APPROVED',  # New templates are approved by default
+                        version,
+                        created_at,
+                    ),
+                )
+
+                # Insert into workflow_template_versions table
+                cur.execute(
+                    """
+                    INSERT INTO workflow_template_versions (
+                        template_id, version, steps, status, metadata,
+                        effective_from, effective_to,
+                        created_by_id, created_by_role, created_by_surface,
+                        approval_action_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        template_id,
+                        version,
+                        json.dumps([asdict(step) for step in steps]),
+                        'APPROVED',
+                        json.dumps(metadata or {}),
+                        created_at,
+                        None,  # effective_to NULL for current version
+                        actor.id,
+                        actor.role,
+                        actor.surface,
+                        None,  # approval_action_id can be added later
+                    ),
+                )
+
+        self._pool.run_transaction(
+            operation="create_template",
+            service_prefix="workflow",
+            actor={"id": actor.id, "role": actor.role, "surface": actor.surface},
+            metadata={"template_id": template_id, "name": name},
+            executor=_execute,
+            telemetry=None,  # WorkflowService uses global emit_event
+        )
+
+        # Invalidate list cache since we added a new template
+        get_cache().invalidate_service('workflow')
 
         emit_event(
             "workflow.template.created",
@@ -240,62 +298,129 @@ class WorkflowService:
         return template
 
     def get_template(self, template_id: str) -> Optional[WorkflowTemplate]:
-        """Retrieve a workflow template by ID.
+        """Retrieve a workflow template by ID using JOIN query with cache-first pattern.
 
         Args:
             template_id: Template identifier
 
         Returns:
-            WorkflowTemplate if found, None otherwise
+            WorkflowTemplate if found with APPROVED version, None otherwise
         """
+        # Try cache first
+        cache = get_cache()
+        cache_key = cache._make_key('workflow', 'get', {'template_id': template_id})
+        cached_result = cache.get(cache_key)
+        if cached_result is not None:
+            if cached_result:
+                # Reconstruct from cached dict with proper types
+                cached_result['steps'] = [TemplateStep(**step) for step in cached_result['steps']]
+                cached_result['role_focus'] = WorkflowRole(cached_result['role_focus'])
+                cached_result['created_by'] = Actor(**cached_result['created_by'])
+                return WorkflowTemplate(**cached_result)
+            return None
+
+        # Cache miss - fetch from database
         conn = self._ensure_connection()
         with conn.cursor() as cur:
+            # JOIN query to get template header + current APPROVED version
             cur.execute(
-                "SELECT template_data FROM workflow_templates WHERE template_id = %s",
+                """
+                SELECT
+                    wt.template_id, wt.name, wt.description, wt.role_focus,
+                    wt.created_at, wt.created_by_id, wt.created_by_role, wt.created_by_surface,
+                    wt.tags, wt.latest_version,
+                    wtv.version, wtv.steps, wtv.metadata
+                FROM workflow_templates wt
+                LEFT JOIN workflow_template_versions wtv
+                    ON wt.template_id = wtv.template_id
+                    AND wtv.status = 'APPROVED'
+                    AND wtv.effective_to IS NULL
+                WHERE wt.template_id = %s
+                """,
                 (template_id,),
             )
             row = cur.fetchone()
 
-            if not row:
+            if not row or row[10] is None:  # No template or no APPROVED version
+                # Cache the None result to avoid repeated lookups
+                cache.set(cache_key, None, ttl=60)
                 return None
 
-            # PostgreSQL returns JSONB as dict, SQLite returned string
-            data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-            return WorkflowTemplate(
-                template_id=data["template_id"],
-                name=data["name"],
-                description=data["description"],
-                role_focus=WorkflowRole(data["role_focus"]),
-                steps=[
-                    TemplateStep(**step) for step in data["steps"]
-                ],
-                created_at=data["created_at"],
-                created_by=Actor(**data["created_by"]),
-                version=data["version"],
-                tags=data["tags"],
-                metadata=data["metadata"],
+            # Reconstruct WorkflowTemplate from JOIN result
+            template = WorkflowTemplate(
+                template_id=row[0],
+                name=row[1],
+                description=row[2],
+                role_focus=WorkflowRole(row[3]),
+                created_at=row[4],
+                created_by=Actor(id=row[5], role=row[6], surface=row[7]),
+                tags=row[8] or [],
+                version=row[10],  # version from workflow_template_versions
+                steps=[TemplateStep(**step) for step in (row[11] or [])],  # steps JSONB
+                metadata=row[12] or {},
             )
+
+            # Cache result for 10 minutes (600s) - templates change less frequently than behaviors
+            cache.set(cache_key, template.to_dict(), ttl=600)
+            return template
 
     def list_templates(
         self,
         role_focus: Optional[WorkflowRole] = None,
         tags: Optional[List[str]] = None,
     ) -> List[WorkflowTemplate]:
-        """List workflow templates with optional filters.
+        """List workflow templates with optional filters using JOIN query with caching.
 
         Args:
             role_focus: Filter by role (optional)
             tags: Filter by tags (optional)
 
         Returns:
-            List of matching WorkflowTemplate instances
+            List of matching WorkflowTemplate instances with APPROVED versions
         """
-        query = "SELECT template_data FROM workflow_templates WHERE 1=1"
+        # Build cache key from query parameters
+        cache = get_cache()
+        cache_params = {}
+        if role_focus:
+            cache_params['role_focus'] = role_focus.value
+        if tags:
+            cache_params['tags'] = sorted(tags)  # Sort for consistent hashing
+
+        cache_key = cache._make_key('workflow', 'list', cache_params if cache_params else None)
+
+        # Try cache first
+        cached_result = cache.get(cache_key)
+        if cached_result is not None:
+            # Reconstruct from cached dicts with proper types
+            templates = []
+            for t in cached_result:
+                t['steps'] = [TemplateStep(**step) for step in t['steps']]
+                t['role_focus'] = WorkflowRole(t['role_focus'])
+                t['created_by'] = Actor(**t['created_by'])
+                templates.append(WorkflowTemplate(**t))
+            return templates
+
+        # Cache miss - fetch from database
+        query = """
+            SELECT
+                wt.template_id, wt.name, wt.description, wt.role_focus,
+                wt.created_at, wt.created_by_id, wt.created_by_role, wt.created_by_surface,
+                wt.tags, wt.latest_version, wt.updated_at,
+                wtv.version, wtv.steps, wtv.metadata
+            FROM workflow_templates wt
+            LEFT JOIN workflow_template_versions wtv
+                ON wt.template_id = wtv.template_id
+                AND wtv.status = 'APPROVED'
+                AND wtv.effective_to IS NULL
+            WHERE wt.status = 'APPROVED'
+        """
         params: List[Any] = []
 
         if role_focus:
-            query += " AND role_focus = %s"
+            query += " AND wt.role_focus = %s"
             params.append(role_focus.value)
+
+        query += " ORDER BY wt.updated_at DESC"
 
         conn = self._ensure_connection()
         with conn.cursor() as cur:
@@ -304,28 +429,32 @@ class WorkflowService:
 
             templates = []
             for row in rows:
-                # PostgreSQL returns JSONB as dict, SQLite returned string
-                data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                if row[11] is None:  # No APPROVED version, skip
+                    continue
+
+                template_tags = row[8] or []
 
                 # Filter by tags if specified
-                if tags and not any(tag in data["tags"] for tag in tags):
+                if tags and not any(tag in template_tags for tag in tags):
                     continue
 
                 templates.append(
                     WorkflowTemplate(
-                        template_id=data["template_id"],
-                        name=data["name"],
-                        description=data["description"],
-                        role_focus=WorkflowRole(data["role_focus"]),
-                        steps=[TemplateStep(**step) for step in data["steps"]],
-                        created_at=data["created_at"],
-                        created_by=Actor(**data["created_by"]),
-                        version=data["version"],
-                        tags=data["tags"],
-                        metadata=data["metadata"],
+                        template_id=row[0],
+                        name=row[1],
+                        description=row[2],
+                        role_focus=WorkflowRole(row[3]),
+                        created_at=row[4],
+                        created_by=Actor(id=row[5], role=row[6], surface=row[7]),
+                        tags=template_tags,
+                        version=row[11],  # version from workflow_template_versions
+                        steps=[TemplateStep(**step) for step in (row[12] or [])],
+                        metadata=row[13] or {},
                     )
                 )
 
+            # Cache result for 10 minutes (600s) - templates change less frequently than behaviors
+            cache.set(cache_key, [t.to_dict() for t in templates], ttl=600)
             return templates
 
     def run_workflow(
@@ -406,28 +535,37 @@ class WorkflowService:
         )
 
         # Store run record
-        conn = self._ensure_connection()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO workflow_runs (
-                    run_id, template_id, template_name, role_focus, status,
-                    actor_id, actor_role, actor_surface, started_at, run_data
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    run_id,
-                    template_id,
-                    template.name,
-                    template.role_focus.value,
-                    WorkflowStatus.PENDING.value,
-                    actor.id,
-                    actor.role,
-                    actor.surface,
-                    started_at,
-                    json.dumps(run.to_dict()),
-                ),
-            )
+        def _execute(conn: Any) -> None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO workflow_runs (
+                        run_id, template_id, template_name, role_focus, status,
+                        actor_id, actor_role, actor_surface, started_at, run_data
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        run_id,
+                        template_id,
+                        template.name,
+                        template.role_focus.value,
+                        WorkflowStatus.PENDING.value,
+                        actor.id,
+                        actor.role,
+                        actor.surface,
+                        started_at,
+                        json.dumps(run.to_dict()),
+                    ),
+                )
+
+        self._pool.run_transaction(
+            operation="run_workflow",
+            service_prefix="workflow",
+            actor={"id": actor.id, "role": actor.role, "surface": actor.surface},
+            metadata={"run_id": run_id, "template_id": template_id},
+            executor=_execute,
+            telemetry=None,  # WorkflowService uses global emit_event
+        )
 
         emit_event(
             "plan_created",
@@ -580,22 +718,31 @@ class WorkflowService:
         if isinstance(context, dict):
             context_keys = sorted(context.keys())
 
-        conn = self._ensure_connection()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE workflow_runs
-                SET status = %s, total_tokens = %s, completed_at = %s, run_data = %s
-                WHERE run_id = %s
-                """,
-                (
-                    status.value,
-                    run.total_tokens,
-                    run.completed_at,
-                    json.dumps(run.to_dict()),
-                    run_id,
-                ),
-            )
+        def _execute(conn: Any) -> None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE workflow_runs
+                    SET status = %s, total_tokens = %s, completed_at = %s, run_data = %s
+                    WHERE run_id = %s
+                    """,
+                    (
+                        status.value,
+                        run.total_tokens,
+                        run.completed_at,
+                        json.dumps(run.to_dict()),
+                        run_id,
+                    ),
+                )
+
+        self._pool.run_transaction(
+            operation="update_run_status",
+            service_prefix="workflow",
+            actor={"id": run.actor.id, "role": run.actor.role, "surface": run.actor.surface},
+            metadata={"run_id": run_id, "status": status.value},
+            executor=_execute,
+            telemetry=None,  # WorkflowService uses global emit_event
+        )
 
         emit_event(
             "execution_update",
