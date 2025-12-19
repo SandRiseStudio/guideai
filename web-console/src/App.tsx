@@ -27,6 +27,7 @@ import { ProtectedRoute } from './components/ProtectedRoute';
 import { BCIResponsePanel } from './components/BCIResponsePanel';
 import { ExtractionCandidates } from './components/ExtractionCandidates';
 import { NotFoundPage } from './components/NotFoundPage';
+import { SecuritySettings } from './components/SecuritySettings';
 import { ProjectsPage } from './components/projects/ProjectsPage';
 import { NewProjectPage } from './components/projects/NewProjectPage';
 import { ProjectPage } from './components/projects/ProjectPage';
@@ -119,6 +120,14 @@ function App() {
               element={
                 <ProtectedRoute>
                   <BCILayout />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/settings"
+              element={
+                <ProtectedRoute>
+                  <SecuritySettings />
                 </ProtectedRoute>
               }
             />

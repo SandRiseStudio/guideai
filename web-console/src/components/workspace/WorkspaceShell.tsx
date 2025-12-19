@@ -9,7 +9,9 @@
  */
 
 import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useCollabStore, collabStore, usePresenceList } from '../../store/collabStore';
+import { useAuth } from '../../auth';
 import './WorkspaceShell.css';
 
 // ---------------------------------------------------------------------------
@@ -115,8 +117,20 @@ interface HeaderProps {
 }
 
 const Header = memo(function Header({ documentTitle, connectionState }: HeaderProps) {
+  const { actor, logout, isAuthenticated } = useAuth();
+  const navigate = useNavigate();
   const presenceList = usePresenceList();
   const [commandPaletteHint, setCommandPaletteHint] = useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const profileMenuRef = useRef<HTMLDivElement>(null);
+
+  const displayName = actor?.displayName ?? actor?.email ?? actor?.id ?? 'Profile';
+  const initials = displayName
+    .split(' ')
+    .map((segment) => segment[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase();
 
   // Show cmd+K hint on hover
   const handleKeyHint = useCallback(() => {
@@ -124,6 +138,23 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
     const timer = setTimeout(() => setCommandPaletteHint(false), 2000);
     return () => clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (!profileMenuRef.current) return;
+      if (!profileMenuRef.current.contains(event.target as Node)) {
+        setProfileMenuOpen(false);
+      }
+    }
+
+    if (profileMenuOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [profileMenuOpen]);
 
   return (
     <header className="workspace-header">
@@ -201,6 +232,74 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
           </svg>
           Share
         </button>
+
+        {/* Profile menu */}
+        {isAuthenticated && (
+          <div className="profile-menu" ref={profileMenuRef}>
+            <button
+              type="button"
+              className="profile-trigger pressable"
+              onClick={() => setProfileMenuOpen((prev) => !prev)}
+              aria-haspopup="menu"
+              aria-expanded={profileMenuOpen}
+              data-haptic="light"
+            >
+              <span className="profile-avatar">
+                {actor?.avatarUrl ? (
+                  <img
+                    src={actor.avatarUrl}
+                    alt={displayName}
+                    className="profile-avatar-image"
+                  />
+                ) : (
+                  <span className="profile-avatar-initials">{initials}</span>
+                )}
+              </span>
+              <span className="profile-name">{displayName}</span>
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                <path
+                  d="M3 4.5L6 7.5L9 4.5"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+            {profileMenuOpen && (
+              <div className="profile-dropdown animate-scale-in" role="menu" aria-label="Profile menu">
+                <div className="profile-dropdown-header">
+                  <span className="profile-dropdown-name">{displayName}</span>
+                  {actor?.email && (
+                    <span className="profile-dropdown-subtitle">{actor.email}</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="profile-menu-item"
+                  role="menuitem"
+                  onClick={() => {
+                    setProfileMenuOpen(false);
+                    navigate('/settings');
+                  }}
+                >
+                  Profile
+                </button>
+                <button
+                  type="button"
+                  className="profile-menu-item profile-menu-item-logout"
+                  role="menuitem"
+                  onClick={async () => {
+                    setProfileMenuOpen(false);
+                    await logout();
+                  }}
+                >
+                  Log out
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );
