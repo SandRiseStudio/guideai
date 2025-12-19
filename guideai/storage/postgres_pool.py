@@ -292,6 +292,99 @@ class PostgresPool:
         message = str(exc).lower()
         return "deadlock detected" in message or "could not serialize access" in message
 
+    def set_tenant_context(
+        self,
+        conn: Any,
+        org_id: Optional[str],
+        user_id: Optional[str],
+    ) -> None:
+        """Set PostgreSQL session variables for row-level security (RLS).
+
+        Args:
+            conn: Active database connection
+            org_id: Organization ID to set as current_org_id
+            user_id: User ID to set as current_user_id
+        """
+        with conn.cursor() as cur:
+            # Set org context for RLS policies
+            if org_id:
+                cur.execute("SET LOCAL app.current_org_id = %s", (org_id,))
+            else:
+                cur.execute("RESET app.current_org_id")
+
+            # Set user context for audit/RLS
+            if user_id:
+                cur.execute("SET LOCAL app.current_user_id = %s", (user_id,))
+            else:
+                cur.execute("RESET app.current_user_id")
+
+    def run_query(
+        self,
+        operation: str,
+        *,
+        service_prefix: str = "postgres",
+        actor: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        executor: Callable[[Any], _T],
+        telemetry: Optional[Any] = None,
+    ) -> _T:
+        """Execute a read-only query with telemetry instrumentation (no retry/transaction).
+
+        This is a simplified version of run_transaction for SELECT operations
+        that don't require transaction semantics or retry logic.
+
+        Args:
+            operation: Human-readable operation name for logging (e.g., "get_board")
+            service_prefix: Service name for telemetry events (e.g., "board", "action")
+            actor: Optional actor metadata dict for telemetry
+            metadata: Optional additional payload for telemetry
+            executor: Callable receiving a connection and returning the result
+            telemetry: Optional TelemetryClient instance for event emission
+
+        Returns:
+            The result from the executor callable
+        """
+        payload_base: Dict[str, Any] = dict(metadata or {})
+
+        postgres_metrics.record_transaction_start(self._service_name, operation)
+        start_time = time.time()
+
+        try:
+            with self.connection(autocommit=True) as conn:
+                if telemetry:
+                    telemetry.emit_event(
+                        event_type=f"{service_prefix}_query_start",
+                        payload={"operation": operation, **payload_base},
+                        actor=actor,
+                    )
+
+                result = executor(conn)
+
+                duration = time.time() - start_time
+                postgres_metrics.transaction_duration_seconds.labels(
+                    service=self._service_name, operation=operation
+                ).observe(duration)
+
+                if telemetry:
+                    telemetry.emit_event(
+                        event_type=f"{service_prefix}_query_complete",
+                        payload={"operation": operation, "duration_ms": duration * 1000, **payload_base},
+                        actor=actor,
+                    )
+
+                return result
+        except Exception as exc:
+            error_type = type(exc).__name__
+            postgres_metrics.record_transaction_failure(self._service_name, operation, error_type)
+
+            if telemetry:
+                telemetry.emit_event(
+                    event_type=f"{service_prefix}_query_failure",
+                    payload={"operation": operation, "error": str(exc), **payload_base},
+                    actor=actor,
+                )
+            raise
+
     def get_pool_stats(self) -> Dict[str, Any]:
         """Get current connection pool statistics.
 

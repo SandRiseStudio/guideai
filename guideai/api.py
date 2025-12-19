@@ -330,6 +330,10 @@ class _ServiceContainer:
         except Exception as exc:
             internal_provider = None
             logger.warning("InternalAuthProvider unavailable; continuing without internal auth: %s", exc)
+
+        # Store for use by identity linking and other services
+        self.internal_auth_provider = internal_provider
+
         self.device_flow_manager = DeviceFlowManager(
             telemetry=telemetry,
             provider=internal_provider,
@@ -388,8 +392,18 @@ class _ServiceContainer:
         self.task_assignment_service = TaskAssignmentService()
         self.task_adapter = RestTaskAssignmentAdapter(self.task_assignment_service)
 
-        # Projects are available without PostgreSQL (in-memory fallback).
-        self.project_store = InMemoryProjectStore()
+        # Projects with PostgreSQL persistence for FK integrity (boards, runs reference projects)
+        # Use auth schema since that's where projects table lives
+        project_dsn = resolve_optional_postgres_dsn(
+            service="PROJECT",
+            explicit_dsn=os.getenv("GUIDEAI_AUTH_PG_DSN"),
+            env_var="GUIDEAI_AUTH_PG_DSN",
+        )
+        project_pool = None
+        if project_dsn:
+            from guideai.storage.postgres_pool import PostgresPool
+            project_pool = PostgresPool(project_dsn, schema="auth")
+        self.project_store = InMemoryProjectStore(pool=project_pool)
 
         # Board/Assignment services for agent suggestions
         self.board_service = BoardService(pool=None, telemetry=telemetry)
@@ -897,19 +911,27 @@ def create_app(
     if auth_enabled is None:
         auth_enabled = os.getenv("GUIDEAI_AUTH_ENABLED", "").lower() in ("true", "1", "yes")
 
-    if auth_enabled:
-        from guideai.auth.middleware import AuthMiddleware, AuthConfig
-        from guideai.multi_tenant.permissions import AsyncPermissionService
+    # Always add auth middleware when device_flow_manager is available (for ga_* token validation)
+    # This ensures OAuth users get their user_id populated in request.state
+    from guideai.auth.middleware import AuthMiddleware, AuthConfig
 
-        auth_config = AuthConfig(
-            skip_paths={
-                "/health", "/health/", "/metrics", "/docs", "/openapi.json", "/redoc",
-                "/api/v1/device/authorize",  # Device flow doesn't need auth
-                "/api/v1/device/token",  # Token endpoint
-                "/api/v1/activate",  # Activation page
-            }
-        )
-        app.add_middleware(AuthMiddleware, config=auth_config)
+    auth_config = AuthConfig(
+        skip_paths={
+            "/health", "/health/", "/metrics", "/docs", "/openapi.json", "/redoc",
+            "/api/v1/device/authorize",  # Device flow doesn't need auth
+            "/api/v1/device/token",  # Token endpoint
+            "/api/v1/activate",  # Activation page
+            "/api/v1/auth/oauth",  # OAuth flow endpoints
+        }
+    )
+    app.add_middleware(
+        AuthMiddleware,
+        config=auth_config,
+        device_flow_manager=container.device_flow_manager,
+    )
+
+    if auth_enabled:
+        from guideai.multi_tenant.permissions import AsyncPermissionService
 
         # Initialize async permission service if DSN is available
         auth_dsn = resolve_optional_postgres_dsn(
@@ -3103,11 +3125,66 @@ def create_app(
                 detail=last_error or "Failed to exchange authorization code. Code may be invalid or expired.",
             )
 
+        # Link OAuth identity to internal user (creates user if needed)
+        # This ensures the user exists in PostgreSQL for FK constraints
+        internal_user_id = user_info.user_id  # Default to OAuth ID
+        try:
+            from guideai.auth.identity_linking_service import IdentityLinkingService, LinkingResult
+
+            user_service = container.internal_auth_provider.user_service if container.internal_auth_provider else None
+            if user_service:
+                linking_service = IdentityLinkingService(user_service, require_email_verification=False)
+                link_result = linking_service.link_identity(
+                    oauth_user_info=user_info,
+                    oauth_access_token=token_response.access_token,
+                    oauth_refresh_token=token_response.refresh_token,
+                )
+
+                if link_result.user:
+                    internal_user_id = link_result.user.id
+                    logger.info(f"OAuth user linked: {provider}:{user_info.user_id} → internal user {internal_user_id} (result: {link_result.result.value})")
+                else:
+                    logger.warning(f"OAuth identity linking returned no user: {link_result.result.value} - {link_result.message}")
+            else:
+                logger.warning("User service not available, skipping identity linking")
+        except Exception as e:
+            logger.warning(f"Identity linking failed, will create user directly: {e}")
+
+        # Ensure user exists in auth.users for FK constraints (projects, boards, etc.)
+        try:
+            # Get pool from project_store which has the auth schema connection
+            pool = getattr(container.project_store, '_pool', None)
+            if pool:
+                with pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        # Check if user already exists
+                        cur.execute("SELECT id FROM auth.users WHERE id = %s", (internal_user_id,))
+                        if not cur.fetchone():
+                            # Create user record
+                            cur.execute("""
+                                INSERT INTO auth.users (id, email, display_name, avatar_url, is_active, email_verified)
+                                VALUES (%s, %s, %s, %s, true, true)
+                                ON CONFLICT (id) DO NOTHING
+                            """, (
+                                internal_user_id,
+                                user_info.email or f"{internal_user_id}@oauth.local",
+                                user_info.display_name or user_info.username or "OAuth User",
+                                getattr(user_info, "picture", None),
+                            ))
+                            conn.commit()
+                            logger.info(f"Created auth.users record for OAuth user: {internal_user_id}")
+                        else:
+                            logger.debug(f"User {internal_user_id} already exists in auth.users")
+            else:
+                logger.warning("No PostgreSQL pool available, skipping user creation")
+        except Exception as e:
+            logger.error(f"Failed to ensure user exists in auth.users: {e}")
+
         # Create a GuideAI session from OAuth credentials
         # This bridges OAuth tokens to device flow tokens, enabling standard refresh
         guideai_tokens = container.device_flow_manager.create_session_from_oauth(
             provider=provider,
-            user_id=user_info.user_id,
+            user_id=internal_user_id,  # Use internal user ID if linked
             email=user_info.email,
             name=user_info.display_name or user_info.username,
             picture=getattr(user_info, "picture", None),

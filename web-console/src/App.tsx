@@ -27,6 +27,11 @@ import { ProtectedRoute } from './components/ProtectedRoute';
 import { BCIResponsePanel } from './components/BCIResponsePanel';
 import { ExtractionCandidates } from './components/ExtractionCandidates';
 import { NotFoundPage } from './components/NotFoundPage';
+import { ProjectsPage } from './components/projects/ProjectsPage';
+import { NewProjectPage } from './components/projects/NewProjectPage';
+import { ProjectPage } from './components/projects/ProjectPage';
+import { ProjectSettingsPage } from './components/projects/ProjectSettingsPage';
+import { BoardPage } from './components/boards/BoardPage';
 import type { ReflectionCandidate } from './api/reflection';
 import './styles/design-system.css';
 import './App.css';
@@ -114,6 +119,56 @@ function App() {
               element={
                 <ProtectedRoute>
                   <BCILayout />
+                </ProtectedRoute>
+              }
+            />
+
+            {/* Project routes */}
+            <Route
+              path="/projects"
+              element={
+                <ProtectedRoute>
+                  <ProjectsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/projects/new"
+              element={
+                <ProtectedRoute>
+                  <NewProjectPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/projects/:projectId"
+              element={
+                <ProtectedRoute>
+                  <ProjectPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/projects/:projectId/settings"
+              element={
+                <ProtectedRoute>
+                  <ProjectSettingsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/projects/:projectId/boards/:boardId"
+              element={
+                <ProtectedRoute>
+                  <BoardPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/projects/:projectId/boards/:boardId/items/:itemId"
+              element={
+                <ProtectedRoute>
+                  <BoardPage />
                 </ProtectedRoute>
               }
             />

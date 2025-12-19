@@ -55,12 +55,14 @@ class AuthConfig:
 
 
 class AuthMiddleware:
-    """FastAPI middleware for JWT authentication.
+    """FastAPI middleware for JWT and device flow token authentication.
 
     Validates JWT tokens from Authorization header and populates request.state with:
     - user_id: User ID from token subject
     - username: Username from token claims
     - token_claims: Full decoded token payload
+
+    Also supports GuideAI device flow tokens (ga_* prefix) via DeviceFlowManager.
 
     Usage:
         from guideai.auth.middleware import AuthMiddleware, AuthConfig
@@ -69,15 +71,17 @@ class AuthMiddleware:
         app.add_middleware(AuthMiddleware, config=config)
     """
 
-    def __init__(self, app, config: Optional[AuthConfig] = None):
+    def __init__(self, app, config: Optional[AuthConfig] = None, device_flow_manager=None):
         """Initialize auth middleware.
 
         Args:
             app: FastAPI application instance.
             config: AuthConfig instance. Uses defaults if not provided.
+            device_flow_manager: Optional DeviceFlowManager for ga_* token validation.
         """
         self.app = app
         self.config = config or AuthConfig()
+        self.device_flow_manager = device_flow_manager
         self.jwt_service = JWTService(
             secret_key=self.config.jwt_secret,
             algorithm=self.config.jwt_algorithm,
@@ -102,24 +106,44 @@ class AuthMiddleware:
         auth_header = request.headers.get("Authorization")
         user_info = None
 
+        import logging
+        logger = logging.getLogger("guideai.auth.middleware")
+
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.split(" ", 1)[1]
-            try:
-                payload = self.jwt_service.validate_token(token, expected_type="access")
-                user_info = {
-                    "user_id": payload.get("sub"),
-                    "username": payload.get("username"),
-                    "claims": payload,
-                }
-            except jwt.ExpiredSignatureError:
-                # Token expired - clear user info, don't block
-                user_info = None
-            except jwt.InvalidTokenError:
-                # Invalid token - clear user info, don't block
-                user_info = None
-            except ValueError:
-                # Token type mismatch
-                user_info = None
+            logger.info(f"AuthMiddleware: Processing token prefix: {token[:20]}...")
+
+            # Check for GuideAI device flow tokens (ga_* prefix) first
+            if token.startswith("ga_") and self.device_flow_manager:
+                logger.info(f"AuthMiddleware: Validating ga_* token via device_flow_manager")
+                df_user_info = self.device_flow_manager.get_user_info_from_access_token(token)
+                logger.info(f"AuthMiddleware: device_flow_manager returned: {df_user_info}")
+                if df_user_info:
+                    user_info = {
+                        "user_id": df_user_info.get("sub"),
+                        "username": df_user_info.get("name") or df_user_info.get("email"),
+                        "claims": df_user_info,
+                    }
+                    logger.info(f"AuthMiddleware: Set user_id={user_info['user_id']}")
+
+            # Fall back to JWT validation
+            if user_info is None:
+                try:
+                    payload = self.jwt_service.validate_token(token, expected_type="access")
+                    user_info = {
+                        "user_id": payload.get("sub"),
+                        "username": payload.get("username"),
+                        "claims": payload,
+                    }
+                except jwt.ExpiredSignatureError:
+                    # Token expired - clear user info, don't block
+                    user_info = None
+                except jwt.InvalidTokenError:
+                    # Invalid token - clear user info, don't block
+                    user_info = None
+                except ValueError:
+                    # Token type mismatch
+                    user_info = None
 
         # Store user info in scope state for downstream access
         scope["state"] = scope.get("state", {})

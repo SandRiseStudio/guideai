@@ -100,6 +100,40 @@ class InternalSession:
         }
 
 
+@dataclass
+class FederatedIdentity:
+    """Represents an OAuth identity linked to an internal user."""
+
+    id: Optional[str] = None  # UUID
+    user_id: Optional[str] = None  # Internal user ID this identity is linked to
+    provider: Optional[str] = None  # OAuth provider (e.g., 'google', 'github')
+    provider_user_id: Optional[str] = None  # User ID from the OAuth provider
+    provider_email: Optional[str] = None  # Email from the OAuth provider
+    provider_username: Optional[str] = None  # Username from the OAuth provider
+    provider_display_name: Optional[str] = None  # Display name from the OAuth provider
+    provider_avatar_url: Optional[str] = None  # Avatar URL from the OAuth provider
+    access_token_encrypted: Optional[str] = None  # Encrypted OAuth access token
+    refresh_token_encrypted: Optional[str] = None  # Encrypted OAuth refresh token
+    token_expires_at: Optional[datetime] = None  # When the OAuth token expires
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization."""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "provider": self.provider,
+            "provider_user_id": self.provider_user_id,
+            "provider_email": self.provider_email,
+            "provider_username": self.provider_username,
+            "provider_display_name": self.provider_display_name,
+            "provider_avatar_url": self.provider_avatar_url,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 # SQL Schema for reference (supports both SQLite and Postgres)
 USERS_TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS internal_users (
