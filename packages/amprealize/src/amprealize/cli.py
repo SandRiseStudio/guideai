@@ -13,6 +13,7 @@ Install with CLI support:
     pip install amprealize[cli]
 """
 
+import os
 from pathlib import Path
 from typing import Optional, List
 import json
@@ -24,6 +25,7 @@ try:
     from rich.table import Table
     from rich.panel import Panel
     from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.prompt import Confirm, Prompt
 except ImportError as e:
     raise ImportError(
         "CLI requires typer and rich. Install with: pip install amprealize[cli]"
@@ -77,6 +79,11 @@ def plan(
         "--module", "-m",
         help="Modules to activate (can specify multiple times)",
     ),
+    machine_disk_size_gb: Optional[int] = typer.Option(
+        None,
+        "--machine-disk-size-gb",
+        help="Override Podman machine disk size in GB (default: 20GB, Podman's default is 100GB!)",
+    ),
     output: Optional[Path] = typer.Option(
         None,
         "--output", "-o",
@@ -112,6 +119,7 @@ def plan(
         compliance_tier=compliance_tier,
         active_modules=modules,
         force_podman=force_podman,
+        machine_disk_size_gb=machine_disk_size_gb,
     )
 
     with Progress(
@@ -255,6 +263,11 @@ def apply(
         "--min-disk-gb",
         help="Minimum disk space required in GB (default: 5.0)",
     ),
+    machine_disk_size_gb: Optional[int] = typer.Option(
+        None,
+        "--machine-disk-size-gb",
+        help="Override Podman machine disk size in GB for auto_init (default: use environment config, typically 20GB)",
+    ),
     min_memory_mb: float = typer.Option(
         1024.0,
         "--min-memory-mb",
@@ -274,6 +287,32 @@ def apply(
         0.0,
         "--stale-max-age-hours",
         help="Max age for stale container cleanup in hours (0 = all stale, -1 = skip age check)",
+    ),
+    # Machine scale-down options for critical disk situations
+    auto_cleanup_scaledown_machines: bool = typer.Option(
+        False,
+        "--auto-cleanup-scaledown-machines",
+        help="Stop unused Podman machines when disk is critically low (last resort, macOS/Windows only)",
+    ),
+    auto_cleanup_remove_machines: bool = typer.Option(
+        False,
+        "--auto-cleanup-remove-machines",
+        help="Remove unused machines if scaledown enabled (WARNING: destructive, requires rebuilding machine)",
+    ),
+    preserve_machines: Optional[List[str]] = typer.Option(
+        None,
+        "--preserve-machine",
+        help="Machine names to never scale down (can specify multiple times)",
+    ),
+    allow_host_resource_warning: bool = typer.Option(
+        False,
+        "--allow-host-resource-warning",
+        help="Proceed even if only HOST is low on disk/memory (unsafe; may still fail later)",
+    ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive/--no-interactive",
+        help="On resource shortage, prompt for actions and retry (default: disabled)",
     ),
     quiet: bool = typer.Option(
         False,
@@ -320,6 +359,7 @@ def apply(
         auto_cleanup=auto_cleanup,
         auto_cleanup_aggressive=auto_cleanup_aggressive,
         auto_cleanup_include_volumes=auto_cleanup_volumes,
+        allow_host_resource_warning=allow_host_resource_warning,
         blueprint_aware_memory_check=blueprint_aware_memory,
         memory_safety_margin_mb=memory_safety_margin_mb,
         min_disk_gb=min_disk_gb,
@@ -327,26 +367,610 @@ def apply(
         auto_resolve_stale=auto_resolve_stale,
         auto_resolve_conflicts=auto_resolve_conflicts,
         stale_max_age_hours=effective_stale_max_age,
+        auto_cleanup_scale_down=auto_cleanup_scaledown_machines,
+        auto_cleanup_remove_machines=auto_cleanup_remove_machines,
+        preserve_machines=preserve_machines or [],
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=not quiet,
-    ) as progress:
-        task = progress.add_task("Applying...", total=None)
+    def _is_resource_shortage_error(exc: Exception) -> bool:
+        text = str(exc)
+        return "Resource shortage detected" in text
 
+    def _is_podman_connection_error(exc: Exception) -> bool:
+        """Check if exception is a Podman connection/proxy error.
+
+        These can happen when:
+        - Podman machine is not running
+        - gvproxy process died but machine reports as running
+        - SSH tunnel to VM failed
+        - Socket file is stale
+        """
+        text = str(exc).lower()
+        return (
+            "cannot connect to podman" in text
+            or "unable to connect to podman socket" in text
+            or ("connection refused" in text and "podman" in text)
+            or ("podman system connection" in text and "refused" in text)
+            # New: catch dial tcp connection refused (from Go network layer)
+            or ("dial tcp" in text and "connection refused" in text)
+        )
+
+    def _extract_warnings(exc: Exception) -> List[str]:
+        text = str(exc)
+        warnings: List[str] = []
+        if "Warnings:" not in text:
+            return warnings
+        after = text.split("Warnings:", 1)[1]
+        for line in after.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                warnings.append(stripped[2:].strip())
+            elif stripped.startswith("• "):
+                warnings.append(stripped[2:].strip())
+            elif stripped.startswith("  - "):
+                warnings.append(stripped[4:].strip())
+        return warnings
+
+    if interactive and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print("[red]--interactive requires an interactive TTY (stdin/stdout).[/red]")
+        raise typer.Exit(2)
+
+    interactive_enabled = bool(interactive)
+    max_attempts = 3
+    attempt = 0
+    response = None
+
+    # NOTE: Prompts must run outside Rich Progress; otherwise the spinner refresh can
+    # prevent interactive input from appearing/working correctly in some terminals.
+    while True:
+        attempt += 1
         try:
-            response = service.apply(request)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=not quiet,
+            ) as progress:
+                progress.add_task("Applying...", total=None)
+                response = service.apply(request)
+            break
         except Exception as e:
-            console.print(f"[red]Apply failed: {e}[/red]")
-            raise typer.Exit(1)
+            # Podman connectivity failures are common on macOS/Windows if the VM isn't running.
+            # In interactive mode, offer to start/init a machine before retrying.
+            if interactive_enabled and _is_podman_connection_error(e):
+                console.print(f"[red]Apply failed: {e}[/red]")
+                try:
+                    from .executors.podman import PodmanExecutor
+
+                    if isinstance(service.executor, PodmanExecutor):
+                        machines = service.executor.list_machines()
+                        running = [m for m in machines if m.running]
+                        stopped = [m for m in machines if not m.running]
+
+                        machine_summary = "No Podman machines found."
+                        if machines:
+                            machine_summary = "\n".join(
+                                f"- {m.name}: {'running' if m.running else 'stopped'}"
+                                for m in machines
+                                if m.name
+                            )
+                        console.print(Panel(machine_summary, title="Podman Machines", expand=False))
+
+                        # If machine shows running but we got connection error, it's likely a dead proxy
+                        if running:
+                            console.print("[yellow]⚠ Machine reports 'running' but connection failed - proxy may be dead.[/yellow]")
+
+                        choices = {
+                            "1": "Force restart machine (fixes dead proxy) and retry",
+                            "2": "Start a Podman machine and retry",
+                            "3": "Init + start a new machine (podman-machine-default) and retry",
+                            "4": "Show podman connections (diagnostic)",
+                            "5": "Abort",
+                        }
+                        menu = "\n".join([f"[bold]{k}.[/bold] {v}" for k, v in choices.items()])
+                        console.print(Panel(menu, title="Next Step", expand=False))
+                        selection = Prompt.ask("Choose", choices=list(choices.keys()), default="1" if running else "2")
+
+                        if selection == "5":
+                            raise typer.Exit(1)
+
+                        if selection == "4":
+                            try:
+                                connections = service.executor.list_connections()
+                                pretty = "\n".join(
+                                    f"- {c.get('Name')}: {c.get('URI')} ({'default' if c.get('Default') else 'non-default'})"
+                                    for c in connections
+                                ) or "No connections found."
+                                console.print(Panel(pretty, title="podman system connection list", expand=False))
+                            except Exception as exc:
+                                console.print(f"[yellow]Failed to list podman connections: {exc}[/yellow]")
+                            continue
+
+                        # selection 1: force restart (stop --force, then start)
+                        if selection == "1":
+                            try:
+                                import subprocess
+                                target = None
+                                for m in running:
+                                    if m.name:
+                                        target = m.name
+                                        break
+                                if not target:
+                                    for m in machines:
+                                        if m.name:
+                                            target = m.name
+                                            break
+                                if target:
+                                    console.print(f"[dim]Force stopping Podman machine '{target}'...[/dim]")
+                                    subprocess.run(["podman", "machine", "stop", "--force", target], capture_output=True)
+                                    import time
+                                    time.sleep(2)
+                                    console.print(f"[dim]Starting Podman machine '{target}'...[/dim]")
+                                    result = subprocess.run(["podman", "machine", "start", target], capture_output=True, text=True)
+                                    if result.returncode != 0:
+                                        console.print(f"[yellow]Start failed: {result.stderr}[/yellow]")
+                                    else:
+                                        console.print("[green]✓ Machine restarted successfully[/green]")
+                                        time.sleep(2)  # Give proxy time to initialize
+                                else:
+                                    console.print("[yellow]No machine found to restart[/yellow]")
+                            except Exception as exc:
+                                console.print(f"[yellow]Force restart failed: {exc}[/yellow]")
+                            continue
+
+                        # selection 2/3: start/init machine best-effort.
+                        try:
+                            preferred = None
+                            for m in stopped:
+                                if m.name == "podman-machine-default":
+                                    preferred = m.name
+                                    break
+                            if not preferred and stopped:
+                                preferred = stopped[0].name
+                            if not preferred and machines:
+                                preferred = machines[0].name
+
+                            if selection == "3" or not machines:
+                                name = "podman-machine-default"
+                                console.print(f"[dim]Initializing Podman machine '{name}'...[/dim]")
+                                service.executor.init_machine(name)
+                                preferred = name
+
+                            if preferred:
+                                console.print(f"[dim]Starting Podman machine '{preferred}'...[/dim]")
+                                service.executor.start_machine(preferred)
+                            elif running:
+                                console.print("[dim]A Podman machine is already running.[/dim]")
+                        except Exception as exc:
+                            console.print(f"[yellow]Podman machine operation failed: {exc}[/yellow]")
+                        continue
+                except Exception:
+                    # If we can't provide a guided fix, fall through to default handling below.
+                    pass
+
+            # In interactive mode, allow unlimited attempts for resource resolution
+            if not _is_resource_shortage_error(e) or (not interactive_enabled and attempt >= max_attempts):
+                console.print(f"[red]Apply failed: {e}[/red]")
+                raise typer.Exit(1)
+
+            warnings = _extract_warnings(e)
+            warning_block = "\n".join(f"- {w}" for w in warnings) if warnings else str(e)
+            console.print(
+                Panel(
+                    warning_block,
+                    title="Resource Shortage Detected",
+                    subtitle=f"Attempt {attempt}/{max_attempts} (interactive)",
+                    expand=False,
+                )
+            )
+
+            # Provide a small, context-aware menu.
+            choices = {
+                "1": "Show resource report (disk/memory) and retry",
+                "2": "Run safe cleanup (host cache) and retry",
+                "3": "Remove unused Podman machines (frees disk; destructive) and retry",
+                "4": "Show disk space analysis (find what's using space)",
+                "5": "Run AGGRESSIVE cleanup (Trash, Homebrew, npm, pip, Xcode)",
+                "6": "Run DEEP cleanup (VS Code caches, Podman cache, unused machines)",
+                "7": "Proceed anyway (allow host warning)",
+                "8": "Skip resource checks (unsafe)",
+                "9": "Adjust thresholds and retry",
+                "0": "Abort",
+            }
+            menu = "\n".join([f"[bold]{k}.[/bold] {v}" for k, v in choices.items()])
+            console.print(Panel(menu, title="Next Step", expand=False))
+            selection = Prompt.ask("Choose", choices=list(choices.keys()), default="0")
+
+            if selection == "0":
+                raise typer.Exit(1)
+
+            if selection == "1":
+                try:
+                    from .executors.base import ResourceCapableExecutor
+                    if isinstance(service.executor, ResourceCapableExecutor):
+                        resources = service.executor.get_all_resources()
+                        lines = []
+                        for info in resources:
+                            disk = info.disk
+                            mem = info.memory
+                            cpu = info.cpu
+                            lines.append(
+                                f"- {info.source}: "
+                                f"disk {disk.available:.1f}{disk.unit} free ({disk.percent_used:.1f}% used), "
+                                f"mem {mem.available:.0f}{mem.unit} free ({mem.percent_used:.1f}% used), "
+                                f"cpu load {cpu.used:.2f}/{cpu.total:.0f}"
+                                if disk and mem and cpu else f"- {info.source}: (incomplete metrics)"
+                            )
+                        console.print(Panel("\n".join(lines) or "No resource info available.", title="Resource Report", expand=False))
+                except Exception as exc:
+                    console.print(f"[yellow]Failed to collect resource report: {exc}[/yellow]")
+                continue
+
+            if selection == "2":
+                if not Confirm.ask("Run host cache cleanup and retry apply?", default=True):
+                    raise typer.Exit(1)
+                try:
+                    from .executors.podman import PodmanExecutor
+                    if isinstance(service.executor, PodmanExecutor):
+                        cleanup = service.executor.mitigate_host_resources(
+                            dry_run=False,
+                            clean_container_cache=True,
+                            clean_tmp_files=True,
+                            aggressive=True,
+                        )
+
+                        # Build detailed report
+                        details = cleanup.details or {}
+                        cleaned_items = []
+                        if details.get("cache_dirs"):
+                            for d in details["cache_dirs"]:
+                                cleaned_items.append(f"  - {d['path']}: {d['size_mb']:.1f}MB")
+                        if details.get("tmp_files"):
+                            for f in details["tmp_files"]:
+                                cleaned_items.append(f"  - {f['path']}: {f['size_mb']:.1f}MB")
+                        if details.get("additional_caches"):
+                            for c in details["additional_caches"]:
+                                cleaned_items.append(f"  - {c['path']}: {c['size_mb']:.1f}MB")
+
+                        if cleanup.host_space_reclaimed_mb < 1:
+                            # If nothing was cleaned, provide helpful suggestions
+                            summary = (
+                                f"Host cleanup reclaimed ~{cleanup.host_space_reclaimed_mb:.0f}MB\n\n"
+                                f"[yellow]Very little found to clean.[/yellow] Your host disk is {cleanup.details.get('host_disk_percent_used', 99):.0f}% full.\n\n"
+                                f"To free significant space, try:\n"
+                                f"  - Empty Trash (often has GB of data)\n"
+                                f"  - Remove large downloads/files\n"
+                                f"  - Run: docker system prune -a (if Docker installed)\n"
+                                f"  - Run: brew cleanup --prune=all (if Homebrew installed)\n"
+                                f"  - Use Disk Utility > First Aid on your disk\n"
+                                f"  - Check ~/Library/Caches for large app caches"
+                            )
+                        else:
+                            summary = (
+                                f"Host cleanup reclaimed ~{cleanup.host_space_reclaimed_mb:.0f}MB"
+                                + (f" (errors: {len(cleanup.errors)})" if cleanup.errors else "")
+                            )
+                            if cleaned_items:
+                                summary += "\n\nCleaned:\n" + "\n".join(cleaned_items[:10])
+                                if len(cleaned_items) > 10:
+                                    summary += f"\n  ...and {len(cleaned_items) - 10} more"
+
+                        console.print(Panel(summary, title="Host Cleanup", expand=False))
+                except Exception as exc:
+                    console.print(f"[yellow]Host cleanup failed: {exc}[/yellow]")
+                continue
+
+            if selection == "3":
+                if not Confirm.ask(
+                    "Remove stopped/unused Podman machines and retry apply? (destructive)",
+                    default=False,
+                ):
+                    raise typer.Exit(1)
+                # Actually perform the cleanup immediately and report results
+                try:
+                    from .executors.podman import PodmanExecutor
+                    if isinstance(service.executor, PodmanExecutor):
+                        # First show what machines exist
+                        machines = service.executor.list_machines()
+                        running = [m for m in machines if m.running]
+                        stopped = [m for m in machines if not m.running]
+
+                        if not stopped:
+                            console.print(Panel(
+                                f"No stopped machines to remove.\n"
+                                f"Running machines: {', '.join(m.name or 'unnamed' for m in running) or 'none'}\n\n"
+                                f"[yellow]Note:[/yellow] The running machine cannot be removed while in use.\n"
+                                f"To free significant space, you may need to:\n"
+                                f"  - Empty Trash (often has GB of data)\n"
+                                f"  - Remove large files/downloads\n"
+                                f"  - Run: docker system prune -a (if Docker Desktop installed)\n"
+                                f"  - Run: brew cleanup (if Homebrew installed)",
+                                title="Machine Cleanup",
+                                expand=False,
+                            ))
+                        else:
+                            # Actually remove stopped machines
+                            scale_result = service.executor.scale_down_machines(
+                                keep_count=1,
+                                remove_stopped=True,
+                            )
+                            removed = scale_result.get("removed", [])
+                            disk_freed = scale_result.get("disk_freed_gb", 0)
+
+                            if removed:
+                                console.print(Panel(
+                                    f"Removed machines: {', '.join(removed)}\n"
+                                    f"Estimated disk freed: {disk_freed:.1f} GB",
+                                    title="Machine Cleanup",
+                                    expand=False,
+                                ))
+                            else:
+                                console.print(Panel(
+                                    f"No machines were removed (they may be in use or protected).",
+                                    title="Machine Cleanup",
+                                    expand=False,
+                                ))
+                except Exception as exc:
+                    console.print(f"[yellow]Machine cleanup failed: {exc}[/yellow]")
+
+                request.auto_cleanup = True
+                request.auto_cleanup_scale_down = True
+                request.auto_cleanup_remove_machines = True
+                continue
+
+            if selection == "4":
+                # Show disk space analysis to help users find what's using space
+                try:
+                    import subprocess
+                    console.print("[dim]Analyzing disk usage...[/dim]")
+
+                    # Find large directories in home folder
+                    home = os.path.expanduser("~")
+                    large_dirs = []
+
+                    # Check common space hogs
+                    check_paths = [
+                        ("Trash", os.path.expanduser("~/.Trash")),
+                        ("Downloads", os.path.expanduser("~/Downloads")),
+                        ("Docker Desktop (if installed)", os.path.expanduser("~/Library/Containers/com.docker.docker")),
+                        ("Xcode DerivedData", os.path.expanduser("~/Library/Developer/Xcode/DerivedData")),
+                        ("Homebrew Cache", os.path.expanduser("~/Library/Caches/Homebrew")),
+                        ("npm Cache", os.path.expanduser("~/.npm")),
+                        ("pip Cache", os.path.expanduser("~/Library/Caches/pip")),
+                        ("Podman Machines", os.path.expanduser("~/.local/share/containers/podman/machine")),
+                        ("VS Code Cache", os.path.expanduser("~/Library/Application Support/Code/Cache")),
+                        ("Browser Caches", os.path.expanduser("~/Library/Caches")),
+                    ]
+
+                    from .executors.podman import PodmanExecutor
+                    if isinstance(service.executor, PodmanExecutor):
+                        get_size = service.executor._get_dir_size
+                    else:
+                        def get_size(path):
+                            total = 0
+                            try:
+                                for dp, dn, fn in os.walk(path):
+                                    for f in fn:
+                                        try:
+                                            total += os.path.getsize(os.path.join(dp, f))
+                                        except:
+                                            pass
+                            except:
+                                pass
+                            return total
+
+                    for name, path in check_paths:
+                        if os.path.exists(path):
+                            size_bytes = get_size(path)
+                            size_gb = size_bytes / (1024 ** 3)
+                            if size_gb >= 0.1:  # Only show if >= 100MB
+                                large_dirs.append((name, path, size_gb))
+
+                    # Sort by size descending
+                    large_dirs.sort(key=lambda x: x[2], reverse=True)
+
+                    # Build report
+                    lines = ["[bold]Potential space savings:[/bold]\n"]
+                    total_potential = 0
+                    for name, path, size_gb in large_dirs[:10]:
+                        lines.append(f"  {size_gb:6.1f} GB - {name}")
+                        total_potential += size_gb
+
+                    if total_potential > 0:
+                        lines.append(f"\n[bold]Total potential: {total_potential:.1f} GB[/bold]")
+                        lines.append("\n[dim]Option 5 will automatically clean these (except Downloads)[/dim]")
+                    else:
+                        lines.append("\nNo large cleanable directories found.")
+                        lines.append("Your disk may be full from other applications or system files.")
+
+                    console.print(Panel("\n".join(lines), title="Disk Space Analysis", expand=False))
+                except Exception as exc:
+                    console.print(f"[yellow]Disk analysis failed: {exc}[/yellow]")
+                continue
+
+            if selection == "5":
+                # Aggressive cleanup - run all available cleanup strategies
+                console.print(Panel(
+                    "[bold yellow]AGGRESSIVE CLEANUP[/bold yellow]\n\n"
+                    "This will clean:\n"
+                    "  • System Trash\n"
+                    "  • Homebrew caches (brew cleanup --prune=all)\n"
+                    "  • npm caches (npm cache clean --force)\n"
+                    "  • pip caches (pip cache purge)\n"
+                    "  • Xcode DerivedData\n"
+                    "  • Docker data (if installed)\n"
+                    "  • Container caches\n\n"
+                    "[dim]This is safe but will require rebuilding some caches later.[/dim]",
+                    title="⚠️  Aggressive Cleanup",
+                    expand=False,
+                ))
+                if not Confirm.ask("Run aggressive host cleanup?", default=False):
+                    continue
+                try:
+                    from .executors.podman import PodmanExecutor
+                    if isinstance(service.executor, PodmanExecutor):
+                        console.print("[dim]Running aggressive cleanup (this may take a minute)...[/dim]")
+                        cleanup = service.executor.mitigate_host_resources(
+                            dry_run=False,
+                            clean_container_cache=True,
+                            clean_tmp_files=True,
+                            aggressive=True,
+                            clean_homebrew=True,
+                            clean_npm=True,
+                            clean_pip=True,
+                            clean_docker=True,
+                            clean_trash=True,
+                            clean_xcode=True,
+                        )
+
+                        # Build detailed report
+                        details = cleanup.details or {}
+                        report_lines = []
+
+                        # Summarize what was cleaned
+                        for category in ["trash", "homebrew", "npm", "pip", "xcode", "docker", "cache_dirs", "tmp_files"]:
+                            items = details.get(category, [])
+                            for item in items:
+                                if item.get("size_freed_mb", 0) > 0.1:
+                                    report_lines.append(f"  ✓ {item.get('action', category)}: {item['size_freed_mb']:.1f}MB freed")
+                                elif item.get("success"):
+                                    report_lines.append(f"  ✓ {item.get('action', category)}: cleaned")
+
+                        if cleanup.host_space_reclaimed_mb > 0:
+                            summary = (
+                                f"[bold green]Aggressive cleanup reclaimed {cleanup.host_space_reclaimed_mb:.0f} MB[/bold green]\n\n"
+                                + "\n".join(report_lines[:15])
+                            )
+                            if cleanup.errors:
+                                summary += f"\n\n[yellow]Warnings: {len(cleanup.errors)}[/yellow]"
+                        else:
+                            summary = (
+                                f"[yellow]Cleanup complete but freed minimal space.[/yellow]\n\n"
+                                f"Your disk may be full from:\n"
+                                f"  • Large files in ~/Downloads or ~/Documents\n"
+                                f"  • Application data (check About This Mac > Storage)\n"
+                                f"  • System files or Time Machine snapshots\n\n"
+                                f"[dim]Consider using Disk Utility or a disk analyzer app.[/dim]"
+                            )
+
+                        console.print(Panel(summary, title="Aggressive Cleanup Results", expand=False))
+                except Exception as exc:
+                    console.print(f"[red]Aggressive cleanup failed: {exc}[/red]")
+                continue
+
+            if selection == "6":
+                # Deep cleanup - VS Code caches, Podman cache, unused machines
+                console.print(Panel(
+                    "[bold cyan]DEEP CLEANUP[/bold cyan]\n\n"
+                    "This will clean:\n"
+                    "  • VS Code caches (workspaceStorage, History, logs) - often 2-4GB\n"
+                    "  • Podman machine cache - often 500MB-1GB\n"
+                    "  • Unused/stopped Podman machines - can be 1-10GB each\n\n"
+                    "[yellow]Note:[/yellow] VS Code will rebuild caches on next launch.\n"
+                    "[yellow]Note:[/yellow] Only stopped machines will be removed.",
+                    title="🔍 Deep Cleanup",
+                    expand=False,
+                ))
+                if not Confirm.ask("Run deep cleanup?", default=False):
+                    continue
+                try:
+                    from .executors.podman import PodmanExecutor
+                    if isinstance(service.executor, PodmanExecutor):
+                        console.print("[dim]Running deep cleanup (VS Code, Podman cache, unused machines)...[/dim]")
+                        cleanup = service.executor.mitigate_host_resources(
+                            dry_run=False,
+                            clean_container_cache=True,
+                            clean_tmp_files=True,
+                            aggressive=False,
+                            clean_vscode=True,
+                            clean_unused_machines=True,
+                            clean_podman_cache=True,
+                        )
+
+                        # Build detailed report
+                        details = cleanup.details or {}
+                        report_lines = []
+
+                        # Summarize what was cleaned
+                        for item in details.get("vscode", []):
+                            if item.get("size_freed_mb", 0) > 0.1:
+                                path_short = os.path.basename(item.get("path", ""))
+                                report_lines.append(f"  ✓ VS Code {path_short}: {item['size_freed_mb']:.1f}MB freed")
+
+                        for item in details.get("podman_cache", []):
+                            if item.get("size_freed_mb", 0) > 0.1:
+                                report_lines.append(f"  ✓ Podman cache: {item['size_freed_mb']:.1f}MB freed")
+
+                        for item in details.get("unused_machines", []):
+                            if item.get("size_freed_mb", 0) > 0.1:
+                                report_lines.append(f"  ✓ Removed machine '{item.get('machine')}': {item['size_freed_mb']:.1f}MB freed")
+
+                        # Show Podman recovery status if it was attempted
+                        recovery_info = details.get("podman_recovery", {})
+                        if recovery_info.get("attempted"):
+                            if recovery_info.get("success"):
+                                report_lines.append(f"  ✓ Podman machine '{recovery_info.get('machine')}' restarted successfully")
+                            else:
+                                report_lines.append(f"  ⚠ Podman machine restart failed - may need manual restart")
+
+                        if cleanup.host_space_reclaimed_mb > 0:
+                            summary = (
+                                f"[bold green]Deep cleanup reclaimed {cleanup.host_space_reclaimed_mb:.0f} MB ({cleanup.host_space_reclaimed_mb/1024:.2f} GB)[/bold green]\n\n"
+                                + "\n".join(report_lines[:15])
+                            )
+                            if cleanup.errors:
+                                summary += f"\n\n[yellow]Warnings: {len(cleanup.errors)}[/yellow]"
+                        else:
+                            summary = (
+                                f"[yellow]Deep cleanup complete but freed minimal space.[/yellow]\n\n"
+                                f"VS Code caches and Podman cache may already be minimal.\n"
+                                f"No unused Podman machines found to remove."
+                            )
+
+                        console.print(Panel(summary, title="Deep Cleanup Results", expand=False))
+                except Exception as exc:
+                    console.print(f"[red]Deep cleanup failed: {exc}[/red]")
+                continue
+
+            if selection == "7":
+                if not Confirm.ask(
+                    "Proceed even though host resources are below threshold?",
+                    default=False,
+                ):
+                    raise typer.Exit(1)
+                request.auto_cleanup = True
+                request.allow_host_resource_warning = True
+                continue
+
+            if selection == "8":
+                if not Confirm.ask("Skip resource checks and proceed?", default=False):
+                    raise typer.Exit(1)
+                request.skip_resource_check = True
+                continue
+
+            if selection == "9":
+                new_disk = Prompt.ask(
+                    "Minimum host disk free (GB)",
+                    default=str(request.min_disk_gb),
+                )
+                new_mem = Prompt.ask(
+                    "Minimum host memory free (MB)",
+                    default=str(int(request.min_memory_mb)),
+                )
+                try:
+                    request.min_disk_gb = float(new_disk)
+                    request.min_memory_mb = float(new_mem)
+                except ValueError:
+                    console.print("[red]Invalid thresholds; aborting.[/red]")
+                    raise typer.Exit(1)
+                continue
 
     if quiet:
+        assert response is not None
         console.print(response.amp_run_id)
         return
 
+    assert response is not None
     # Display result
     console.print(Panel(
         f"[bold]Run ID:[/bold] {response.amp_run_id}\n"
@@ -492,6 +1116,11 @@ def destroy(
         "--force", "-f",
         help="Force destroy without confirmation",
     ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive/--no-interactive",
+        help="Require interactive confirmation prompt (default: disabled)",
+    ),
     force_podman: bool = typer.Option(
         False,
         "--force-podman",
@@ -522,8 +1151,14 @@ def destroy(
 
     # Confirmation
     if not force:
-        confirm = typer.confirm(f"Destroy run {run_id}?")
-        if not confirm:
+        if not interactive:
+            console.print("[red]Refusing to prompt in non-interactive mode.[/red]")
+            console.print("[dim]Use --force to destroy without confirmation, or --interactive to confirm.[/dim]")
+            raise typer.Exit(2)
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            console.print("[red]--interactive requires an interactive TTY (stdin/stdout).[/red]")
+            raise typer.Exit(2)
+        if not typer.confirm(f"Destroy run {run_id}?"):
             console.print("[yellow]Cancelled[/yellow]")
             raise typer.Exit(0)
 
@@ -563,6 +1198,1109 @@ def destroy(
             console.print(f"  [dim]✓ {item}[/dim]")
         if len(response.teardown_report) > 10:
             console.print(f"  [dim]... and {len(response.teardown_report) - 10} more[/dim]")
+
+
+# =============================================================================
+# Restart Command
+# =============================================================================
+
+@app.command()
+def restart(
+    run_id: Optional[str] = typer.Argument(
+        None,
+        help="Run ID to restart (defaults to most recent active environment)",
+    ),
+    services: Optional[List[str]] = typer.Option(
+        None,
+        "--service", "-s",
+        help="Specific service(s) to restart (can specify multiple times)",
+    ),
+    all_services: bool = typer.Option(
+        False,
+        "--all", "-a",
+        help="Restart all services in the environment",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force", "-f",
+        help="Force restart (stop + start) even if container is healthy",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+) -> None:
+    """Restart containers in an environment.
+
+    By default, restarts only containers that are not healthy or have been
+    updated. Use --all to restart everything, or --service to target specific
+    services.
+
+    If no run_id is specified, uses the most recent active environment.
+
+    Examples:
+        amprealize restart                      # Restart unhealthy containers in latest env
+        amprealize restart --all                # Restart all containers in latest env
+        amprealize restart -s postgres-guideai  # Restart specific service
+        amprealize restart amp-abc123 --force   # Force restart all in specific env
+    """
+    import subprocess
+
+    service = get_service()
+
+    # Find the run to restart
+    target_run_id = run_id
+    if not target_run_id:
+        # Find most recent active environment by file modification time
+        # Include STOPPED environments since restart can bring them back
+        envs = list(service.environments_dir.glob("*.json"))
+        active_runs = []
+        for env_file in envs:
+            try:
+                with open(env_file) as f:
+                    data = json.load(f)
+                if data.get("phase") in ("APPLIED", "PROVISIONING", "DEGRADED", "STOPPED"):
+                    mtime = env_file.stat().st_mtime
+                    active_runs.append((env_file.stem, data, mtime))
+            except Exception:
+                pass
+
+        if not active_runs:
+            console.print("[yellow]No active environments found[/yellow]")
+            console.print("[dim]Run 'amprealize plan <environment>' to create one[/dim]")
+            raise typer.Exit(1)
+
+        # Sort by modification time (most recent first)
+        active_runs.sort(key=lambda x: x[2], reverse=True)
+        target_run_id = active_runs[0][0]
+        console.print(f"[dim]Using most recent environment: {target_run_id}[/dim]")
+
+    # Load environment manifest
+    env_path = service.environments_dir / f"{target_run_id}.json"
+    if not env_path.exists():
+        console.print(f"[red]Environment {target_run_id} not found[/red]")
+        raise typer.Exit(1)
+
+    with open(env_path) as f:
+        run_data = json.load(f)
+
+    runtime = run_data.get("runtime", {})
+    executor = PodmanExecutor(connection=runtime.get("podman_connection"))
+    if not executor.connection:
+        machine_name = runtime.get("podman_machine")
+        if machine_name:
+            executor.connection = executor.resolve_connection_for_machine(machine_name)
+
+    podman_cmd = ["podman"]
+    if executor.connection:
+        podman_cmd.extend(["--connection", executor.connection])
+
+    outputs = run_data.get("environment_outputs", {})
+    if not outputs:
+        console.print(f"[yellow]No services found in environment {target_run_id}[/yellow]")
+        raise typer.Exit(1)
+
+    runtime = run_data.get("runtime", {})
+    executor = PodmanExecutor(connection=runtime.get("podman_connection"))
+    if not executor.connection:
+        machine_name = runtime.get("podman_machine")
+        if machine_name:
+            executor.connection = executor.resolve_connection_for_machine(machine_name)
+
+    podman_cmd = ["podman"]
+    if executor.connection:
+        podman_cmd.extend(["--connection", executor.connection])
+
+    # Determine which services to restart
+    target_services = []
+    if services:
+        # Specific services requested
+        for svc in services:
+            if svc in outputs:
+                target_services.append(svc)
+            else:
+                console.print(f"[yellow]Service '{svc}' not found in environment[/yellow]")
+    elif all_services or force:
+        # Restart all services
+        target_services = list(outputs.keys())
+    else:
+        # Smart restart: only unhealthy or stopped containers
+        for svc_name, svc_info in outputs.items():
+            container_id = svc_info.get("container_id")
+            if container_id:
+                try:
+                    info = executor.inspect_container(container_id)
+                    if info.status != "running" or (info.health and info.health != "healthy"):
+                        target_services.append(svc_name)
+                except Exception:
+                    # Container doesn't exist or error - needs restart
+                    target_services.append(svc_name)
+
+    if not target_services:
+        console.print("[green]✓ All services are healthy - nothing to restart[/green]")
+        if json_output:
+            console.print(json.dumps({"restarted": [], "status": "healthy"}))
+        return
+
+    # First, check if containers actually exist
+    missing_containers = []
+    existing_containers = []
+    for svc_name in target_services:
+        svc_info = outputs.get(svc_name, {})
+        container_id = svc_info.get("container_id")
+        if container_id:
+            check = subprocess.run(
+                podman_cmd + ["container", "exists", container_id],
+                capture_output=True,
+            )
+            if check.returncode != 0:
+                missing_containers.append(svc_name)
+            else:
+                existing_containers.append(svc_name)
+        else:
+            missing_containers.append(svc_name)
+
+    # If all containers are missing, suggest using 'up' instead
+    if missing_containers and not existing_containers:
+        console.print("[yellow]⚠ All containers have been removed[/yellow]")
+        console.print(
+            "[dim]Environment manifest exists but containers were deleted (e.g., by 'amprealize nuke')[/dim]"
+        )
+        console.print()
+        console.print("[bold]To recreate the environment:[/bold]")
+        blueprint = run_data.get("blueprint_name", "development")
+        # Simplify suggestion - 'development' is the default so no arg needed
+        if blueprint == "development":
+            console.print("  [cyan]amprealize up[/cyan]")
+        else:
+            console.print(f"  [cyan]amprealize up {blueprint}[/cyan]")
+        console.print()
+        console.print("[dim]Or to start fresh:[/dim]")
+        if blueprint == "development":
+            console.print("  [dim]amprealize plan && amprealize apply <plan-id>[/dim]")
+        else:
+            console.print(f"  [dim]amprealize plan {blueprint} && amprealize apply <plan-id>[/dim]")
+        if json_output:
+            console.print(
+                json.dumps(
+                    {
+                        "error": "containers_missing",
+                        "missing": missing_containers,
+                        "suggestion": "amprealize up" if blueprint == "development" else f"amprealize up {blueprint}",
+                    }
+                )
+            )
+        raise typer.Exit(1)
+
+    # If some containers are missing, warn but continue with existing ones
+    if missing_containers:
+        console.print(f"[yellow]⚠ {len(missing_containers)} container(s) no longer exist:[/yellow]")
+        for svc in missing_containers:
+            console.print(f"  [dim]• {svc}[/dim]")
+        console.print(f"[dim]Continuing with {len(existing_containers)} existing container(s)...[/dim]")
+        console.print()
+        target_services = existing_containers
+
+    results = {"restarted": [], "failed": [], "skipped": [], "missing": missing_containers}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Restarting services...", total=len(target_services))
+        for svc_name in target_services:
+            progress.update(task, description=f"Restarting {svc_name}...")
+            svc_info = outputs.get(svc_name, {})
+            container_id = svc_info.get("container_id")
+
+            if not container_id:
+                results["skipped"].append({"service": svc_name, "reason": "no container_id"})
+                progress.advance(task)
+                continue
+
+            try:
+                # Stop container
+                try:
+                    subprocess.run(
+                        podman_cmd + ["stop", "-t", "10", container_id],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                except Exception:
+                    pass  # Container might already be stopped
+
+                # Start container
+                result = subprocess.run(
+                    podman_cmd + ["start", container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+                if result.returncode == 0:
+                    results["restarted"].append(svc_name)
+                else:
+                    results["failed"].append(
+                        {
+                            "service": svc_name,
+                            "error": result.stderr.strip() or "Unknown error",
+                        }
+                    )
+            except Exception as e:
+                results["failed"].append({"service": svc_name, "error": str(e)})
+
+            progress.advance(task)
+
+    # Update manifest phase back to APPLIED if we successfully restarted containers
+    if results["restarted"] and not results["failed"]:
+        if run_data.get("phase") == "STOPPED":
+            run_data["phase"] = "APPLIED"
+            with open(env_path, "w") as f:
+                json.dump(run_data, f, indent=2, default=str)
+
+    if json_output:
+        console.print(json.dumps(results, indent=2))
+        return
+
+    # Display results
+    if results["restarted"]:
+        console.print(f"[green]✓ Restarted {len(results['restarted'])} service(s):[/green]")
+        for svc in results["restarted"]:
+            console.print(f"  [dim]• {svc}[/dim]")
+
+    if results["failed"]:
+        console.print(f"[red]✗ Failed to restart {len(results['failed'])} service(s):[/red]")
+        for item in results["failed"]:
+            console.print(f"  [red]• {item['service']}: {item['error']}[/red]")
+
+    if results["skipped"]:
+        console.print(f"[yellow]⊘ Skipped {len(results['skipped'])} service(s)[/yellow]")
+
+
+# =============================================================================
+# Sync Command
+# =============================================================================
+
+@app.command()
+def sync(
+    run_id: Optional[str] = typer.Argument(
+        None,
+        help="Run ID to sync (defaults to most recent active environment)",
+    ),
+    files: Optional[List[str]] = typer.Option(
+        None,
+        "--file", "-f",
+        help="Specific file(s) to sync (can specify multiple times). If not provided, uses git status.",
+    ),
+    since: Optional[str] = typer.Option(
+        None,
+        "--since",
+        help="Git ref to compare against (commit, tag, branch). Shows all changes since that ref.",
+    ),
+    all_files: bool = typer.Option(
+        False,
+        "--all", "-a",
+        help="Sync all source files (ignores git status, useful when container is very stale)",
+    ),
+    service: Optional[str] = typer.Option(
+        None,
+        "--service", "-s",
+        help="Target specific service (auto-detected if not provided)",
+    ),
+    rebuild: bool = typer.Option(
+        False,
+        "--rebuild", "-r",
+        help="Force image rebuild instead of file copy (slower but cleaner)",
+    ),
+    no_restart: bool = typer.Option(
+        False,
+        "--no-restart",
+        help="Don't restart the service after sync (useful for volume-mounted services)",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+) -> None:
+    """Sync code changes to running containers.
+
+    Detects what files have changed and syncs them to the appropriate services:
+
+    - For services with baked images (guideai-api): Copies files via 'podman cp'
+      and restarts the service.
+    - For services with volume mounts (web-console): Just triggers a restart
+      if needed (hot reload usually handles it automatically).
+
+    If --rebuild is specified, rebuilds the entire image instead of copying files.
+    This is slower but ensures a clean state.
+
+    Examples:
+        amprealize sync                               # Auto-detect uncommitted changes
+        amprealize sync --since HEAD~20              # Changes in last 20 commits
+        amprealize sync --since 2024-12-01           # Changes since Dec 1st
+        amprealize sync --all -s guideai-api         # Sync ALL Python backend files
+        amprealize sync -f guideai/api.py            # Sync specific file
+        amprealize sync --rebuild                    # Full image rebuild
+    """
+    import subprocess
+
+    svc = get_service()
+
+    # Find the run to sync
+    target_run_id = run_id
+    if not target_run_id:
+        envs = list(svc.environments_dir.glob("*.json"))
+        active_runs = []
+        for env_file in envs:
+            try:
+                with open(env_file) as f:
+                    data = json.load(f)
+                if data.get("phase") in ("APPLIED", "PROVISIONING", "DEGRADED"):
+                    mtime = env_file.stat().st_mtime
+                    active_runs.append((env_file.stem, data, mtime))
+            except Exception:
+                pass
+
+        if not active_runs:
+            console.print("[yellow]No active environments found[/yellow]")
+            raise typer.Exit(1)
+
+        active_runs.sort(key=lambda x: x[2], reverse=True)
+        target_run_id = active_runs[0][0]
+        console.print(f"[dim]Using most recent environment: {target_run_id}[/dim]")
+
+    # Load environment manifest
+    env_path = svc.environments_dir / f"{target_run_id}.json"
+    if not env_path.exists():
+        console.print(f"[red]Environment {target_run_id} not found[/red]")
+        raise typer.Exit(1)
+
+    with open(env_path) as f:
+        run_data = json.load(f)
+
+    runtime = run_data.get("runtime", {})
+    executor = PodmanExecutor(connection=runtime.get("podman_connection"))
+    if not executor.connection:
+        machine_name = runtime.get("podman_machine")
+        if machine_name:
+            executor.connection = executor.resolve_connection_for_machine(machine_name)
+
+    podman_cmd = ["podman"]
+    if executor.connection:
+        podman_cmd.extend(["--connection", executor.connection])
+
+    outputs = run_data.get("environment_outputs", {})
+    blueprint_name = run_data.get("blueprint_name")
+
+    # Helper function to get container/image creation time
+    def get_container_age(service_name: str) -> Optional[str]:
+        """Get the creation time of a container or its image."""
+        container_name = f"{target_run_id}-{service_name}"
+        try:
+            # First try container creation time
+            result = subprocess.run(
+                podman_cmd + ["ps", "-a", "--filter", f"name={container_name}", "--format", "{{.CreatedAt}}"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            if result.stdout.strip():
+                # Format: "2025-12-18 15:09:08.303887639 -0800 PST"
+                # Convert to ISO format for git
+                created_str = result.stdout.strip()
+                # Parse the date part
+                date_part = created_str.split('.')[0]  # "2025-12-18 15:09:08"
+                return date_part
+        except subprocess.CalledProcessError:
+            pass
+        return None
+
+    # Determine what files to sync
+    files_to_sync: List[str] = []
+    auto_since: Optional[str] = None  # Track if we auto-detected --since
+
+    if files:
+        files_to_sync = list(files)
+    elif all_files:
+        # Sync all source files for relevant services
+        # Find all Python files in guideai/ directory
+        try:
+            find_result = subprocess.run(
+                ["find", "guideai", "-name", "*.py", "-type", "f"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            for line in find_result.stdout.strip().split('\n'):
+                if line.strip():
+                    files_to_sync.append(line.strip())
+            console.print(f"[cyan]Using --all: found {len(files_to_sync)} Python files in guideai/[/cyan]")
+        except subprocess.CalledProcessError:
+            console.print("[yellow]⚠ Could not find source files[/yellow]")
+            raise typer.Exit(1)
+    elif since:
+        # Use git diff to find changes since a specific ref
+        try:
+            # First, try to resolve the ref
+            subprocess.run(
+                ["git", "rev-parse", "--verify", since],
+                capture_output=True,
+                check=True
+            )
+            # Get diff with that ref
+            git_result = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=ACMR", since],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            for line in git_result.stdout.strip().split('\n'):
+                if line.strip():
+                    files_to_sync.append(line.strip())
+            console.print(f"[cyan]Changes since '{since}':[/cyan]")
+        except subprocess.CalledProcessError as e:
+            # Maybe it's a date instead of a ref
+            try:
+                git_result = subprocess.run(
+                    ["git", "log", "--since", since, "--name-only", "--pretty=format:", "--diff-filter=ACMR"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                seen = set()
+                for line in git_result.stdout.strip().split('\n'):
+                    if line.strip() and line.strip() not in seen:
+                        files_to_sync.append(line.strip())
+                        seen.add(line.strip())
+                console.print(f"[cyan]Changes since date '{since}':[/cyan]")
+            except subprocess.CalledProcessError:
+                console.print(f"[red]Could not parse '{since}' as git ref or date[/red]")
+                console.print("[dim]Examples: HEAD~10, main, v1.0.0, 2024-12-01[/dim]")
+                raise typer.Exit(1)
+    else:
+        # Smart detection: first check uncommitted changes, then check container drift
+        uncommitted_files: List[str] = []
+        try:
+            git_result = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            for line in git_result.stdout.strip().split('\n'):
+                if line.strip():
+                    status = line[:2]
+                    filepath = line[3:].strip()
+                    if ' -> ' in filepath:
+                        filepath = filepath.split(' -> ')[1]
+                    if status.strip() != 'D':
+                        uncommitted_files.append(filepath)
+        except subprocess.CalledProcessError:
+            pass
+
+        if uncommitted_files:
+            # Has uncommitted changes - use those
+            files_to_sync = uncommitted_files
+            console.print(f"[cyan]Uncommitted changes:[/cyan]")
+        else:
+            # No uncommitted changes - check container age and find commits since then
+            target_service = service or "guideai-api"  # Default to API service
+            container_created = get_container_age(target_service)
+
+            if container_created:
+                console.print(f"[dim]Container '{target_service}' created: {container_created}[/dim]")
+
+                # Find commits since container was created
+                try:
+                    git_result = subprocess.run(
+                        ["git", "log", f"--since={container_created}", "--name-only", "--pretty=format:", "--diff-filter=ACMR"],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    seen = set()
+                    for line in git_result.stdout.strip().split('\n'):
+                        if line.strip() and line.strip() not in seen:
+                            files_to_sync.append(line.strip())
+                            seen.add(line.strip())
+
+                    if files_to_sync:
+                        auto_since = container_created
+                        console.print(f"[cyan]Auto-detected {len(files_to_sync)} file(s) changed since container start:[/cyan]")
+                    else:
+                        console.print("[green]✓ Container is up to date with git history[/green]")
+                except subprocess.CalledProcessError:
+                    console.print("[yellow]⚠ Could not check git history[/yellow]")
+            else:
+                console.print("[dim]No uncommitted changes and could not detect container age.[/dim]")
+                console.print("  [dim]Use --since or --all to sync:[/dim]")
+                console.print("  [dim]  amprealize sync --since HEAD~20[/dim]")
+                console.print("  [dim]  amprealize sync --all[/dim]")
+
+    if not files_to_sync:
+        console.print("[green]✓ No changed files detected[/green]")
+        if json_output:
+            console.print(json.dumps({"synced": [], "status": "no_changes"}))
+        return
+
+    console.print(f"[cyan]Found {len(files_to_sync)} changed file(s):[/cyan]")
+    for f in files_to_sync[:10]:  # Show first 10
+        console.print(f"  • {f}")
+    if len(files_to_sync) > 10:
+        console.print(f"  [dim]... and {len(files_to_sync) - 10} more[/dim]")
+    console.print()
+
+    # Map files to services
+    # This mapping is based on common guideai project structure
+    file_service_map = {
+        "guideai/": "guideai-api",        # Python backend
+        "web-console/": "web-console",    # React frontend
+        "packages/": None,                # Standalone packages (may need manual handling)
+        "extension/": None,               # VS Code extension (not containerized)
+        "tests/": None,                   # Tests (not synced to containers)
+        "scripts/": None,                 # Scripts (not synced to containers)
+        "docs/": None,                    # Docs (not synced to containers)
+    }
+
+    # Reverse mapping: which prefixes belong to which service
+    service_file_prefixes = {
+        "guideai-api": ["guideai/"],
+        "web-console": ["web-console/"],
+    }
+
+    # Services that use volume mounts (auto hot-reload)
+    volume_mounted_services = {"web-console"}
+
+    # Group files by target service
+    service_files: dict = {}
+    unmatched_files: List[str] = []
+
+    for filepath in files_to_sync:
+        target_svc = None
+
+        if service:
+            # When service is explicitly specified, only include files relevant to that service
+            prefixes = service_file_prefixes.get(service, [])
+            if any(filepath.startswith(prefix) for prefix in prefixes):
+                target_svc = service
+        else:
+            # Auto-detect service based on file path
+            for prefix, svc_name in file_service_map.items():
+                if filepath.startswith(prefix) and svc_name:
+                    target_svc = svc_name
+                    break
+
+        if target_svc and target_svc in outputs:
+            if target_svc not in service_files:
+                service_files[target_svc] = []
+            service_files[target_svc].append(filepath)
+        else:
+            unmatched_files.append(filepath)
+
+    if unmatched_files and not service:
+        console.print(f"[yellow]⚠ {len(unmatched_files)} file(s) don't map to any running service:[/yellow]")
+        for f in unmatched_files[:5]:
+            console.print(f"  [dim]• {f}[/dim]")
+        console.print()
+
+    if not service_files:
+        console.print("[yellow]No files to sync to running services[/yellow]")
+        if json_output:
+            console.print(json.dumps({"synced": [], "status": "no_matching_services"}))
+        return
+
+    # Get repo root for absolute paths
+    try:
+        repo_root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        repo_root = repo_root_result.stdout.strip()
+    except subprocess.CalledProcessError:
+        repo_root = str(Path.cwd())
+
+    results = {"synced": [], "failed": [], "hot_reload": []}
+
+    for target_svc, svc_files in service_files.items():
+        svc_info = outputs.get(target_svc, {})
+        container_id = svc_info.get("container_id")
+
+        if not container_id:
+            results["failed"].append({"service": target_svc, "error": "No container ID"})
+            continue
+
+        # Check if container exists
+        check = subprocess.run(
+            podman_cmd + ["container", "exists", container_id],
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            results["failed"].append({"service": target_svc, "error": "Container not running"})
+            continue
+
+        if target_svc in volume_mounted_services:
+            # Volume-mounted services: files are already synced via mount
+            console.print(f"[green]✓ {target_svc}:[/green] {len(svc_files)} file(s) - hot reload (volume mounted)")
+            results["hot_reload"].append({"service": target_svc, "files": len(svc_files)})
+            continue
+
+        if rebuild:
+            # Full rebuild requested
+            console.print(f"[cyan]Rebuilding {target_svc}...[/cyan]")
+            # Get build info from blueprint if available
+            try:
+                build_result = subprocess.run(
+                    podman_cmd + ["build", "-t", f"{target_svc}:dev", "-f", "deployment/Dockerfile.core.simple", repo_root],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # 5 minute timeout
+                )
+                if build_result.returncode != 0:
+                    results["failed"].append({"service": target_svc, "error": f"Build failed: {build_result.stderr[:200]}"})
+                    continue
+                console.print(f"[green]✓ Rebuilt {target_svc}[/green]")
+            except subprocess.TimeoutExpired:
+                results["failed"].append({"service": target_svc, "error": "Build timed out"})
+                continue
+        else:
+            # Copy files to container
+            console.print(f"[cyan]Syncing {len(svc_files)} file(s) to {target_svc}...[/cyan]")
+
+            for filepath in svc_files:
+                src_path = os.path.join(repo_root, filepath)
+                # Map source path to container path
+                # guideai/ -> /app/guideai/
+                dest_path = f"/app/{filepath}"
+
+                try:
+                    executor.copy_to_container(container_id, src_path, dest_path)
+                    console.print(f"  [green]✓[/green] {filepath}")
+                except Exception as e:
+                    console.print(f"  [red]✗[/red] {filepath}: {e}")
+                    results["failed"].append({"service": target_svc, "file": filepath, "error": str(e)})
+
+        # Restart service unless --no-restart
+        if not no_restart and target_svc not in volume_mounted_services:
+            console.print(f"[cyan]Restarting {target_svc}...[/cyan]")
+            try:
+                subprocess.run(
+                    podman_cmd + ["restart", container_id],
+                    capture_output=True,
+                    check=True,
+                    timeout=60,
+                )
+                console.print(f"[green]✓ Restarted {target_svc}[/green]")
+                results["synced"].append({"service": target_svc, "files": len(svc_files), "restarted": True})
+            except Exception as e:
+                results["failed"].append({"service": target_svc, "error": f"Restart failed: {e}"})
+        else:
+            results["synced"].append({"service": target_svc, "files": len(svc_files), "restarted": False})
+
+    console.print()
+
+    # Summary
+    if results["synced"]:
+        console.print(f"[green]✓ Synced {len(results['synced'])} service(s)[/green]")
+    if results["hot_reload"]:
+        console.print(f"[green]⚡ {len(results['hot_reload'])} service(s) using hot reload[/green]")
+    if results["failed"]:
+        console.print(f"[red]✗ Failed: {len(results['failed'])} operation(s)[/red]")
+        for item in results["failed"]:
+            console.print(f"  [red]• {item}[/red]")
+
+    if json_output:
+        console.print(json.dumps(results))
+
+
+# =============================================================================
+# Stop Command
+# =============================================================================
+
+@app.command()
+def stop(
+    run_id: Optional[str] = typer.Argument(
+        None,
+        help="Run ID to stop (defaults to most recent active environment)",
+    ),
+    services: Optional[List[str]] = typer.Option(
+        None,
+        "--service", "-s",
+        help="Specific service(s) to stop (can specify multiple times)",
+    ),
+    timeout: int = typer.Option(
+        10,
+        "--timeout", "-t",
+        help="Seconds to wait for graceful stop before killing",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+) -> None:
+    """Stop containers in an environment without removing them.
+
+    Containers are stopped gracefully (SIGTERM, then SIGKILL after timeout).
+    The environment manifest is preserved, so you can use 'amprealize restart'
+    to bring the containers back up.
+
+    For full cleanup (remove containers), use 'amprealize nuke' instead.
+
+    Examples:
+        amprealize stop                      # Stop all containers in latest env
+        amprealize stop amp-abc123           # Stop all containers in specific env
+        amprealize stop -s postgres-guideai  # Stop specific service
+    """
+    import subprocess
+
+    service = get_service()
+
+    # Find the run to stop
+    target_run_id = run_id
+    if not target_run_id:
+        # Find most recent active environment by file modification time
+        envs = list(service.environments_dir.glob("*.json"))
+        active_runs = []
+        for env_file in envs:
+            try:
+                with open(env_file) as f:
+                    data = json.load(f)
+                if data.get("phase") in ("APPLIED", "PROVISIONING", "DEGRADED"):
+                    mtime = env_file.stat().st_mtime
+                    active_runs.append((env_file.stem, data, mtime))
+            except Exception:
+                pass
+
+        if not active_runs:
+            console.print("[yellow]No active environments found[/yellow]")
+            console.print("[dim]Nothing to stop[/dim]")
+            raise typer.Exit(0)
+
+        # Sort by modification time (most recent first)
+        active_runs.sort(key=lambda x: x[2], reverse=True)
+        target_run_id = active_runs[0][0]
+        console.print(f"[dim]Using most recent environment: {target_run_id}[/dim]")
+
+    # Load environment manifest
+    env_path = service.environments_dir / f"{target_run_id}.json"
+    if not env_path.exists():
+        console.print(f"[red]Environment {target_run_id} not found[/red]")
+        raise typer.Exit(1)
+
+    with open(env_path) as f:
+        run_data = json.load(f)
+
+    outputs = run_data.get("environment_outputs", {})
+    if not outputs:
+        console.print(f"[yellow]No services found in environment {target_run_id}[/yellow]")
+        raise typer.Exit(0)
+
+    # Determine which services to stop
+    target_services = []
+    if services:
+        # Specific services requested
+        for svc in services:
+            if svc in outputs:
+                target_services.append(svc)
+            else:
+                console.print(f"[yellow]Service '{svc}' not found in environment[/yellow]")
+    else:
+        # Stop all services
+        target_services = list(outputs.keys())
+
+    if not target_services:
+        console.print("[yellow]No services to stop[/yellow]")
+        raise typer.Exit(0)
+
+    # Check which containers exist and their current state
+    containers_to_stop = []
+    already_stopped = []
+    missing_containers = []
+
+    for svc_name in target_services:
+        svc_info = outputs.get(svc_name, {})
+        container_id = svc_info.get("container_id")
+        if not container_id:
+            missing_containers.append(svc_name)
+            continue
+
+        # Check if container exists
+        check = subprocess.run(
+            podman_cmd + ["container", "exists", container_id],
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            missing_containers.append(svc_name)
+            continue
+
+        # Check if container is running
+        inspect = subprocess.run(
+            podman_cmd + ["inspect", "--format", "{{.State.Running}}", container_id],
+            capture_output=True,
+            text=True,
+        )
+        is_running = inspect.stdout.strip().lower() == "true"
+
+        if is_running:
+            containers_to_stop.append((svc_name, container_id))
+        else:
+            already_stopped.append(svc_name)
+
+    # Report missing containers
+    if missing_containers:
+        console.print(f"[yellow]⚠ {len(missing_containers)} container(s) do not exist:[/yellow]")
+        for svc in missing_containers:
+            console.print(f"  [dim]• {svc}[/dim]")
+        console.print()
+
+    # Report already stopped
+    if already_stopped and not json_output:
+        console.print(f"[dim]Already stopped: {', '.join(already_stopped)}[/dim]")
+
+    if not containers_to_stop:
+        if json_output:
+            console.print(json.dumps({
+                "stopped": [],
+                "already_stopped": already_stopped,
+                "missing": missing_containers,
+            }))
+        else:
+            console.print("[green]✓ All containers are already stopped[/green]")
+            console.print("[dim]Use 'amprealize restart' to start them again[/dim]")
+        return
+
+    results = {"stopped": [], "failed": [], "already_stopped": already_stopped, "missing": missing_containers}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Stopping services...", total=len(containers_to_stop))
+
+        for svc_name, container_id in containers_to_stop:
+            progress.update(task, description=f"Stopping {svc_name}...")
+
+            try:
+                result = subprocess.run(
+                    podman_cmd + ["stop", "-t", str(timeout), container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout + 15,  # Allow extra time for podman
+                )
+
+                if result.returncode == 0:
+                    results["stopped"].append(svc_name)
+                else:
+                    results["failed"].append({
+                        "service": svc_name,
+                        "error": result.stderr.strip() or "Unknown error",
+                    })
+            except subprocess.TimeoutExpired:
+                # Force kill if stop times out
+                subprocess.run(podman_cmd + ["kill", container_id], capture_output=True)
+                results["stopped"].append(svc_name)
+            except Exception as e:
+                results["failed"].append({"service": svc_name, "error": str(e)})
+
+            progress.advance(task)
+
+    # Update manifest phase to STOPPED (optional - allows tracking stopped state)
+    if results["stopped"] and not results["failed"]:
+        # Check if all containers are now stopped
+        all_stopped = (len(results["stopped"]) + len(already_stopped)) == len([
+            s for s in outputs.keys() if outputs[s].get("container_id")
+        ])
+        if all_stopped:
+            run_data["phase"] = "STOPPED"
+            with open(env_path, "w") as f:
+                json.dump(run_data, f, indent=2, default=str)
+
+    if json_output:
+        console.print(json.dumps(results, indent=2))
+        return
+
+    # Display results
+    if results["stopped"]:
+        console.print(f"[green]✓ Stopped {len(results['stopped'])} service(s):[/green]")
+        for svc in results["stopped"]:
+            console.print(f"  [dim]• {svc}[/dim]")
+
+    if results["failed"]:
+        console.print(f"[red]✗ Failed to stop {len(results['failed'])} service(s):[/red]")
+        for item in results["failed"]:
+            console.print(f"  [red]• {item['service']}: {item['error']}[/red]")
+
+    console.print()
+    console.print("[dim]Containers preserved. Use 'amprealize restart' to start them again.[/dim]")
+
+
+# =============================================================================
+# Up Command (convenience: plan + apply in one step)
+# =============================================================================
+
+@app.command()
+def up(
+    environment: str = typer.Argument(
+        "development",
+        help="Environment name (default: 'development')",
+    ),
+    blueprint: Optional[str] = typer.Option(
+        None,
+        "--blueprint", "-b",
+        help="Blueprint ID to plan (e.g., 'core-data-plane')",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force", "-f",
+        help="Force recreation even if environment exists",
+    ),
+    skip_resource_check: bool = typer.Option(
+        False,
+        "--skip-resource-check", "-S",
+        help="Skip resource availability checks (proceed despite disk/memory warnings)",
+    ),
+    auto_cleanup: bool = typer.Option(
+        False,
+        "--auto-cleanup", "-c",
+        help="Automatically clean up resources if disk/memory is low",
+    ),
+    rebuild_images: bool = typer.Option(
+        False,
+        "--rebuild-images", "-R",
+        help="Force rebuild of local images (ensures latest code is used)",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet", "-q",
+        help="Minimal output",
+    ),
+) -> None:
+    """Bring up an environment (combines plan + apply).
+
+    This is a convenience command that plans and applies in one step.
+    If an active environment already exists, it will be reused unless --force is specified.
+
+    Examples:
+        amprealize up                           # Bring up default development env
+        amprealize up development -b core-data-plane  # Specific blueprint
+        amprealize up --force                   # Force recreate
+        amprealize up --skip-resource-check    # Ignore disk/memory warnings
+        amprealize up --auto-cleanup           # Auto-cleanup if resources low
+        amprealize up --rebuild-images         # Rebuild local images with latest code
+    """
+    import subprocess
+    service = get_service()
+
+    # Check for existing active environment with running containers
+    if not force:
+        envs = list(service.environments_dir.glob("*.json"))
+        active_envs = []
+        for env_file in envs:
+            try:
+                with open(env_file) as f:
+                    data = json.load(f)
+                if data.get("phase") in ("APPLIED", "PROVISIONING"):
+                    mtime = env_file.stat().st_mtime
+                    active_envs.append((env_file.stem, data, mtime))
+            except Exception:
+                pass
+
+        # Sort by modification time (most recent first)
+        active_envs.sort(key=lambda x: x[2], reverse=True)
+
+        # Check if the most recent active env has running containers
+        for run_id, data, _ in active_envs:
+            outputs = data.get("environment_outputs", {})
+            if outputs:
+                # Check if at least one container exists
+                container_exists = False
+                for svc_info in outputs.values():
+                    cid = svc_info.get("container_id")
+                    if cid:
+                        check = subprocess.run(
+                            ["podman", "container", "exists", cid],
+                            capture_output=True,
+                        )
+                        if check.returncode == 0:
+                            container_exists = True
+                            break
+
+                if container_exists:
+                    if not quiet:
+                        console.print(f"[green]✓ Environment already active: {run_id}[/green]")
+                        console.print("[dim]Use --force to recreate, or 'amprealize restart' to restart services[/dim]")
+                    return
+
+    # Plan
+    if not quiet:
+        console.print(f"[dim]Planning environment '{environment}'...[/dim]")
+
+    from .models import PlanRequest
+    plan_req = PlanRequest(
+        environment=environment,
+        blueprint=blueprint,
+    )
+
+    try:
+        plan_response = service.plan(plan_req)
+    except Exception as e:
+        console.print(f"[red]Plan failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    if not quiet:
+        console.print(f"[dim]Plan created: {plan_response.plan_id}[/dim]")
+        console.print(f"[dim]Applying...[/dim]")
+
+    # Apply
+    from .models import ApplyRequest
+    apply_req = ApplyRequest(
+        plan_id=plan_response.plan_id,
+        watch=True,
+        skip_resource_check=skip_resource_check,
+        auto_cleanup=auto_cleanup,
+        rebuild_images=rebuild_images,
+    )
+
+    try:
+        apply_response = service.apply(apply_req)
+    except Exception as e:
+        console.print(f"[red]Apply failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Check if all containers are running
+    all_running = all(
+        svc.get("status") == "running"
+        for svc in apply_response.environment_outputs.values()
+    )
+
+    if all_running:
+        if not quiet:
+            console.print(f"[green]✓ Environment ready: {apply_response.amp_run_id}[/green]")
+
+            # Show connection info
+            if apply_response.environment_outputs:
+                console.print()
+                for svc_name, svc_info in apply_response.environment_outputs.items():
+                    host = svc_info.get("host", "localhost")
+                    port = svc_info.get("port")
+                    if port:
+                        console.print(f"  [cyan]{svc_name}:[/cyan] {host}:{port}")
+    else:
+        console.print(f"[yellow]⚠ Some services may not be running[/yellow]")
+        for svc_name, svc_info in apply_response.environment_outputs.items():
+            status = svc_info.get("status", "unknown")
+            icon = "✓" if status == "running" else "✗"
+            color = "green" if status == "running" else "yellow"
+            console.print(f"  [{color}]{icon} {svc_name}: {status}[/{color}]")
+        raise typer.Exit(1)
 
 
 # =============================================================================
@@ -837,6 +2575,193 @@ def resources(
 
 
 # =============================================================================
+# Cleanup Command
+# =============================================================================
+
+@app.command()
+def cleanup(
+    aggressive: bool = typer.Option(
+        False,
+        "--aggressive", "-a",
+        help="Use aggressive cleanup (images, build cache, dangling volumes)",
+    ),
+    include_volumes: bool = typer.Option(
+        False,
+        "--include-volumes",
+        help="Include ALL volumes (WARNING: may lose data)",
+    ),
+    scaledown_machines: bool = typer.Option(
+        False,
+        "--scaledown-machines",
+        help="Stop unused Podman machines (macOS/Windows only)",
+    ),
+    remove_machines: bool = typer.Option(
+        False,
+        "--remove-machines",
+        help="Remove unused machines after stopping (WARNING: requires rebuild)",
+    ),
+    preserve_machines: Optional[List[str]] = typer.Option(
+        None,
+        "--preserve-machine", "-p",
+        help="Machine names to never stop/remove (can specify multiple times)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run", "-n",
+        help="Show what would be cleaned without actually doing it",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet", "-q",
+        help="Minimal output",
+    ),
+) -> None:
+    """Clean up container resources to free disk space.
+
+    By default, performs standard cleanup (stopped containers, unused networks).
+    Use --aggressive for deeper cleanup including images and cache.
+    Use --scaledown-machines as a last resort to stop unused Podman machines.
+
+    Examples:
+        amprealize cleanup                    # Standard cleanup
+        amprealize cleanup --aggressive       # Include images and cache
+        amprealize cleanup --scaledown-machines --preserve-machine default
+        amprealize cleanup --dry-run          # Preview cleanup
+    """
+    executor = PodmanExecutor()
+
+    if dry_run:
+        # Show current resource usage and what could be cleaned
+        console.print("[yellow]Dry run mode - no changes will be made[/yellow]")
+        console.print()
+
+        try:
+            resource_data = executor.get_resource_insights(verbose=True)
+            if resource_data.get("summary"):
+                console.print(Panel(
+                    resource_data["summary"],
+                    title="Current Resource Status",
+                    expand=False,
+                ))
+        except Exception:
+            pass
+
+        console.print()
+        console.print("[cyan]Cleanup actions that would be performed:[/cyan]")
+        console.print("  • Remove stopped containers")
+        console.print("  • Remove unused networks")
+        if aggressive:
+            console.print("  • Remove unused images")
+            console.print("  • Remove build cache")
+            console.print("  • Remove dangling volumes")
+        if include_volumes:
+            console.print("  • [red]Remove ALL volumes (data loss possible)[/red]")
+        if scaledown_machines:
+            console.print("  • Stop unused Podman machines")
+            if remove_machines:
+                console.print("  • [red]Remove unused machines (rebuild required)[/red]")
+            if preserve_machines:
+                console.print(f"  • Preserving machines: {', '.join(preserve_machines)}")
+        return
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=not quiet,
+    ) as progress:
+        task = progress.add_task("Cleaning up resources...", total=None)
+
+        try:
+            # Perform standard or aggressive cleanup
+            result = executor.mitigate_resources(
+                aggressive=aggressive,
+                prune_volumes=include_volumes,
+            )
+
+            # Optionally stop/remove machines
+            machine_result = None
+            if scaledown_machines and hasattr(executor, 'stop_unused_machines'):
+                progress.update(task, description="Scaling down machines...")
+                machine_result = executor.stop_unused_machines(
+                    preserve=preserve_machines or []
+                )
+
+                # Optionally remove machines
+                if remove_machines and machine_result and machine_result.machines_stopped > 0:
+                    progress.update(task, description="Removing machines...")
+                    # The stopped machines are tracked in machine_result
+                    # We could iterate over them to remove, but for safety
+                    # we'll just note this in the result
+                    pass
+
+        except Exception as e:
+            console.print(f"[red]Cleanup failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    if json_output:
+        output = result.to_dict() if hasattr(result, 'to_dict') else {}
+        if machine_result:
+            output["machines_stopped"] = machine_result.machines_stopped
+            output["machines_removed"] = machine_result.machines_removed
+        console.print(json.dumps(output, indent=2))
+        return
+
+    if quiet:
+        items = result.items_cleaned if hasattr(result, 'items_cleaned') else 0
+        if machine_result:
+            items += machine_result.machines_stopped
+        console.print(f"{items}")
+        return
+
+    # Display results
+    table = Table(title="Cleanup Results")
+    table.add_column("Resource", style="cyan")
+    table.add_column("Cleaned", style="green")
+
+    table.add_row("Containers", str(result.containers_removed))
+    table.add_row("Images", str(result.images_removed))
+    table.add_row("Volumes", str(result.volumes_removed))
+    table.add_row("Networks", str(result.networks_removed))
+    if hasattr(result, 'cache_cleared') and result.cache_cleared:
+        table.add_row("Build Cache", "Yes")
+
+    if machine_result:
+        table.add_row("Machines Stopped", str(machine_result.machines_stopped))
+        table.add_row("Machines Removed", str(machine_result.machines_removed))
+
+    console.print(table)
+
+    # Show space reclaimed
+    space_mb = result.space_reclaimed_mb
+    if machine_result:
+        space_mb += machine_result.space_reclaimed_mb
+    if space_mb > 0:
+        if space_mb > 1024:
+            console.print(f"\n[green]Space reclaimed: {space_mb / 1024:.2f} GB[/green]")
+        else:
+            console.print(f"\n[green]Space reclaimed: {space_mb:.0f} MB[/green]")
+
+    # Show post-cleanup resource status
+    try:
+        resource_data = executor.get_resource_insights()
+        if resource_data.get("summary"):
+            console.print()
+            console.print(Panel(
+                resource_data["summary"],
+                title="Post-Cleanup Resource Status",
+                expand=False,
+            ))
+    except Exception:
+        pass
+
+
+# =============================================================================
 # Validate Command
 # =============================================================================
 
@@ -927,6 +2852,1245 @@ def validate(
             console.print(f"  [red]•[/red] {error}")
 
         raise typer.Exit(1)
+
+
+# =============================================================================
+# Plan for Tests Command
+# =============================================================================
+
+@app.command("plan-for-tests")
+def plan_for_tests(
+    test_paths: List[str] = typer.Argument(
+        ...,
+        help="Test file or directory paths to analyze",
+    ),
+    blueprint: str = typer.Option(
+        ...,
+        "--blueprint", "-b",
+        help="Blueprint ID containing full service definitions",
+    ),
+    environment: str = typer.Option(
+        "development",
+        "--env", "-e",
+        help="Environment to use",
+    ),
+    markers: Optional[List[str]] = typer.Option(
+        None,
+        "--marker", "-m",
+        help="Explicit pytest markers to include (can specify multiple)",
+    ),
+    suite_config: Optional[Path] = typer.Option(
+        None,
+        "--suite-config", "-s",
+        help="Path to test suite configuration YAML",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output", "-o",
+        help="Output plan to JSON file",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet", "-q",
+        help="Only output plan ID",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Show detailed analysis information",
+    ),
+) -> None:
+    """Analyze tests and plan minimal infrastructure.
+
+    This command examines test files to discover which services they need,
+    then creates a minimal deployment plan containing only those services.
+
+    Examples:
+        amprealize plan-for-tests tests/integration/ -b full-stack
+        amprealize plan-for-tests tests/test_api.py -b dev-stack -m db -m redis
+        amprealize plan-for-tests tests/ -b full-stack --suite-config tests/suite.yaml
+    """
+    from .models import PlanForTestsRequest
+
+    service = get_service()
+
+    request = PlanForTestsRequest(
+        test_paths=test_paths,
+        blueprint_id=blueprint,
+        environment=environment,
+        markers=markers,
+        suite_config_path=str(suite_config) if suite_config else None,
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task("Analyzing tests...", total=None)
+
+        try:
+            response = service.plan_for_tests(request)
+        except Exception as e:
+            console.print(f"[red]Analysis failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    if quiet:
+        console.print(response.plan_id)
+        return
+
+    if output:
+        output.write_text(json.dumps({
+            "plan_id": response.plan_id,
+            "amp_run_id": response.amp_run_id,
+            "required_services": response.required_services,
+            "startup_order": response.startup_order,
+            "discovered_markers": response.discovered_markers,
+            "service_sources": response.service_sources,
+            "test_files_analyzed": response.test_files_analyzed,
+            "environment_estimates": {
+                "memory_footprint_mb": response.environment_estimates.memory_footprint_mb,
+                "expected_boot_duration_s": response.environment_estimates.expected_boot_duration_s,
+            },
+        }, indent=2))
+        console.print(f"[green]Plan written to {output}[/green]")
+        return
+
+    # Display analysis summary
+    console.print(Panel(
+        f"[bold]Plan ID:[/bold] {response.plan_id}\n"
+        f"[bold]Run ID:[/bold] {response.amp_run_id}\n"
+        f"[bold]Test Files Analyzed:[/bold] {response.test_files_analyzed}\n"
+        f"[bold]Memory:[/bold] {response.environment_estimates.memory_footprint_mb} MB\n"
+        f"[bold]Boot Time:[/bold] ~{response.environment_estimates.expected_boot_duration_s}s",
+        title="Test Infrastructure Plan",
+        expand=False,
+    ))
+
+    # Show discovered markers
+    if response.discovered_markers:
+        console.print()
+        console.print("[bold]Discovered Markers:[/bold]")
+        for marker in response.discovered_markers:
+            console.print(f"  [cyan]@pytest.mark.{marker}[/cyan]")
+
+    # Show required services with startup order
+    if response.required_services:
+        console.print()
+        table = Table(title="Required Services (Startup Order)")
+        table.add_column("#", style="dim")
+        table.add_column("Service", style="cyan")
+        table.add_column("Reason", style="green")
+
+        for i, svc in enumerate(response.startup_order, 1):
+            reason = response.service_sources.get(svc, "dependency")
+            table.add_row(str(i), svc, reason)
+
+        console.print(table)
+
+    # Show analysis errors if any
+    if response.analysis_errors:
+        console.print()
+        console.print("[yellow]Analysis Warnings:[/yellow]")
+        for error in response.analysis_errors:
+            console.print(f"  [yellow]⚠[/yellow] {error}")
+
+    if verbose and response.minimal_blueprint:
+        console.print()
+        console.print("[bold]Minimal Blueprint Services:[/bold]")
+        for svc_name, svc_config in response.minimal_blueprint.get("services", {}).items():
+            console.print(f"  [cyan]{svc_name}[/cyan]: {svc_config.get('image', 'unknown')}")
+            if svc_config.get("depends_on"):
+                console.print(f"    [dim]depends_on: {', '.join(svc_config['depends_on'])}[/dim]")
+
+    console.print()
+    console.print(f"[dim]Run 'amprealize apply --plan-id {response.plan_id}' to provision[/dim]")
+
+
+# =============================================================================
+# Run Tests Command
+# =============================================================================
+
+@app.command("run-tests")
+def run_tests(
+    test_paths: List[str] = typer.Argument(
+        ...,
+        help="Test file or directory paths",
+    ),
+    blueprint: str = typer.Option(
+        ...,
+        "--blueprint", "-b",
+        help="Blueprint ID containing full service definitions",
+    ),
+    environment: str = typer.Option(
+        "development",
+        "--env", "-e",
+        help="Environment to use",
+    ),
+    markers: Optional[List[str]] = typer.Option(
+        None,
+        "--marker", "-m",
+        help="Pytest markers to filter tests (can specify multiple)",
+    ),
+    pytest_args: Optional[List[str]] = typer.Option(
+        None,
+        "--pytest-arg", "-p",
+        help="Additional pytest arguments (can specify multiple)",
+    ),
+    suite_config: Optional[Path] = typer.Option(
+        None,
+        "--suite-config", "-s",
+        help="Path to test suite configuration YAML",
+    ),
+    timeout: int = typer.Option(
+        600,
+        "--timeout", "-t",
+        help="Test execution timeout in seconds",
+    ),
+    keep: bool = typer.Option(
+        False,
+        "--keep", "-k",
+        help="Keep infrastructure after tests complete",
+    ),
+    no_pytest: bool = typer.Option(
+        False,
+        "--no-pytest",
+        help="Only provision infrastructure, don't run pytest",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Show detailed output",
+    ),
+) -> None:
+    """Provision infrastructure, run tests, and teardown.
+
+    This is an all-in-one command that:
+    1. Analyzes test files to determine required services
+    2. Provisions only the needed infrastructure
+    3. Runs pytest with the specified options
+    4. Tears down the environment (unless --keep)
+
+    Examples:
+        amprealize run-tests tests/integration/ -b full-stack
+        amprealize run-tests tests/test_api.py -b dev-stack -p "-v" -p "--tb=short"
+        amprealize run-tests tests/ -b full-stack -m db --keep
+    """
+    from .models import RunTestsRequest
+
+    service = get_service()
+
+    request = RunTestsRequest(
+        test_paths=test_paths,
+        blueprint_id=blueprint,
+        environment=environment,
+        markers=markers,
+        pytest_args=pytest_args,
+        suite_config_path=str(suite_config) if suite_config else None,
+        timeout_s=timeout,
+        skip_teardown=keep,
+        run_pytest=not no_pytest,
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Analyzing tests...", total=None)
+
+        try:
+            progress.update(task, description="Planning infrastructure...")
+            # Note: run_tests() handles the full workflow internally
+            response = service.run_tests(request)
+        except Exception as e:
+            console.print(f"[red]Test run failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    # Display results
+    console.print()
+    console.print(Panel(
+        f"[bold]Plan ID:[/bold] {response.plan_id or 'N/A'}\n"
+        f"[bold]Run ID:[/bold] {response.amp_run_id or 'N/A'}\n"
+        f"[bold]Services:[/bold] {', '.join(response.required_services) or 'None'}\n"
+        f"[bold]Duration:[/bold] {response.total_duration_s:.1f}s",
+        title="Test Run Summary",
+        expand=False,
+    ))
+
+    # Show pytest results
+    if response.pytest_exit_code is not None:
+        console.print()
+        if response.pytest_exit_code == 0:
+            console.print("[green]✓ Tests passed[/green]")
+        else:
+            console.print(f"[red]✗ Tests failed (exit code: {response.pytest_exit_code})[/red]")
+
+        if verbose and response.pytest_output:
+            console.print()
+            console.print("[bold]Pytest Output:[/bold]")
+            console.print(response.pytest_output)
+
+    # Show environment outputs
+    if response.environment_outputs and verbose:
+        console.print()
+        table = Table(title="Service Endpoints")
+        table.add_column("Service", style="cyan")
+        table.add_column("URL/Endpoint", style="green")
+
+        for svc_name, outputs in response.environment_outputs.items():
+            url = outputs.get("url") or f"{outputs.get('host', 'localhost')}:{outputs.get('port', '?')}"
+            table.add_row(svc_name, url)
+
+        console.print(table)
+
+    # Show teardown report
+    if response.teardown_report:
+        console.print()
+        console.print("[dim]Teardown:[/dim]", ", ".join(response.teardown_report))
+
+    # Show errors
+    if response.errors:
+        console.print()
+        console.print("[yellow]Errors:[/yellow]")
+        for error in response.errors:
+            console.print(f"  [yellow]⚠[/yellow] {error}")
+
+    # Exit with pytest exit code if tests were run
+    if response.pytest_exit_code is not None and response.pytest_exit_code != 0:
+        raise typer.Exit(response.pytest_exit_code)
+
+
+# =============================================================================
+# Nuke Command
+# =============================================================================
+
+@app.command()
+def nuke(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run", "-n",
+        help="Preview what would be removed without actually doing it",
+    ),
+    include_volumes: bool = typer.Option(
+        False,
+        "--include-volumes", "-v",
+        help="Also remove associated volumes (WARNING: data loss possible)",
+    ),
+    include_state: bool = typer.Option(
+        False,
+        "--include-state", "-s",
+        help="Also remove amprealize state files (manifests, environments)",
+    ),
+    include_processes: bool = typer.Option(
+        True,
+        "--include-processes/--no-processes", "-p/-P",
+        help="Kill GuideAI processes (uvicorn, vite) on standard ports",
+    ),
+    include_networks: bool = typer.Option(
+        True,
+        "--include-networks/--no-networks",
+        help="Remove guideai/amprealize Podman networks",
+    ),
+    stop_machine: bool = typer.Option(
+        True,
+        "--stop-machine/--no-stop-machine",
+        help="Stop (not destroy) the Podman machine to release ports (safe, VM preserved)",
+    ),
+    include_machine: bool = typer.Option(
+        False,
+        "--include-machine", "-m",
+        help="Also destroy the Podman machine (WARNING: removes VM completely)",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force", "-f",
+        help="Skip confirmation prompt",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet", "-q",
+        help="Minimal output",
+    ),
+) -> None:
+    """Remove ALL guideai/amprealize containers, volumes, networks, state, and processes.
+
+    This command is a nuclear option to clean up all guideai infrastructure.
+    It finds and removes:
+    - Containers matching guideai-* or amp-*
+    - Podman networks matching guideai-* or amp-*
+    - GuideAI processes on ports 8000 (backend) and 5173 (frontend)
+    - Stops the Podman machine to release ports (gvproxy)
+    - Optionally: volumes, state files, and destroy (not just stop) the Podman machine
+
+    Use --dry-run to preview what would be removed before actually doing it.
+
+    Examples:
+        amprealize nuke --dry-run          # Preview what would be removed
+        amprealize nuke                    # Remove containers + networks + processes + stop machine
+        amprealize nuke --force            # Remove without confirmation
+        amprealize nuke -v -s              # Also remove volumes and state files
+        amprealize nuke -m                 # Also destroy the Podman machine (not just stop)
+        amprealize nuke --no-stop-machine  # Keep machine running (ports may remain bound)
+        amprealize nuke --no-processes     # Skip killing processes
+        amprealize nuke --no-networks      # Skip removing networks
+        amprealize nuke --json             # Output results as JSON
+    """
+    import subprocess
+    import re
+
+    executor = PodmanExecutor()
+
+    # Prefer a connection that targets the guideai Podman machine (when present),
+    # so nuke operates on the same Podman "universe" as other amprealize commands.
+    podman_local_cmd = ["podman"]
+    machine_name: Optional[str] = None
+    try:
+        result = subprocess.run(
+            podman_local_cmd + ["machine", "list", "--format", "{{.Name}}\t{{.Running}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        default_name: Optional[str] = None
+        first_name: Optional[str] = None
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            name_raw = parts[0].strip()
+            name = name_raw.rstrip("*")
+            if first_name is None:
+                first_name = name
+            if name_raw.endswith("*"):
+                default_name = name
+            if "guideai" in name.lower():
+                machine_name = name
+                break
+
+        machine_name = machine_name or default_name or first_name
+    except Exception:
+        machine_name = None
+
+    # If we can identify a machine, clean both its common rootless/rootful
+    # connections so "nuke" truly means nuke.
+    podman_connections_to_clean: List[Optional[str]] = []
+    if machine_name:
+        resolved: Optional[str] = None
+        try:
+            resolved = executor.resolve_connection_for_machine(machine_name)
+        except Exception:
+            resolved = None
+
+        for candidate in [resolved, machine_name, f"{machine_name}-root"]:
+            if candidate and candidate not in podman_connections_to_clean:
+                podman_connections_to_clean.append(candidate)
+
+    if not podman_connections_to_clean:
+        podman_connections_to_clean = [None]
+
+    def _podman_cmd_for_connection(connection: Optional[str]) -> List[str]:
+        cmd = ["podman"]
+        if connection:
+            cmd += ["--connection", connection]
+        return cmd
+
+    # Container name patterns to match
+    patterns = [
+        r"^guideai-",
+        r"^amp-[a-f0-9-]+.*guideai",
+        r"^amp-[a-f0-9-]+-",  # Amprealize-managed containers
+    ]
+
+    # Discover containers
+    try:
+        all_containers = []
+        discovery_errors: List[str] = []
+        any_success = False
+        for connection in podman_connections_to_clean:
+            podman_cmd = _podman_cmd_for_connection(connection)
+            try:
+                # Get all containers (running + stopped)
+                result = subprocess.run(
+                    podman_cmd + ["ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                any_success = True
+                for line in result.stdout.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        container_id, name, status = parts[0], parts[1], parts[2]
+                        # Check if name matches any pattern
+                        for pattern in patterns:
+                            if re.match(pattern, name):
+                                all_containers.append({
+                                    "id": container_id,
+                                    "name": name,
+                                    "status": status,
+                                    "running": "Up" in status,
+                                    "connection": connection,
+                                })
+                                break
+            except subprocess.TimeoutExpired:
+                discovery_errors.append(f"Timeout discovering containers (connection={connection or 'default'})")
+            except Exception as e:
+                discovery_errors.append(f"Failed to list containers (connection={connection or 'default'}): {e}")
+
+        if not any_success:
+            console.print("[red]Failed to discover containers on any Podman connection[/red]")
+            for err in discovery_errors:
+                console.print(f"[red]  • {err}[/red]")
+            raise typer.Exit(1)
+    except subprocess.TimeoutExpired:
+        console.print("[red]Timeout discovering containers[/red]")
+        raise typer.Exit(1)
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Failed to list containers: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Discover volumes
+    volumes_to_remove: List[Dict[str, Any]] = []
+    if include_volumes:
+        try:
+            for connection in podman_connections_to_clean:
+                podman_cmd = _podman_cmd_for_connection(connection)
+                result = subprocess.run(
+                    podman_cmd + ["volume", "ls", "--format", "{{.Name}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                for vol_name in result.stdout.strip().split("\n"):
+                    vol_name = vol_name.strip()
+                    if not vol_name:
+                        continue
+                    for pattern in patterns:
+                        if re.match(pattern, vol_name):
+                            volumes_to_remove.append({"name": vol_name, "connection": connection})
+                            break
+        except Exception:
+            pass  # Non-critical, continue anyway
+
+    # Discover networks
+    networks_to_remove: List[Dict[str, Any]] = []
+    if include_networks:
+        try:
+            for connection in podman_connections_to_clean:
+                podman_cmd = _podman_cmd_for_connection(connection)
+                result = subprocess.run(
+                    podman_cmd + ["network", "ls", "--format", "{{.Name}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                for net_name in result.stdout.strip().split("\n"):
+                    net_name = net_name.strip()
+                    if not net_name or net_name == "podman":  # Never remove default network
+                        continue
+                    for pattern in patterns:
+                        if re.match(pattern, net_name):
+                            networks_to_remove.append({"name": net_name, "connection": connection})
+                            break
+        except Exception:
+            pass  # Non-critical, continue anyway
+
+    # Discover state files
+    state_files_to_remove: List[Path] = []
+    if include_state:
+        state_dir = Path.home() / ".guideai" / "amprealize"
+        if state_dir.exists():
+            for subdir in ["manifests", "environments"]:
+                path = state_dir / subdir
+                if path.exists():
+                    for f in path.glob("*.json"):
+                        state_files_to_remove.append(f)
+
+    # Discover GuideAI processes on standard ports
+    processes_to_kill: List[Dict[str, Any]] = []
+    guideai_ports = {
+        8000: "backend (uvicorn)",
+        5173: "frontend (vite)",
+        5174: "frontend alt (vite)",
+        3000: "web console",
+    }
+    if include_processes:
+        import platform
+        for port, description in guideai_ports.items():
+            try:
+                if platform.system() == "Darwin":
+                    # macOS: use lsof
+                    result = subprocess.run(
+                        ["lsof", "-ti", f":{port}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        pids = result.stdout.strip().split("\n")
+                        for pid in pids:
+                            pid = pid.strip()
+                            if pid:
+                                # Get process command
+                                ps_result = subprocess.run(
+                                    ["ps", "-p", pid, "-o", "command="],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=5,
+                                )
+                                cmd = ps_result.stdout.strip()[:60] if ps_result.returncode == 0 else "unknown"
+                                processes_to_kill.append({
+                                    "pid": pid,
+                                    "port": port,
+                                    "description": description,
+                                    "command": cmd,
+                                })
+                else:
+                    # Linux: use ss or netstat
+                    result = subprocess.run(
+                        ["ss", "-tlnp", f"sport = :{port}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    # Parse PID from ss output
+                    for line in result.stdout.split("\n"):
+                        if f":{port}" in line and "pid=" in line:
+                            pid_match = re.search(r"pid=(\d+)", line)
+                            if pid_match:
+                                pid = pid_match.group(1)
+                                processes_to_kill.append({
+                                    "pid": pid,
+                                    "port": port,
+                                    "description": description,
+                                    "command": "unknown",
+                                })
+            except Exception:
+                pass  # Non-critical
+
+    # Discover Podman machine to stop (releases gvproxy ports)
+    machine_to_stop: Optional[Dict[str, Any]] = None
+    if stop_machine and not include_machine:  # Only stop if not destroying
+        try:
+            result = subprocess.run(
+                podman_local_cmd + ["machine", "list", "--format", "{{.Name}}\t{{.VMType}}\t{{.Running}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    name, vm_type, running = parts[0], parts[1], parts[2]
+                    # Match guideai machines that are running
+                    if "guideai" in name.lower() and running.lower() == "true":
+                        machine_to_stop = {
+                            "name": name.rstrip("*"),  # Remove default marker
+                            "vm_type": vm_type,
+                            "running": True,
+                        }
+                        break
+        except Exception:
+            pass  # Non-critical
+
+    # Discover Podman machine to destroy (complete removal)
+    machine_to_destroy: Optional[Dict[str, str]] = None
+    if include_machine:
+        try:
+            result = subprocess.run(
+                podman_local_cmd + ["machine", "list", "--format", "{{.Name}}\t{{.VMType}}\t{{.Running}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    name, vm_type, running = parts[0], parts[1], parts[2]
+                    # Match guideai machines
+                    if "guideai" in name.lower():
+                        machine_to_destroy = {
+                            "name": name.rstrip("*"),  # Remove default marker
+                            "vm_type": vm_type,
+                            "running": running.lower() == "true",
+                        }
+                        break
+        except Exception:
+            pass  # Non-critical
+
+    # Calculate totals
+    running_count = sum(1 for c in all_containers if c["running"])
+    stopped_count = len(all_containers) - running_count
+
+    # Dry run output
+    if dry_run:
+        if json_output:
+            output = {
+                "dry_run": True,
+                "containers": all_containers,
+                "processes": processes_to_kill,
+                "volumes": [
+                    (f"{v['name']} (conn: {v['connection']})" if v.get("connection") else v["name"])
+                    for v in volumes_to_remove
+                ],
+                "networks": [
+                    (f"{n['name']} (conn: {n['connection']})" if n.get("connection") else n["name"])
+                    for n in networks_to_remove
+                ],
+                "state_files": [str(f) for f in state_files_to_remove],
+                "machine_to_stop": machine_to_stop,
+                "machine_to_destroy": machine_to_destroy,
+                "summary": {
+                    "containers_running": running_count,
+                    "containers_stopped": stopped_count,
+                    "containers_total": len(all_containers),
+                    "processes": len(processes_to_kill),
+                    "volumes": len(volumes_to_remove),
+                    "networks": len(networks_to_remove),
+                    "state_files": len(state_files_to_remove),
+                    "machine_stop": 1 if machine_to_stop else 0,
+                    "machine_destroy": 1 if machine_to_destroy else 0,
+                },
+            }
+            console.print(json.dumps(output, indent=2))
+            return
+
+        console.print("[yellow]Dry run mode - no changes will be made[/yellow]")
+        console.print()
+
+        if all_containers:
+            table = Table(title="Containers to Remove")
+            table.add_column("Name", style="cyan")
+            table.add_column("Status", style="dim")
+            table.add_column("State", style="green")
+
+            for c in all_containers:
+                state = "[green]running[/green]" if c["running"] else "[dim]stopped[/dim]"
+                table.add_row(c["name"], c["status"][:30], state)
+
+            console.print(table)
+            console.print()
+            console.print(f"[bold]Total:[/bold] {len(all_containers)} containers ({running_count} running, {stopped_count} stopped)")
+        else:
+            console.print("[green]No guideai containers found[/green]")
+
+        if volumes_to_remove:
+            console.print()
+            console.print("[bold]Volumes to remove:[/bold]")
+            for vol in volumes_to_remove:
+                if vol.get("connection"):
+                    console.print(f"  • {vol['name']} [dim](conn: {vol['connection']})[/dim]")
+                else:
+                    console.print(f"  • {vol['name']}")
+
+        if networks_to_remove:
+            console.print()
+            console.print("[bold]Networks to remove:[/bold]")
+            for net in networks_to_remove:
+                if net.get("connection"):
+                    console.print(f"  • {net['name']} [dim](conn: {net['connection']})[/dim]")
+                else:
+                    console.print(f"  • {net['name']}")
+
+        if state_files_to_remove:
+            console.print()
+            console.print("[bold]State files to remove:[/bold]")
+            for f in state_files_to_remove:
+                console.print(f"  • {f.name}")
+
+        if processes_to_kill:
+            console.print()
+            table = Table(title="Processes to Kill")
+            table.add_column("PID", style="cyan")
+            table.add_column("Port", style="yellow")
+            table.add_column("Description", style="dim")
+            table.add_column("Command", style="dim")
+
+            for p in processes_to_kill:
+                table.add_row(p["pid"], str(p["port"]), p["description"], p["command"][:40])
+
+            console.print(table)
+
+        if machine_to_stop:
+            console.print()
+            console.print(f"[bold yellow]Podman machine to stop:[/bold yellow] {machine_to_stop['name']} ({machine_to_stop['vm_type']}) - [green]running[/green]")
+            console.print("[dim]  (stops VM to release ports; use --no-stop-machine to keep running)[/dim]")
+
+        if machine_to_destroy:
+            console.print()
+            status = "[green]running[/green]" if machine_to_destroy.get("running") else "[dim]stopped[/dim]"
+            console.print(f"[bold red]Podman machine to destroy:[/bold red] {machine_to_destroy['name']} ({machine_to_destroy['vm_type']}) - {status}")
+
+        return
+
+    # Nothing to do
+    if not all_containers and not volumes_to_remove and not networks_to_remove and not state_files_to_remove and not processes_to_kill and not machine_to_stop and not machine_to_destroy:
+        if json_output:
+            console.print(json.dumps({"message": "Nothing to remove", "removed": {}}))
+        elif not quiet:
+            console.print("[green]✓ Nothing to remove - no guideai resources found[/green]")
+        return
+
+    # Confirmation
+    if not force:
+        console.print()
+        console.print("[bold red]⚠ WARNING: This will remove:[/bold red]")
+        if all_containers:
+            console.print(f"  • {len(all_containers)} container(s) ({running_count} running)")
+        if processes_to_kill:
+            console.print(f"  • {len(processes_to_kill)} process(es) on ports {', '.join(str(p['port']) for p in processes_to_kill)}")
+        if networks_to_remove:
+            console.print(f"  • {len(networks_to_remove)} network(s)")
+        if volumes_to_remove:
+            console.print(f"  • {len(volumes_to_remove)} volume(s) [red](data loss possible)[/red]")
+        if state_files_to_remove:
+            console.print(f"  • {len(state_files_to_remove)} state file(s)")
+        if machine_to_stop:
+            console.print(f"  • Stop Podman machine '{machine_to_stop['name']}' [yellow](releases ports, VM preserved)[/yellow]")
+        if machine_to_destroy:
+            console.print(f"  • Podman machine '{machine_to_destroy['name']}' [red](VM will be destroyed)[/red]")
+        console.print()
+
+        if not Confirm.ask("[yellow]Are you sure you want to continue?[/yellow]"):
+            console.print("[dim]Aborted[/dim]")
+            raise typer.Exit(0)
+
+    # Execute removal
+    removed = {
+        "containers": [],
+        "processes": [],
+        "volumes": [],
+        "networks": [],
+        "state_files": [],
+        "machine_stopped": None,
+        "machine": None,
+        "errors": [],
+    }
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=quiet,
+    ) as progress:
+        # Kill processes first (before containers, so ports are freed)
+        if processes_to_kill:
+            task = progress.add_task("Killing processes...", total=len(processes_to_kill))
+
+            for proc in processes_to_kill:
+                try:
+                    subprocess.run(
+                        ["kill", "-9", proc["pid"]],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    removed["processes"].append(f"PID {proc['pid']} (port {proc['port']})")
+                except Exception as e:
+                    removed["errors"].append(f"Failed to kill PID {proc['pid']}: {e}")
+
+                progress.advance(task)
+
+        # Remove containers
+        if all_containers:
+            task = progress.add_task("Removing containers...", total=len(all_containers))
+
+            for container in all_containers:
+                try:
+                    container_podman_cmd = _podman_cmd_for_connection(container.get("connection"))
+                    # Stop if running
+                    if container["running"]:
+                        subprocess.run(
+                            container_podman_cmd + ["stop", "--time", "5", container["id"]],
+                            capture_output=True,
+                            timeout=30,
+                        )
+
+                    # Remove
+                    subprocess.run(
+                        container_podman_cmd + ["rm", "-f", container["id"]],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    if container.get("connection") and len(podman_connections_to_clean) > 1:
+                        removed["containers"].append(f"{container['name']} (conn: {container['connection']})")
+                    else:
+                        removed["containers"].append(container["name"])
+                except Exception as e:
+                    removed["errors"].append(f"Failed to remove {container['name']}: {e}")
+
+                progress.advance(task)
+
+        # Remove volumes
+        if volumes_to_remove:
+            task = progress.add_task("Removing volumes...", total=len(volumes_to_remove))
+
+            for vol in volumes_to_remove:
+                try:
+                    subprocess.run(
+                        _podman_cmd_for_connection(vol.get("connection")) + ["volume", "rm", "-f", vol["name"]],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    if vol.get("connection") and len(podman_connections_to_clean) > 1:
+                        removed["volumes"].append(f"{vol['name']} (conn: {vol['connection']})")
+                    else:
+                        removed["volumes"].append(vol["name"])
+                except Exception as e:
+                    removed["errors"].append(f"Failed to remove volume {vol.get('name')}: {e}")
+
+                progress.advance(task)
+
+        # Remove networks (after containers are removed)
+        if networks_to_remove:
+            task = progress.add_task("Removing networks...", total=len(networks_to_remove))
+
+            for net in networks_to_remove:
+                try:
+                    subprocess.run(
+                        _podman_cmd_for_connection(net.get("connection")) + ["network", "rm", "-f", net["name"]],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    if net.get("connection") and len(podman_connections_to_clean) > 1:
+                        removed["networks"].append(f"{net['name']} (conn: {net['connection']})")
+                    else:
+                        removed["networks"].append(net["name"])
+                except Exception as e:
+                    removed["errors"].append(f"Failed to remove network {net.get('name')}: {e}")
+
+                progress.advance(task)
+
+        # Remove state files
+        if state_files_to_remove:
+            task = progress.add_task("Removing state files...", total=len(state_files_to_remove))
+
+            for f in state_files_to_remove:
+                try:
+                    f.unlink()
+                    removed["state_files"].append(str(f))
+                except Exception as e:
+                    removed["errors"].append(f"Failed to remove {f}: {e}")
+
+                progress.advance(task)
+
+        # Stop Podman machine (releases gvproxy ports)
+        # Do this after containers are removed but before machine destroy
+        if machine_to_stop and not machine_to_destroy:
+            # Only stop if we're not also destroying (destroy does its own stop)
+            task = progress.add_task(f"Stopping Podman machine '{machine_to_stop['name']}'...", total=1)
+
+            try:
+                result = subprocess.run(
+                    podman_local_cmd + ["machine", "stop", machine_to_stop["name"]],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if result.returncode == 0:
+                    removed["machine_stopped"] = machine_to_stop["name"]
+                else:
+                    # Machine might already be stopped
+                    if "already stopped" in result.stderr.lower() or "not running" in result.stderr.lower():
+                        removed["machine_stopped"] = f"{machine_to_stop['name']} (was already stopped)"
+                    elif "process does not exist" in result.stderr.lower():
+                        removed["machine_stopped"] = f"{machine_to_stop['name']} (process already gone)"
+                    else:
+                        removed["errors"].append(f"Failed to stop machine: {result.stderr}")
+            except Exception as e:
+                removed["errors"].append(f"Failed to stop machine {machine_to_stop['name']}: {e}")
+
+            progress.advance(task)
+
+        # Destroy Podman machine (do this last, after containers are removed)
+        if machine_to_destroy:
+            task = progress.add_task(f"Destroying Podman machine '{machine_to_destroy['name']}'...", total=1)
+
+            try:
+                # Stop first if running
+                if machine_to_destroy.get("running"):
+                    subprocess.run(
+                        podman_local_cmd + ["machine", "stop", machine_to_destroy["name"]],
+                        capture_output=True,
+                        timeout=60,
+                    )
+
+                # Destroy the machine
+                result = subprocess.run(
+                    podman_local_cmd + ["machine", "rm", "-f", machine_to_destroy["name"]],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode == 0:
+                    removed["machine"] = machine_to_destroy["name"]
+                else:
+                    removed["errors"].append(f"Failed to destroy machine: {result.stderr}")
+            except Exception as e:
+                removed["errors"].append(f"Failed to destroy machine {machine_to_destroy['name']}: {e}")
+
+            progress.advance(task)
+
+    # Output results
+    if json_output:
+        console.print(json.dumps(removed, indent=2))
+        return
+
+    if quiet:
+        parts = []
+        if removed["containers"]:
+            parts.append(f"{len(removed['containers'])} containers")
+        if removed["processes"]:
+            parts.append(f"{len(removed['processes'])} processes")
+        if removed["volumes"]:
+            parts.append(f"{len(removed['volumes'])} volumes")
+        if removed["state_files"]:
+            parts.append(f"{len(removed['state_files'])} state files")
+        if removed["networks"]:
+            parts.append(f"{len(removed['networks'])} networks")
+        if removed["machine_stopped"]:
+            parts.append(f"stopped machine '{removed['machine_stopped']}'")
+        if removed["machine"]:
+            parts.append(f"destroyed machine '{removed['machine']}'")
+        console.print(", ".join(parts) if parts else "nothing removed")
+        return
+
+    # Summary table
+    console.print()
+    table = Table(title="Nuke Results")
+    table.add_column("Resource", style="cyan")
+    table.add_column("Removed", style="green")
+
+    table.add_row("Processes", str(len(removed["processes"])))
+    table.add_row("Containers", str(len(removed["containers"])))
+    table.add_row("Networks", str(len(removed["networks"])))
+    table.add_row("Volumes", str(len(removed["volumes"])))
+    table.add_row("State Files", str(len(removed["state_files"])))
+    table.add_row("Machine Stopped", removed["machine_stopped"] or "-")
+    table.add_row("Machine Destroyed", removed["machine"] or "-")
+
+    console.print(table)
+
+    if removed["errors"]:
+        console.print()
+        console.print("[yellow]Errors:[/yellow]")
+        for error in removed["errors"]:
+            console.print(f"  [yellow]⚠[/yellow] {error}")
+
+    console.print()
+    console.print("[green]✓ Nuke complete[/green]")
+
+
+# =============================================================================
+# Fresh Command (nuke + up in one step)
+# =============================================================================
+
+@app.command()
+def fresh(
+    environment: str = typer.Argument(
+        "development",
+        help="Environment name (default: 'development')",
+    ),
+    blueprint: Optional[str] = typer.Option(
+        None,
+        "--blueprint", "-b",
+        help="Blueprint ID to plan (e.g., 'core-data-plane')",
+    ),
+    include_volumes: bool = typer.Option(
+        False,
+        "--include-volumes", "-v",
+        help="Also remove volumes during nuke (WARNING: data loss possible)",
+    ),
+    include_state: bool = typer.Option(
+        False,
+        "--include-state", "-s",
+        help="Also remove state files during nuke",
+    ),
+    skip_machine_stop: bool = typer.Option(
+        False,
+        "--skip-machine-stop",
+        help="Don't stop the Podman machine (faster but ports may remain bound)",
+    ),
+    skip_resource_check: bool = typer.Option(
+        False,
+        "--skip-resource-check", "-S",
+        help="Skip resource availability checks (proceed despite disk/memory warnings)",
+    ),
+    auto_cleanup: bool = typer.Option(
+        False,
+        "--auto-cleanup", "-c",
+        help="Automatically clean up resources if disk/memory is low",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force", "-f",
+        help="Skip confirmation prompt",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet", "-q",
+        help="Minimal output",
+    ),
+) -> None:
+    """Nuke everything and bring up a fresh environment.
+
+    This is the nuclear rebuild option - it combines:
+    1. amprealize nuke (stop/remove containers, networks, processes)
+    2. amprealize up (plan + apply a fresh environment)
+
+    Use this when you want a completely clean slate.
+
+    Examples:
+        amprealize fresh                         # Nuke + bring up default development env
+        amprealize fresh development -b core-data-plane  # Specific blueprint
+        amprealize fresh --force                 # Skip confirmation
+        amprealize fresh -v -s                   # Also remove volumes and state files
+        amprealize fresh --skip-machine-stop     # Faster, but may have port conflicts
+        amprealize fresh --skip-resource-check   # Ignore disk/memory warnings
+        amprealize fresh --auto-cleanup          # Auto-cleanup if resources low
+    """
+    import subprocess
+    import time
+
+    # Confirmation prompt
+    if not force:
+        console.print("[yellow]⚠ This will:[/yellow]")
+        console.print("  • Kill all guideai processes (ports 8000, 5173, 3000)")
+        console.print("  • Remove all guideai/amp containers")
+        console.print("  • Remove all guideai/amp networks")
+        if not skip_machine_stop:
+            console.print("  • Stop the Podman machine")
+        if include_volumes:
+            console.print("  • [red]Remove all guideai volumes (DATA LOSS)[/red]")
+        if include_state:
+            console.print("  • Remove amprealize state files")
+        console.print("  • Bring up a fresh environment")
+        console.print()
+
+        if not typer.confirm("Continue?"):
+            raise typer.Exit(0)
+
+    console.print()
+
+    # Phase 1: Nuke
+    if not quiet:
+        console.print("[bold cyan]Phase 1/2: Nuking existing environment...[/bold cyan]")
+        console.print()
+
+    # Call nuke directly (it's defined above in this module)
+    try:
+        nuke(
+            dry_run=False,
+            include_volumes=include_volumes,
+            include_state=include_state,
+            include_processes=True,
+            include_networks=True,
+            stop_machine=not skip_machine_stop,
+            include_machine=False,
+            force=True,  # Already confirmed above
+            json_output=False,
+            quiet=quiet,
+        )
+    except typer.Exit as e:
+        if e.exit_code != 0:
+            console.print("[red]Nuke failed, aborting fresh[/red]")
+            raise
+    except Exception as e:
+        console.print(f"[red]Nuke failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    # Brief pause to let things settle
+    time.sleep(2)
+
+    console.print()
+
+    # Phase 2: Start machine if it was stopped
+    if not skip_machine_stop:
+        if not quiet:
+            console.print("[dim]Starting Podman machine...[/dim]")
+
+        try:
+            # Find guideai machine
+            result = subprocess.run(
+                ["podman", "machine", "list", "--format", "{{.Name}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            machine_name = None
+            for line in result.stdout.strip().split("\n"):
+                name = line.strip().rstrip("*")
+                if "guideai" in name.lower():
+                    machine_name = name
+                    break
+
+            if machine_name:
+                start_result = subprocess.run(
+                    ["podman", "machine", "start", machine_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if start_result.returncode == 0:
+                    if not quiet:
+                        console.print(f"[green]✓ Started Podman machine '{machine_name}'[/green]")
+                elif "already running" in start_result.stderr.lower():
+                    if not quiet:
+                        console.print(f"[dim]Podman machine '{machine_name}' already running[/dim]")
+                else:
+                    console.print(f"[yellow]⚠ Could not start machine: {start_result.stderr}[/yellow]")
+            else:
+                if not quiet:
+                    console.print("[dim]No guideai Podman machine found, continuing...[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ Machine start error: {e}[/yellow]")
+
+        # Wait a moment for machine to be ready
+        time.sleep(3)
+
+    console.print()
+
+    # Phase 3: Bring up fresh environment
+    if not quiet:
+        console.print("[bold cyan]Phase 2/2: Bringing up fresh environment...[/bold cyan]")
+        console.print()
+
+    # Call up directly
+    try:
+        up(
+            environment=environment,
+            blueprint=blueprint,
+            force=True,  # Force to ensure fresh creation
+            skip_resource_check=skip_resource_check,
+            auto_cleanup=auto_cleanup,
+            rebuild_images=True,  # Always rebuild images on fresh to ensure latest code
+            quiet=quiet,
+        )
+    except typer.Exit as e:
+        if e.exit_code != 0:
+            console.print("[red]Failed to bring up environment[/red]")
+            raise
+    except Exception as e:
+        console.print(f"[red]Failed to bring up environment: {e}[/red]")
+        raise typer.Exit(1)
+
+    console.print()
+    console.print("[bold green]✓ Fresh environment ready![/bold green]")
 
 
 # =============================================================================

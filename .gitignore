@@ -36,3 +36,19 @@ Thumbs.db
 .idea/
 
 .env.github-oauth
+
+# OAuth client secret exports (do not commit)
+client_secret*.json
+*apps.googleusercontent.com.json
+
+# Amprealize runtime state (contains resolved secrets)
+.amprealize/
+
+# Environment configs with secrets
+environments.yaml
+
+# Backup files
+*.backup
+
+# Archive files with old secrets
+*.archive

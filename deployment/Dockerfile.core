@@ -21,10 +21,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml ./
 COPY docs/README.md ./docs/README.md
 COPY guideai/__init__.py guideai/__init__.py
+COPY packages/ ./packages/
 
-# Install Python dependencies
+# Install Python dependencies.
+# Note: This repo is a monorepo; the core service imports local packages like
+# `amprealize` and `raze`, so we install them from ./packages/.
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -e .[telemetry,postgres,redis,semantic]
+    pip install --no-cache-dir -e ./packages/raze && \
+    pip install --no-cache-dir -e ./packages/amprealize && \
+    pip install --no-cache-dir -e .[telemetry,postgres,redis]
 
 # ============================================================================
 # Stage 2: Runtime - Minimal production image

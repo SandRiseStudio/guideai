@@ -13,7 +13,10 @@ from datetime import datetime, UTC, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-import numpy as np
+try:  # pragma: no cover - optional dependency
+    import numpy as np  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    np = None  # type: ignore
 
 from .behavior_service import BehaviorSearchResult, BehaviorService, SearchBehaviorsRequest
 from .bci_contracts import BehaviorMatch, RetrieveRequest, RetrievalStrategy, RoleFocus
@@ -141,7 +144,7 @@ class BehaviorRetriever:
 
         self._eager_load_model = eager_load_model
 
-        self._semantic_available = SentenceTransformer is not None and faiss is not None
+        self._semantic_available = SentenceTransformer is not None and faiss is not None and np is not None
         self._model: Optional[Any] = None
         self._index: Any = None
         self._behavior_ids: List[str] = []
@@ -195,7 +198,7 @@ class BehaviorRetriever:
             return {
                 "status": "degraded",
                 "mode": "keyword",
-                "reason": "sentence-transformers and faiss not available",
+                "reason": "sentence-transformers and faiss not available (install guideai[ml] to enable semantic retrieval)",
             }
         if self._index is None or not self._behavior_ids:
             return self.build_index()

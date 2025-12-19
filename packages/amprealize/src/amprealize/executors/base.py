@@ -570,6 +570,7 @@ class ExecutorError(Exception):
     Attributes:
         message: Error description
         command: The command that failed (if applicable)
+        stdout: Standard output (if available)
         stderr: Standard error output (if available)
         returncode: Process return code (if applicable)
     """
@@ -578,12 +579,14 @@ class ExecutorError(Exception):
         self,
         message: str,
         command: Optional[List[str]] = None,
+        stdout: Optional[str] = None,
         stderr: Optional[str] = None,
         returncode: Optional[int] = None
     ):
         super().__init__(message)
         self.message = message
         self.command = command
+        self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
 
@@ -591,6 +594,8 @@ class ExecutorError(Exception):
         parts = [self.message]
         if self.command:
             parts.append(f"Command: {' '.join(self.command)}")
+        if self.stdout:
+            parts.append(f"Stdout: {self.stdout}")
         if self.stderr:
             parts.append(f"Stderr: {self.stderr}")
         if self.returncode is not None:

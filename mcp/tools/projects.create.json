@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "name": "projects.create",
+  "description": "Create a new project within an organization. Requires member or higher role in the organization.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "user_id": {
+        "type": "string",
+        "description": "ID of the user performing the action (required for authorization)"
+      },
+      "org_id": {
+        "type": "string",
+        "description": "Organization ID to create the project in"
+      },
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 255,
+        "description": "Project name"
+      },
+      "description": {
+        "type": "string",
+        "maxLength": 1000,
+        "description": "Project description"
+      },
+      "visibility": {
+        "type": "string",
+        "enum": ["public", "internal", "private"],
+        "default": "private",
+        "description": "Project visibility level"
+      },
+      "settings": {
+        "type": "object",
+        "description": "Project-specific settings"
+      },
+      "metadata": {
+        "type": "object",
+        "description": "Additional metadata for the project"
+      }
+    },
+    "required": ["user_id", "org_id", "name"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean"
+      },
+      "project": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "org_id": { "type": "string" },
+          "name": { "type": "string" },
+          "slug": { "type": "string" },
+          "description": { "type": "string" },
+          "visibility": { "type": "string" },
+          "created_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "message": { "type": "string" }
+    }
+  }
+}

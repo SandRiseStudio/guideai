@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 import uuid
@@ -32,13 +33,18 @@ from .models import (
     EnvironmentManifest,
     HealthCheck,
     InfrastructureConfig,
+    PlanForTestsRequest,
+    PlanForTestsResponse,
     PlanRequest,
     PlanResponse,
+    RunTestsRequest,
+    RunTestsResponse,
     RuntimeConfig,
     ServiceSpec,
     StatusEvent,
     StatusResponse,
     TelemetryData,
+    TestSuiteDefinition,
 )
 
 
@@ -138,6 +144,9 @@ class AmprealizeService:
         self.environments: Dict[str, EnvironmentDefinition] = {}
         self.environment_manifest_path: Optional[Path] = None
 
+        # Auto-load .env file if present (for OAuth, secrets, etc.)
+        self._load_dotenv_if_present()
+
         # Load environments from file if available
         self.load_environments()
 
@@ -160,6 +169,84 @@ class AmprealizeService:
     # =========================================================================
     # Environment Management
     # =========================================================================
+
+    def _load_dotenv_if_present(self) -> None:
+        """Auto-load .env file from cwd or guideai repo root.
+
+        This ensures that environment variables like GOOGLE_CLIENT_ID,
+        GITHUB_CLIENT_SECRET, etc. are available for blueprint expansion
+        without requiring manual `source .env` before running amprealize.
+
+        Search order:
+          1. AMPREALIZE_DOTENV_PATH env var (explicit override)
+          2. Current working directory (.env)
+          3. GuideAI repo root (~/guideai/.env or detected via environments.yaml location)
+        """
+        candidates: List[Path] = []
+
+        # 1. Explicit override
+        override = os.environ.get("AMPREALIZE_DOTENV_PATH")
+        if override:
+            candidates.append(Path(override).expanduser())
+
+        # 2. Current working directory
+        candidates.append(Path.cwd() / ".env")
+
+        # 3. Common guideai locations
+        home = Path.home()
+        candidates.extend([
+            home / "guideai" / ".env",
+            home / "src" / "guideai" / ".env",
+            home / "projects" / "guideai" / ".env",
+        ])
+
+        # 4. If we found an environments.yaml, check its parent
+        if self.environment_manifest_path:
+            candidates.append(self.environment_manifest_path.parent / ".env")
+
+        for dotenv_path in candidates:
+            if dotenv_path.exists():
+                self._parse_dotenv_file(dotenv_path)
+                return
+
+    def _parse_dotenv_file(self, path: Path) -> None:
+        """Parse a .env file and set environment variables (if not already set).
+
+        This is a minimal parser that handles:
+          - KEY=value
+          - KEY="value with spaces"
+          - KEY='value with spaces'
+          - # comments
+          - Empty lines
+
+        Variables already set in the environment are NOT overwritten.
+        """
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith("#"):
+                        continue
+                    # Skip lines without =
+                    if "=" not in line:
+                        continue
+
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip()
+
+                    # Remove surrounding quotes
+                    if (value.startswith('"') and value.endswith('"')) or \
+                       (value.startswith("'") and value.endswith("'")):
+                        value = value[1:-1]
+
+                    # Only set if not already in environment (don't override)
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception:
+            # Silently ignore parse errors - .env loading is best-effort
+            pass
 
     def load_environments(self) -> None:
         """Load environment definitions from a YAML file."""
@@ -188,6 +275,12 @@ class AmprealizeService:
                         env_payload["default_lifetime"] = env_payload.pop("lifetime")
                     if "blueprint_id" in env_payload and "infrastructure" not in env_payload:
                         env_payload["infrastructure"] = {"blueprint_id": env_payload.pop("blueprint_id")}
+                    if (
+                        "active_modules" not in env_payload
+                        and isinstance(env_payload.get("infrastructure"), dict)
+                        and "active_modules" in env_payload["infrastructure"]
+                    ):
+                        env_payload["active_modules"] = env_payload["infrastructure"].get("active_modules")
 
                     try:
                         env_def = EnvironmentDefinition(**env_payload)
@@ -215,6 +308,12 @@ class AmprealizeService:
         package_root = Path(__file__).resolve().parents[2]
         candidates.append(package_root / "config" / "amprealize" / "environments.yaml")
         candidates.append(package_root / "environments.yaml")
+
+        # Common developer layouts (best-effort; helps when invoking CLI from outside repo)
+        home = Path.home()
+        candidates.append(home / "guideai" / "environments.yaml")
+        candidates.append(home / "src" / "guideai" / "environments.yaml")
+        candidates.append(home / "projects" / "guideai" / "environments.yaml")
 
         for candidate in candidates:
             if candidate.exists():
@@ -305,31 +404,40 @@ class AmprealizeService:
     # Blueprint Management
     # =========================================================================
 
-    def _resolve_blueprint(self, blueprint_id: str) -> Blueprint:
+    def _resolve_blueprint(
+        self, blueprint_id: str, *, variables: Optional[Dict[str, Any]] = None
+    ) -> Blueprint:
         """Resolve a blueprint by ID or path."""
         # 1. Try as absolute path
         path = Path(blueprint_id)
         if path.exists() and path.is_file():
-            return self._load_blueprint_from_file(path)
+            return self._load_blueprint_from_file(path, variables=variables)
 
         # 2. Try in user blueprints dir
         for ext in [".yaml", ".yml", ".json"]:
             path = self.user_blueprints_dir / f"{blueprint_id}{ext}"
             if path.exists():
-                return self._load_blueprint_from_file(path)
+                return self._load_blueprint_from_file(path, variables=variables)
 
         # 3. Try in package blueprints dir
         for ext in [".yaml", ".yml", ".json"]:
             path = self.pkg_blueprints_dir / f"{blueprint_id}{ext}"
             if path.exists():
-                return self._load_blueprint_from_file(path)
+                return self._load_blueprint_from_file(path, variables=variables)
 
         raise ValueError(f"Blueprint '{blueprint_id}' not found")
 
-    def _expand_env_vars(self, data: Any) -> Any:
+    def _expand_env_vars(
+        self, data: Any, variables: Optional[Dict[str, Any]] = None
+    ) -> Any:
         """Recursively expand environment variables in data structures.
 
         Handles ${VAR} and ${VAR:-default} syntax in strings.
+
+        Priority:
+        1. os.environ (always takes precedence for actual secret values)
+        2. variables dict (for template values like GUIDEAI_REPO_ROOT)
+        3. default value from ${VAR:-default} syntax
         """
         if isinstance(data, str):
             # Pattern to match ${VAR} or ${VAR:-default}
@@ -338,17 +446,32 @@ class AmprealizeService:
             def replace_var(match):
                 var_name = match.group(1)
                 default_value = match.group(2) if match.group(2) is not None else ""
-                return os.environ.get(var_name, default_value)
+                # ALWAYS check os.environ first for actual secret values
+                if var_name in os.environ:
+                    return os.environ[var_name]
+                # Then check variables dict for template values
+                if variables and var_name in variables:
+                    value = variables.get(var_name)
+                    if value is None:
+                        return ""
+                    # If the variable value is itself a template, skip it and use default
+                    str_value = str(value)
+                    if str_value.startswith("${"):
+                        return default_value
+                    return str_value
+                return default_value
 
             return pattern.sub(replace_var, data)
         elif isinstance(data, dict):
-            return {k: self._expand_env_vars(v) for k, v in data.items()}
+            return {k: self._expand_env_vars(v, variables) for k, v in data.items()}
         elif isinstance(data, list):
-            return [self._expand_env_vars(item) for item in data]
+            return [self._expand_env_vars(item, variables) for item in data]
         else:
             return data
 
-    def _load_blueprint_from_file(self, path: Path) -> Blueprint:
+    def _load_blueprint_from_file(
+        self, path: Path, *, variables: Optional[Dict[str, Any]] = None
+    ) -> Blueprint:
         """Load a blueprint from a file, expanding environment variables."""
         with open(path, "r") as f:
             if path.suffix == ".json":
@@ -356,7 +479,7 @@ class AmprealizeService:
             else:
                 data = yaml.safe_load(f)
         # Expand environment variables in the loaded data
-        data = self._expand_env_vars(data)
+        data = self._expand_env_vars(data, variables)
         return Blueprint(**data)
 
     def _discover_packaged_blueprints(self) -> Dict[str, Path]:
@@ -414,6 +537,47 @@ class AmprealizeService:
     # Runtime Management
     # =========================================================================
 
+    def _ensure_runtime_ready_from_run_manifest(
+        self, run: Dict[str, Any], *, force: bool = True
+    ) -> None:
+        """Ensure runtime is ready using the stored run manifest.
+
+        This is needed for `destroy`/`status` when the user's default Podman
+        connection points at a different machine than the one used for apply.
+        """
+        runtime_payload = run.get("runtime") or {}
+        if not isinstance(runtime_payload, dict):
+            return
+
+        provider = runtime_payload.get("provider")
+        if provider not in ("podman", "docker"):
+            return
+
+        if not isinstance(self.executor, MachineCapableExecutor):
+            return
+
+        runtime = RuntimeConfig(**runtime_payload)
+        env_def = EnvironmentDefinition(
+            name=run.get("environment", "unknown"),
+            runtime=runtime,
+            infrastructure=InfrastructureConfig(),
+            variables=(run.get("variables") or {}) if isinstance(run.get("variables"), dict) else {},
+        )
+        self._ensure_runtime_ready(env_def, force=force)
+
+        # Persist any resolved runtime fields back onto the run manifest.
+        # This makes plan/apply/status/destroy deterministic across process boundaries
+        # (e.g. when the user's default Podman connection points elsewhere).
+        try:
+            if isinstance(run.get("runtime"), dict):
+                if env_def.runtime.podman_machine:
+                    run["runtime"]["podman_machine"] = env_def.runtime.podman_machine
+                if env_def.runtime.podman_connection:
+                    run["runtime"]["podman_connection"] = env_def.runtime.podman_connection
+        except Exception:
+            # Best-effort; runtime readiness is the primary goal.
+            pass
+
     def _ensure_runtime_ready(
         self, env_def: EnvironmentDefinition, *, force: bool = False
     ) -> None:
@@ -437,10 +601,19 @@ class AmprealizeService:
 
         if not machine:
             if runtime.auto_init:
+                disk_gb = runtime.disk_size_gb or 20  # Default to 20GB if not specified
+                print(
+                    f"Auto-initializing Podman machine '{machine_name}' "
+                    f"(CPUs: {runtime.cpu_limit or 'default'}, "
+                    f"Memory: {runtime.memory_limit_mb or 'default'}MB, "
+                    f"Disk: {disk_gb}GB)",
+                    file=sys.stderr
+                )
                 self.executor.init_machine(
                     machine_name,
                     cpus=runtime.cpu_limit,
                     memory_mb=runtime.memory_limit_mb,
+                    disk_gb=disk_gb,
                 )
                 machine = self.executor.get_machine(machine_name)
             elif force:
@@ -454,7 +627,20 @@ class AmprealizeService:
 
         if machine and not machine.running:
             if runtime.auto_start:
-                self.executor.start_machine(machine_name)
+                try:
+                    self.executor.start_machine(machine_name)
+                except ExecutorError as exc:
+                    stderr = (exc.stderr or "").lower()
+                    if "only one vm can be active at a time" not in stderr:
+                        raise
+
+                    # Podman on macOS currently allows only one VM active at a time.
+                    # When another machine is already running, proactively stop it and retry.
+                    try:
+                        self.executor.stop_unused_machines(preserve_machines=[machine_name])
+                        self.executor.start_machine(machine_name)
+                    except Exception:
+                        raise exc
             elif force:
                 print(f"Warning: Machine '{machine_name}' is stopped", file=sys.stderr)
                 return
@@ -464,18 +650,34 @@ class AmprealizeService:
                     f"Start it or enable auto_start."
                 )
 
-        # Set the executor connection to use the correct machine
-        # Use -root suffix for rootful machines (required for port forwarding on macOS)
+        # Set the executor connection to use the correct Podman connection.
+        # Deterministic rules (prevents "containers exist but on the other connection" confusion):
+        # 1) Respect explicit runtime.podman_connection if set
+        # 2) Prefer the host's default Podman connection for this machine
+        # 3) Fall back to <machine> then <machine>-root if needed
         from .executors.podman import PodmanExecutor
         if isinstance(self.executor, PodmanExecutor):
-            connection_name = machine_name
-            try:
-                inspect = self.executor.inspect_machine(machine_name)
-                if inspect.get("Rootful", False):
-                    connection_name = f"{machine_name}-root"
-            except Exception:
-                pass  # Fall back to base machine name
+            connection_name: Optional[str] = None
+
+            if runtime.podman_connection:
+                connection_name = runtime.podman_connection
+            else:
+                try:
+                    connection_name = self.executor.resolve_connection_for_machine(machine_name)
+                except Exception:
+                    connection_name = None
+
+            if not connection_name:
+                connection_name = machine_name
+                try:
+                    inspect = self.executor.inspect_machine(machine_name)
+                    if inspect.get("Rootful", False) and self.executor.connection_exists(f"{machine_name}-root"):
+                        connection_name = f"{machine_name}-root"
+                except Exception:
+                    pass
+
             self.executor.connection = connection_name
+            runtime.podman_connection = connection_name
 
         self._verify_podman_resources(machine_name, runtime, env_def.name, force=force)
 
@@ -635,6 +837,48 @@ class AmprealizeService:
 
             # If host is STILL unhealthy after cleanup, check if we should allow override
             if not detailed_health.host_healthy:
+                # If enabled, try machine scale-down/removal to reclaim host disk.
+                # This is useful on macOS where Podman machine disk images consume host space.
+                if request.auto_cleanup_scale_down:
+                    from .executors.podman import PodmanExecutor
+
+                    if isinstance(self.executor, PodmanExecutor):
+                        try:
+                            stopped_machines = self.executor.stop_unused_machines(
+                                preserve_current=True,
+                            )
+                            if stopped_machines:
+                                self.hooks.emit_metric(
+                                    "amprealize.apply.host_only_machines_stopped",
+                                    machines=stopped_machines,
+                                    count=len(stopped_machines),
+                                )
+
+                            if request.auto_cleanup_remove_machines:
+                                scale_result = self.executor.scale_down_machines(
+                                    keep_count=1,
+                                    remove_stopped=True,
+                                )
+                                if scale_result.get("removed"):
+                                    total_host_space_freed_mb += scale_result.get("disk_freed_gb", 0) * 1024
+                                    self.hooks.emit_metric(
+                                        "amprealize.apply.host_only_machines_removed",
+                                        machines=scale_result.get("removed", []),
+                                        disk_freed_gb=scale_result.get("disk_freed_gb", 0),
+                                    )
+
+                            detailed_health = self.executor.check_resource_health_detailed(
+                                min_disk_gb=request.min_disk_gb,
+                                min_memory_mb=request.min_memory_mb,
+                            )
+                            if detailed_health.host_healthy and detailed_health.vm_healthy:
+                                return True, detailed_health.host_warnings
+                        except Exception as e:
+                            self.hooks.emit_metric(
+                                "amprealize.apply.host_only_machine_cleanup_error",
+                                error=str(e),
+                            )
+
                 if request.allow_host_resource_warning:
                     self.hooks.emit_metric(
                         "amprealize.apply.host_warning_override",
@@ -769,6 +1013,64 @@ class AmprealizeService:
                     )
                     # Continue to next attempt/tier
 
+        # All container cleanup tiers exhausted - try machine scale-down if enabled
+        if request.auto_cleanup_scale_down:
+            from .executors.podman import PodmanExecutor
+
+            if isinstance(self.executor, PodmanExecutor):
+                self.hooks.emit_metric(
+                    "amprealize.apply.machine_scale_down_triggered",
+                    current_warnings=current_warnings,
+                    remove_machines=request.auto_cleanup_remove_machines,
+                )
+
+                try:
+                    # Stop unused machines first
+                    stopped_machines = self.executor.stop_unused_machines(
+                        preserve_current=True,  # Keep the machine we need
+                    )
+
+                    if stopped_machines:
+                        self.hooks.emit_metric(
+                            "amprealize.apply.machines_stopped",
+                            machines=stopped_machines,
+                            count=len(stopped_machines),
+                        )
+
+                    # If still not healthy and remove_machines is enabled, remove stopped machines
+                    if request.auto_cleanup_remove_machines:
+                        scale_result = self.executor.scale_down_machines(
+                            keep_count=1,
+                            remove_stopped=True,
+                        )
+
+                        if scale_result.get("removed"):
+                            total_space_freed_mb += scale_result.get("disk_freed_gb", 0) * 1024
+                            self.hooks.emit_metric(
+                                "amprealize.apply.machines_removed",
+                                machines=scale_result.get("removed", []),
+                                disk_freed_gb=scale_result.get("disk_freed_gb", 0),
+                            )
+
+                    # Re-check resources after machine cleanup
+                    healthy, current_warnings = self.executor.check_resource_health(
+                        min_disk_gb=request.min_disk_gb,
+                        min_memory_mb=request.min_memory_mb,
+                    )
+
+                    if healthy:
+                        self.hooks.emit_metric(
+                            "amprealize.apply.machine_scale_down_success",
+                            total_space_freed_mb=total_space_freed_mb,
+                        )
+                        return True, current_warnings
+
+                except Exception as e:
+                    self.hooks.emit_metric(
+                        "amprealize.apply.machine_scale_down_error",
+                        error=str(e),
+                    )
+
         # All tiers exhausted
         self.hooks.emit_metric(
             "amprealize.apply.auto_cleanup_exhausted",
@@ -801,11 +1103,21 @@ class AmprealizeService:
             )
 
         env_def = self.environments[request.environment]
+
+        # Apply CLI override for disk size if provided
+        if request.machine_disk_size_gb is not None:
+            env_def.runtime.disk_size_gb = request.machine_disk_size_gb
+
         self._ensure_runtime_ready(env_def, force=request.force_podman)
 
         # Merge variables: request overrides environment
         merged_variables = env_def.variables.copy()
         merged_variables.update(request.variables)
+        if "GUIDEAI_REPO_ROOT" not in merged_variables:
+            if self.environment_manifest_path:
+                merged_variables["GUIDEAI_REPO_ROOT"] = str(self.environment_manifest_path.parent)
+            else:
+                merged_variables["GUIDEAI_REPO_ROOT"] = str(Path.cwd())
 
         # Apply defaults
         lifetime = request.lifetime or env_def.default_lifetime
@@ -818,11 +1130,13 @@ class AmprealizeService:
                 f"Provide blueprint_id or update the manifest."
             )
 
-        blueprint = self._resolve_blueprint(blueprint_id)
+        blueprint = self._resolve_blueprint(blueprint_id, variables=merged_variables)
 
-        # Filter services by module if active_modules is set
-        active_modules = request.active_modules or env_def.active_modules
-        if active_modules:
+        # Filter services by module only when explicitly requested.
+        # Environment-level active_modules is treated as informational by default
+        # to avoid silently stripping services from planned manifests.
+        if request.active_modules is not None:
+            active_modules = request.active_modules
             filtered_services = {}
             for name, svc in blueprint.services.items():
                 if svc.module and svc.module in active_modules:
@@ -830,6 +1144,11 @@ class AmprealizeService:
                 elif not svc.module and "core" in active_modules:
                     filtered_services[name] = svc
             blueprint.services = filtered_services
+            if not blueprint.services:
+                raise ValueError(
+                    "Module filtering selected zero services. "
+                    "Either adjust active_modules or omit it to include all services."
+                )
 
         # Calculate resources
         req_mem, req_cpu, req_bandwidth = self._calculate_blueprint_resources(blueprint)
@@ -911,6 +1230,338 @@ class AmprealizeService:
             ),
         )
 
+    # =========================================================================
+    # Test-Aware Provisioning
+    # =========================================================================
+
+    def plan_for_tests(self, request: PlanForTestsRequest) -> PlanForTestsResponse:
+        """Analyze test files and plan minimal infrastructure for them.
+
+        This method examines test files to discover which services they need,
+        then creates a minimal blueprint containing only those services with
+        their dependencies resolved.
+
+        Args:
+            request: Plan request with test paths and optional blueprint override
+
+        Returns:
+            Response with analysis details and minimal plan
+
+        Example:
+            response = service.plan_for_tests(PlanForTestsRequest(
+                test_paths=["tests/integration/test_api.py"],
+                blueprint_id="full-stack",
+                environment="development",
+            ))
+            print(f"Required services: {response.required_services}")
+            # Apply the minimal plan
+            apply_response = service.apply(ApplyRequest(plan_id=response.plan_id))
+        """
+        from .test_analyzer import TestDependencyAnalyzer
+
+        # Resolve the full blueprint
+        blueprint_id = request.blueprint_id
+        merged_variables: Dict[str, Any] = {}
+        if request.environment and request.environment in self.environments:
+            env_def = self.environments[request.environment]
+            blueprint_id = blueprint_id or env_def.infrastructure.blueprint_id
+            merged_variables = env_def.variables.copy()
+            merged_variables.setdefault("GUIDEAI_REPO_ROOT", str(Path.cwd()))
+
+        if not blueprint_id:
+            raise ValueError(
+                "No blueprint_id provided and no default found for environment"
+            )
+
+        full_blueprint = self._resolve_blueprint(blueprint_id, variables=merged_variables or None)
+
+        # Load test suite definition if provided
+        suite_definition: Optional[TestSuiteDefinition] = None
+        if request.suite_config_path:
+            suite_path = Path(request.suite_config_path)
+            if suite_path.exists():
+                with open(suite_path, "r") as f:
+                    suite_data = yaml.safe_load(f)
+                suite_definition = TestSuiteDefinition(**suite_data)
+
+        # Create analyzer and analyze test files
+        analyzer = TestDependencyAnalyzer(
+            default_marker_mappings=request.marker_mappings,
+        )
+
+        analysis = analyzer.analyze_tests(
+            test_paths=request.test_paths,
+            blueprint=full_blueprint,
+            suite_definition=suite_definition,
+            markers=request.markers,
+        )
+
+        # Get minimal blueprint with only required services
+        minimal_blueprint = analyzer.get_minimal_blueprint(
+            analysis=analysis,
+            full_blueprint=full_blueprint,
+            suite_definition=suite_definition,
+        )
+
+        # Get startup order for the minimal blueprint
+        startup_order = minimal_blueprint.get_startup_order()
+
+        # Calculate resources for minimal blueprint
+        req_mem, req_cpu, req_bandwidth = self._calculate_blueprint_resources(minimal_blueprint)
+
+        # Generate plan IDs
+        plan_id = f"plan-test-{uuid.uuid4()}"
+        amp_run_id = f"amp-test-{uuid.uuid4()}"
+
+        # Get environment definition (use default if not specified)
+        environment = request.environment or "development"
+        if environment not in self.environments:
+            environment = list(self.environments.keys())[0] if self.environments else "development"
+
+        env_def = self.environments.get(environment, EnvironmentDefinition(name=environment))
+
+        # Build manifest (similar to plan() but for tests)
+        runtime_payload = (
+            env_def.runtime.model_dump()
+            if hasattr(env_def.runtime, "model_dump")
+            else env_def.runtime.dict()
+        )
+
+        manifest = {
+            "blueprint": minimal_blueprint.model_dump() if hasattr(minimal_blueprint, "model_dump") else minimal_blueprint.dict(),
+            "blueprint_id": f"{blueprint_id}-minimal",
+            "original_blueprint_id": blueprint_id,
+            "tier": request.compliance_tier or env_def.default_compliance_tier or "standard",
+            "created_at": datetime.utcnow().isoformat(),
+            "variables": {},
+            "plan_id": plan_id,
+            "amp_run_id": amp_run_id,
+            "phase": "PLANNED",
+            "environment": environment,
+            "lifetime": request.lifetime or "30m",
+            "runtime": runtime_payload,
+            "test_context": {
+                "test_paths": request.test_paths,
+                "markers": list(analysis.discovered_markers),
+                "required_services": list(analysis.required_services),
+                "startup_order": startup_order,
+                "service_sources": analysis.service_sources,
+                "test_files_analyzed": analysis.test_files_analyzed,
+            },
+            "teardown_on_exit": True,  # Always teardown after tests
+        }
+
+        # Save manifest
+        manifest_path = self.manifests_dir / f"{plan_id}.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        # Record action via hooks
+        self.hooks.record_action(
+            "amprealize.plan_for_tests",
+            blueprint_id=blueprint_id,
+            test_paths=request.test_paths,
+            required_services=list(analysis.required_services),
+            plan_id=plan_id,
+            amp_run_id=amp_run_id,
+        )
+
+        # Emit metric
+        self.hooks.emit_metric(
+            "amprealize.plan_for_tests.created",
+            plan_id=plan_id,
+            original_blueprint_id=blueprint_id,
+            services_in_full=len(full_blueprint.services),
+            services_in_minimal=len(minimal_blueprint.services),
+            test_files_analyzed=analysis.test_files_analyzed,
+            markers_discovered=len(analysis.discovered_markers),
+        )
+
+        return PlanForTestsResponse(
+            plan_id=plan_id,
+            amp_run_id=amp_run_id,
+            required_services=list(analysis.required_services),
+            startup_order=startup_order,
+            discovered_markers=list(analysis.discovered_markers),
+            service_sources=analysis.service_sources,
+            test_files_analyzed=analysis.test_files_analyzed,
+            analysis_errors=analysis.analysis_errors,
+            minimal_blueprint=minimal_blueprint.model_dump() if hasattr(minimal_blueprint, "model_dump") else minimal_blueprint.dict(),
+            environment_estimates=EnvironmentEstimates(
+                cost_estimate=0.25,  # Minimal setup should cost less
+                memory_footprint_mb=req_mem or 512,
+                bandwidth_mbps=req_bandwidth,
+                region="local",
+                expected_boot_duration_s=30,  # Faster with fewer services
+            ),
+        )
+
+    def run_tests(self, request: RunTestsRequest) -> RunTestsResponse:
+        """Plan, provision, run tests, and teardown in one operation.
+
+        This is a convenience method that:
+        1. Analyzes test files to determine required services
+        2. Plans a minimal environment
+        3. Provisions the environment
+        4. (Optionally) runs pytest
+        5. Tears down the environment
+
+        Args:
+            request: Run tests request with test paths and options
+
+        Returns:
+            Response with test results and timing information
+
+        Example:
+            result = service.run_tests(RunTestsRequest(
+                test_paths=["tests/integration/"],
+                blueprint_id="full-stack",
+                pytest_args=["-v", "--tb=short"],
+            ))
+            print(f"Exit code: {result.pytest_exit_code}")
+            print(f"Total duration: {result.total_duration_s}s")
+        """
+        import subprocess
+
+        start_time = time.time()
+        plan_response: Optional[PlanForTestsResponse] = None
+        apply_response: Optional[ApplyResponse] = None
+        pytest_exit_code: Optional[int] = None
+        pytest_output: Optional[str] = None
+        teardown_report: List[str] = []
+        errors: List[str] = []
+
+        try:
+            # Step 1: Plan for tests
+            plan_start = time.time()
+            plan_response = self.plan_for_tests(PlanForTestsRequest(
+                test_paths=request.test_paths,
+                blueprint_id=request.blueprint_id,
+                environment=request.environment,
+                markers=request.markers,
+                marker_mappings=request.marker_mappings,
+                suite_config_path=request.suite_config_path,
+                lifetime=request.lifetime,
+            ))
+            plan_duration_s = time.time() - plan_start
+
+            self.hooks.emit_metric(
+                "amprealize.run_tests.planned",
+                plan_id=plan_response.plan_id,
+                required_services=plan_response.required_services,
+                plan_duration_s=plan_duration_s,
+            )
+
+            # Step 2: Apply the plan (provision environment)
+            apply_start = time.time()
+            apply_response = self.apply(ApplyRequest(
+                plan_id=plan_response.plan_id,
+                skip_resource_check=request.skip_resource_check,
+            ))
+            apply_duration_s = time.time() - apply_start
+
+            self.hooks.emit_metric(
+                "amprealize.run_tests.applied",
+                amp_run_id=plan_response.amp_run_id,
+                services_started=len(apply_response.environment_outputs),
+                apply_duration_s=apply_duration_s,
+            )
+
+            # Step 3: Run pytest if requested
+            if request.run_pytest:
+                test_start = time.time()
+
+                # Build environment variables from service outputs
+                env = os.environ.copy()
+                for name, output in apply_response.environment_outputs.items():
+                    upper_name = name.upper().replace("-", "_")
+                    if "port" in output:
+                        env[f"{upper_name}_PORT"] = str(output["port"])
+                    if "host" in output:
+                        env[f"{upper_name}_HOST"] = str(output["host"])
+                    if "url" in output:
+                        env[f"{upper_name}_URL"] = str(output["url"])
+
+                # Build pytest command
+                pytest_cmd = ["pytest"] + request.test_paths
+                if request.pytest_args:
+                    pytest_cmd.extend(request.pytest_args)
+                if request.markers:
+                    marker_expr = " or ".join(request.markers)
+                    pytest_cmd.extend(["-m", marker_expr])
+
+                # Run pytest
+                try:
+                    result = subprocess.run(
+                        pytest_cmd,
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=request.timeout_s or 600,
+                    )
+                    pytest_exit_code = result.returncode
+                    pytest_output = result.stdout + result.stderr
+                except subprocess.TimeoutExpired:
+                    pytest_exit_code = -1
+                    pytest_output = "Test execution timed out"
+                    errors.append(f"Pytest timed out after {request.timeout_s}s")
+                except Exception as e:
+                    pytest_exit_code = -1
+                    pytest_output = str(e)
+                    errors.append(f"Failed to run pytest: {e}")
+
+                test_duration_s = time.time() - test_start
+
+                self.hooks.emit_metric(
+                    "amprealize.run_tests.pytest_completed",
+                    amp_run_id=plan_response.amp_run_id,
+                    exit_code=pytest_exit_code,
+                    test_duration_s=test_duration_s,
+                )
+
+        except Exception as e:
+            errors.append(str(e))
+            self.hooks.emit_metric(
+                "amprealize.run_tests.failed",
+                error=str(e),
+            )
+
+        finally:
+            # Step 4: Always teardown (unless skip_teardown is True)
+            if plan_response and not request.skip_teardown:
+                try:
+                    destroy_response = self.destroy(DestroyRequest(
+                        amp_run_id=plan_response.amp_run_id,
+                        reason="Test run completed",
+                        cleanup_after_destroy=True,
+                        cleanup_aggressive=False,
+                    ))
+                    teardown_report = destroy_response.teardown_report
+                except Exception as e:
+                    errors.append(f"Teardown failed: {e}")
+
+        total_duration_s = time.time() - start_time
+
+        self.hooks.emit_metric(
+            "amprealize.run_tests.completed",
+            plan_id=plan_response.plan_id if plan_response else None,
+            total_duration_s=total_duration_s,
+            pytest_exit_code=pytest_exit_code,
+            errors=errors,
+        )
+
+        return RunTestsResponse(
+            plan_id=plan_response.plan_id if plan_response else None,
+            amp_run_id=plan_response.amp_run_id if plan_response else None,
+            required_services=plan_response.required_services if plan_response else [],
+            environment_outputs=apply_response.environment_outputs if apply_response else {},
+            pytest_exit_code=pytest_exit_code,
+            pytest_output=pytest_output,
+            teardown_report=teardown_report,
+            total_duration_s=total_duration_s,
+            errors=errors,
+        )
+
     def apply(self, request: ApplyRequest) -> ApplyResponse:
         """Apply a plan and provision the environment.
 
@@ -942,24 +1593,17 @@ class AmprealizeService:
 
         # Configure executor for the environment's runtime
         runtime_config = manifest.get("runtime", {})
-        if runtime_config.get("provider") in ("podman", "docker"):
-            machine_name = runtime_config.get("podman_machine") or "podman-machine-default"
+        if isinstance(runtime_config, dict) and runtime_config.get("provider") in ("podman", "docker"):
+            # Reuse the canonical runtime readiness + Podman connection resolution logic.
+            # This prevents "containers exist but on a different connection" confusion.
+            self._ensure_runtime_ready_from_run_manifest(manifest, force=False)
+
             from .executors.podman import PodmanExecutor
             if isinstance(self.executor, PodmanExecutor):
-                # Use -root suffix for rootful machines (required for port forwarding on macOS)
-                connection_name = machine_name
-                try:
-                    inspect = self.executor.inspect_machine(machine_name)
-                    if inspect.get("Rootful", False):
-                        connection_name = f"{machine_name}-root"
-                except Exception:
-                    pass  # Fall back to base machine name
-                self.executor.connection = connection_name
-                # Ensure the machine is running if auto_start is enabled
-                if runtime_config.get("auto_start"):
-                    machine = self.executor.get_machine(machine_name)
-                    if machine and not machine.running:
-                        self.executor.start_machine(machine_name)
+                # Prefer the resolved executor connection when present; otherwise keep
+                # whatever was resolved onto the manifest by _ensure_runtime_ready_from_run_manifest.
+                if self.executor.connection:
+                    runtime_config["podman_connection"] = self.executor.connection
 
         # Calculate blueprint memory requirements for smart resource checking
         blueprint_data = manifest.get("blueprint", manifest)
@@ -1138,22 +1782,173 @@ class AmprealizeService:
                     warning=str(e),
                 )
 
+        def _parse_host_port(port_mapping: str) -> Optional[int]:
+            parts = port_mapping.split(":")
+            if len(parts) < 2:
+                return None
+            try:
+                return int(parts[-2] if len(parts) > 2 else parts[0])
+            except ValueError:
+                return None
+
+        def _wait_for_port(host_port: int, timeout_s: int) -> None:
+            deadline = time.time() + max(timeout_s, 1)
+            last_err: Optional[Exception] = None
+            while time.time() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", host_port), timeout=1.0):
+                        return
+                except OSError as exc:
+                    last_err = exc
+                    time.sleep(0.25)
+            raise RuntimeError(f"Timed out waiting for port {host_port} to become ready: {last_err}")
+
+        def _wait_for_healthcheck(
+            container_name: str,
+            healthcheck_spec: Optional[Dict[str, Any]],
+            timeout_s: int,
+            executor: Any,
+        ) -> None:
+            """Wait for a container's healthcheck to pass before proceeding.
+
+            Uses the healthcheck.test command from the blueprint spec to verify
+            the service is ready (e.g., pg_isready for Postgres).
+
+            Args:
+                container_name: Name of the container to check
+                healthcheck_spec: Healthcheck specification dict with 'test' command
+                timeout_s: Max seconds to wait for healthcheck to pass
+                executor: The executor (PodmanExecutor) to run commands
+            """
+            if not healthcheck_spec:
+                return  # No healthcheck defined, skip
+
+            test_cmd = healthcheck_spec.get("test")
+            if not test_cmd:
+                return  # No test command defined
+
+            # Parse healthcheck command (Docker/Podman compose format)
+            # Formats: ["CMD-SHELL", "cmd"], ["CMD", "cmd", "arg1"], or just "cmd"
+            if isinstance(test_cmd, str):
+                shell_cmd = test_cmd
+            elif isinstance(test_cmd, list) and len(test_cmd) >= 2:
+                if test_cmd[0] == "CMD-SHELL":
+                    shell_cmd = test_cmd[1]
+                elif test_cmd[0] == "CMD":
+                    shell_cmd = " ".join(test_cmd[1:])
+                else:
+                    shell_cmd = " ".join(test_cmd)
+            else:
+                return  # Invalid format
+
+            # Parse interval from spec (e.g., "5s" -> 5)
+            interval_str = healthcheck_spec.get("interval", "2s")
+            try:
+                interval = int(interval_str.rstrip("smh"))  # Strip time suffix
+            except ValueError:
+                interval = 2
+
+            retries = healthcheck_spec.get("retries", 5)
+            deadline = time.time() + max(timeout_s, 1)
+            attempts = 0
+            last_err: Optional[str] = None
+
+            while time.time() < deadline:
+                attempts += 1
+                try:
+                    if hasattr(executor, "exec_in_container"):
+                        # Run healthcheck command inside container
+                        executor.exec_in_container(
+                            container_name,
+                            ["sh", "-c", shell_cmd],
+                        )
+                        return  # Healthcheck passed!
+                except Exception as exc:
+                    last_err = str(exc)
+                    if attempts >= retries:
+                        # Log but continue waiting until deadline
+                        pass
+                time.sleep(interval)
+
+            raise RuntimeError(
+                f"Healthcheck failed for {container_name} after {timeout_s}s "
+                f"(command: {shell_cmd}): {last_err}"
+            )
+
         try:
             # Create a dedicated network for this run (enables inter-container DNS)
             network_name = f"amp-net-{amp_run_id}"
             from .executors.podman import PodmanExecutor
+            should_wait_for_ports = isinstance(self.executor, PodmanExecutor)
             if isinstance(self.executor, PodmanExecutor):
                 self.executor.create_network(network_name, ignore_exists=True)
                 manifest["network_name"] = network_name
             else:
                 network_name = None  # Non-Podman executors don't need this
 
+            # Start core services first, then optional modules, then console/UI.
+            # This reduces race conditions where UI/API containers start before Postgres/Redis.
+            ordered_services: List[Tuple[str, Dict[str, Any]]] = []
             for name, spec in services.items():
+                module = spec.get("module")
+                if module in (None, "core"):
+                    group = 0
+                elif module == "console":
+                    group = 2
+                else:
+                    group = 1
+                ordered_services.append((name, spec | {"__amp_group": group}))
+            ordered_services.sort(key=lambda item: int(item[1].get("__amp_group", 1)))
+
+            for name, spec in ordered_services:
                 container_name = f"{amp_run_id}-{name}"
 
                 # Stop existing if any (simple reconciliation)
                 self.executor.stop_container(container_name)
                 self.executor.remove_container(container_name)
+
+                build_spec = spec.get("build")
+                if build_spec:
+                    image = spec.get("image")
+                    if not image:
+                        raise ValueError(f"Service '{name}' is missing required image tag for build")
+
+                    # Force rebuild if requested at apply level OR in build spec
+                    rebuild = request.rebuild_images or bool(build_spec.get("rebuild", False))
+                    should_build = rebuild
+                    if not should_build and hasattr(self.executor, "image_exists"):
+                        try:
+                            should_build = not bool(self.executor.image_exists(image))  # type: ignore[attr-defined]
+                        except Exception:
+                            should_build = True
+
+                    if should_build:
+                        if not hasattr(self.executor, "build_image"):
+                            raise RuntimeError(
+                                "Executor does not support image builds; "
+                                f"cannot build image for service '{name}'"
+                            )
+                        self.hooks.emit_metric(
+                            "amprealize.apply.build.started",
+                            plan_id=plan_id,
+                            amp_run_id=amp_run_id,
+                            service=name,
+                            image=image,
+                        )
+                        self.executor.build_image(  # type: ignore[attr-defined]
+                            image=image,
+                            context=str(build_spec.get("context", ".")),
+                            dockerfile=build_spec.get("dockerfile"),
+                            build_args=build_spec.get("build_args") or {},
+                            pull=bool(build_spec.get("pull", False)),
+                        )
+                        self.hooks.emit_metric(
+                            "amprealize.apply.build.completed",
+                            plan_id=plan_id,
+                            amp_run_id=amp_run_id,
+                            service=name,
+                            image=image,
+                        )
 
                 # Build run config
                 # Use the service name as a network alias so containers can reference
@@ -1172,6 +1967,102 @@ class AmprealizeService:
 
                 container_id = self.executor.run_container(config)
                 outputs[name] = {"container_id": container_id, "status": "running"}
+
+                timeout_s = int(spec.get("healthcheck_timeout_s") or 0)
+                ports = spec.get("ports", []) or []
+                if should_wait_for_ports and timeout_s > 0 and ports:
+                    host_port = _parse_host_port(str(ports[0]))
+                    if host_port is not None:
+                        _wait_for_port(host_port, timeout_s)
+
+                # Wait for healthcheck to pass before proceeding to next service
+                # This ensures services like Postgres are actually ready (not just listening)
+                # so dependent services can connect immediately on startup
+                healthcheck_spec = spec.get("healthcheck")
+                if healthcheck_spec:
+                    healthcheck_timeout = timeout_s if timeout_s > 0 else 60
+                    self.hooks.emit_metric(
+                        "amprealize.apply.healthcheck.waiting",
+                        plan_id=plan_id,
+                        amp_run_id=amp_run_id,
+                        service=name,
+                        timeout_s=healthcheck_timeout,
+                    )
+                    try:
+                        _wait_for_healthcheck(
+                            container_name,
+                            healthcheck_spec,
+                            healthcheck_timeout,
+                            self.executor,
+                        )
+                        self.hooks.emit_metric(
+                            "amprealize.apply.healthcheck.passed",
+                            plan_id=plan_id,
+                            amp_run_id=amp_run_id,
+                            service=name,
+                        )
+                    except RuntimeError as hc_err:
+                        self.hooks.emit_metric(
+                            "amprealize.apply.healthcheck.failed",
+                            plan_id=plan_id,
+                            amp_run_id=amp_run_id,
+                            service=name,
+                            error=str(hc_err),
+                        )
+                        raise
+
+                # Execute post-start commands (e.g., Alembic migrations)
+                post_start_commands = spec.get("post_start_commands", [])
+                for cmd_spec in post_start_commands:
+                    cmd_description = cmd_spec.get("description", "post-start command")
+                    cmd = cmd_spec.get("command", [])
+                    cmd_timeout = int(cmd_spec.get("timeout_s", 300))
+
+                    if not cmd:
+                        continue
+
+                    self.hooks.emit_metric(
+                        "amprealize.apply.post_start_command.started",
+                        plan_id=plan_id,
+                        amp_run_id=amp_run_id,
+                        service=name,
+                        description=cmd_description,
+                    )
+
+                    try:
+                        if hasattr(self.executor, "exec_in_container"):
+                            output = self.executor.exec_in_container(
+                                container_name,
+                                cmd,
+                            )
+                            self.hooks.emit_metric(
+                                "amprealize.apply.post_start_command.completed",
+                                plan_id=plan_id,
+                                amp_run_id=amp_run_id,
+                                service=name,
+                                description=cmd_description,
+                                output_preview=output[:500] if output else "",
+                            )
+                        else:
+                            self.hooks.emit_metric(
+                                "amprealize.apply.post_start_command.skipped",
+                                plan_id=plan_id,
+                                amp_run_id=amp_run_id,
+                                service=name,
+                                reason="executor does not support exec_in_container",
+                            )
+                    except Exception as cmd_error:
+                        self.hooks.emit_metric(
+                            "amprealize.apply.post_start_command.failed",
+                            plan_id=plan_id,
+                            amp_run_id=amp_run_id,
+                            service=name,
+                            description=cmd_description,
+                            error=str(cmd_error),
+                        )
+                        raise RuntimeError(
+                            f"Post-start command failed for {name}: {cmd_description} - {cmd_error}"
+                        ) from cmd_error
 
         except Exception as e:
             self.hooks.emit_metric(
@@ -1251,6 +2142,27 @@ class AmprealizeService:
         with open(env_path, "r") as f:
             run = json.load(f)
 
+        # Ensure we are connected to the machine used for this run before querying containers.
+        prev_connection = None
+        runtime_payload = run.get("runtime")
+        if isinstance(runtime_payload, dict):
+            prev_connection = runtime_payload.get("podman_connection")
+        self._ensure_runtime_ready_from_run_manifest(run, force=True)
+
+        # If we resolved a previously-missing Podman connection, persist it so future
+        # commands (and manual inspection) remain consistent.
+        runtime_payload = run.get("runtime")
+        if (
+            isinstance(runtime_payload, dict)
+            and not prev_connection
+            and runtime_payload.get("podman_connection")
+        ):
+            try:
+                with open(env_path, "w") as f:
+                    json.dump(run, f, indent=2)
+            except Exception:
+                pass
+
         phase = run.get("phase", "UNKNOWN")
         outputs = run.get("environment_outputs", {})
         checks = []
@@ -1305,6 +2217,9 @@ class AmprealizeService:
             checklist_id = run.get("checklist_id")
         else:
             run = {}
+
+        # Ensure we are connected to the machine used for this run before stopping containers.
+        self._ensure_runtime_ready_from_run_manifest(run, force=True)
 
         # Emit start metric
         self.hooks.emit_metric(

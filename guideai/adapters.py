@@ -870,6 +870,235 @@ class MCPTaskAssignmentAdapter(BaseTaskAdapter):
 
 
 # ------------------------------------------------------------------
+# Agent Registry Adapters
+# ------------------------------------------------------------------
+
+
+class RestAgentRegistryAdapter:
+    """Adapter backing REST API endpoints for AgentRegistryService.
+
+    Note: This adapter is intentionally light-weight and avoids importing
+    AgentRegistryService at module import time so the core API can start even
+    when agent-registry dependencies are not installed.
+    """
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+        self.surface = "api"
+
+    def _build_actor(self, actor_payload: Optional[Dict[str, Any]]) -> Actor:
+        actor_payload = actor_payload or {}
+        return Actor(
+            id=actor_payload.get("id", "unknown"),
+            role=actor_payload.get("role", "UNKNOWN"),
+            surface=self.surface,
+        )
+
+    @staticmethod
+    def _coerce_enum(enum_cls: Any, raw: Any) -> Any:
+        if raw is None:
+            return None
+        if hasattr(raw, "value"):
+            return raw
+        try:
+            return enum_cls(str(raw))
+        except Exception:
+            return raw
+
+    def list_agents(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        from .agent_registry_contracts import AgentStatus, AgentVisibility, ListAgentsRequest, RoleAlignment
+
+        request = ListAgentsRequest(
+            status=self._coerce_enum(AgentStatus, payload.get("status")),
+            visibility=self._coerce_enum(AgentVisibility, payload.get("visibility")),
+            role_alignment=self._coerce_enum(RoleAlignment, payload.get("role_alignment")),
+            owner_id=payload.get("owner_id"),
+            include_builtin=payload.get("builtin", payload.get("include_builtin", True)),
+            limit=min(int(payload.get("limit", 50)), 200),
+            org_id=payload.get("org_id"),
+        )
+        results = self._service.list_agents(request, org_id=payload.get("org_id"))
+
+        offset = int(payload.get("offset", 0) or 0)
+        if offset > 0:
+            return list(results)[offset:]
+        return list(results)
+
+    def create_agent(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .agent_registry_contracts import AgentVisibility, CreateAgentRequest, RoleAlignment
+
+        actor = self._build_actor(payload.get("actor"))
+        request = CreateAgentRequest(
+            name=payload["name"],
+            slug=payload.get("slug", ""),
+            description=payload.get("description", ""),
+            mission=payload.get("mission", ""),
+            role_alignment=self._coerce_enum(RoleAlignment, payload.get("role_alignment", "STUDENT")),
+            capabilities=list(payload.get("capabilities", [])),
+            default_behaviors=list(payload.get("default_behaviors", [])),
+            playbook_content=payload.get("playbook_content", ""),
+            tags=list(payload.get("tags", [])),
+            visibility=self._coerce_enum(AgentVisibility, payload.get("visibility"))
+            or AgentVisibility.PRIVATE.value,
+            metadata=dict(payload.get("metadata", {})),
+        )
+        agent = self._service.create_agent(request, actor, org_id=payload.get("org_id"))
+        return agent.to_dict() if hasattr(agent, "to_dict") else cast(Dict[str, Any], agent)
+
+    def search_agents(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .agent_registry_contracts import (
+            AgentStatus,
+            AgentVisibility,
+            RoleAlignment,
+            SearchAgentsRequest,
+        )
+
+        actor_payload = payload.get("actor")
+        actor = self._build_actor(actor_payload) if actor_payload else None
+        request = SearchAgentsRequest(
+            query=payload.get("query"),
+            tags=list(payload.get("tags", [])) or None,
+            role_alignment=self._coerce_enum(RoleAlignment, payload.get("role_alignment")),
+            visibility=self._coerce_enum(AgentVisibility, payload.get("visibility")),
+            status=self._coerce_enum(AgentStatus, payload.get("status")),
+            owner_id=payload.get("owner_id"),
+            include_builtin=payload.get("include_builtin", True),
+            limit=min(int(payload.get("limit", 25)), 100),
+            org_id=payload.get("org_id"),
+        )
+        results = self._service.search_agents(request, actor=actor)
+        formatted = [result.to_dict() if hasattr(result, "to_dict") else result for result in results]
+        return {"results": formatted, "total": len(formatted)}
+
+    def get_agent(
+        self,
+        agent_id: str,
+        *,
+        version: Optional[Any] = None,
+        include_history: bool = False,
+    ) -> Dict[str, Any]:
+        del include_history
+        version_str = str(version) if version is not None else None
+        return self._service.get_agent(agent_id, version=version_str)
+
+    def update_agent(self, agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .agent_registry_contracts import AgentVisibility, UpdateAgentRequest
+
+        actor = self._build_actor(payload.get("actor"))
+        request = UpdateAgentRequest(
+            agent_id=agent_id,
+            version=str(payload.get("version") or payload.get("latest_version") or "latest"),
+            name=payload.get("name"),
+            description=payload.get("description"),
+            mission=payload.get("mission"),
+            role_alignment=payload.get("role_alignment"),
+            capabilities=payload.get("capabilities"),
+            default_behaviors=payload.get("default_behaviors"),
+            playbook_content=payload.get("playbook_content"),
+            tags=payload.get("tags"),
+            metadata=payload.get("metadata"),
+        )
+        # Map visibility separately; service only updates agent-level visibility.
+        if "visibility" in payload:
+            request.visibility = self._coerce_enum(AgentVisibility, payload.get("visibility"))
+
+        updated = self._service.update_agent(request, actor)
+        return updated.to_dict() if hasattr(updated, "to_dict") else cast(Dict[str, Any], updated)
+
+    def delete_agent(self, agent_id: str) -> None:
+        actor = Actor(id="api", role="SYSTEM", surface=self.surface)
+        self._service.delete_agent(agent_id, actor)
+
+    def create_new_version(self, agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .agent_registry_contracts import CreateNewVersionRequest, RoleAlignment
+
+        actor = self._build_actor(payload.get("actor"))
+        request = CreateNewVersionRequest(
+            agent_id=agent_id,
+            base_version=payload.get("base_version"),
+            mission=payload.get("mission"),
+            role_alignment=self._coerce_enum(RoleAlignment, payload.get("role_alignment")),
+            capabilities=payload.get("capabilities"),
+            default_behaviors=payload.get("default_behaviors"),
+            playbook_content=payload.get("playbook_content"),
+            metadata=payload.get("metadata"),
+        )
+        version = self._service.create_new_version(request, actor)
+        return version.to_dict() if hasattr(version, "to_dict") else cast(Dict[str, Any], version)
+
+    def publish_agent(self, agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .agent_registry_contracts import AgentVisibility, PublishAgentRequest
+
+        actor = self._build_actor(payload.get("actor"))
+        request = PublishAgentRequest(
+            agent_id=agent_id,
+            version=str(payload.get("version") or "1.0.0"),
+            visibility=self._coerce_enum(AgentVisibility, payload.get("visibility"))
+            or AgentVisibility.PUBLIC.value,
+            effective_from=payload.get("effective_from"),
+        )
+        agent = self._service.publish_agent(request, actor)
+        return agent.to_dict() if hasattr(agent, "to_dict") else cast(Dict[str, Any], agent)
+
+    def deprecate_agent(self, agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from .agent_registry_contracts import DeprecateAgentRequest
+
+        actor = self._build_actor(payload.get("actor"))
+        request = DeprecateAgentRequest(
+            agent_id=agent_id,
+            version=str(payload["version"]),
+            effective_to=payload["effective_to"],
+            successor_agent_id=payload.get("successor_agent_id"),
+        )
+        agent = self._service.deprecate_agent(request, actor)
+        return agent.to_dict() if hasattr(agent, "to_dict") else cast(Dict[str, Any], agent)
+
+    def bootstrap_from_playbooks(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor_payload = payload.get("actor")
+        actor = self._build_actor(actor_payload) if actor_payload else None
+        force = bool(payload.get("force", False))
+        return self._service.bootstrap_from_playbooks(actor=actor, force=force)
+
+
+# ------------------------------------------------------------------
+# Assignment Service Adapters
+# ------------------------------------------------------------------
+
+class RestAssignmentAdapter:
+    """Adapter backing REST API endpoints for AssignmentService (agent suggestions)."""
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+
+    def _build_actor(self, actor_payload: Optional[Dict[str, Any]]) -> Optional[Any]:
+        if not actor_payload:
+            return None
+        from guideai.services.board_service import Actor
+        return Actor(
+            id=actor_payload.get("id", "unknown"),
+            role=actor_payload.get("role", "UNKNOWN"),
+            surface="api",
+        )
+
+    def suggest_agent(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Suggest agents for an assignable entity."""
+        from guideai.multi_tenant.board_contracts import SuggestAgentRequest
+
+        request = SuggestAgentRequest(
+            assignable_id=payload["assignable_id"],
+            assignable_type=payload["assignable_type"],
+            required_behaviors=payload.get("required_behaviors", []),
+            exclude_agent_ids=payload.get("exclude_agent_ids"),
+            max_suggestions=payload.get("max_suggestions", 5),
+        )
+        actor = self._build_actor(payload.get("actor"))
+        org_id = payload.get("org_id")
+
+        response = self._service.suggest_agent(request, actor=actor, org_id=org_id)
+        return response.model_dump() if hasattr(response, "model_dump") else response.dict()
+
+
+# ------------------------------------------------------------------
 # Compliance Service Adapters
 # ------------------------------------------------------------------
 

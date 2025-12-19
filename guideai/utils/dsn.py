@@ -95,3 +95,20 @@ def resolve_postgres_dsn(
 
     candidate = explicit_dsn or os.getenv(env_var) or build_dsn_from_components(service) or default_dsn
     return apply_host_overrides(candidate, service)
+
+
+def resolve_optional_postgres_dsn(
+    *,
+    service: str,
+    explicit_dsn: Optional[str],
+    env_var: str,
+) -> Optional[str]:
+    """Resolve DSN but return None if no configuration found.
+
+    Unlike resolve_postgres_dsn, this does not provide a default and can return None,
+    allowing callers to handle the absence of database configuration gracefully.
+    """
+    candidate = explicit_dsn or os.getenv(env_var) or build_dsn_from_components(service)
+    if not candidate:
+        return None
+    return apply_host_overrides(candidate, service)

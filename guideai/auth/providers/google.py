@@ -36,9 +36,10 @@ logger = logging.getLogger(__name__)
 
 
 class GoogleOAuthProvider(OAuthProvider):
-    """Google OAuth device flow implementation"""
+    """Google OAuth provider supporting both device flow and authorization code flow"""
 
     # Google OAuth endpoints
+    AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
     DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
     TOKEN_URL = "https://oauth2.googleapis.com/token"
     USER_INFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo"
@@ -59,6 +60,107 @@ class GoogleOAuthProvider(OAuthProvider):
     @property
     def name(self) -> str:
         return "google"
+
+    # -------------------------------------------------------------------------
+    # Authorization Code Flow (for web)
+    # -------------------------------------------------------------------------
+
+    def get_authorization_url(self, redirect_uri: str, state: Optional[str] = None, scopes: Optional[list[str]] = None) -> str:
+        """
+        Generate Google OAuth authorization URL.
+
+        Args:
+            redirect_uri: Callback URL after authorization
+            state: CSRF state parameter (recommended)
+            scopes: List of OAuth scopes to request (default: ["email", "profile", "openid"])
+
+        Returns:
+            str: URL to redirect user to for authorization
+        """
+        if scopes is None:
+            scopes = ["email", "profile", "openid"]
+
+        import urllib.parse
+
+        params = {
+            "client_id": self._client_id,
+            "redirect_uri": redirect_uri,
+            "scope": " ".join(scopes),
+            "response_type": "code",
+            "access_type": "offline",  # Get refresh token
+            "prompt": "consent",  # Force consent to ensure refresh token
+        }
+        if state:
+            params["state"] = state
+
+        return f"{self.AUTHORIZATION_URL}?{urllib.parse.urlencode(params)}"
+
+    async def exchange_code(self, code: str, redirect_uri: str) -> "TokenResponse":
+        """
+        Exchange authorization code for access token.
+
+        Args:
+            code: Authorization code from callback
+            redirect_uri: Same redirect_uri used in authorization request
+
+        Returns:
+            TokenResponse: Access token and metadata
+        """
+        from .base import TokenResponse
+
+        logger.info("Exchanging Google authorization code for token (redirect_uri=%s)", redirect_uri)
+
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    self.TOKEN_URL,
+                    data={
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                        "grant_type": "authorization_code",
+                    },
+                    timeout=10.0
+                )
+
+                # Parse response body first to get error details
+                data = response.json()
+
+                # Check for error in response (Google returns 400 with error details)
+                if "error" in data:
+                    error = data.get("error", "unknown_error")
+                    error_description = data.get("error_description", "Unknown error")
+                    logger.error(
+                        "Google code exchange error: %s - %s (status=%d, redirect_uri=%s)",
+                        error, error_description, response.status_code, redirect_uri
+                    )
+                    raise OAuthError(f"Google OAuth error: {error} - {error_description}")
+
+                # Now raise for other HTTP errors
+                response.raise_for_status()
+
+                logger.info("Google code exchange successful")
+                return TokenResponse(
+                    access_token=data["access_token"],
+                    token_type=data.get("token_type", "Bearer"),
+                    expires_in=data.get("expires_in", 3600),
+                    refresh_token=data.get("refresh_token"),
+                    scope=data.get("scope")
+                )
+
+            except httpx.HTTPStatusError as e:
+                # Try to get error body for more context
+                try:
+                    error_body = e.response.json()
+                    error_detail = error_body.get("error_description", error_body.get("error", str(e)))
+                except Exception:
+                    error_detail = str(e)
+                logger.error("Google code exchange HTTP error: %s (body: %s)", e, error_detail)
+                raise OAuthError(f"Google code exchange failed: {error_detail}")
+            except httpx.RequestError as e:
+                logger.error("Google code exchange request error: %s", e)
+                raise OAuthError(f"Google code exchange request failed: {e}")
 
     async def start_device_flow(self, scopes: Optional[list[str]] = None) -> DeviceCodeResponse:
         """

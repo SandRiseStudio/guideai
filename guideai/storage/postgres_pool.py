@@ -99,12 +99,18 @@ class _ConnectionProxy:
 class PostgresPool:
     """Lightweight wrapper around SQLAlchemy engine for pooled connections."""
 
-    def __init__(self, dsn: Optional[str] = None, service_name: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        dsn: Optional[str] = None,
+        service_name: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> None:
         """Initialize PostgresPool with DSN from parameter, settings, or environment.
 
         Args:
             dsn: PostgreSQL DSN string. If None, falls back to settings.database.postgres_url
             service_name: Optional service name for metrics tracking
+            schema: Optional schema name (reserved for future multi-schema support)
         """
         # Resolve DSN from multiple sources (parameter > settings > error)
         resolved_dsn: str
@@ -122,6 +128,7 @@ class PostgresPool:
         self._dsn = resolved_dsn
         self._engine = _get_engine(resolved_dsn)
         self._service_name = service_name or "postgres"
+        self._schema = schema  # Reserved for future multi-schema support
 
         # Register Prometheus metrics collection if available
         if service_name and postgres_metrics.PROMETHEUS_AVAILABLE:

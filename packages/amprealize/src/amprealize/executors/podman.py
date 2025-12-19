@@ -9,7 +9,9 @@ import os
 import platform
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import (
@@ -99,14 +101,449 @@ class PodmanExecutor(ResourceCapableExecutor):
             text=True
         )
 
+        # Always attempt recovery for connection errors, regardless of check flag
+        # This ensures methods using check=False (like create_network) still get recovery
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else ""
+
+            recovery_notes: List[str] = []
+
+            if self._should_recover_from_remote_proxy_error(stderr=stderr, returncode=result.returncode):
+                # First, try switching connection variants (rootful vs rootless) for this machine.
+                switched = self._try_switch_connection_variant_for_current_machine()
+                if switched:
+                    recovery_notes.append(f"switched connection to '{self.connection}'")
+                    retry = subprocess.run(
+                        cmd,
+                        capture_output=capture_output,
+                        text=True,
+                    )
+                    if retry.returncode == 0:
+                        return retry
+                    stderr = retry.stderr.strip() if retry.stderr else stderr
+
+                # Next, restart the machine to reset the host-side proxy.
+                recovered = self._recover_remote_proxy()
+                if recovered:
+                    recovery_notes.append("restarted podman machine")
+                    retry = subprocess.run(
+                        cmd,
+                        capture_output=capture_output,
+                        text=True,
+                    )
+                    if retry.returncode == 0:
+                        return retry
+                    stderr = retry.stderr.strip() if retry.stderr else stderr
+
+            # Podman on macOS uses a remote connection to a Linux VM. In some
+            # environments, container-mutating commands intermittently fail via
+            # the host-side remote socket with an overlay storage readlink error.
+            # Retrying inside the VM via `podman machine ssh` is a pragmatic
+            # workaround that keeps local dev/test flows running.
+            if self._should_fallback_to_machine_ssh(stderr):
+                machine_result = self._run_podman_via_machine_ssh(
+                    args=args,
+                    check=False,
+                    capture_output=capture_output,
+                )
+                if machine_result.returncode == 0:
+                    return machine_result
+
+            # Only raise if check=True; otherwise return the failed result
+            if check:
+                if recovery_notes:
+                    stderr = f"{stderr}\n\nAmprealize attempted recovery: " + "; ".join(recovery_notes)
+
+                stdout = result.stdout.strip() if result.stdout else ""
+                raise ExecutorError(
+                    message="Podman command failed",
+                    command=cmd,
+                    stdout=stdout or None,
+                    stderr=stderr or None,
+                    returncode=result.returncode,
+                )
+
+        return result
+
+    def _run_podman_local(
+        self,
+        args: List[str],
+        check: bool = True,
+        capture_output: bool = True,
+    ) -> subprocess.CompletedProcess:
+        """Execute a local podman command without forcing a remote `--connection`.
+
+        Machine lifecycle commands (e.g., `podman machine start`) must work even
+        when the configured connection points at a dead socket.
+        """
+
+        cmd = ["podman"]
+        cmd.extend(args)
+        result = subprocess.run(
+            cmd,
+            capture_output=capture_output,
+            text=True,
+        )
         if check and result.returncode != 0:
             raise ExecutorError(
-                message=f"Podman command failed",
+                message="Podman command failed",
                 command=cmd,
                 stderr=result.stderr.strip() if result.stderr else None,
-                returncode=result.returncode
+                returncode=result.returncode,
+            )
+        return result
+
+    def _should_recover_from_remote_proxy_error(self, *, stderr: str, returncode: int) -> bool:
+        """Return True when Podman remote proxy appears wedged or disconnected.
+
+        On macOS, Podman remote connections rely on a host-side proxy to the VM.
+        In rare cases the proxy state can become inconsistent and Podman returns
+        an error like: "something went wrong with the request: proxy already running".
+
+        Additionally, the machine may report as "running" but the SSH tunnel/proxy
+        has died (e.g., gvproxy process crashed), resulting in "connection refused"
+        errors even though `podman machine list` shows the machine as running.
+
+        Restarting the machine typically restores the proxy in both cases.
+        """
+        if returncode == 0:
+            return False
+        lowered = (stderr or "").lower()
+
+        # Proxy state inconsistency
+        if "proxy already running" in lowered:
+            return True
+        if "something went wrong with the request" in lowered and "proxy" in lowered:
+            return True
+
+        # Connection refused - machine reports running but socket is dead
+        # This happens when gvproxy dies but machine state file shows "running"
+        if "connection refused" in lowered and "podman socket" in lowered:
+            return True
+        if "unable to connect to podman" in lowered:
+            return True
+        if "cannot connect to podman" in lowered:
+            return True
+        # Generic dial tcp connection refused (from Go network errors)
+        if "dial tcp" in lowered and "connection refused" in lowered:
+            return True
+
+        return False
+
+    def list_connections(self) -> List[Dict[str, Any]]:
+        """List configured Podman connections on the host."""
+        try:
+            result = subprocess.run(
+                ["podman", "system", "connection", "list", "--format", "json"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return []
+            payload = json.loads(result.stdout)
+            return payload if isinstance(payload, list) else []
+        except Exception:
+            return []
+
+    def resolve_connection_for_machine(self, machine_name: str) -> Optional[str]:
+        """Resolve the best Podman connection name for a given machine.
+
+        Selection rules:
+        1) If the *default* host connection targets this machine, use it.
+        2) Otherwise prefer an exact name match (<machine>) if it exists.
+        3) Otherwise fall back to <machine>-root if it exists.
+
+        Note: This deliberately does not automatically prefer `-root` on macOS,
+        because rootful/rootless connections are separate universes and can make
+        users think containers "disappeared".
+        """
+        if not machine_name:
+            return None
+
+        machine_root = f"{machine_name}-root"
+        connections = self.list_connections()
+
+        def _is_default(conn: Dict[str, Any]) -> bool:
+            return bool(conn.get("Default"))
+
+        def _is_name(conn: Dict[str, Any], name: str) -> bool:
+            return isinstance(conn.get("Name"), str) and conn.get("Name") == name
+
+        # Prefer whichever connection is host-default *if* it is for this machine.
+        for conn in connections:
+            if not isinstance(conn, dict) or not _is_default(conn):
+                continue
+            if _is_name(conn, machine_name):
+                return machine_name
+            if _is_name(conn, machine_root):
+                return machine_root
+
+        # Otherwise prefer rootless connection if it exists.
+        if self.connection_exists(machine_name):
+            return machine_name
+
+        if self.connection_exists(machine_root):
+            return machine_root
+
+        return None
+
+    def connection_exists(self, name: str) -> bool:
+        """Return True if a named Podman connection exists."""
+        for conn in self.list_connections():
+            if isinstance(conn, dict) and conn.get("Name") == name:
+                return True
+        return False
+
+    def _try_switch_connection_variant_for_current_machine(self) -> bool:
+        """Try switching between <machine> and <machine>-root connections.
+
+        Returns:
+            True if the executor connection was changed, False otherwise.
+        """
+        if not self.connection:
+            return False
+
+        machine = self.connection.replace("-root", "")
+        if not machine:
+            return False
+
+        root_variant = f"{machine}-root"
+        base_variant = machine
+
+        # Prefer switching to the opposite variant if it exists.
+        if self.connection.endswith("-root"):
+            if self.connection_exists(base_variant):
+                self.connection = base_variant
+                return True
+            return False
+
+        if self.connection_exists(root_variant):
+            self.connection = root_variant
+            return True
+        return False
+
+    def _recover_remote_proxy(self, *, auto_init: bool = True) -> bool:
+        """Best-effort recovery for proxy/connection errors.
+
+        Attempts to restart the Podman machine associated with the current
+        connection (or the currently-running machine if unknown).
+
+        Handles cases where:
+        - "proxy already running" error occurs
+        - Machine reports "running" but gvproxy process has died
+        - Connection refused due to stale socket
+        - No machine exists (will auto-init if auto_init=True)
+
+        Args:
+            auto_init: If True and no machine exists, initialize one automatically.
+        """
+        machine_name: Optional[str] = None
+        if self.connection:
+            machine_name = self.connection.replace("-root", "")
+        if not machine_name:
+            machine_name = self._get_running_machine_name()
+        if not machine_name:
+            # Try to get any machine name from list even if not "running"
+            machine_name = self._get_any_machine_name()
+        if not machine_name:
+            # No machine exists at all - auto-init if enabled
+            if auto_init:
+                return self._auto_init_and_start_machine()
+            return False
+
+        def run_local(cmd: List[str]) -> subprocess.CompletedProcess:
+            return subprocess.run(cmd, capture_output=True, text=True)
+
+        # Stop other running machines first when macOS enforces single active VM.
+        try:
+            machines = run_local(["podman", "machine", "list", "--format", "json"])
+            if machines.returncode == 0 and machines.stdout.strip():
+                payload = json.loads(machines.stdout)
+                if isinstance(payload, list):
+                    for machine in payload:
+                        if not isinstance(machine, dict):
+                            continue
+                        name = machine.get("Name")
+                        running = machine.get("Running")
+                        if running is True and isinstance(name, str) and name and name != machine_name:
+                            run_local(["podman", "machine", "stop", name])
+        except Exception:
+            pass
+
+        # Restart machine (best-effort).
+        # Use --force on stop in case machine is in a bad state (e.g., gvproxy died)
+        # The stop may fail with "process does not exist" - that's OK, we just need to start.
+        stop_result = run_local(["podman", "machine", "stop", machine_name])
+        if stop_result.returncode != 0:
+            # Try force stop if normal stop fails
+            run_local(["podman", "machine", "stop", "--force", machine_name])
+
+        # Small delay to ensure cleanup completes
+        time.sleep(1.0)
+
+        started = run_local(["podman", "machine", "start", machine_name])
+        if started.returncode != 0:
+            return False
+
+        # Give the proxy a moment to come up.
+        time.sleep(2.0)
+        return True
+
+    def _get_any_machine_name(self) -> Optional[str]:
+        """Get any machine name from the list (even if not running)."""
+        try:
+            result = subprocess.run(
+                ["podman", "machine", "list", "--format", "json"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+            machines = json.loads(result.stdout)
+            if not isinstance(machines, list) or not machines:
+                return None
+            # Return the first machine (prefer default or match connection name)
+            for machine in machines:
+                if isinstance(machine, dict):
+                    name = machine.get("Name")
+                    if isinstance(name, str) and name:
+                        # Prefer machine matching our connection
+                        if self.connection and name in self.connection:
+                            return name
+            # Fallback to first machine
+            first = machines[0]
+            if isinstance(first, dict):
+                name = first.get("Name")
+                if isinstance(name, str):
+                    return name
+            return None
+        except Exception:
+            return None
+
+    def _auto_init_and_start_machine(self, machine_name: str = "guideai-dev") -> bool:
+        """Initialize and start a Podman machine when none exists.
+
+        This handles the case where no Podman machine has been initialized yet,
+        or all machines have been removed. Creates a new machine with sensible
+        defaults and starts it.
+
+        Args:
+            machine_name: Name for the new machine (defaults to "guideai-dev")
+
+        Returns:
+            True if machine was successfully initialized and started, False otherwise
+        """
+        from .utils import run_local
+
+        # Check if machine already exists (in any state)
+        existing = self._get_any_machine_name()
+        if existing:
+            # Machine exists but isn't running - try to start it
+            logger.info(f"Found existing machine '{existing}', attempting to start...")
+            started = run_local(["podman", "machine", "start", existing])
+            if started.returncode == 0:
+                time.sleep(2.0)  # Give proxy time to come up
+                return True
+            # If start failed, the machine may be in a bad state
+            logger.warning(f"Failed to start existing machine '{existing}', attempting recovery...")
+            # Stop then start to clear bad state
+            run_local(["podman", "machine", "stop", existing])
+            time.sleep(1.0)
+            started = run_local(["podman", "machine", "start", existing])
+            if started.returncode == 0:
+                time.sleep(2.0)
+                return True
+            return False
+
+        # No machine exists - initialize a new one
+        logger.info(f"No Podman machine found. Initializing '{machine_name}'...")
+
+        # Initialize with reasonable defaults for development
+        init_result = run_local([
+            "podman", "machine", "init",
+            machine_name,
+            "--memory", "2048",
+            "--cpus", "2",
+            "--disk-size", "15",
+        ])
+
+        if init_result.returncode != 0:
+            logger.error(f"Failed to initialize Podman machine: {init_result.stderr}")
+            return False
+
+        logger.info(f"Machine '{machine_name}' initialized. Starting...")
+
+        # Start the newly created machine
+        start_result = run_local(["podman", "machine", "start", machine_name])
+        if start_result.returncode != 0:
+            logger.error(f"Failed to start Podman machine: {start_result.stderr}")
+            return False
+
+        # Give the proxy time to come up
+        time.sleep(2.0)
+        logger.info(f"Podman machine '{machine_name}' started successfully")
+        return True
+
+    def _should_fallback_to_machine_ssh(self, stderr: str) -> bool:
+        lowered = (stderr or "").lower()
+        return (
+            "getting graph driver info" in lowered
+            and "readlink" in lowered
+            and "containers/storage/overlay" in lowered
+            and "invalid argument" in lowered
+        )
+
+    def _get_running_machine_name(self) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["podman", "machine", "list", "--format", "json"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return None
+            machines = json.loads(result.stdout)
+            if not isinstance(machines, list):
+                return None
+            for machine in machines:
+                if isinstance(machine, dict) and machine.get("Running") is True:
+                    name = machine.get("Name")
+                    if isinstance(name, str) and name:
+                        return name
+            return None
+        except Exception:
+            return None
+
+    def _run_podman_via_machine_ssh(
+        self,
+        args: List[str],
+        check: bool = True,
+        capture_output: bool = True,
+    ) -> subprocess.CompletedProcess:
+        machine_name = self._get_running_machine_name()
+        if not machine_name:
+            raise ExecutorError(
+                message="Podman machine SSH fallback unavailable (no running machine)",
+                command=["podman", "machine", "list"],
             )
 
+        ssh_cmd = ["podman", "machine", "ssh", machine_name, "--", "podman"]
+        ssh_cmd.extend(args)
+
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=capture_output,
+            text=True,
+        )
+        if check and result.returncode != 0:
+            stdout = result.stdout.strip() if result.stdout else ""
+            raise ExecutorError(
+                message="Podman machine SSH fallback command failed",
+                command=ssh_cmd,
+                stderr=result.stderr.strip() if result.stderr else None,
+                stdout=stdout or None,
+                returncode=result.returncode,
+            )
         return result
 
     # -------------------------------------------------------------------------
@@ -465,6 +902,61 @@ class PodmanExecutor(ResourceCapableExecutor):
         result = self._run_podman(args)
         return result.stdout
 
+    def copy_to_container(
+        self,
+        container_id: str,
+        src: str,
+        dest: str
+    ) -> None:
+        """Copy a file or directory from host to container.
+
+        Args:
+            container_id: Container name or ID
+            src: Source path on host
+            dest: Destination path in container (container:path format added automatically)
+
+        Raises:
+            ExecutorError: If copy fails
+
+        Example:
+            executor.copy_to_container("guideai-api", "/local/path/api.py", "/app/guideai/api.py")
+        """
+        # podman cp <src> <container>:<dest>
+        target = f"{container_id}:{dest}"
+        args = ["cp", src, target]
+
+        result = self._run_podman(args, check=False)
+        if result.returncode != 0:
+            raise ExecutorError(
+                f"Failed to copy {src} to {target}: {result.stderr}"
+            )
+
+    def copy_from_container(
+        self,
+        container_id: str,
+        src: str,
+        dest: str
+    ) -> None:
+        """Copy a file or directory from container to host.
+
+        Args:
+            container_id: Container name or ID
+            src: Source path in container
+            dest: Destination path on host
+
+        Raises:
+            ExecutorError: If copy fails
+        """
+        # podman cp <container>:<src> <dest>
+        source = f"{container_id}:{src}"
+        args = ["cp", source, dest]
+
+        result = self._run_podman(args, check=False)
+        if result.returncode != 0:
+            raise ExecutorError(
+                f"Failed to copy {source} to {dest}: {result.stderr}"
+            )
+
     def get_logs(
         self,
         container_id: str,
@@ -500,7 +992,7 @@ class PodmanExecutor(ResourceCapableExecutor):
 
     def list_machines(self) -> List[MachineInfo]:
         """List all Podman machines."""
-        result = self._run_podman(["machine", "list", "--format", "json"], check=False)
+        result = self._run_podman_local(["machine", "list", "--format", "json"], check=False)
 
         if result.returncode != 0:
             return []
@@ -535,7 +1027,7 @@ class PodmanExecutor(ResourceCapableExecutor):
         Silently handles cases where the machine is already running.
         """
         try:
-            self._run_podman(["machine", "start", name])
+            self._run_podman_local(["machine", "start", name])
         except ExecutorError as e:
             stderr = (e.stderr or "").lower()
             # Ignore if machine is already running
@@ -550,7 +1042,7 @@ class PodmanExecutor(ResourceCapableExecutor):
         Silently handles cases where the machine is already stopped.
         """
         try:
-            self._run_podman(["machine", "stop", name])
+            self._run_podman_local(["machine", "stop", name])
         except ExecutorError as e:
             stderr = (e.stderr or "").lower()
             # Ignore if machine is already stopped
@@ -577,11 +1069,11 @@ class PodmanExecutor(ResourceCapableExecutor):
             args.extend(["--disk-size", str(disk_gb)])
 
         args.append(name)
-        self._run_podman(args)
+        self._run_podman_local(args)
 
     def inspect_machine(self, name: str) -> Dict[str, Any]:
         """Get detailed machine configuration."""
-        result = self._run_podman(["machine", "inspect", name])
+        result = self._run_podman_local(["machine", "inspect", name])
 
         try:
             raw_data = json.loads(result.stdout or "[]")
@@ -592,6 +1084,131 @@ class PodmanExecutor(ResourceCapableExecutor):
             return {}
         except json.JSONDecodeError:
             return {}
+
+    def remove_machine(self, name: str, force: bool = False) -> bool:
+        """Remove a Podman machine and free its disk space.
+
+        This will stop and remove the machine, freeing up the virtual disk
+        that the machine uses on the host filesystem.
+
+        Args:
+            name: Machine name
+            force: Force removal even if machine is running
+
+        Returns:
+            True if machine was removed, False otherwise
+        """
+        try:
+            args = ["machine", "rm", "-f" if force else ""]
+            args = [a for a in args if a]  # Remove empty strings
+            args.append(name)
+            self._run_podman_local(args)
+            return True
+        except ExecutorError as e:
+            stderr = (e.stderr or "").lower()
+            # Ignore if machine doesn't exist
+            if "does not exist" in stderr or "not found" in stderr:
+                return False
+            raise
+
+    def stop_unused_machines(
+        self,
+        preserve_machines: Optional[List[str]] = None,
+        preserve_current: bool = True,
+    ) -> List[str]:
+        """Stop all running machines except preserved ones to free resources.
+
+        This is useful when host disk is critically low - stopping machines
+        can free up memory-mapped files and reduce resource pressure.
+
+        Args:
+            preserve_machines: List of machine names to keep running
+            preserve_current: Whether to preserve the machine associated with
+                             current executor connection (default True)
+
+        Returns:
+            List of machine names that were stopped
+        """
+        preserve = set(preserve_machines or [])
+
+        # If preserving current connection, extract machine name from connection
+        if preserve_current and self.connection:
+            # Connection might be "machine-name" or "machine-name-root"
+            current_machine = self.connection.replace("-root", "")
+            preserve.add(current_machine)
+
+        stopped = []
+        for machine in self.list_machines():
+            if machine.running and machine.name not in preserve:
+                try:
+                    self.stop_machine(machine.name)
+                    stopped.append(machine.name)
+                except ExecutorError:
+                    pass  # Best effort
+
+        return stopped
+
+    def scale_down_machines(
+        self,
+        keep_count: int = 1,
+        preserve_machines: Optional[List[str]] = None,
+        remove_stopped: bool = False,
+    ) -> Dict[str, Any]:
+        """Scale down machines to reduce host resource usage.
+
+        Stops running machines beyond keep_count and optionally removes
+        stopped machines to free disk space.
+
+        Args:
+            keep_count: Number of running machines to keep (default 1)
+            preserve_machines: Machines to never stop/remove
+            remove_stopped: Whether to remove stopped machines (frees disk)
+
+        Returns:
+            Dict with 'stopped' and 'removed' lists of machine names
+        """
+        preserve = set(preserve_machines or [])
+
+        # If we have a current connection, preserve that machine
+        if self.connection:
+            current_machine = self.connection.replace("-root", "")
+            preserve.add(current_machine)
+
+        machines = self.list_machines()
+        running = [m for m in machines if m.running and m.name not in preserve]
+        stopped_machines = [m for m in machines if not m.running and m.name not in preserve]
+
+        result: Dict[str, Any] = {
+            "stopped": [],
+            "removed": [],
+            "disk_freed_gb": 0.0,
+        }
+
+        # Stop excess running machines
+        machines_to_stop = running[keep_count:] if keep_count > 0 else running
+        for machine in machines_to_stop:
+            try:
+                self.stop_machine(machine.name)
+                result["stopped"].append(machine.name)
+            except ExecutorError:
+                pass
+
+        # Remove stopped machines if requested
+        if remove_stopped:
+            all_stopped = stopped_machines + [
+                m for m in machines_to_stop
+                if m.name in result["stopped"]
+            ]
+            for machine in all_stopped:
+                try:
+                    disk_gb = machine.disk_gb or 0
+                    if self.remove_machine(machine.name, force=True):
+                        result["removed"].append(machine.name)
+                        result["disk_freed_gb"] += disk_gb
+                except ExecutorError:
+                    pass
+
+        return result
 
     # -------------------------------------------------------------------------
     # Utility Methods
@@ -635,6 +1252,41 @@ class PodmanExecutor(ResourceCapableExecutor):
             check=False
         )
         return result.returncode == 0
+
+    def build_image(
+        self,
+        *,
+        image: str,
+        context: str,
+        dockerfile: Optional[str] = None,
+        build_args: Optional[Dict[str, Any]] = None,
+        pull: bool = False,
+    ) -> None:
+        """Build a container image using Podman."""
+        context_path = Path(context).expanduser()
+        if not context_path.is_absolute():
+            context_path = (Path.cwd() / context_path).resolve()
+        else:
+            context_path = context_path.resolve()
+
+        dockerfile_path: Optional[Path] = None
+        if dockerfile:
+            dockerfile_path = Path(dockerfile).expanduser()
+            if not dockerfile_path.is_absolute():
+                dockerfile_path = (context_path / dockerfile_path).resolve()
+            else:
+                dockerfile_path = dockerfile_path.resolve()
+
+        args: List[str] = ["build", "-t", image]
+        if pull:
+            args.append("--pull")
+        if dockerfile_path:
+            args.extend(["-f", str(dockerfile_path)])
+        for key, value in (build_args or {}).items():
+            args.extend(["--build-arg", f"{key}={value}"])
+        args.append(str(context_path))
+
+        self._run_podman(args)
 
     def list_containers(
         self,
@@ -707,7 +1359,8 @@ class PodmanExecutor(ResourceCapableExecutor):
 
         raise ExecutorError(
             message=f"Failed to create network '{name}'",
-            stderr=result.stderr
+            stderr=result.stderr,
+            stdout=result.stdout.strip() if result.stdout else None,
         )
 
     def network_exists(self, name: str) -> bool:
@@ -2249,36 +2902,70 @@ class PodmanExecutor(ResourceCapableExecutor):
         clean_container_cache: bool = True,
         clean_tmp_files: bool = True,
         aggressive: bool = False,
+        clean_homebrew: bool = False,
+        clean_npm: bool = False,
+        clean_pip: bool = False,
+        clean_docker: bool = False,
+        clean_trash: bool = False,
+        clean_xcode: bool = False,
+        clean_vscode: bool = False,
+        clean_unused_machines: bool = False,
+        clean_podman_cache: bool = False,
     ) -> CleanupResult:
-        """Attempt to free up HOST disk space by cleaning Podman-related caches.
+        """Attempt to free up HOST disk space by cleaning various caches.
 
         Unlike mitigate_resources() which cleans inside the VM, this method
-        cleans files on the HOST filesystem that Podman uses, such as:
+        cleans files on the HOST filesystem including:
         - Container storage cache (~/.local/share/containers/cache/)
         - Temporary files from image pulls
         - Old machine disk images (if aggressive)
-
-        This is useful when the host disk is low but the VM has sufficient space.
-
-        Note: This is limited in what it can clean safely. For significant space
-        recovery, users may need to manually clean other disk space.
+        - Homebrew caches (if clean_homebrew=True)
+        - npm caches (if clean_npm=True)
+        - pip caches (if clean_pip=True)
+        - Docker Desktop data (if clean_docker=True)
+        - System Trash (if clean_trash=True)
+        - Xcode DerivedData (if clean_xcode=True)
+        - VS Code caches (if clean_vscode=True) - workspaceStorage, History, logs, etc.
+        - Unused Podman machines (if clean_unused_machines=True)
+        - Podman machine cache (if clean_podman_cache=True)
 
         Args:
             dry_run: If True, only report what would be cleaned without doing it
             clean_container_cache: Clean container storage cache directories
             clean_tmp_files: Clean temporary files from image operations
             aggressive: Enable deeper cleanup (machine disk images, blob cache)
+            clean_homebrew: Run `brew cleanup --prune=all` (macOS)
+            clean_npm: Run `npm cache clean --force`
+            clean_pip: Run `pip cache purge`
+            clean_docker: Run `docker system prune -af`
+            clean_trash: Empty system Trash
+            clean_xcode: Clean Xcode DerivedData (macOS)
+            clean_vscode: Clean VS Code caches (workspaceStorage, History, logs, etc.)
+            clean_unused_machines: Remove stopped/unused Podman machines
+            clean_podman_cache: Clean Podman machine cache directory
 
         Returns:
             CleanupResult with details of what was (or would be) removed
         """
         import glob
+        import subprocess
+        import shutil
 
         result = CleanupResult(source="host", dry_run=dry_run)
         details: Dict[str, Any] = {
             "cache_dirs": [],
             "tmp_files": [],
             "blob_cache": [],
+            "homebrew": [],
+            "npm": [],
+            "pip": [],
+            "docker": [],
+            "trash": [],
+            "xcode": [],
+            "vscode": [],
+            "unused_machines": [],
+            "podman_cache": [],
+            "additional_caches": [],
         }
         total_freed_bytes = 0
 
@@ -2354,7 +3041,43 @@ class PodmanExecutor(ResourceCapableExecutor):
                     except (PermissionError, OSError) as e:
                         result.errors.append(f"Cannot clean {tmp_path}: {e}")
 
-        # Step 3: Clean blob cache (aggressive mode only)
+        # Step 3: Clean additional macOS-specific caches (aggressive mode only)
+        if aggressive and system == "Darwin":
+            details["additional_caches"] = []
+            additional_cache_paths = [
+                # Docker Desktop residue (if previously installed)
+                os.path.expanduser("~/Library/Containers/com.docker.docker/Data/vms"),
+                os.path.expanduser("~/Library/Containers/com.docker.docker/Data/docker.raw"),
+                # Podman Desktop caches
+                os.path.expanduser("~/Library/Application Support/Podman Desktop/cache"),
+                # Homebrew caches (can be GB)
+                os.path.expanduser("~/Library/Caches/Homebrew"),
+                # npm cache
+                os.path.expanduser("~/.npm/_cacache"),
+                # pip cache
+                os.path.expanduser("~/Library/Caches/pip"),
+                # Xcode derived data (often huge)
+                os.path.expanduser("~/Library/Developer/Xcode/DerivedData"),
+            ]
+
+            for cache_path in additional_cache_paths:
+                if os.path.exists(cache_path):
+                    try:
+                        if os.path.isdir(cache_path):
+                            size_bytes = self._get_dir_size(cache_path)
+                        else:
+                            size_bytes = os.path.getsize(cache_path)
+
+                        if size_bytes > 10 * 1024 * 1024:  # Only report if > 10MB
+                            details["additional_caches"].append({
+                                "path": cache_path,
+                                "size_mb": size_bytes / (1024 * 1024),
+                                "cleanable": False,  # Just report, don't auto-clean these
+                            })
+                    except (PermissionError, OSError):
+                        pass
+
+        # Step 4: Clean blob cache (aggressive mode only)
         if aggressive:
             blob_cache_paths = [
                 os.path.join(container_storage_base, "storage", "overlay-images"),
@@ -2392,9 +3115,476 @@ class PodmanExecutor(ResourceCapableExecutor):
                     except Exception as e:
                         result.errors.append(f"Error scanning blob cache: {e}")
 
+        # Step 4: Clean Homebrew cache (macOS only)
+        if clean_homebrew and system == "Darwin":
+            homebrew_cache = os.path.expanduser("~/Library/Caches/Homebrew")
+            try:
+                # Measure size before cleanup
+                size_before = self._get_dir_size(homebrew_cache) if os.path.exists(homebrew_cache) else 0
+
+                if not dry_run:
+                    # Run brew cleanup
+                    brew_result = subprocess.run(
+                        ["brew", "cleanup", "--prune=all", "-s"],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    # Measure size after
+                    size_after = self._get_dir_size(homebrew_cache) if os.path.exists(homebrew_cache) else 0
+                    freed = size_before - size_after
+
+                    details["homebrew"].append({
+                        "action": "brew cleanup --prune=all",
+                        "size_freed_mb": freed / (1024 * 1024),
+                        "success": brew_result.returncode == 0,
+                        "output": brew_result.stdout[:500] if brew_result.stdout else "",
+                    })
+                    total_freed_bytes += max(0, freed)
+                else:
+                    details["homebrew"].append({
+                        "action": "brew cleanup --prune=all (dry run)",
+                        "size_mb": size_before / (1024 * 1024),
+                        "cleanable": True,
+                    })
+            except FileNotFoundError:
+                details["homebrew"].append({"action": "brew not installed", "cleanable": False})
+            except subprocess.TimeoutExpired:
+                result.errors.append("Homebrew cleanup timed out")
+            except Exception as e:
+                result.errors.append(f"Homebrew cleanup failed: {e}")
+
+        # Step 5: Clean npm cache
+        if clean_npm:
+            npm_cache = os.path.expanduser("~/.npm/_cacache")
+            try:
+                # Measure size before cleanup
+                size_before = self._get_dir_size(npm_cache) if os.path.exists(npm_cache) else 0
+
+                if not dry_run and size_before > 0:
+                    npm_result = subprocess.run(
+                        ["npm", "cache", "clean", "--force"],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    size_after = self._get_dir_size(npm_cache) if os.path.exists(npm_cache) else 0
+                    freed = size_before - size_after
+
+                    details["npm"].append({
+                        "action": "npm cache clean --force",
+                        "size_freed_mb": freed / (1024 * 1024),
+                        "success": npm_result.returncode == 0,
+                    })
+                    total_freed_bytes += max(0, freed)
+                else:
+                    details["npm"].append({
+                        "action": "npm cache clean --force (dry run)",
+                        "size_mb": size_before / (1024 * 1024),
+                        "cleanable": size_before > 0,
+                    })
+            except FileNotFoundError:
+                details["npm"].append({"action": "npm not installed", "cleanable": False})
+            except Exception as e:
+                result.errors.append(f"npm cache cleanup failed: {e}")
+
+        # Step 6: Clean pip cache
+        if clean_pip:
+            pip_cache = os.path.expanduser("~/Library/Caches/pip") if system == "Darwin" else os.path.expanduser("~/.cache/pip")
+            try:
+                size_before = self._get_dir_size(pip_cache) if os.path.exists(pip_cache) else 0
+
+                if not dry_run and size_before > 0:
+                    pip_result = subprocess.run(
+                        ["pip", "cache", "purge"],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    size_after = self._get_dir_size(pip_cache) if os.path.exists(pip_cache) else 0
+                    freed = size_before - size_after
+
+                    details["pip"].append({
+                        "action": "pip cache purge",
+                        "size_freed_mb": freed / (1024 * 1024),
+                        "success": pip_result.returncode == 0,
+                    })
+                    total_freed_bytes += max(0, freed)
+                else:
+                    details["pip"].append({
+                        "action": "pip cache purge (dry run)",
+                        "size_mb": size_before / (1024 * 1024),
+                        "cleanable": size_before > 0,
+                    })
+            except FileNotFoundError:
+                details["pip"].append({"action": "pip not installed", "cleanable": False})
+            except Exception as e:
+                result.errors.append(f"pip cache cleanup failed: {e}")
+
+        # Step 7: Clean Docker (if installed alongside Podman)
+        if clean_docker:
+            try:
+                # Check if docker is available
+                docker_check = subprocess.run(
+                    ["docker", "info"],
+                    capture_output=True,
+                    timeout=30,
+                )
+                if docker_check.returncode == 0:
+                    if not dry_run:
+                        docker_result = subprocess.run(
+                            ["docker", "system", "prune", "-af", "--volumes"],
+                            capture_output=True,
+                            text=True,
+                            timeout=600,
+                        )
+                        # Parse output for space reclaimed
+                        output = docker_result.stdout or ""
+                        reclaimed = 0
+                        for line in output.split("\n"):
+                            if "reclaimed" in line.lower():
+                                # Try to extract size from output like "Total reclaimed space: 2.5GB"
+                                import re
+                                match = re.search(r"(\d+\.?\d*)\s*(GB|MB|KB|B)", line, re.IGNORECASE)
+                                if match:
+                                    size = float(match.group(1))
+                                    unit = match.group(2).upper()
+                                    if unit == "GB":
+                                        reclaimed = int(size * 1024 * 1024 * 1024)
+                                    elif unit == "MB":
+                                        reclaimed = int(size * 1024 * 1024)
+                                    elif unit == "KB":
+                                        reclaimed = int(size * 1024)
+                                    else:
+                                        reclaimed = int(size)
+
+                        details["docker"].append({
+                            "action": "docker system prune -af --volumes",
+                            "size_freed_mb": reclaimed / (1024 * 1024),
+                            "success": docker_result.returncode == 0,
+                            "output": output[:500],
+                        })
+                        total_freed_bytes += reclaimed
+                    else:
+                        # Get docker system df for estimate
+                        df_result = subprocess.run(
+                            ["docker", "system", "df"],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        details["docker"].append({
+                            "action": "docker system prune -af (dry run)",
+                            "info": df_result.stdout[:500] if df_result.stdout else "Docker data present",
+                            "cleanable": True,
+                        })
+                else:
+                    details["docker"].append({"action": "Docker not running", "cleanable": False})
+            except FileNotFoundError:
+                details["docker"].append({"action": "Docker not installed", "cleanable": False})
+            except subprocess.TimeoutExpired:
+                result.errors.append("Docker cleanup timed out")
+            except Exception as e:
+                result.errors.append(f"Docker cleanup failed: {e}")
+
+        # Step 8: Empty Trash (macOS only)
+        if clean_trash and system == "Darwin":
+            trash_path = os.path.expanduser("~/.Trash")
+            try:
+                size_before = self._get_dir_size(trash_path) if os.path.exists(trash_path) else 0
+
+                if not dry_run and size_before > 0:
+                    # Use rm -rf on trash contents (safer than AppleScript which needs permissions)
+                    for item in os.listdir(trash_path):
+                        item_path = os.path.join(trash_path, item)
+                        try:
+                            if os.path.isdir(item_path):
+                                shutil.rmtree(item_path)
+                            else:
+                                os.remove(item_path)
+                        except (PermissionError, OSError) as e:
+                            result.errors.append(f"Could not remove {item}: {e}")
+
+                    size_after = self._get_dir_size(trash_path) if os.path.exists(trash_path) else 0
+                    freed = size_before - size_after
+
+                    details["trash"].append({
+                        "action": "Empty Trash",
+                        "size_freed_mb": freed / (1024 * 1024),
+                        "success": True,
+                    })
+                    total_freed_bytes += max(0, freed)
+                else:
+                    details["trash"].append({
+                        "action": "Empty Trash (dry run)",
+                        "size_mb": size_before / (1024 * 1024),
+                        "cleanable": size_before > 0,
+                    })
+            except Exception as e:
+                result.errors.append(f"Trash cleanup failed: {e}")
+
+        # Step 9: Clean Xcode DerivedData (macOS only)
+        if clean_xcode and system == "Darwin":
+            xcode_derived = os.path.expanduser("~/Library/Developer/Xcode/DerivedData")
+            try:
+                size_before = self._get_dir_size(xcode_derived) if os.path.exists(xcode_derived) else 0
+
+                if not dry_run and size_before > 0:
+                    # Remove DerivedData contents (can be regenerated)
+                    for item in os.listdir(xcode_derived):
+                        item_path = os.path.join(xcode_derived, item)
+                        try:
+                            if os.path.isdir(item_path):
+                                shutil.rmtree(item_path)
+                            else:
+                                os.remove(item_path)
+                        except (PermissionError, OSError) as e:
+                            result.errors.append(f"Could not remove Xcode data {item}: {e}")
+
+                    size_after = self._get_dir_size(xcode_derived) if os.path.exists(xcode_derived) else 0
+                    freed = size_before - size_after
+
+                    details["xcode"].append({
+                        "action": "Clean DerivedData",
+                        "size_freed_mb": freed / (1024 * 1024),
+                        "success": True,
+                    })
+                    total_freed_bytes += max(0, freed)
+                else:
+                    details["xcode"].append({
+                        "action": "Clean DerivedData (dry run)",
+                        "size_mb": size_before / (1024 * 1024),
+                        "cleanable": size_before > 0,
+                    })
+            except Exception as e:
+                result.errors.append(f"Xcode cleanup failed: {e}")
+
+        # Step 10: Clean VS Code caches (can be several GB)
+        if clean_vscode:
+            vscode_base = os.path.expanduser("~/Library/Application Support/Code") if system == "Darwin" else os.path.expanduser("~/.config/Code")
+            vscode_cache_dirs = [
+                os.path.join(vscode_base, "User", "workspaceStorage"),  # Often 2-3GB
+                os.path.join(vscode_base, "User", "History"),           # Often 400-500MB
+                os.path.join(vscode_base, "CachedExtensionVSIXs"),      # Often 500MB
+                os.path.join(vscode_base, "logs"),                      # Often 100-200MB
+                os.path.join(vscode_base, "Crashpad"),                  # Often 100MB
+                os.path.join(vscode_base, "Cache"),                     # Browser cache
+                os.path.join(vscode_base, "CachedData"),                # Extension cache
+            ]
+
+            total_vscode_freed = 0
+            for cache_dir in vscode_cache_dirs:
+                if os.path.exists(cache_dir) and os.path.isdir(cache_dir):
+                    try:
+                        size_before = self._get_dir_size(cache_dir)
+
+                        if not dry_run and size_before > 0:
+                            # Remove contents but keep the directory
+                            for item in os.listdir(cache_dir):
+                                item_path = os.path.join(cache_dir, item)
+                                try:
+                                    if os.path.isdir(item_path):
+                                        shutil.rmtree(item_path)
+                                    else:
+                                        os.remove(item_path)
+                                except (PermissionError, OSError) as e:
+                                    result.errors.append(f"Could not remove VS Code cache {item}: {e}")
+
+                            size_after = self._get_dir_size(cache_dir) if os.path.exists(cache_dir) else 0
+                            freed = size_before - size_after
+
+                            details["vscode"].append({
+                                "path": cache_dir,
+                                "size_freed_mb": freed / (1024 * 1024),
+                                "success": True,
+                            })
+                            total_vscode_freed += max(0, freed)
+                        else:
+                            details["vscode"].append({
+                                "path": cache_dir,
+                                "size_mb": size_before / (1024 * 1024),
+                                "cleanable": size_before > 1024 * 1024,  # > 1MB
+                            })
+                    except Exception as e:
+                        result.errors.append(f"VS Code cache cleanup failed for {cache_dir}: {e}")
+
+            total_freed_bytes += total_vscode_freed
+
+        # Step 11: Remove unused Podman machines (stopped machines that aren't currently needed)
+        if clean_unused_machines:
+            try:
+                # Get list of machines
+                machines = self.list_machines()
+                current_machine = self.connection or "guideai-dev"  # Default to our machine
+
+                for machine in machines:
+                    # Skip the current active machine
+                    if machine.name == current_machine:
+                        continue
+
+                    # Skip running machines
+                    if machine.running:
+                        continue
+
+                    # Calculate size of machine disk image
+                    machine_disk_paths = []
+                    if system == "Darwin":
+                        machine_disk_paths = [
+                            os.path.expanduser(f"~/.local/share/containers/podman/machine/applehv/{machine.name}-arm64.raw"),
+                            os.path.expanduser(f"~/.local/share/containers/podman/machine/qemu/{machine.name}.qcow2"),
+                        ]
+                    else:
+                        machine_disk_paths = [
+                            os.path.expanduser(f"~/.local/share/containers/podman/machine/qemu/{machine.name}.qcow2"),
+                        ]
+
+                    for disk_path in machine_disk_paths:
+                        if os.path.exists(disk_path):
+                            try:
+                                size_bytes = os.path.getsize(disk_path)
+
+                                if not dry_run:
+                                    # Remove the machine using podman machine rm
+                                    rm_result = subprocess.run(
+                                        ["podman", "machine", "rm", "-f", machine.name],
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=60,
+                                    )
+
+                                    details["unused_machines"].append({
+                                        "machine": machine.name,
+                                        "disk_path": disk_path,
+                                        "size_freed_mb": size_bytes / (1024 * 1024),
+                                        "success": rm_result.returncode == 0,
+                                        "output": rm_result.stderr[:200] if rm_result.stderr else "",
+                                    })
+                                    if rm_result.returncode == 0:
+                                        total_freed_bytes += size_bytes
+                                else:
+                                    details["unused_machines"].append({
+                                        "machine": machine.name,
+                                        "disk_path": disk_path,
+                                        "size_mb": size_bytes / (1024 * 1024),
+                                        "cleanable": True,
+                                    })
+                            except Exception as e:
+                                result.errors.append(f"Failed to remove machine {machine.name}: {e}")
+            except Exception as e:
+                result.errors.append(f"Unused machine cleanup failed: {e}")
+
+        # Step 12: Clean Podman machine cache directory (can be 500MB-1GB)
+        if clean_podman_cache:
+            podman_cache_paths = []
+            if system == "Darwin":
+                podman_cache_paths = [
+                    os.path.expanduser("~/.local/share/containers/podman/machine/applehv/cache"),
+                    os.path.expanduser("~/.local/share/containers/podman/machine/qemu/cache"),
+                    os.path.expanduser("~/.local/share/containers/cache"),
+                ]
+            else:
+                podman_cache_paths = [
+                    os.path.expanduser("~/.local/share/containers/podman/machine/qemu/cache"),
+                    os.path.expanduser("~/.local/share/containers/cache"),
+                ]
+
+            for cache_path in podman_cache_paths:
+                if os.path.exists(cache_path) and os.path.isdir(cache_path):
+                    try:
+                        size_before = self._get_dir_size(cache_path)
+
+                        if not dry_run and size_before > 0:
+                            # Remove contents but keep the directory
+                            shutil.rmtree(cache_path, ignore_errors=True)
+                            os.makedirs(cache_path, exist_ok=True)
+
+                            size_after = self._get_dir_size(cache_path) if os.path.exists(cache_path) else 0
+                            freed = size_before - size_after
+
+                            details["podman_cache"].append({
+                                "path": cache_path,
+                                "size_freed_mb": freed / (1024 * 1024),
+                                "success": True,
+                            })
+                            total_freed_bytes += max(0, freed)
+                        else:
+                            details["podman_cache"].append({
+                                "path": cache_path,
+                                "size_mb": size_before / (1024 * 1024),
+                                "cleanable": size_before > 1024 * 1024,  # > 1MB
+                            })
+                    except Exception as e:
+                        result.errors.append(f"Podman cache cleanup failed for {cache_path}: {e}")
+
+        # Step 13: Verify Podman machine health after cleanup and recover if needed
+        # This is critical because cleaning caches can sometimes break the Podman socket connection
+        if clean_podman_cache or clean_unused_machines:
+            try:
+                # Quick health check - try to list containers
+                health_check = subprocess.run(
+                    ["podman", "ps", "--format", "json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
+                if health_check.returncode != 0:
+                    # Socket may be broken, try to recover
+                    machine_name = self._get_running_machine_name()
+                    if machine_name:
+                        details["podman_recovery"] = {"attempted": True, "machine": machine_name}
+
+                        # Stop and restart the machine to restore socket connection
+                        stop_result = subprocess.run(
+                            ["podman", "machine", "stop", machine_name],
+                            capture_output=True,
+                            text=True,
+                            timeout=60,
+                        )
+
+                        start_result = subprocess.run(
+                            ["podman", "machine", "start", machine_name],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+
+                        if start_result.returncode == 0:
+                            details["podman_recovery"]["success"] = True
+                            # Give socket time to initialize
+                            time.sleep(2)
+                        else:
+                            details["podman_recovery"]["success"] = False
+                            result.errors.append(
+                                f"Podman machine restart failed: {start_result.stderr}"
+                            )
+                    else:
+                        details["podman_recovery"] = {"attempted": False, "reason": "no running machine"}
+                else:
+                    details["podman_recovery"] = {"attempted": False, "reason": "health check passed"}
+            except subprocess.TimeoutExpired:
+                result.errors.append("Podman health check timed out - machine may need manual restart")
+                details["podman_recovery"] = {"attempted": False, "reason": "timeout"}
+            except Exception as e:
+                result.errors.append(f"Podman health check failed: {e}")
+                details["podman_recovery"] = {"attempted": False, "reason": str(e)}
+
+        # Get current host disk usage for reporting
+        try:
+            statvfs = os.statvfs(os.path.expanduser("~"))
+            total_bytes = statvfs.f_blocks * statvfs.f_frsize
+            free_bytes = statvfs.f_bavail * statvfs.f_frsize
+            used_percent = ((total_bytes - free_bytes) / total_bytes) * 100
+            details["host_disk_percent_used"] = used_percent
+        except Exception:
+            details["host_disk_percent_used"] = 99  # Assume worst case
+
+        result.cache_cleared = (
+            clean_container_cache or clean_tmp_files or clean_homebrew or
+            clean_npm or clean_pip or clean_docker or clean_trash or clean_xcode or
+            clean_vscode or clean_unused_machines or clean_podman_cache
+        )
         result.host_space_reclaimed_mb = total_freed_bytes / (1024 * 1024)
-        result.space_reclaimed_mb = result.host_space_reclaimed_mb
-        result.cache_cleared = clean_container_cache or clean_tmp_files
         result.details = details
 
         return result

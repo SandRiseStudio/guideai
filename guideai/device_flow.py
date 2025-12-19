@@ -29,6 +29,7 @@ from .auth.providers import (
     AccessDeniedError,
     InvalidCredentialsError,
     OAuthError,
+    UserInfo,
 )
 from .telemetry import TelemetryClient
 
@@ -101,6 +102,7 @@ class DeviceAuthorizationSession:
     denied_at: Optional[datetime] = None
     denied_reason: Optional[str] = None
     last_poll_at: Optional[datetime] = None
+    oauth_user_info: Optional[UserInfo] = None
 
     def expires_in(self, *, as_of: Optional[datetime] = None) -> int:
         """Seconds until the device code expires."""
@@ -199,6 +201,7 @@ class DeviceFlowManager:
         self._sessions: Dict[str, DeviceAuthorizationSession] = {}
         self._user_code_index: Dict[str, str] = {}
         self._refresh_token_index: Dict[str, str] = {}
+        self._access_token_index: Dict[str, str] = {}  # access_token -> device_code
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
@@ -792,6 +795,55 @@ class DeviceFlowManager:
         )
         return session
 
+    def get_user_info_from_access_token(self, access_token: str) -> Optional[Dict[str, Any]]:
+        """Retrieve user info associated with a valid access token.
+
+        Returns a dictionary with user info if the access token is valid,
+        or None if the token is invalid, expired, or not found.
+        """
+        if not access_token:
+            return None
+
+        with self._lock:
+            device_code = self._access_token_index.get(access_token)
+            if device_code is None:
+                return None
+
+            session = self._sessions.get(device_code)
+            if session is None:
+                return None
+
+            self._update_status_for_expiry(session)
+            if session.status is DeviceAuthorizationStatus.EXPIRED:
+                self._unregister_tokens_locked(session)
+                return None
+
+            if session.tokens is None:
+                return None
+
+            tokens = session.tokens
+            if tokens.access_token != access_token:
+                return None
+            if tokens.access_expires_in(as_of=_now()) <= 0:
+                return None
+
+            # Build user info from session data
+            user_info: Dict[str, Any] = {
+                "sub": session.device_code,  # Default to device_code
+                "scopes": session.scopes,
+            }
+
+            # Include OAuth user info if available (UserInfo has: user_id, username, email, display_name, avatar_url)
+            if session.oauth_user_info:
+                user_info["sub"] = session.oauth_user_info.user_id
+                user_info["name"] = session.oauth_user_info.display_name or session.oauth_user_info.username
+                user_info["email"] = session.oauth_user_info.email
+                user_info["picture"] = session.oauth_user_info.avatar_url
+                user_info["username"] = session.oauth_user_info.username
+                user_info["provider"] = session.oauth_user_info.provider
+
+            return user_info
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -865,11 +917,13 @@ class DeviceFlowManager:
         if session.tokens is None:
             return
         self._refresh_token_index[session.tokens.refresh_token] = session.device_code
+        self._access_token_index[session.tokens.access_token] = session.device_code
 
     def _unregister_tokens_locked(self, session: DeviceAuthorizationSession) -> None:
         if session.tokens is None:
             return
         self._refresh_token_index.pop(session.tokens.refresh_token, None)
+        self._access_token_index.pop(session.tokens.access_token, None)
 
     def _emit_event(
         self,
@@ -894,6 +948,98 @@ class DeviceFlowManager:
             payload=payload,
             actor={"id": "agentauth", "role": "SYSTEM", "surface": "api"},
         )
+
+    def create_session_from_oauth(
+        self,
+        *,
+        provider: str,
+        user_id: str,
+        email: str,
+        name: Optional[str] = None,
+        picture: Optional[str] = None,
+        provider_access_token: Optional[str] = None,
+        provider_refresh_token: Optional[str] = None,
+        scopes: Optional[List[str]] = None,
+    ) -> DeviceTokens:
+        """
+        Create a GuideAI session from OAuth credentials.
+
+        This bridges OAuth login (Google, GitHub) to the device flow session system,
+        enabling token refresh via the standard device flow refresh endpoints.
+
+        Args:
+            provider: OAuth provider name (e.g., "google", "github")
+            user_id: User ID from the OAuth provider
+            email: User's email address
+            name: User's display name (optional)
+            picture: User's avatar URL (optional)
+            provider_access_token: Access token from OAuth provider (stored for API calls)
+            provider_refresh_token: Refresh token from OAuth provider (stored for re-auth)
+            scopes: Scopes granted by the OAuth provider
+
+        Returns:
+            DeviceTokens with GuideAI access and refresh tokens that work with
+            the standard device flow refresh endpoints.
+        """
+        now = _now()
+        device_code = secrets.token_urlsafe(32)
+        user_code = self._generate_user_code()
+
+        # Create OAuth user info to store in session
+        oauth_user_info = UserInfo(
+            provider=provider,
+            user_id=user_id,
+            username=email,  # Use email as username for OAuth users
+            email=email,
+            display_name=name,
+            avatar_url=picture,
+        )
+
+        # Create session
+        # Store OAuth provider info in metadata field (provider tokens for potential re-auth)
+        metadata = {
+            "oauth_provider": provider,
+        }
+        if provider_access_token:
+            metadata["oauth_access_token"] = provider_access_token
+        if provider_refresh_token:
+            metadata["oauth_refresh_token"] = provider_refresh_token
+
+        session = DeviceAuthorizationSession(
+            device_code=device_code,
+            user_code=user_code,
+            client_id=f"oauth-{provider}",
+            scopes=scopes or ["openid", "profile", "email"],
+            surface="WEB",
+            verification_uri="",
+            verification_uri_complete="",
+            created_at=now,
+            expires_at=now + timedelta(days=30),  # Long expiry for OAuth sessions
+            poll_interval=self._poll_interval,
+            status=DeviceAuthorizationStatus.APPROVED,
+            approver=email,
+            approved_at=now,
+            oauth_user_info=oauth_user_info,
+            metadata=metadata,
+        )
+
+        # Issue GuideAI tokens
+        session.tokens = self._issue_tokens()
+
+        # Register session and tokens
+        with self._lock:
+            self._sessions[device_code] = session
+            self._user_code_index[user_code] = device_code
+            self._register_tokens_locked(session)
+
+        self._emit_event(
+            "auth_oauth_session_created",
+            session,
+            extra={"provider": provider, "email": email},
+        )
+
+        assert session.tokens is not None
+        return session.tokens
 
 
 __all__ = [

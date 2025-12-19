@@ -34,6 +34,38 @@ class ServiceSpec(BaseModel):
         bandwidth_mbps: Estimated network bandwidth in Mbps
         module: Module grouping (e.g., "datastores", "observability")
     """
+class BuildSpec(BaseModel):
+    """Optional image build specification for a service.
+
+    This enables blueprints to declare local-build images (e.g. `:dev` tags)
+    so `apply` can build them when missing instead of trying to pull from a
+    remote registry.
+    """
+
+    context: str = Field(".", description="Build context directory")
+    dockerfile: Optional[str] = Field(None, description="Path to Dockerfile relative to context")
+    rebuild: bool = Field(False, description="Force rebuild even if image exists")
+    pull: bool = Field(False, description="Pull base images during build")
+    build_args: Dict[str, Any] = Field(default_factory=dict, description="Build-time args")
+
+
+class ServiceSpec(BaseModel):
+    """Specification for a single service within a blueprint.
+
+    Attributes:
+        image: Container image name (e.g., "postgres:16-alpine")
+        ports: Port mappings in "host:container" format
+        environment: Environment variables
+        volumes: Volume/bind mount specifications
+        command: Optional command override
+        cpu_cores: CPU cores required
+        memory_mb: Memory required in MB
+        bandwidth_mbps: Estimated network bandwidth in Mbps
+        module: Module grouping (e.g., "datastores", "observability")
+        build: Optional local build spec (context/dockerfile/rebuild)
+        depends_on: Optional dependency list (best-effort ordering)
+    """
+
     image: str
     ports: List[str] = Field(default_factory=list)
     environment: Dict[str, str] = Field(default_factory=dict)
@@ -45,6 +77,8 @@ class ServiceSpec(BaseModel):
     module: Optional[str] = Field(
         None, description="Module name this service belongs to (e.g. 'datastores', 'observability')"
     )
+    build: Optional[BuildSpec] = None
+    depends_on: List[str] = Field(default_factory=list)
 
 
 class Blueprint(BaseModel):
@@ -182,6 +216,7 @@ class PlanRequest(BaseModel):
         variables: Variable overrides
         active_modules: Module filter override
         force_podman: Skip Podman checks/warnings
+        machine_disk_size_gb: Override disk size for Podman machine
     """
     blueprint_id: Optional[str] = None
     environment: str
@@ -194,6 +229,9 @@ class PlanRequest(BaseModel):
         None, description="Override active modules for this plan"
     )
     force_podman: bool = False
+    machine_disk_size_gb: Optional[int] = Field(
+        None, description="Override disk size for Podman machine initialization"
+    )
 
 
 class EnvironmentEstimates(BaseModel):
@@ -278,6 +316,8 @@ class ApplyRequest(BaseModel):
     auto_resolve_stale: bool = True
     auto_resolve_conflicts: bool = True
     stale_max_age_hours: Optional[float] = 0.0  # 0 = clean all stale, None = skip age check
+    # Force rebuild of local images (useful for fresh starts with code changes)
+    rebuild_images: bool = False
 
 
 class ApplyResponse(BaseModel):
@@ -564,3 +604,174 @@ class EnvironmentManifest(BaseModel):
             List of environment names
         """
         return list(self.environments.keys())
+
+
+# =============================================================================
+# Test Planning Models
+# =============================================================================
+
+
+class TestSuiteDefinition(BaseModel):
+    """Definition of a test suite with marker-to-service mappings."""
+
+    name: str = Field(default="default", description="Name of the test suite")
+    description: str = Field(default="", description="Description of the test suite")
+    marker_mappings: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Mapping of pytest markers to required service names"
+    )
+    default_services: List[str] = Field(
+        default_factory=list,
+        description="Services always required for this suite"
+    )
+    timeout_minutes: int = Field(
+        default=30,
+        description="Default timeout for test runs in minutes"
+    )
+
+
+class PlanForTestsRequest(BaseModel):
+    """Request to plan infrastructure for running tests."""
+
+    test_paths: List[str] = Field(
+        description="Paths to test files or directories to analyze"
+    )
+    blueprint_id: Optional[str] = Field(
+        default=None,
+        description="Blueprint ID to use (uses environment default if not specified)"
+    )
+    environment: Optional[str] = Field(
+        default=None,
+        description="Environment name to use for configuration"
+    )
+    markers: Optional[List[str]] = Field(
+        default=None,
+        description="Specific pytest markers to filter for"
+    )
+    marker_mappings: Optional[Dict[str, List[str]]] = Field(
+        default=None,
+        description="Override marker-to-service mappings"
+    )
+    suite_config_path: Optional[str] = Field(
+        default=None,
+        description="Path to test suite YAML configuration file"
+    )
+    compliance_tier: Optional[str] = Field(
+        default=None,
+        description="Compliance tier to use"
+    )
+    lifetime: Optional[str] = Field(
+        default="30m",
+        description="How long the test environment should live"
+    )
+
+
+class PlanForTestsResponse(BaseModel):
+    """Response from test infrastructure planning."""
+
+    plan_id: str = Field(description="Unique ID for this test plan")
+    amp_run_id: str = Field(description="Amprealize run ID")
+    required_services: List[str] = Field(
+        description="Services required to run the tests"
+    )
+    startup_order: List[str] = Field(
+        description="Order in which services should start"
+    )
+    discovered_markers: List[str] = Field(
+        default_factory=list,
+        description="Pytest markers discovered in test files"
+    )
+    service_sources: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Why each service is required (marker, import, etc.)"
+    )
+    test_files_analyzed: int = Field(
+        default=0,
+        description="Number of test files analyzed"
+    )
+    analysis_errors: List[str] = Field(
+        default_factory=list,
+        description="Any errors encountered during analysis"
+    )
+    minimal_blueprint: Dict[str, Any] = Field(
+        description="The minimal blueprint with only required services"
+    )
+    environment_estimates: Optional[EnvironmentEstimates] = Field(
+        default=None,
+        description="Resource estimates for the minimal environment"
+    )
+
+
+class RunTestsRequest(BaseModel):
+    """Request to run tests with automatic infrastructure management."""
+
+    test_paths: List[str] = Field(
+        description="Paths to test files or directories to run"
+    )
+    blueprint_id: Optional[str] = Field(
+        default=None,
+        description="Blueprint ID to use"
+    )
+    environment: Optional[str] = Field(
+        default=None,
+        description="Environment name to use"
+    )
+    markers: Optional[List[str]] = Field(
+        default=None,
+        description="Pytest markers to filter tests"
+    )
+    marker_mappings: Optional[Dict[str, List[str]]] = Field(
+        default=None,
+        description="Override marker-to-service mappings"
+    )
+    suite_config_path: Optional[str] = Field(
+        default=None,
+        description="Path to test suite YAML configuration"
+    )
+    pytest_args: Optional[List[str]] = Field(
+        default=None,
+        description="Additional arguments to pass to pytest"
+    )
+    timeout_minutes: int = Field(
+        default=30,
+        description="Timeout for test run in minutes"
+    )
+    keep_infrastructure: bool = Field(
+        default=False,
+        description="Keep infrastructure running after tests complete"
+    )
+    verbose: bool = Field(
+        default=False,
+        description="Enable verbose output"
+    )
+
+
+class RunTestsResponse(BaseModel):
+    """Response from running tests."""
+
+    success: bool = Field(description="Whether all tests passed")
+    plan_id: str = Field(description="ID of the test plan used")
+    amp_run_id: str = Field(description="Amprealize run ID")
+    exit_code: int = Field(description="Pytest exit code")
+    tests_run: int = Field(default=0, description="Number of tests executed")
+    tests_passed: int = Field(default=0, description="Number of tests passed")
+    tests_failed: int = Field(default=0, description="Number of tests failed")
+    tests_skipped: int = Field(default=0, description="Number of tests skipped")
+    tests_error: int = Field(default=0, description="Number of tests with errors")
+    duration_seconds: float = Field(
+        default=0.0,
+        description="Total duration of test run in seconds"
+    )
+    infrastructure_time_seconds: float = Field(
+        default=0.0,
+        description="Time spent setting up/tearing down infrastructure"
+    )
+    output: str = Field(default="", description="Pytest output")
+    services_started: List[str] = Field(
+        default_factory=list,
+        description="Services that were started for this run"
+    )
+    errors: List[str] = Field(
+        default_factory=list,
+        description="Any errors encountered"
+    )

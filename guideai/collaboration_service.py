@@ -17,6 +17,15 @@ from .collaboration_contracts import (
 from .telemetry import TelemetryClient
 
 
+class VersionConflictError(Exception):
+    """Raised when a document edit conflicts with the current version."""
+
+    def __init__(self, message: str, expected_version: int, got_version: int) -> None:
+        super().__init__(message)
+        self.expected_version = expected_version
+        self.got_version = got_version
+
+
 class CollaborationService:
     """Collaboration service for shared workspaces and real-time co-editing."""
 
