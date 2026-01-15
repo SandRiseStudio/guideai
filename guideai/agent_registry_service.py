@@ -30,6 +30,7 @@ from guideai.agent_registry_contracts import (
     AgentVersion,
     AgentVisibility,
     CreateAgentRequest,
+    CreateAgentResponse,
     CreateNewVersionRequest,
     DeprecateAgentRequest,
     ListAgentsRequest,
@@ -43,6 +44,18 @@ from guideai.storage.postgres_pool import PostgresPool
 from guideai.utils.dsn import resolve_postgres_dsn
 from guideai.telemetry import TelemetryClient
 
+# Import for optional ServicePrincipalService dependency
+try:
+    from guideai.auth.service_principal_service import (
+        ServicePrincipalService,
+        CreateServicePrincipalRequest,
+    )
+    SERVICE_PRINCIPAL_AVAILABLE = True
+except ImportError:
+    SERVICE_PRINCIPAL_AVAILABLE = False
+    ServicePrincipalService = None  # type: ignore[assignment, misc]
+    CreateServicePrincipalRequest = None  # type: ignore[assignment, misc]
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +65,7 @@ def _enum_value(v: Any) -> str:
 
 # Environment variable for PostgreSQL DSN
 _AGENT_REGISTRY_PG_DSN_ENV = "GUIDEAI_AGENT_REGISTRY_PG_DSN"
-_DEFAULT_PG_DSN = "postgresql://guideai:guideai@localhost:5432/guideai"
+_DEFAULT_PG_DSN = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
 
 # System owner ID for builtin agents
 SYSTEM_OWNER_ID = "system"
@@ -117,6 +130,7 @@ class AgentRegistryService:
         telemetry: Optional[TelemetryClient] = None,
         agents_dir: Optional[Path] = None,
         pool: Optional[PostgresPool] = None,
+        service_principal_service: Optional["ServicePrincipalService"] = None,
     ) -> None:
         """Initialize agent registry service.
 
@@ -125,10 +139,13 @@ class AgentRegistryService:
             telemetry: Telemetry client for event emission.
             agents_dir: Path to agents directory for playbook bootstrapping.
             pool: Optional pre-configured PostgresPool (takes precedence over dsn)
+            service_principal_service: Optional ServicePrincipalService for creating
+                API credentials when request_api_credentials=True.
         """
         self._telemetry = telemetry or TelemetryClient.noop()
         self._agents_dir = agents_dir
         self._playbook_loader: Optional[AgentPlaybookLoader] = None
+        self._service_principal_service = service_principal_service
 
         if pool is not None:
             self._pool = pool
@@ -158,7 +175,7 @@ class AgentRegistryService:
         actor: Actor,
         *,
         org_id: Optional[str] = None,
-    ) -> Agent:
+    ) -> CreateAgentResponse:
         """Create a new agent.
 
         Args:
@@ -167,7 +184,7 @@ class AgentRegistryService:
             org_id: Optional organization ID for multi-tenant isolation.
 
         Returns:
-            The created Agent with initial version.
+            CreateAgentResponse containing the agent and optional API credentials.
         """
         agent_id = str(uuid.uuid4())
         version = "1.0.0"
@@ -175,6 +192,41 @@ class AgentRegistryService:
         slug = request.slug or generate_slug(request.name)
 
         _org_id = org_id
+
+        # Create service principal if requested and service is available
+        service_principal_id: Optional[str] = None
+        client_id: Optional[str] = None
+        client_secret: Optional[str] = None
+
+        if request.request_api_credentials:
+            if not SERVICE_PRINCIPAL_AVAILABLE or self._service_principal_service is None:
+                raise ValueError(
+                    "API credentials requested but ServicePrincipalService is not available. "
+                    "Ensure the auth module is properly installed."
+                )
+
+            # Create service principal for this agent
+            sp_request = CreateServicePrincipalRequest(
+                name=f"Agent: {request.name}",
+                description=f"API credentials for agent '{request.name}' ({slug})",
+                allowed_scopes=["read", "write", "execute"],  # Standard agent scopes
+                role="STUDENT",  # Default role for agent credentials
+                metadata={
+                    "agent_slug": slug,
+                    "created_for": "agent",
+                },
+            )
+            sp_response = self._service_principal_service.create(
+                sp_request,
+                created_by=actor.id,
+            )
+            service_principal_id = sp_response.service_principal.id
+            client_id = sp_response.service_principal.client_id
+            client_secret = sp_response.client_secret
+
+            logger.info(
+                f"Created service principal {service_principal_id} for agent {slug}"
+            )
 
         def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
@@ -185,10 +237,11 @@ class AgentRegistryService:
                 # Insert agent
                 cur.execute(
                     """
-                    INSERT INTO agents (
+                    INSERT INTO execution.agents (
                         agent_id, name, slug, description, tags, status, visibility,
-                        owner_id, org_id, is_builtin, latest_version, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        owner_id, org_id, is_builtin, latest_version, created_at, updated_at,
+                        service_principal_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         agent_id,
@@ -204,13 +257,14 @@ class AgentRegistryService:
                         version,
                         timestamp,
                         timestamp,
+                        service_principal_id,
                     ),
                 )
 
                 # Insert initial version
                 cur.execute(
                     """
-                    INSERT INTO agent_versions (
+                    INSERT INTO execution.agent_versions (
                         agent_id, version, mission, role_alignment,
                         capabilities, default_behaviors, playbook_content, status,
                         effective_from, created_by, created_at
@@ -239,6 +293,7 @@ class AgentRegistryService:
                 "agent_id": agent_id,
                 "version": version,
                 "visibility": _enum_value(request.visibility),
+                "has_api_credentials": request.request_api_credentials,
             },
             executor=_execute,
             telemetry=self._telemetry,
@@ -252,11 +307,16 @@ class AgentRegistryService:
                 "name": request.name,
                 "version": version,
                 "visibility": _enum_value(request.visibility),
+                "has_api_credentials": request.request_api_credentials,
             },
             actor=self._actor_payload(actor),
         )
 
-        return agent
+        return CreateAgentResponse(
+            agent=agent,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
 
     def update_agent(
         self,
@@ -301,7 +361,7 @@ class AgentRegistryService:
                     values.append(request.agent_id)
 
                     cur.execute(
-                        f"UPDATE agents SET {', '.join(updates)} WHERE agent_id = %s",
+                        f"UPDATE execution.agents SET {', '.join(updates)} WHERE agent_id = %s",
                         values,
                     )
 
@@ -372,12 +432,12 @@ class AgentRegistryService:
             with conn.cursor() as cur:
                 # Delete versions first (foreign key constraint)
                 cur.execute(
-                    "DELETE FROM agent_versions WHERE agent_id = %s",
+                    "DELETE FROM execution.agent_versions WHERE agent_id = %s",
                     (agent_id,),
                 )
                 # Delete agent
                 cur.execute(
-                    "DELETE FROM agents WHERE agent_id = %s",
+                    "DELETE FROM execution.agents WHERE agent_id = %s",
                     (agent_id,),
                 )
 
@@ -422,7 +482,7 @@ class AgentRegistryService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO agent_versions (
+                    INSERT INTO execution.agent_versions (
                         agent_id, version, mission, role_alignment,
                         capabilities, default_behaviors, playbook_content, status,
                         effective_from, created_from, created_by, created_at
@@ -448,7 +508,7 @@ class AgentRegistryService:
                 # Update agent's latest_version
                 cur.execute(
                     """
-                    UPDATE agents SET latest_version = %s, updated_at = %s
+                    UPDATE execution.agents SET latest_version = %s, updated_at = %s
                     WHERE agent_id = %s
                     """,
                     (new_version, timestamp, request.agent_id),
@@ -511,7 +571,7 @@ class AgentRegistryService:
                 # Deprecate previous published versions
                 cur.execute(
                     """
-                    UPDATE agent_versions
+                    UPDATE execution.agent_versions
                     SET status = %s, effective_to = %s
                     WHERE agent_id = %s
                       AND status = %s
@@ -529,7 +589,7 @@ class AgentRegistryService:
                 # Publish the new version
                 cur.execute(
                     """
-                    UPDATE agent_versions
+                    UPDATE execution.agent_versions
                     SET status = %s, effective_from = %s
                     WHERE agent_id = %s AND version = %s
                     """,
@@ -544,7 +604,7 @@ class AgentRegistryService:
                 # Update agent status
                 cur.execute(
                     """
-                    UPDATE agents SET status = %s, updated_at = %s
+                    UPDATE execution.agents SET status = %s, updated_at = %s
                     WHERE agent_id = %s
                     """,
                     (AgentStatus.ACTIVE.value, timestamp, request.agent_id),
@@ -596,7 +656,7 @@ class AgentRegistryService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE agent_versions
+                    UPDATE execution.agent_versions
                     SET status = %s, effective_to = %s
                     WHERE agent_id = %s AND version = %s
                     """,
@@ -611,7 +671,7 @@ class AgentRegistryService:
                 # Check if any non-deprecated versions remain
                 cur.execute(
                     """
-                    SELECT COUNT(*) FROM agent_versions
+                    SELECT COUNT(*) FROM execution.agent_versions
                     WHERE agent_id = %s AND status != %s
                     """,
                     (request.agent_id, AgentStatus.DEPRECATED.value),
@@ -622,7 +682,7 @@ class AgentRegistryService:
                     # All versions deprecated, mark agent as deprecated
                     cur.execute(
                         """
-                        UPDATE agents SET status = %s, updated_at = %s
+                        UPDATE execution.agents SET status = %s, updated_at = %s
                         WHERE agent_id = %s
                         """,
                         (AgentStatus.DEPRECATED.value, timestamp, request.agent_id),
@@ -687,10 +747,10 @@ class AgentRegistryService:
                         av.capabilities, av.default_behaviors, av.playbook_content,
                         av.status as version_status, av.effective_from, av.effective_to,
                         av.created_from, av.created_by, av.created_at as version_created_at
-                    FROM agents a
-                    LEFT JOIN agent_versions av ON a.agent_id = av.agent_id
+                    FROM execution.agents a
+                    LEFT JOIN execution.agent_versions av ON a.agent_id = av.agent_id
                         AND av.status = COALESCE(
-                            (SELECT status FROM agent_versions
+                            (SELECT status FROM execution.agent_versions
                              WHERE agent_id = a.agent_id AND status = 'ACTIVE'
                              LIMIT 1),
                             a.status
@@ -769,8 +829,8 @@ class AgentRegistryService:
                         av.status as version_status, av.effective_from, av.effective_to,
                         av.created_from, av.created_by, av.created_at as version_created_at,
                         ts_rank_cd(to_tsvector('english', a.name || ' ' || a.description), plainto_tsquery('english', %s)) as score
-                    FROM agents a
-                    LEFT JOIN agent_versions av ON a.agent_id = av.agent_id
+                    FROM execution.agents a
+                    LEFT JOIN execution.agent_versions av ON a.agent_id = av.agent_id
                         AND av.status = 'ACTIVE'
                     WHERE 1=1
                 """
@@ -941,7 +1001,7 @@ class AgentRegistryService:
                 # Insert agent
                 cur.execute(
                     """
-                    INSERT INTO agents (
+                    INSERT INTO execution.agents (
                         agent_id, name, slug, description, tags, status, visibility,
                         owner_id, org_id, is_builtin, latest_version, created_at, updated_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -966,7 +1026,7 @@ class AgentRegistryService:
                 # Insert version
                 cur.execute(
                     """
-                    INSERT INTO agent_versions (
+                    INSERT INTO execution.agent_versions (
                         agent_id, version, mission, role_alignment,
                         capabilities, default_behaviors, playbook_content, status,
                         effective_from, created_by, created_at
@@ -1031,7 +1091,7 @@ class AgentRegistryService:
                 # Deprecate old versions
                 cur.execute(
                     """
-                    UPDATE agent_versions
+                    UPDATE execution.agent_versions
                     SET status = %s, effective_to = %s
                     WHERE agent_id = %s AND status = %s
                     """,
@@ -1046,7 +1106,7 @@ class AgentRegistryService:
                 # Insert new version
                 cur.execute(
                     """
-                    INSERT INTO agent_versions (
+                    INSERT INTO execution.agent_versions (
                         agent_id, version, mission, role_alignment,
                         capabilities, default_behaviors, playbook_content, status,
                         effective_from, created_from, created_by, created_at
@@ -1071,7 +1131,7 @@ class AgentRegistryService:
                 # Update agent metadata
                 cur.execute(
                     """
-                    UPDATE agents
+                    UPDATE execution.agents
                     SET name = %s, description = %s, tags = %s,
                         latest_version = %s, updated_at = %s
                     WHERE agent_id = %s
@@ -1108,7 +1168,7 @@ class AgentRegistryService:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM agents WHERE agent_id = %s",
+                    "SELECT * FROM execution.agents WHERE agent_id = %s",
                     (agent_id,),
                 )
                 row = cur.fetchone()
@@ -1124,7 +1184,7 @@ class AgentRegistryService:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM agents WHERE slug = %s",
+                    "SELECT * FROM execution.agents WHERE slug = %s",
                     (slug,),
                 )
                 row = cur.fetchone()
@@ -1140,7 +1200,7 @@ class AgentRegistryService:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM agent_versions WHERE agent_id = %s AND version = %s",
+                    "SELECT * FROM execution.agent_versions WHERE agent_id = %s AND version = %s",
                     (agent_id, version),
                 )
                 row = cur.fetchone()
@@ -1159,7 +1219,7 @@ class AgentRegistryService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT * FROM agent_versions
+                    SELECT * FROM execution.agent_versions
                     WHERE agent_id = %s
                     ORDER BY status = 'ACTIVE' DESC, effective_from DESC NULLS LAST
                     """,
@@ -1208,6 +1268,7 @@ class AgentRegistryService:
             latest_version=data["latest_version"],
             created_at=str(data["created_at"]),
             updated_at=str(data["updated_at"]),
+            service_principal_id=data.get("service_principal_id"),
         )
 
     @staticmethod

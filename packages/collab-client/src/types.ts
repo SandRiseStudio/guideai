@@ -275,3 +275,157 @@ export interface CollabClientEvents {
   /** Generic error */
   error: (code: ErrorCode, message: string) => void;
 }
+
+// ---------------------------------------------------------------------------
+// Work Item Execution (shared UI + API types)
+// ---------------------------------------------------------------------------
+
+export type ExecutionState =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'unknown';
+
+export interface ExecutionStatus {
+  hasExecution: boolean;
+  runId?: string | null;
+  taskCycleId?: string | null;
+  state?: ExecutionState | null;
+  phase?: string | null;
+  startedAt?: string | null;
+  progressPct?: number | null;
+  currentStep?: string | null;
+  totalTokens?: number | null;
+  totalCostUsd?: number | null;
+  pendingClarifications?: Array<Record<string, unknown>> | null;
+}
+
+export interface ExecutionListItem {
+  runId: string;
+  workItemId: string;
+  workItemTitle?: string | null;
+  agentId: string;
+  state: ExecutionState | string;
+  phase?: string | null;
+  startedAt: string;
+  completedAt?: string | null;
+  progressPct: number;
+}
+
+export interface ExecutionListResponse {
+  executions: ExecutionListItem[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export interface ExecutionStep {
+  stepId: string;
+  phase: string;
+  stepType: string;
+  startedAt: string;
+  completedAt?: string | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  toolCalls?: number | null;
+  contentPreview?: string | null;
+}
+
+export interface ExecutionStepsResponse {
+  steps: ExecutionStep[];
+  total: number;
+}
+
+export interface ExecutionStatusEventPayload {
+  run_id: string;
+  work_item_id?: string | null;
+  org_id?: string | null;
+  project_id?: string | null;
+  agent_id?: string | null;
+  model_id?: string | null;
+  cycle_id?: string | null;
+  task_cycle_id?: string | null;
+  status: string;
+  phase?: string | null;
+  progress_pct?: number | null;
+  current_step?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+  step_count?: number | null;
+  updated_at?: string | null;
+}
+
+export interface ExecutionStepEventPayload {
+  run_id: string;
+  work_item_id?: string | null;
+  org_id?: string | null;
+  project_id?: string | null;
+  step: {
+    step_id: string;
+    name: string;
+    status: string;
+    started_at?: string | null;
+    completed_at?: string | null;
+    progress_pct?: number | null;
+    metadata?: Record<string, unknown>;
+  };
+}
+
+export interface ExecutionStepSnapshotPayload {
+  step_id: string;
+  phase?: string | null;
+  step_type?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  tool_calls?: number | null;
+  content_preview?: string | null;
+  name?: string | null;
+  status?: string | null;
+  progress_pct?: number | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ExecutionStatusSnapshotPayload {
+  run_id: string;
+  cycle_id?: string | null;
+  task_cycle_id?: string | null;
+  work_item_id?: string | null;
+  status?: string | null;
+  phase?: string | null;
+  progress_pct?: number | null;
+  current_step?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+  model_id?: string | null;
+  step_count?: number | null;
+}
+
+export interface ExecutionSnapshotEventPayload {
+  run_id?: string | null;
+  status?: ExecutionStatusEventPayload | ExecutionStatusSnapshotPayload | null;
+  steps?: Array<ExecutionStepEventPayload['step'] | ExecutionStepSnapshotPayload>;
+  executions?: ExecutionStatusEventPayload[];
+}
+
+export interface ExecutionReadyEventPayload {
+  run_id?: string | null;
+  org_id?: string | null;
+  project_id?: string | null;
+}
+
+export interface ExecutionStreamEvents {
+  connected: (context: ExecutionReadyEventPayload) => void;
+  disconnected: (reason: string) => void;
+  status: (payload: ExecutionStatusEventPayload) => void;
+  step: (payload: ExecutionStepEventPayload) => void;
+  snapshot: (payload: ExecutionSnapshotEventPayload) => void;
+  ready: (payload: ExecutionReadyEventPayload) => void;
+  error: (code: string, message: string) => void;
+}

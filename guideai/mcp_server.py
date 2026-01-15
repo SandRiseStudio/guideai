@@ -37,13 +37,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 # MCP protocol types
 
@@ -112,6 +113,20 @@ class MCPServiceRegistry:
         self._api_rate_limiting_service: Optional[Any] = None
         self._reflection_service: Optional[Any] = None
 
+        # Multi-tenant services for orgs/projects/boards
+        self._organization_service: Optional[Any] = None
+        self._board_service: Optional[Any] = None
+        self._agent_registry_service: Optional[Any] = None
+
+        # Work item execution
+        self._work_item_execution_service: Optional[Any] = None
+
+        # File and GitHub services
+        self._github_service: Optional[Any] = None
+
+        # Config services
+        self._credential_store: Optional[Any] = None
+
         # Shared connection pools for PostgreSQL services
         # Note: Services create their own PostgresPool instances, but PostgresPool
         # internally caches engines by DSN, so multiple services with the same DSN
@@ -132,7 +147,11 @@ class MCPServiceRegistry:
         return self._pools[dsn]
 
     def prewarm_pools(self) -> None:
-        """Pre-warm connection pools for all configured PostgreSQL services."""
+        """Pre-warm connection pools for all configured PostgreSQL services.
+
+        Validates database connectivity and provides clear error diagnostics
+        including DSN comparison when connections fail.
+        """
         dsn_map = {
             "GUIDEAI_BEHAVIOR_PG_DSN": "behavior",
             "GUIDEAI_WORKFLOW_PG_DSN": "workflow",
@@ -144,8 +163,11 @@ class MCPServiceRegistry:
             "GUIDEAI_COLLABORATION_PG_DSN": "collaboration",
         }
 
+        failed_services: list[tuple[str, str, str]] = []  # (service, env_var, error)
+
         for env_var, service_name in dsn_map.items():
-            dsn = apply_host_overrides(os.environ.get(env_var), service_name.upper())
+            raw_dsn = os.environ.get(env_var)
+            dsn = apply_host_overrides(raw_dsn, service_name.upper())
             if dsn:
                 try:
                     pool = self._get_pool(dsn, service_name)
@@ -158,7 +180,34 @@ class MCPServiceRegistry:
                             cur.close()
                     self._logger.info(f"Pre-warmed {service_name} pool successfully")
                 except Exception as e:
-                    self._logger.warning(f"Failed to pre-warm {service_name} pool: {e}")
+                    # Extract connection details for diagnostic (hide password)
+                    dsn_diagnostic = self._sanitize_dsn_for_logging(dsn)
+                    error_msg = str(e)
+                    failed_services.append((service_name, env_var, error_msg))
+                    self._logger.error(
+                        f"❌ Database connection failed for {service_name}:\n"
+                        f"   Environment variable: {env_var}\n"
+                        f"   DSN (sanitized): {dsn_diagnostic}\n"
+                        f"   Error: {error_msg}\n"
+                        f"   💡 Check that .env matches your database configuration "
+                        f"(port, credentials, database name)"
+                    )
+
+        # Log summary if any failures occurred
+        if failed_services:
+            service_names = ", ".join(s[0] for s in failed_services)
+            self._logger.warning(
+                f"⚠️  {len(failed_services)} database connection(s) failed: {service_names}\n"
+                f"   Some MCP tools may not work. Check your .env configuration."
+            )
+
+    def _sanitize_dsn_for_logging(self, dsn: str) -> str:
+        """Remove password from DSN for safe logging."""
+        import re
+        # Match patterns like :password@ or password=xxx
+        sanitized = re.sub(r':([^:@/]+)@', r':***@', dsn)
+        sanitized = re.sub(r'password=[^&\s]+', 'password=***', sanitized)
+        return sanitized
 
     def amprealize_service(self) -> Any:
         if not self._amprealize_service:
@@ -400,11 +449,11 @@ class MCPServiceRegistry:
                 dsn_source = "GUIDEAI_TELEMETRY_PG_DSN"
 
             if not dsn:
-                dsn = "postgresql://guideai_telemetry:dev_telemetry_pass@localhost:5432/telemetry"
-                dsn_source = "legacy_default_localhost_telemetry"
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+                dsn_source = "default_guideai_db"
                 self._logger.warning(
-                    "TaskService falling back to legacy telemetry DSN (localhost:5432); set "
-                    "GUIDEAI_TASK_PG_DSN or GUIDEAI_TELEMETRY_PG_DSN for Podman/CI ports"
+                    "TaskService falling back to default guideai DSN; set "
+                    "GUIDEAI_TASK_PG_DSN for custom configuration"
                 )
 
             service = TaskService(dsn=dsn)
@@ -550,6 +599,148 @@ class MCPServiceRegistry:
                 self._raze_service = None
         return self._raze_service
 
+    def organization_service(self) -> Any:
+        """Get or create OrganizationService singleton for MCP."""
+        if self._organization_service is None:
+            from .multi_tenant.organization_service import OrganizationService
+
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_ORG_PG_DSN") or os.environ.get("GUIDEAI_MULTI_TENANT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "ORG"
+            )
+            if dsn:
+                service = OrganizationService(dsn=dsn)
+                self._logger.info("Initialized OrganizationService for MCP (PostgreSQL backend)")
+            else:
+                # Fallback DSN for local development - include auth schema in search_path
+                service = OrganizationService(dsn="postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dauth")
+                self._logger.warning("Using default OrganizationService DSN (GUIDEAI_ORG_PG_DSN not set)")
+            self._organization_service = service
+        return self._organization_service
+
+    def board_service(self) -> Any:
+        """Get or create BoardService singleton for MCP."""
+        if self._board_service is None:
+            from .services.board_service import BoardService
+
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_BOARD_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "BOARD"
+            )
+            if dsn:
+                service = BoardService(dsn=dsn)
+                self._logger.info("Initialized BoardService for MCP (PostgreSQL backend)")
+            else:
+                # Fallback DSN for local development
+                service = BoardService(dsn="postgresql://guideai:guideai_dev@localhost:5432/guideai")
+                self._logger.warning("Using default BoardService DSN (GUIDEAI_BOARD_PG_DSN not set)")
+            self._board_service = service
+        return self._board_service
+
+    def agent_registry_service(self) -> Any:
+        """Get or create AgentRegistryService singleton for MCP.
+
+        Used by agentRegistry.* tools for bootstrap, publish, search operations.
+        """
+        if self._agent_registry_service is None:
+            from .agent_registry_service import AgentRegistryService
+            from .telemetry import TelemetryClient
+
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_AGENT_REGISTRY_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "AGENT_REGISTRY"
+            )
+            if dsn:
+                service = AgentRegistryService(dsn=dsn, telemetry=TelemetryClient.noop())
+                self._logger.info("Initialized AgentRegistryService for MCP (PostgreSQL backend)")
+            else:
+                # Fallback DSN for local development
+                service = AgentRegistryService(
+                    dsn="postgresql://guideai:guideai_dev@localhost:5432/guideai",
+                    telemetry=TelemetryClient.noop(),
+                )
+                self._logger.warning("Using default AgentRegistryService DSN (GUIDEAI_AGENT_REGISTRY_PG_DSN not set)")
+            self._agent_registry_service = service
+        return self._agent_registry_service
+
+    def github_service(self) -> Any:
+        """Get or create GitHubService singleton for MCP.
+
+        Used by github.* tools for PR and commit operations.
+        Uses GITHUB_TOKEN or GH_TOKEN environment variable for authentication.
+        """
+        if self._github_service is None:
+            from .services.github_service import GitHubService
+
+            service = GitHubService()
+            self._logger.info("Initialized GitHubService for MCP")
+            self._github_service = service
+        return self._github_service
+
+    def credential_store(self) -> Any:
+        """Get or create CredentialStore singleton for MCP.
+
+        Used by config.* tools for model availability queries.
+        Manages LLM provider credentials at platform/org/project scope.
+        """
+        if self._credential_store is None:
+            from .work_item_execution_service import CredentialStore
+            from .auth.llm_credential_repository import LLMCredentialRepository
+
+            # CredentialStore needs LLMCredentialRepository for BYOK credentials
+            # Get DSN from environment for database access
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_PG_DSN"),
+                "CREDENTIAL_STORE"
+            )
+            if not dsn:
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+
+            from .storage.postgres_pool import PostgresPool
+            pool = PostgresPool(dsn)
+            credential_repo = LLMCredentialRepository(pool=pool)
+
+            # CredentialStore loads platform credentials from environment
+            # and can resolve org/project BYOK credentials from database
+            store = CredentialStore(pool=pool, credential_repository=credential_repo)
+            self._logger.info("Initialized CredentialStore for MCP with LLMCredentialRepository")
+            self._credential_store = store
+        return self._credential_store
+
+    def work_item_execution_service(self) -> Any:
+        """Get or create WorkItemExecutionService singleton for MCP.
+
+        Orchestrates GuideAI Execution Protocol (GEP) for work item execution
+        through 8 phases: PLANNING → CLARIFYING → ARCHITECTING → EXECUTING →
+        TESTING → FIXING → VERIFYING → COMPLETING.
+
+        Uses wire_execution_service to connect AgentExecutionLoop + AgentLLMClient
+        for real agent execution.
+        """
+        if self._work_item_execution_service is None:
+            from .execution_wiring import wire_execution_service
+
+            # WorkItemExecutionService needs PostgreSQL for execution state
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_EXECUTION_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "EXECUTION"
+            )
+            if not dsn:
+                # Fallback DSN for local development
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+                self._logger.warning("Using default WorkItemExecutionService DSN (GUIDEAI_EXECUTION_PG_DSN not set)")
+
+            # Use wire_execution_service to create fully-wired service
+            # This connects AgentExecutionLoop + AgentLLMClient for real execution
+            service = wire_execution_service(
+                dsn=dsn,
+                run_service=self.run_service(),
+                telemetry=self.telemetry_client(),
+            )
+            self._logger.info("Initialized WorkItemExecutionService for MCP with AgentExecutionLoop wired")
+            self._work_item_execution_service = service
+        return self._work_item_execution_service
+
 
 class MCPServer:
     """
@@ -572,6 +763,11 @@ class MCPServer:
         self._setup_logging()
         self._logger = logging.getLogger("guideai.mcp_server")
         self._services = MCPServiceRegistry(logger=self._logger)
+
+        # Stdio framing mode detection.
+        # Some MCP clients (including VS Code/Copilot) use LSP-style Content-Length framing.
+        # Keep backward compatibility with line-delimited JSON used by older/manual clients.
+        self._stdio_framing: Literal["unknown", "newline", "content-length"] = "unknown"
 
         # Initialize rate limiter for abuse prevention (MCP_SERVER_DESIGN.md §9)
         from .mcp_rate_limiter import MCPRateLimiter
@@ -649,6 +845,106 @@ class MCPServer:
             stream=sys.stderr,
         )
 
+    def _write_stdout_message(self, message: str) -> None:
+        """Write a JSON-RPC message to stdout using the active framing mode."""
+        if self._stdio_framing == "content-length":
+            body = message.encode("utf-8")
+            header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            sys.stdout.buffer.write(header)
+            sys.stdout.buffer.write(body)
+            sys.stdout.buffer.flush()
+        else:
+            # Default to newline-delimited framing.
+            sys.stdout.write(message + "\n")
+            sys.stdout.flush()
+
+    def _read_stdin_message_blocking(self) -> Optional[str]:
+        """Read a single JSON-RPC message from stdin.
+
+        Supports either:
+        - newline-delimited JSON (one JSON object per line), or
+        - LSP-style Content-Length framing.
+
+        Returns:
+            The raw JSON string payload, or None on EOF.
+        """
+        buf = sys.stdin.buffer
+
+        while True:
+            first_line = buf.readline()
+            if first_line == b"":
+                return None
+
+            # Ignore empty lines (common in content-length framing between messages).
+            if first_line in (b"\r\n", b"\n") or first_line.strip() == b"":
+                if self._stdio_framing == "newline":
+                    continue
+                # In unknown/content-length mode, treat blank lines as separators.
+                continue
+
+            # Detect framing if unknown.
+            if self._stdio_framing == "unknown":
+                stripped = first_line.lstrip()
+                if stripped.lower().startswith(b"content-length:"):
+                    self._stdio_framing = "content-length"
+                elif stripped.startswith(b"{") or stripped.startswith(b"["):
+                    self._stdio_framing = "newline"
+                    return first_line.decode("utf-8", errors="replace").strip()
+                else:
+                    # Unknown/noise line. Keep scanning.
+                    continue
+
+            if self._stdio_framing == "newline":
+                return first_line.decode("utf-8", errors="replace").strip()
+
+            # Content-Length framing.
+            headers: Dict[str, str] = {}
+            header_line = first_line
+
+            while True:
+                if header_line in (b"\r\n", b"\n", b""):
+                    break
+                try:
+                    decoded = header_line.decode("utf-8", errors="replace")
+                    key, value = decoded.split(":", 1)
+                    headers[key.strip().lower()] = value.strip()
+                except ValueError:
+                    # Malformed header; ignore.
+                    pass
+
+                header_line = buf.readline()
+                if header_line == b"":
+                    return None
+
+            content_length_value = headers.get("content-length")
+            if not content_length_value:
+                self._logger.warning("Missing Content-Length header; falling back to newline framing")
+                self._stdio_framing = "newline"
+                continue
+
+            try:
+                content_length = int(content_length_value)
+            except ValueError:
+                self._logger.warning("Invalid Content-Length header; falling back to newline framing")
+                self._stdio_framing = "newline"
+                continue
+
+            body = buf.read(content_length)
+            if body == b"":
+                return None
+
+            return body.decode("utf-8", errors="replace")
+
+    def _normalize_tool_name(self, name: str) -> str:
+        """Normalize tool name to be VS Code MCP compliant.
+
+        VS Code currently validates tool names against: [a-z0-9_-]
+        """
+        normalized = name.replace(".", "_").replace("/", "_")
+        normalized = normalized.lower()
+        normalized = re.sub(r"[^a-z0-9_-]", "_", normalized)
+        return normalized
+
     def _load_tool_manifests(self) -> None:
         """Load MCP tool manifests from mcp/tools/ directory."""
         # Find mcp/tools directory relative to this file
@@ -664,10 +960,24 @@ class MCPServer:
                 with open(manifest_path) as f:
                     manifest = json.load(f)
 
-                tool_name = manifest.get("name")
-                if not tool_name:
+                original_name = manifest.get("name")
+                if not original_name:
                     self._logger.warning(f"Tool manifest missing 'name': {manifest_path}")
                     continue
+
+                # Normalize tool name for MCP compliance (VS Code only allows [a-z0-9_-])
+                tool_name = self._normalize_tool_name(original_name)
+                manifest["name"] = tool_name  # Update manifest with normalized name
+                manifest["_original_name"] = original_name  # Keep original for handler lookup
+
+                if tool_name in self._tools:
+                    existing_original = self._tools[tool_name].get("_original_name")
+                    if existing_original != original_name:
+                        self._logger.error(
+                            "Tool name collision after normalization: "
+                            f"{original_name} -> {tool_name} conflicts with {existing_original}"
+                        )
+                        continue
 
                 self._tools[tool_name] = manifest
                 self._logger.info(f"Loaded tool: {tool_name}")
@@ -746,6 +1056,12 @@ class MCPServer:
         request_id = request_data.get("id")
         method = request_data.get("method")
         params = request_data.get("params", {})
+
+        # JSON-RPC 2.0: Notifications have no "id" field and expect no response
+        # Per spec, notifications MUST NOT receive a response (not even an error)
+        if request_id is None:
+            self._logger.debug(f"Received notification: {method} (no response expected)")
+            return None
 
         self._logger.info(f"Received request: method={method}, id={request_id}")
 
@@ -880,10 +1196,34 @@ class MCPServer:
             self._logger.error(f"Tool {tool_name} failed after {duration:.3f}s: {e}", exc_info=True)
             raise
 
+    def _denormalize_tool_name(self, normalized_name: str) -> str:
+        """Convert underscore-normalized tool name back to dot notation for handler dispatch.
+
+        This reverses the normalization done in _normalize_tool_name.
+        Tool names follow the pattern: namespace_action or namespace_subnamespace_action
+        We need to restore the first underscore to a dot for namespace.action format.
+        """
+        # First check if we have the original name stored in the tool manifest
+        if normalized_name in self._tools:
+            tool_def = self._tools[normalized_name]
+            if "_original_name" in tool_def:
+                return tool_def["_original_name"]
+
+        # Fallback: Convert first underscore to dot (handles namespace_action pattern)
+        # This is a heuristic for tools not in manifest
+        parts = normalized_name.split("_", 1)
+        if len(parts) == 2:
+            return f"{parts[0]}.{parts[1]}"
+        return normalized_name
+
     async def _dispatch_tool_call(self, request_id: Optional[str], tool_name: str, tool_params: Dict[str, Any]) -> str:
         """Dispatch tool call to appropriate handler."""
+        # Convert from normalized name (underscores) back to internal format (dots)
+        internal_tool_name = self._denormalize_tool_name(tool_name)
+        self._logger.debug(f"Tool dispatch: normalized={tool_name} -> internal={internal_tool_name}")
+
         # Route device flow tools
-        if tool_name.startswith("auth."):
+        if internal_tool_name.startswith("auth."):
             if not self._device_flow_handler:
                 return self._error_response(
                     request_id,
@@ -891,7 +1231,7 @@ class MCPServer:
                     "Device flow handler not available",
                 )
 
-            result = await self._device_flow_handler.handle_tool_call(tool_name, tool_params)
+            result = await self._device_flow_handler.handle_tool_call(internal_tool_name, tool_params)
 
             # Wrap result in MCP content format
             mcp_result = {
@@ -906,7 +1246,7 @@ class MCPServer:
             return self._success_response(request_id, mcp_result)
 
         # Route task management tools
-        if tool_name.startswith("tasks."):
+        if internal_tool_name.startswith("tasks."):
             if not self._task_handler:
                 return self._error_response(
                     request_id,
@@ -915,19 +1255,19 @@ class MCPServer:
                 )
 
             # Dispatch to appropriate handler method
-            if tool_name == "tasks.listAssignments":
+            if internal_tool_name == "tasks.listAssignments":
                 result = await self._task_handler.handle_list_assignments(tool_params)
-            elif tool_name == "tasks.create":
+            elif internal_tool_name == "tasks.create":
                 result = await self._task_handler.handle_create_task(tool_params)
-            elif tool_name == "tasks.updateStatus":
+            elif internal_tool_name == "tasks.updateStatus":
                 result = await self._task_handler.handle_update_status(tool_params)
-            elif tool_name == "tasks.getStats":
+            elif internal_tool_name == "tasks.getStats":
                 result = await self._task_handler.handle_get_stats(tool_params)
             else:
                 return self._error_response(
                     request_id,
                     self.METHOD_NOT_FOUND,
-                    f"Unknown task tool: {tool_name}",
+                    f"Unknown task tool: {internal_tool_name}",
                 )
 
             # Wrap result in MCP content format
@@ -943,7 +1283,7 @@ class MCPServer:
             return self._success_response(request_id, mcp_result)
 
         # Route Amprealize tools
-        if tool_name.startswith("amprealize."):
+        if internal_tool_name.startswith("amprealize."):
             if not self._amprealize_adapter:
                 return self._error_response(
                     request_id,
@@ -952,7 +1292,7 @@ class MCPServer:
                 )
 
             try:
-                if tool_name == "amprealize.plan":
+                if internal_tool_name == "amprealize.plan":
                     result = self._amprealize_adapter.plan(
                         blueprint_id=tool_params["blueprint_id"],
                         environment=tool_params.get("environment", "development"),
@@ -962,32 +1302,32 @@ class MCPServer:
                         behaviors=tool_params.get("behaviors"),
                         variables=tool_params.get("variables"),
                     )
-                elif tool_name == "amprealize.apply":
+                elif internal_tool_name == "amprealize.apply":
                     result = self._amprealize_adapter.apply(
                         plan_id=tool_params.get("plan_id"),
                         manifest_file=tool_params.get("manifest_file"),
                         watch=tool_params.get("watch", False),
                         resume=tool_params.get("resume", False),
                     )
-                elif tool_name == "amprealize.status":
+                elif internal_tool_name == "amprealize.status":
                     result = self._amprealize_adapter.status(
                         run_id=tool_params["run_id"]
                     )
-                elif tool_name == "amprealize.destroy":
+                elif internal_tool_name == "amprealize.destroy":
                     result = self._amprealize_adapter.destroy(
                         run_id=tool_params["run_id"],
                         cascade=tool_params.get("cascade", True),
                         reason=tool_params.get("reason", "MANUAL"),
                     )
-                elif tool_name == "amprealize.listBlueprints":
+                elif internal_tool_name == "amprealize.listBlueprints":
                     result = self._amprealize_adapter.list_blueprints(
                         source=tool_params.get("source", "all"),
                     )
-                elif tool_name == "amprealize.listEnvironments":
+                elif internal_tool_name == "amprealize.listEnvironments":
                     result = self._amprealize_adapter.list_environments(
                         phase=tool_params.get("phase", "all"),
                     )
-                elif tool_name == "amprealize.configure":
+                elif internal_tool_name == "amprealize.configure":
                     result = self._amprealize_adapter.configure(
                         config_dir=tool_params.get("config_dir"),
                         include_blueprints=tool_params.get("include_blueprints", False),
@@ -998,7 +1338,7 @@ class MCPServer:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown Amprealize tool: {tool_name}",
+                        f"Unknown Amprealize tool: {internal_tool_name}",
                     )
             except KeyError as e:
                 return self._error_response(
@@ -1020,19 +1360,19 @@ class MCPServer:
             return self._success_response(request_id, mcp_result)
 
         # Route pattern analysis tools
-        if tool_name.startswith("patterns."):
+        if internal_tool_name.startswith("patterns."):
             try:
                 from .adapters import MCPTraceAnalysisServiceAdapter
 
                 adapter = MCPTraceAnalysisServiceAdapter(self._services.trace_analysis_service())
 
-                if tool_name == "patterns.detectPatterns":
+                if internal_tool_name == "patterns.detectPatterns":
                     # Send progress notification for long-running operation
                     self._send_notification(
                         "tool/progress",
                         {
                             "request_id": request_id,
-                            "tool": tool_name,
+                            "tool": internal_tool_name,
                             "status": "starting",
                             "message": "Analyzing trace for recurring patterns...",
                         }
@@ -1045,18 +1385,18 @@ class MCPServer:
                         "tool/progress",
                         {
                             "request_id": request_id,
-                            "tool": tool_name,
+                            "tool": internal_tool_name,
                             "status": "complete",
                             "message": f"Detected {len(result.get('patterns', []))} patterns",
                         }
                     )
-                elif tool_name == "patterns.scoreReusability":
+                elif internal_tool_name == "patterns.scoreReusability":
                     result = adapter.scoreReusability(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown patterns tool: {tool_name}",
+                        f"Unknown patterns tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1080,17 +1420,17 @@ class MCPServer:
                 )
 
         # Route action service tools
-        if tool_name.startswith("actions."):
+        if internal_tool_name.startswith("actions."):
             try:
                 from .adapters import MCPActionServiceAdapter
 
                 adapter = MCPActionServiceAdapter(self._services.action_service())
 
-                if tool_name == "actions.create":
+                if internal_tool_name == "actions.create":
                     result = adapter.create(tool_params)
-                elif tool_name == "actions.list":
+                elif internal_tool_name == "actions.list":
                     result = adapter.list()
-                elif tool_name == "actions.get":
+                elif internal_tool_name == "actions.get":
                     action_id = tool_params.get("action_id")
                     if not action_id:
                         return self._error_response(
@@ -1099,9 +1439,9 @@ class MCPServer:
                             "Missing required parameter: action_id",
                         )
                     result = adapter.get(action_id)
-                elif tool_name == "actions.replay":
+                elif internal_tool_name == "actions.replay":
                     result = adapter.replay(tool_params)
-                elif tool_name == "actions.replayStatus":
+                elif internal_tool_name == "actions.replayStatus":
                     replay_id = tool_params.get("replay_id")
                     if not replay_id:
                         return self._error_response(
@@ -1114,7 +1454,7 @@ class MCPServer:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown actions tool: {tool_name}",
+                        f"Unknown actions tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1138,17 +1478,17 @@ class MCPServer:
                 )
 
         # Route behavior service tools
-        if tool_name.startswith("behaviors."):
+        if internal_tool_name.startswith("behaviors."):
             try:
                 from .adapters import MCPBehaviorServiceAdapter
 
                 adapter = MCPBehaviorServiceAdapter(self._services.behavior_service())
 
-                if tool_name == "behaviors.create":
+                if internal_tool_name == "behaviors.create":
                     result = adapter.create(tool_params)
-                elif tool_name == "behaviors.list":
+                elif internal_tool_name == "behaviors.list":
                     result = adapter.list(tool_params)
-                elif tool_name == "behaviors.search":
+                elif internal_tool_name == "behaviors.search":
                     query = tool_params.get("query")
                     if not query:
                         return self._error_response(
@@ -1157,7 +1497,7 @@ class MCPServer:
                             "Missing required parameter: query",
                         )
                     result = adapter.search(tool_params)
-                elif tool_name == "behaviors.get":
+                elif internal_tool_name == "behaviors.get":
                     behavior_id = tool_params.get("behavior_id")
                     if not behavior_id:
                         return self._error_response(
@@ -1166,7 +1506,7 @@ class MCPServer:
                             "Missing required parameter: behavior_id",
                         )
                     result = adapter.get(tool_params)
-                elif tool_name == "behaviors.update":
+                elif internal_tool_name == "behaviors.update":
                     behavior_id = tool_params.get("behavior_id")
                     version = tool_params.get("version")
                     if not behavior_id or not version:
@@ -1176,7 +1516,7 @@ class MCPServer:
                             "Missing required parameters: behavior_id, version",
                         )
                     result = adapter.update(tool_params)
-                elif tool_name == "behaviors.submit":
+                elif internal_tool_name == "behaviors.submit":
                     behavior_id = tool_params.get("behavior_id")
                     version = tool_params.get("version")
                     if not behavior_id or not version:
@@ -1186,7 +1526,7 @@ class MCPServer:
                             "Missing required parameters: behavior_id, version",
                         )
                     result = adapter.submit(tool_params)
-                elif tool_name == "behaviors.approve":
+                elif internal_tool_name == "behaviors.approve":
                     behavior_id = tool_params.get("behavior_id")
                     version = tool_params.get("version")
                     effective_from = tool_params.get("effective_from")
@@ -1197,7 +1537,7 @@ class MCPServer:
                             "Missing required parameters: behavior_id, version, effective_from",
                         )
                     result = adapter.approve(tool_params)
-                elif tool_name == "behaviors.deprecate":
+                elif internal_tool_name == "behaviors.deprecate":
                     behavior_id = tool_params.get("behavior_id")
                     version = tool_params.get("version")
                     effective_to = tool_params.get("effective_to")
@@ -1208,7 +1548,7 @@ class MCPServer:
                             "Missing required parameters: behavior_id, version, effective_to",
                         )
                     result = adapter.deprecate(tool_params)
-                elif tool_name == "behaviors.deleteDraft":
+                elif internal_tool_name == "behaviors.deleteDraft":
                     behavior_id = tool_params.get("behavior_id")
                     version = tool_params.get("version")
                     if not behavior_id or not version:
@@ -1223,7 +1563,7 @@ class MCPServer:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown behaviors tool: {tool_name}",
+                        f"Unknown behaviors tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1247,14 +1587,14 @@ class MCPServer:
                 )
 
         # ComplianceService tool routing
-        if tool_name.startswith("compliance/"):
+        if internal_tool_name.startswith("compliance/"):
             from guideai.compliance_service import RecordStepRequest, Actor
 
             try:
                 compliance_service = self._services.compliance_service()
                 actor = Actor(id="test-strategist", role="STRATEGIST", surface="mcp")
 
-                if tool_name == "compliance/create-checklist":
+                if internal_tool_name == "compliance/create-checklist":
                     result = compliance_service.create_checklist(
                         title=tool_params["title"],
                         description=tool_params.get("description", ""),
@@ -1276,7 +1616,7 @@ class MCPServer:
                         "coverage_score": result.coverage_score,
                     }
 
-                elif tool_name == "compliance/list-checklists":
+                elif internal_tool_name == "compliance/list-checklists":
                     checklists = compliance_service.list_checklists(
                         milestone=tool_params.get("milestone"),
                         compliance_category=tool_params.get("compliance_category"),
@@ -1315,7 +1655,7 @@ class MCPServer:
                         ]
                     }
 
-                elif tool_name == "compliance/get-checklist":
+                elif internal_tool_name == "compliance/get-checklist":
                     checklist = compliance_service.get_checklist(
                         checklist_id=tool_params["checklist_id"]
                     )
@@ -1347,7 +1687,7 @@ class MCPServer:
                         "coverage_score": checklist.coverage_score,
                     }
 
-                elif tool_name == "compliance/record-step":
+                elif internal_tool_name == "compliance/record-step":
                     record_req = RecordStepRequest(
                         checklist_id=tool_params["checklist_id"],
                         title=tool_params["title"],
@@ -1371,7 +1711,7 @@ class MCPServer:
                         "timestamp": step.timestamp,
                     }
 
-                elif tool_name == "compliance/validate-compliance":
+                elif internal_tool_name == "compliance/validate-compliance":
                     validation = compliance_service.validate_checklist(
                         checklist_id=tool_params["checklist_id"],
                         actor=actor,
@@ -1385,7 +1725,7 @@ class MCPServer:
                         "warnings": validation.warnings,
                     }
 
-                elif tool_name == "compliance/validate-by-action":
+                elif internal_tool_name == "compliance/validate-by-action":
                     validation = compliance_service.validate_by_action_id(
                         action_id=tool_params["action_id"],
                         actor=actor,
@@ -1399,7 +1739,7 @@ class MCPServer:
                         "warnings": validation.warnings,
                     }
 
-                elif tool_name == "compliance/create-policy":
+                elif internal_tool_name == "compliance/create-policy":
                     policy = compliance_service.create_policy(
                         name=tool_params["name"],
                         description=tool_params.get("description", ""),
@@ -1416,11 +1756,11 @@ class MCPServer:
                     )
                     result_dict = policy.to_dict()
 
-                elif tool_name == "compliance/get-policy":
+                elif internal_tool_name == "compliance/get-policy":
                     policy = compliance_service.get_policy(tool_params["policy_id"])
                     result_dict = policy.to_dict()
 
-                elif tool_name == "compliance/list-policies":
+                elif internal_tool_name == "compliance/list-policies":
                     policies = compliance_service.list_policies(
                         org_id=tool_params.get("org_id"),
                         project_id=tool_params.get("project_id"),
@@ -1431,7 +1771,7 @@ class MCPServer:
                     )
                     result_dict = {"policies": [p.to_dict() for p in policies]}
 
-                elif tool_name == "compliance/audit-trail":
+                elif internal_tool_name == "compliance/audit-trail":
                     report = compliance_service.get_audit_trail(
                         run_id=tool_params.get("run_id"),
                         checklist_id=tool_params.get("checklist_id"),
@@ -1445,7 +1785,7 @@ class MCPServer:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown compliance tool: {tool_name}",
+                        f"Unknown compliance tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP format
@@ -1469,17 +1809,17 @@ class MCPServer:
                 )
 
         # Route run service tools
-        if tool_name.startswith("runs."):
+        if internal_tool_name.startswith("runs."):
             try:
                 from .adapters import MCPRunServiceAdapter
 
                 adapter = MCPRunServiceAdapter(self._services.run_service())
 
-                if tool_name == "runs.create":
+                if internal_tool_name == "runs.create":
                     result = adapter.create(tool_params)
-                elif tool_name == "runs.list":
+                elif internal_tool_name == "runs.list":
                     result = {"runs": adapter.list(tool_params)}
-                elif tool_name == "runs.get":
+                elif internal_tool_name == "runs.get":
                     run_id = tool_params.get("run_id")
                     if not run_id:
                         return self._error_response(
@@ -1488,7 +1828,7 @@ class MCPServer:
                             "Missing required parameter: run_id",
                         )
                     result = adapter.get(run_id)
-                elif tool_name == "runs.updateProgress":
+                elif internal_tool_name == "runs.updateProgress":
                     run_id = tool_params.get("run_id")
                     if not run_id:
                         return self._error_response(
@@ -1497,7 +1837,7 @@ class MCPServer:
                             "Missing required parameter: run_id",
                         )
                     result = adapter.update(run_id, tool_params)
-                elif tool_name == "runs.complete":
+                elif internal_tool_name == "runs.complete":
                     run_id = tool_params.get("run_id")
                     if not run_id:
                         return self._error_response(
@@ -1506,7 +1846,7 @@ class MCPServer:
                             "Missing required parameter: run_id",
                         )
                     result = adapter.complete(run_id, tool_params)
-                elif tool_name == "runs.cancel":
+                elif internal_tool_name == "runs.cancel":
                     run_id = tool_params.get("run_id")
                     if not run_id:
                         return self._error_response(
@@ -1515,11 +1855,51 @@ class MCPServer:
                             "Missing required parameter: run_id",
                         )
                     result = adapter.cancel(run_id, tool_params)
+                elif internal_tool_name == "runs.updateStatus":
+                    run_id = tool_params.get("run_id")
+                    if not run_id:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: run_id",
+                        )
+                    if "status" not in tool_params:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: status",
+                        )
+                    result = adapter.update_status(run_id, tool_params)
+                elif internal_tool_name == "runs.fetchLogs":
+                    run_id = tool_params.get("run_id")
+                    if not run_id:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: run_id",
+                        )
+                    # Get RazeService for log queries
+                    raze_service = self._get_raze_service()
+                    import asyncio
+                    # Run async method
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(
+                                asyncio.run,
+                                adapter.fetch_logs(run_id, tool_params, raze_service)
+                            )
+                            result = future.result()
+                    else:
+                        result = loop.run_until_complete(
+                            adapter.fetch_logs(run_id, tool_params, raze_service)
+                        )
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown runs tool: {tool_name}",
+                        f"Unknown runs tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1543,17 +1923,17 @@ class MCPServer:
                 )
 
         # Workflow tools: workflow.template.*, workflow.run.*
-        if tool_name.startswith("workflow."):
+        if internal_tool_name.startswith("workflow."):
             try:
                 from .adapters import MCPWorkflowServiceAdapter
 
                 adapter = MCPWorkflowServiceAdapter(self._services.workflow_service())
 
-                if tool_name == "workflow.template.create":
+                if internal_tool_name == "workflow.template.create":
                     result = adapter.create_template(tool_params)
-                elif tool_name == "workflow.template.list":
+                elif internal_tool_name == "workflow.template.list":
                     result = {"templates": adapter.list_templates(tool_params)}
-                elif tool_name == "workflow.template.get":
+                elif internal_tool_name == "workflow.template.get":
                     template_id = tool_params.get("template_id")
                     if not template_id:
                         return self._error_response(
@@ -1568,9 +1948,9 @@ class MCPServer:
                             self.INTERNAL_ERROR,
                             f"Template not found: {template_id}",
                         )
-                elif tool_name == "workflow.run.start":
+                elif internal_tool_name == "workflow.run.start":
                     result = adapter.run_workflow(tool_params)
-                elif tool_name == "workflow.run.status":
+                elif internal_tool_name == "workflow.run.status":
                     run_id = tool_params.get("run_id")
                     if not run_id:
                         return self._error_response(
@@ -1589,7 +1969,7 @@ class MCPServer:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown workflow tool: {tool_name}",
+                        f"Unknown workflow tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1613,43 +1993,43 @@ class MCPServer:
                 )
 
         # BCI tools: bci.*
-        if tool_name.startswith("bci."):
+        if internal_tool_name.startswith("bci."):
             try:
                 from .mcp.handlers import bci_handlers
 
                 service = self._services.bci_service()
 
-                if tool_name == "bci.retrieve":
+                if internal_tool_name == "bci.retrieve":
                     result = bci_handlers.bci_retrieve(tool_params)
-                elif tool_name == "bci.retrieveHybrid":
+                elif internal_tool_name == "bci.retrieveHybrid":
                     result = bci_handlers.bci_retrieve_hybrid(tool_params)
-                elif tool_name == "bci.composePrompt":
+                elif internal_tool_name == "bci.composePrompt":
                     result = bci_handlers.bci_compose_prompt(tool_params)
-                elif tool_name == "bci.composeBatchPrompts":
+                elif internal_tool_name == "bci.composeBatchPrompts":
                     result = bci_handlers.bci_compose_prompts_batch(tool_params)
-                elif tool_name == "bci.parseCitations":
+                elif internal_tool_name == "bci.parseCitations":
                     result = bci_handlers.bci_parse_citations(tool_params)
-                elif tool_name == "bci.validateCitations":
+                elif internal_tool_name == "bci.validateCitations":
                     result = bci_handlers.bci_validate_citations(tool_params)
-                elif tool_name == "bci.computeTokenSavings":
+                elif internal_tool_name == "bci.computeTokenSavings":
                     result = bci_handlers.bci_compute_token_savings(tool_params)
-                elif tool_name == "bci.segmentTrace":
+                elif internal_tool_name == "bci.segmentTrace":
                     result = bci_handlers.bci_segment_trace(tool_params)
-                elif tool_name == "bci.detectPatterns":
+                elif internal_tool_name == "bci.detectPatterns":
                     result = bci_handlers.bci_detect_patterns(tool_params)
-                elif tool_name == "bci.scoreReusability":
+                elif internal_tool_name == "bci.scoreReusability":
                     result = bci_handlers.bci_score_reusability(tool_params)
-                elif tool_name == "bci.rebuildIndex":
+                elif internal_tool_name == "bci.rebuildIndex":
                     result = bci_handlers.bci_rebuild_index(tool_params)
-                elif tool_name == "bci.generate":
+                elif internal_tool_name == "bci.generate":
                     result = bci_handlers.bci_generate(tool_params)
-                elif tool_name == "bci.improve":
+                elif internal_tool_name == "bci.improve":
                     result = bci_handlers.bci_improve(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown BCI tool: {tool_name}",
+                        f"Unknown BCI tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1673,24 +2053,24 @@ class MCPServer:
                 )
 
         # Handle metrics.* tools
-        if tool_name.startswith("metrics."):
+        if internal_tool_name.startswith("metrics."):
             try:
                 from .adapters import MCPMetricsServiceAdapter
 
                 service = self._services.metrics_service()
                 adapter = MCPMetricsServiceAdapter(service=service)
 
-                if tool_name == "metrics.getSummary":
+                if internal_tool_name == "metrics.getSummary":
                     result = adapter.get_summary(tool_params or {})
-                elif tool_name == "metrics.export":
+                elif internal_tool_name == "metrics.export":
                     result = adapter.export(tool_params or {})
-                elif tool_name == "metrics.subscribe":
+                elif internal_tool_name == "metrics.subscribe":
                     result = adapter.subscribe(tool_params or {})
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown metrics tool: {tool_name}",
+                        f"Unknown metrics tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1714,26 +2094,26 @@ class MCPServer:
                 )
 
         # Handle analytics.* tools
-        if tool_name.startswith("analytics."):
+        if internal_tool_name.startswith("analytics."):
             try:
                 from .adapters import MCPAnalyticsServiceAdapter
 
                 service = self._services.analytics_service()
                 adapter = MCPAnalyticsServiceAdapter(service=service)
 
-                if tool_name == "analytics.kpiSummary":
+                if internal_tool_name == "analytics.kpiSummary":
                     result = adapter.kpi_summary(tool_params or {})
-                elif tool_name == "analytics.behaviorUsage":
+                elif internal_tool_name == "analytics.behaviorUsage":
                     result = adapter.behavior_usage(tool_params or {})
-                elif tool_name == "analytics.tokenSavings":
+                elif internal_tool_name == "analytics.tokenSavings":
                     result = adapter.token_savings(tool_params or {})
-                elif tool_name == "analytics.complianceCoverage":
+                elif internal_tool_name == "analytics.complianceCoverage":
                     result = adapter.compliance_coverage(tool_params or {})
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown analytics tool: {tool_name}",
+                        f"Unknown analytics tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1757,32 +2137,32 @@ class MCPServer:
                 )
 
         # Handle audit.* tools (compliance-grade audit log access)
-        if tool_name.startswith("audit."):
+        if internal_tool_name.startswith("audit."):
             try:
                 from .adapters import MCPAuditServiceAdapter
 
                 service = self._services.audit_log_service()
                 adapter = MCPAuditServiceAdapter(service=service)
 
-                if tool_name == "audit.query":
+                if internal_tool_name == "audit.query":
                     result = await adapter.query(tool_params or {})
-                elif tool_name == "audit.archive":
+                elif internal_tool_name == "audit.archive":
                     result = await adapter.archive(tool_params or {})
-                elif tool_name == "audit.verify":
+                elif internal_tool_name == "audit.verify":
                     result = await adapter.verify(tool_params or {})
-                elif tool_name == "audit.status":
+                elif internal_tool_name == "audit.status":
                     result = await adapter.status(tool_params or {})
-                elif tool_name == "audit.listArchives":
+                elif internal_tool_name == "audit.listArchives":
                     result = adapter.list_archives(tool_params or {})
-                elif tool_name == "audit.getRetention":
+                elif internal_tool_name == "audit.getRetention":
                     result = adapter.get_retention(tool_params or {})
-                elif tool_name == "audit.verifyArchive":
+                elif internal_tool_name == "audit.verifyArchive":
                     result = adapter.verify_archive(tool_params or {})
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown audit tool: {tool_name}",
+                        f"Unknown audit tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1806,18 +2186,18 @@ class MCPServer:
                 )
 
         # Handle agents.* tools
-        if tool_name.startswith("agents."):
+        if internal_tool_name.startswith("agents."):
             try:
                 from .adapters import MCPAgentOrchestratorAdapter
 
                 service = self._services.agent_orchestrator_service()
                 adapter = MCPAgentOrchestratorAdapter(service=service)
 
-                if tool_name == "agents.assign":
+                if internal_tool_name == "agents.assign":
                     result = adapter.assign(tool_params or {})
-                elif tool_name == "agents.switch":
+                elif internal_tool_name == "agents.switch":
                     result = adapter.switch(tool_params or {})
-                elif tool_name == "agents.status":
+                elif internal_tool_name == "agents.status":
                     result = adapter.status(tool_params or {})
                     if result is None:
                         return self._error_response(
@@ -1825,11 +2205,17 @@ class MCPServer:
                             self.INTERNAL_ERROR,
                             "Agent assignment not found",
                         )
+                elif internal_tool_name == "agents.delegate":
+                    result = adapter.delegate(tool_params or {})
+                elif internal_tool_name == "agents.consult":
+                    result = adapter.consult(tool_params or {})
+                elif internal_tool_name == "agents.handoff":
+                    result = adapter.handoff(tool_params or {})
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown agents tool: {tool_name}",
+                        f"Unknown agents tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1859,8 +2245,102 @@ class MCPServer:
                     f"Agent orchestration tool execution failed: {str(e)}",
                 )
 
+        # Handle escalation.* tools (Section 11.4 - Human Escalation)
+        if internal_tool_name.startswith("escalation."):
+            try:
+                from .adapters import MCPEscalationAdapter
+
+                service = self._services.agent_orchestrator_service()
+                adapter = MCPEscalationAdapter(service)
+
+                if internal_tool_name == "escalation.requestHelp":
+                    result = adapter.request_help(tool_params or {})
+                elif internal_tool_name == "escalation.requestApproval":
+                    result = adapter.request_approval(tool_params or {})
+                elif internal_tool_name == "escalation.notifyBlocked":
+                    result = adapter.notify_blocked(tool_params or {})
+                else:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown escalation tool: {internal_tool_name}",
+                    )
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except KeyError as e:
+                self._logger.error(f"Escalation validation failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    f"Invalid parameters: {str(e)}",
+                )
+            except ValueError as e:
+                self._logger.error(f"Escalation validation failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    f"Validation error: {str(e)}",
+                )
+            except Exception as e:
+                self._logger.error(f"Escalation tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Escalation tool execution failed: {str(e)}",
+                )
+
+        # Handle agentRegistry.* tools (agent CRUD operations)
+        if internal_tool_name.startswith("agentRegistry."):
+            try:
+                from .mcp.handlers.agent_registry_handlers import AGENT_REGISTRY_HANDLERS
+
+                handler = AGENT_REGISTRY_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown agentRegistry tool: {internal_tool_name}",
+                    )
+
+                # All agentRegistry.* tools use AgentRegistryService
+                service = self._services.agent_registry_service()
+
+                # Call the async handler
+                result = await handler(service=service, params=tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"agentRegistry tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"agentRegistry tool execution failed: {str(e)}",
+                )
+
         # Handle reflection.* tools
-        if tool_name.startswith("reflection."):
+        if internal_tool_name.startswith("reflection."):
             try:
                 from .adapters import MCPReflectionServiceAdapter
 
@@ -1868,13 +2348,13 @@ class MCPServer:
                 service = self._services.reflection_service()
                 adapter = MCPReflectionServiceAdapter(service=service)
 
-                if tool_name == "reflection.extract":
+                if internal_tool_name == "reflection.extract":
                     result = adapter.extract(tool_params or {})
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown reflection tool: {tool_name}",
+                        f"Unknown reflection tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1898,9 +2378,9 @@ class MCPServer:
                 )
 
         # Handle security.* tools
-        if tool_name.startswith("security."):
+        if internal_tool_name.startswith("security."):
             try:
-                if tool_name == "security.scanSecrets":
+                if internal_tool_name == "security.scanSecrets":
                     # Integrate with existing gitleaks scanner
                     repo_path = tool_params.get("repo_path", ".")
                     result = subprocess.run(
@@ -1923,7 +2403,7 @@ class MCPServer:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown security tool: {tool_name}",
+                        f"Unknown security tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1953,20 +2433,20 @@ class MCPServer:
                 )
 
         # Handle tasks.* tools
-        if tool_name.startswith("tasks."):
+        if internal_tool_name.startswith("tasks."):
             try:
                 from .adapters import MCPTaskAssignmentAdapter
 
                 service = self._services.task_assignment_service()
                 adapter = MCPTaskAssignmentAdapter(service=service)
 
-                if tool_name == "tasks.listAssignments":
+                if internal_tool_name == "tasks.listAssignments":
                     result = adapter.list_assignments(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown tasks tool: {tool_name}",
+                        f"Unknown tasks tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -1990,26 +2470,26 @@ class MCPServer:
                 )
 
         # Handle auth.* tools
-        if tool_name.startswith("auth."):
+        if internal_tool_name.startswith("auth."):
             try:
                 from .adapters import MCPAgentAuthServiceAdapter
 
                 service = self._services.agent_auth_service()
                 adapter = MCPAgentAuthServiceAdapter(client=service)
 
-                if tool_name == "auth.ensureGrant":
+                if internal_tool_name == "auth.ensureGrant":
                     result = adapter.ensure_grant(tool_params)
-                elif tool_name == "auth.listGrants":
+                elif internal_tool_name == "auth.listGrants":
                     result = adapter.list_grants(tool_params)
-                elif tool_name == "auth.policy.preview":
+                elif internal_tool_name == "auth.policy.preview":
                     result = adapter.policy_preview(tool_params)
-                elif tool_name == "auth.revoke":
+                elif internal_tool_name == "auth.revoke":
                     result = adapter.revoke(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown auth tool: {tool_name}",
+                        f"Unknown auth tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2033,30 +2513,30 @@ class MCPServer:
                 )
 
         # Handle fine-tuning.* tools (using midnighter package)
-        if tool_name.startswith("fine-tuning."):
+        if internal_tool_name.startswith("fine-tuning."):
             try:
                 from .adapters import MCPFineTuningServiceAdapter
 
                 service = self._services.fine_tuning_service()
                 adapter = MCPFineTuningServiceAdapter(service=service)
 
-                if tool_name == "fine-tuning.create-corpus":
+                if internal_tool_name == "fine-tuning.create-corpus":
                     result = adapter.create_corpus(tool_params)
-                elif tool_name == "fine-tuning.generate-corpus":
+                elif internal_tool_name == "fine-tuning.generate-corpus":
                     result = adapter.generate_corpus(tool_params)
-                elif tool_name == "fine-tuning.start-job":
+                elif internal_tool_name == "fine-tuning.start-job":
                     result = adapter.start_job(tool_params)
-                elif tool_name == "fine-tuning.status":
+                elif internal_tool_name == "fine-tuning.status":
                     result = adapter.get_status(tool_params)
-                elif tool_name == "fine-tuning.list":
+                elif internal_tool_name == "fine-tuning.list":
                     result = adapter.list_jobs(tool_params)
-                elif tool_name == "fine-tuning.list-corpora":
+                elif internal_tool_name == "fine-tuning.list-corpora":
                     result = adapter.list_corpora(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown fine-tuning tool: {tool_name}",
+                        f"Unknown fine-tuning tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2080,24 +2560,24 @@ class MCPServer:
                 )
 
         # Handle reviews.* tools
-        if tool_name.startswith("reviews."):
+        if internal_tool_name.startswith("reviews."):
             try:
                 from .adapters import MCPAgentReviewServiceAdapter
 
                 service = self._services.agent_review_service()
                 adapter = MCPAgentReviewServiceAdapter(service=service)
 
-                if tool_name == "reviews.create":
+                if internal_tool_name == "reviews.create":
                     result = adapter.create_review(tool_params)
-                elif tool_name == "reviews.status":
+                elif internal_tool_name == "reviews.status":
                     result = adapter.get_review_status(tool_params)
-                elif tool_name == "reviews.list":
+                elif internal_tool_name == "reviews.list":
                     result = adapter.list_reviews(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown reviews tool: {tool_name}",
+                        f"Unknown reviews tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2121,24 +2601,24 @@ class MCPServer:
                 )
 
         # Handle tenants.* tools
-        if tool_name.startswith("tenants."):
+        if internal_tool_name.startswith("tenants."):
             try:
                 from .adapters import MCPMultiTenantServiceAdapter
 
                 service = self._services.multi_tenant_service()
                 adapter = MCPMultiTenantServiceAdapter(service=service)
 
-                if tool_name == "tenants.create":
+                if internal_tool_name == "tenants.create":
                     result = adapter.create_tenant(tool_params)
-                elif tool_name == "tenants.status":
+                elif internal_tool_name == "tenants.status":
                     result = adapter.get_tenant_status(tool_params)
-                elif tool_name == "tenants.list":
+                elif internal_tool_name == "tenants.list":
                     result = adapter.list_tenants(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown tenants tool: {tool_name}",
+                        f"Unknown tenants tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2162,20 +2642,20 @@ class MCPServer:
                 )
 
         # Handle retrieval.* tools
-        if tool_name.startswith("retrieval."):
+        if internal_tool_name.startswith("retrieval."):
             try:
                 from .adapters import MCPAdvancedRetrievalServiceAdapter
 
                 service = self._services.advanced_retrieval_service()
                 adapter = MCPAdvancedRetrievalServiceAdapter(service=service)
 
-                if tool_name == "retrieval.advanced-search":
+                if internal_tool_name == "retrieval.advanced-search":
                     result = adapter.advanced_search(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown retrieval tool: {tool_name}",
+                        f"Unknown retrieval tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2199,22 +2679,22 @@ class MCPServer:
                 )
 
         # Handle collaboration.* tools
-        if tool_name.startswith("collaboration."):
+        if internal_tool_name.startswith("collaboration."):
             try:
                 from .adapters import MCPCollaborationServiceAdapter
 
                 service = self._services.collaboration_service()
                 adapter = MCPCollaborationServiceAdapter(service=service)
 
-                if tool_name == "collaboration.workspace.create":
+                if internal_tool_name == "collaboration.workspace.create":
                     result = adapter.create_workspace(tool_params)
-                elif tool_name == "collaboration.workspace.status":
+                elif internal_tool_name == "collaboration.workspace.status":
                     result = adapter.get_workspace_status(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown collaboration tool: {tool_name}",
+                        f"Unknown collaboration tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2238,22 +2718,22 @@ class MCPServer:
                 )
 
         # Handle mcp-rate-limits.* tools (MCP server rate limiting)
-        if tool_name.startswith("mcp-rate-limits."):
+        if internal_tool_name.startswith("mcp-rate-limits."):
             try:
-                if tool_name == "mcp-rate-limits.status":
+                if internal_tool_name == "mcp-rate-limits.status":
                     client_id = tool_params.get("client_id") or self._client_id or f"anonymous:{id(self)}"
                     status = self._rate_limiter.get_client_status(client_id)
                     if status is None:
                         result = {"error": f"No rate limit state for client: {client_id}"}
                     else:
                         result = status
-                elif tool_name == "mcp-rate-limits.metrics":
+                elif internal_tool_name == "mcp-rate-limits.metrics":
                     result = self._rate_limiter.get_metrics()
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown mcp-rate-limits tool: {tool_name}",
+                        f"Unknown mcp-rate-limits tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2277,22 +2757,22 @@ class MCPServer:
                 )
 
         # Handle rate-limits.* tools (API rate limiting)
-        if tool_name.startswith("rate-limits."):
+        if internal_tool_name.startswith("rate-limits."):
             try:
                 from .adapters import MCPAPIRateLimitingServiceAdapter
 
                 service = self._services.api_rate_limiting_service()
                 adapter = MCPAPIRateLimitingServiceAdapter(service=service)
 
-                if tool_name == "rate-limits.configure":
+                if internal_tool_name == "rate-limits.configure":
                     result = adapter.configure_rate_limits(tool_params)
-                elif tool_name == "rate-limits.status":
+                elif internal_tool_name == "rate-limits.status":
                     result = adapter.get_rate_limit_status(tool_params)
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown rate-limits tool: {tool_name}",
+                        f"Unknown rate-limits tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2316,7 +2796,7 @@ class MCPServer:
                 )
 
         # Handle raze.* tools for structured logging
-        if tool_name.startswith("raze."):
+        if internal_tool_name.startswith("raze."):
             try:
                 service = self._services.raze_service()
                 if service is None:
@@ -2326,7 +2806,7 @@ class MCPServer:
                         "Raze service not available (package not installed)",
                     )
 
-                if tool_name == "raze.emit":
+                if internal_tool_name == "raze.emit":
                     # Emit a single log entry
                     result = service.emit(
                         level=tool_params.get("level", "info"),
@@ -2336,11 +2816,11 @@ class MCPServer:
                         behavior_id=tool_params.get("behavior_id"),
                         tags=tool_params.get("tags", []),
                     )
-                elif tool_name == "raze.emit-batch":
+                elif internal_tool_name == "raze.emit-batch":
                     # Emit multiple log entries
                     entries = tool_params.get("entries", [])
                     result = service.emit_batch(entries)
-                elif tool_name == "raze.query":
+                elif internal_tool_name == "raze.query":
                     # Query logs with filters
                     result = service.query(
                         start_time=tool_params.get("start_time"),
@@ -2352,7 +2832,7 @@ class MCPServer:
                         limit=tool_params.get("limit", 100),
                         offset=tool_params.get("offset", 0),
                     )
-                elif tool_name == "raze.aggregate":
+                elif internal_tool_name == "raze.aggregate":
                     # Get aggregated statistics
                     result = service.aggregate(
                         start_time=tool_params.get("start_time"),
@@ -2360,17 +2840,17 @@ class MCPServer:
                         group_by=tool_params.get("group_by", ["level"]),
                         run_id=tool_params.get("run_id"),
                     )
-                elif tool_name == "raze.flush":
+                elif internal_tool_name == "raze.flush":
                     # Flush pending logs to sink
                     result = service.flush()
-                elif tool_name == "raze.status":
+                elif internal_tool_name == "raze.status":
                     # Get service status
                     result = service.status()
                 else:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown raze tool: {tool_name}",
+                        f"Unknown raze tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2394,9 +2874,9 @@ class MCPServer:
                 )
 
         # Handle telemetry.* tools for telemetry querying and dashboards
-        if tool_name.startswith("telemetry."):
+        if internal_tool_name.startswith("telemetry."):
             try:
-                if tool_name == "telemetry.query":
+                if internal_tool_name == "telemetry.query":
                     # Query telemetry events using RazeService
                     service = self._services.raze_service()
                     if service is None:
@@ -2462,7 +2942,7 @@ class MCPServer:
                         "offset": query_params["offset"],
                     }
 
-                elif tool_name == "telemetry.dashboard":
+                elif internal_tool_name == "telemetry.dashboard":
                     # Dashboard using AnalyticsWarehouse
                     from datetime import datetime, timezone, timedelta
                     warehouse = self._services.analytics_service()
@@ -2533,7 +3013,7 @@ class MCPServer:
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
-                        f"Unknown telemetry tool: {tool_name}",
+                        f"Unknown telemetry tool: {internal_tool_name}",
                     )
 
                 # Wrap result in MCP content format
@@ -2556,11 +3036,347 @@ class MCPServer:
                     f"Telemetry tool execution failed: {str(e)}",
                 )
 
+        # Handle orgs.* tools (organization management)
+        if internal_tool_name.startswith("orgs."):
+            try:
+                from .mcp.handlers.org_handlers import ORG_HANDLERS
+
+                handler = ORG_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown orgs tool: {internal_tool_name}",
+                    )
+
+                # Get the organization service
+                org_service = self._services.organization_service()
+
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, org_service, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Orgs tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Orgs tool execution failed: {str(e)}",
+                )
+
+        # Handle projects.* tools (project management)
+        if internal_tool_name.startswith("projects."):
+            try:
+                from .mcp.handlers.project_handlers import PROJECT_HANDLERS
+
+                handler = PROJECT_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown projects tool: {internal_tool_name}",
+                    )
+
+                # Get services - OrganizationService handles both orgs and projects
+                org_service = self._services.organization_service()
+
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, org_service, org_service, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Projects tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Projects tool execution failed: {str(e)}",
+                )
+
+        # Handle boards.* tools (board management)
+        if internal_tool_name.startswith("boards."):
+            try:
+                from .mcp.handlers.board_handlers import BOARD_HANDLERS
+
+                handler = BOARD_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown boards tool: {internal_tool_name}",
+                    )
+
+                # Get the board service
+                board_service = self._services.board_service()
+
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, board_service, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Boards tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Boards tool execution failed: {str(e)}",
+                )
+
+        # Handle workItems.* tools (work item management and execution)
+        if internal_tool_name.startswith("workItems."):
+            # Execution tools (workItems.execute, executionStatus, etc.)
+            execution_tools = {
+                "workItems.execute",
+                "workItems.executionStatus",
+                "workItems.cancelExecution",
+                "workItems.provideClarification",
+                "workItems.listExecutions",
+            }
+
+            if internal_tool_name in execution_tools:
+                try:
+                    from .mcp.handlers.work_item_execution_handlers import (
+                        create_work_item_execution_handlers,
+                    )
+
+                    # Get the work item execution service
+                    work_item_execution_service = self._services.work_item_execution_service()
+
+                    # Create handlers
+                    handlers = create_work_item_execution_handlers(work_item_execution_service)
+                    handler = handlers.get(internal_tool_name)
+
+                    if not handler:
+                        return self._error_response(
+                            request_id,
+                            self.METHOD_NOT_FOUND,
+                            f"Unknown work item execution tool: {internal_tool_name}",
+                        )
+
+                    # Call the async handler
+                    result = await handler(tool_params)
+
+                    # Wrap result in MCP content format
+                    mcp_result = {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(result, indent=2),
+                            }
+                        ]
+                    }
+
+                    return self._success_response(request_id, mcp_result)
+
+                except Exception as e:
+                    self._logger.error(f"Work item execution tool failed: {e}", exc_info=True)
+                    return self._error_response(
+                        request_id,
+                        self.INTERNAL_ERROR,
+                        f"Work item execution tool failed: {str(e)}",
+                    )
+
+            # Board management tools (workItems.create, update, delete, etc.)
+            try:
+                from .mcp.handlers.board_handlers import WORK_ITEM_HANDLERS
+
+                handler = WORK_ITEM_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown workItems tool: {internal_tool_name}",
+                    )
+
+                # Get the board service (work items are managed by BoardService)
+                board_service = self._services.board_service()
+
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, board_service, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"WorkItems tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"WorkItems tool execution failed: {str(e)}",
+                )
+
+        # Handle files.* tools (file operations)
+        if internal_tool_name.startswith("files."):
+            try:
+                from .mcp.handlers.file_handlers import FILE_HANDLERS
+
+                handler = FILE_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown files tool: {internal_tool_name}",
+                    )
+
+                # File handlers don't need a service - they operate on the filesystem
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, None, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Files tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Files tool execution failed: {str(e)}",
+                )
+
+        # Handle github.* tools (GitHub PR and commit operations)
+        if internal_tool_name.startswith("github."):
+            try:
+                from .mcp.handlers.github_handlers import GITHUB_HANDLERS
+
+                handler = GITHUB_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown github tool: {internal_tool_name}",
+                    )
+
+                # Get the GitHub service
+                github_service = self._services.github_service()
+
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, github_service, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"GitHub tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"GitHub tool execution failed: {str(e)}",
+                )
+
+        # Handle config.* tools (configuration and model availability)
+        if internal_tool_name.startswith("config."):
+            try:
+                from .mcp.handlers.config_handlers import CONFIG_HANDLERS
+
+                handler = CONFIG_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown config tool: {internal_tool_name}",
+                    )
+
+                # Get the credential store for model availability queries
+                credential_store = self._services.credential_store()
+
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, credential_store, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except KeyError as exc:
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    f"Missing required field: {exc}",
+                )
+            except ValueError as exc:
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    str(exc),
+                )
+            except Exception as e:
+                self._logger.error(f"Config tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Config tool execution failed: {str(e)}",
+                )
+
         # Unknown tool prefix
         return self._error_response(
             request_id,
             self.METHOD_NOT_FOUND,
-            f"Unknown tool: {tool_name}",
+            f"Unknown tool: {internal_tool_name}",
         )
 
     def get_metrics_summary(self) -> Dict[str, Any]:
@@ -2734,9 +3550,7 @@ class MCPServer:
             "method": method,
             "params": params,
         }
-        # Write directly to stdout
-        sys.stdout.write(json.dumps(notification) + "\n")
-        sys.stdout.flush()
+        self._write_stdout_message(json.dumps(notification))
         self._logger.debug(f"Sent notification: {method}")
 
     def _error_response(self, request_id: Optional[str], code: int, message: str, data: Any = None) -> str:
@@ -2783,7 +3597,7 @@ class MCPServer:
                 # Read one line (JSON-RPC request) with timeout for shutdown check
                 try:
                     request_line = await asyncio.wait_for(
-                        loop.run_in_executor(None, sys.stdin.readline),
+                        loop.run_in_executor(None, self._read_stdin_message_blocking),
                         timeout=1.0  # Check shutdown flag every second
                     )
                 except asyncio.TimeoutError:
@@ -2804,9 +3618,7 @@ class MCPServer:
                 response = await self.handle_request(request_line)
 
                 if response:
-                    # Write response to stdout
-                    sys.stdout.write(response + "\n")
-                    sys.stdout.flush()
+                    self._write_stdout_message(response)
 
         except KeyboardInterrupt:
             self._logger.info("Received keyboard interrupt")

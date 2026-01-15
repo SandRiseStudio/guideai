@@ -69,6 +69,10 @@ class Run:
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     steps: List[RunStep] = field(default_factory=list)
+    # Agent interaction linking fields
+    origin_run_id: Optional[str] = None  # Parent run for delegations
+    delegation_id: Optional[str] = None  # Link to DelegationResponse
+    handoff_from_run_id: Optional[str] = None  # Previous run in handoff chain
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -90,6 +94,10 @@ class RunCreateRequest:
     metadata: Dict[str, Any] = field(default_factory=dict)
     initial_message: Optional[str] = None
     total_steps: Optional[int] = None
+    # Agent interaction linking fields
+    origin_run_id: Optional[str] = None  # Parent run for delegations
+    delegation_id: Optional[str] = None  # Link to DelegationResponse
+    handoff_from_run_id: Optional[str] = None  # Previous run in handoff chain
 
 
 @dataclass
@@ -116,3 +124,57 @@ class RunCompletion:
     message: Optional[str] = None
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RunLogEntry:
+    """A single log entry for a run."""
+
+    log_id: str
+    timestamp: str
+    level: str
+    service: str
+    message: str
+    action_id: Optional[str] = None
+    session_id: Optional[str] = None
+    actor_surface: Optional[str] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RunLogsRequest:
+    """Request parameters for fetching run logs."""
+
+    run_id: str
+    level: Optional[str] = None  # Minimum log level
+    start_time: Optional[str] = None  # ISO 8601
+    end_time: Optional[str] = None  # ISO 8601
+    limit: int = 100
+    after: Optional[str] = None  # Cursor for pagination (log_id)
+    search: Optional[str] = None
+    include_steps: bool = True
+
+
+@dataclass
+class RunLogsResponse:
+    """Response from fetching run logs."""
+
+    run_id: str
+    logs: List[RunLogEntry]
+    steps: List[RunStep] = field(default_factory=list)
+    total: int = 0
+    has_more: bool = False
+    next_cursor: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "logs": [log.to_dict() for log in self.logs],
+            "steps": [step.to_dict() for step in self.steps],
+            "total": self.total,
+            "has_more": self.has_more,
+            "next_cursor": self.next_cursor,
+        }

@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "name": "workItems.update",
+  "description": "Update work item fields. Only provided fields will be updated.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "item_id": {
+        "type": "string",
+        "description": "Work item ID to update (required)"
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500,
+        "description": "New title"
+      },
+      "description": {
+        "type": "string",
+        "maxLength": 10000,
+        "description": "New description"
+      },
+      "status": {
+        "type": "string",
+        "enum": ["draft", "backlog", "todo", "in_progress", "in_review", "done", "cancelled"],
+        "description": "New status"
+      },
+      "priority": {
+        "type": "string",
+        "enum": ["critical", "high", "medium", "low"],
+        "description": "New priority"
+      },
+      "labels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "New labels (replaces existing)"
+      },
+      "story_points": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "description": "Story point estimate"
+      },
+      "estimated_hours": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Estimated hours"
+      },
+      "actual_hours": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Actual hours spent"
+      },
+      "start_date": {
+        "type": "string",
+        "format": "date",
+        "description": "Start date"
+      },
+      "target_date": {
+        "type": "string",
+        "format": "date",
+        "description": "Target date"
+      },
+      "due_date": {
+        "type": "string",
+        "format": "date",
+        "description": "Due date"
+      },
+      "behavior_id": {
+        "type": "string",
+        "description": "Associated behavior ID"
+      },
+      "run_id": {
+        "type": "string",
+        "description": "Associated run ID"
+      },
+      "metadata": {
+        "type": "object",
+        "description": "Additional metadata"
+      },
+      "user_id": {
+        "type": "string",
+        "description": "ID of the user updating the item"
+      },
+      "org_id": {
+        "type": "string",
+        "description": "Optional organization ID for multi-tenant context"
+      }
+    },
+    "required": ["item_id"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": { "type": "boolean" },
+      "item": {
+        "type": "object",
+        "properties": {
+          "item_id": { "type": "string" },
+          "item_type": { "type": "string" },
+          "title": { "type": "string" },
+          "status": { "type": "string" },
+          "priority": { "type": "string" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "message": { "type": "string" },
+      "error": { "type": "string" }
+    }
+  }
+}

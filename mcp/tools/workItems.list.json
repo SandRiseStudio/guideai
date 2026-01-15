@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "name": "workItems.list",
+  "description": "List work items with optional filters for board, project, type, and status.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "board_id": {
+        "type": "string",
+        "description": "Filter by board ID"
+      },
+      "project_id": {
+        "type": "string",
+        "description": "Filter by project ID"
+      },
+      "item_type": {
+        "type": "string",
+        "enum": ["epic", "story", "task"],
+        "description": "Filter by work item type"
+      },
+      "status": {
+        "type": "string",
+        "enum": ["draft", "backlog", "todo", "in_progress", "in_review", "done", "cancelled"],
+        "description": "Filter by status"
+      },
+      "org_id": {
+        "type": "string",
+        "description": "Optional organization ID for multi-tenant context"
+      },
+      "limit": {
+        "type": "integer",
+        "default": 100,
+        "minimum": 1,
+        "maximum": 500,
+        "description": "Maximum number of items to return"
+      },
+      "offset": {
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "description": "Number of items to skip for pagination"
+      }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": { "type": "boolean" },
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "item_id": { "type": "string" },
+            "item_type": { "type": "string" },
+            "project_id": { "type": "string" },
+            "board_id": { "type": "string" },
+            "column_id": { "type": "string" },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "status": { "type": "string" },
+            "priority": { "type": "string" },
+            "created_at": { "type": "string", "format": "date-time" },
+            "updated_at": { "type": "string", "format": "date-time" }
+          }
+        }
+      },
+      "total": { "type": "integer" },
+      "limit": { "type": "integer" },
+      "offset": { "type": "integer" }
+    }
+  }
+}

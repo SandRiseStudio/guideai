@@ -33,6 +33,8 @@ from .models import (
     EnvironmentManifest,
     HealthCheck,
     InfrastructureConfig,
+    MigrationConfig,
+    MigrationSpec,
     PlanForTestsRequest,
     PlanForTestsResponse,
     PlanRequest,
@@ -281,6 +283,17 @@ class AmprealizeService:
                         and "active_modules" in env_payload["infrastructure"]
                     ):
                         env_payload["active_modules"] = env_payload["infrastructure"].get("active_modules")
+
+                    # Convert migrations dict to MigrationConfig model
+                    if "migrations" in env_payload and isinstance(env_payload["migrations"], dict):
+                        mig_data = env_payload["migrations"]
+                        migration_specs = [
+                            MigrationSpec(**m) for m in mig_data.get("migrations", [])
+                        ]
+                        env_payload["migrations"] = MigrationConfig(
+                            auto_run=mig_data.get("auto_run", True),
+                            migrations=migration_specs,
+                        )
 
                     try:
                         env_def = EnvironmentDefinition(**env_payload)
@@ -1079,6 +1092,185 @@ class AmprealizeService:
         )
 
         return False, current_warnings
+
+    def _run_migrations(
+        self,
+        env_def: EnvironmentDefinition,
+        manifest: Dict[str, Any],
+        plan_id: str,
+        amp_run_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Run database migrations after containers are healthy.
+
+        Migrations run from the host machine (where Alembic configs and migration
+        files reside) against the database container (accessible via port mapping).
+
+        Args:
+            env_def: Environment definition with migration config
+            manifest: Apply manifest with variables
+            plan_id: Plan identifier for logging
+            amp_run_id: Run identifier for logging
+
+        Returns:
+            List of migration results with status and output
+        """
+        import subprocess
+
+        results: List[Dict[str, Any]] = []
+
+        if not env_def.migrations or not env_def.migrations.auto_run:
+            return results
+
+        migrations = env_def.migrations.migrations
+        if not migrations:
+            return results
+
+        # Get working directory from environment manifest or current directory
+        working_dir = Path(manifest.get("environment_manifest", ".")).parent
+        if not working_dir.exists():
+            working_dir = Path.cwd()
+
+        # Merge environment variables
+        env_vars = os.environ.copy()
+        env_vars.update(manifest.get("variables", {}))
+
+        for migration_spec in migrations:
+            if not migration_spec.enabled:
+                results.append({
+                    "name": migration_spec.name,
+                    "status": "skipped",
+                    "reason": "disabled",
+                })
+                continue
+
+            self.hooks.emit_metric(
+                "amprealize.apply.migration.started",
+                plan_id=plan_id,
+                amp_run_id=amp_run_id,
+                migration_name=migration_spec.name,
+                alembic_config=migration_spec.alembic_config,
+                target_revision=migration_spec.target_revision,
+            )
+
+            # Check if Alembic config exists
+            alembic_config_path = working_dir / migration_spec.alembic_config
+            if not alembic_config_path.exists():
+                error_msg = f"Alembic config not found: {alembic_config_path}"
+                self.hooks.emit_metric(
+                    "amprealize.apply.migration.failed",
+                    plan_id=plan_id,
+                    amp_run_id=amp_run_id,
+                    migration_name=migration_spec.name,
+                    error=error_msg,
+                )
+                results.append({
+                    "name": migration_spec.name,
+                    "status": "failed",
+                    "error": error_msg,
+                })
+                continue
+
+            # Resolve database URL from environment variable
+            db_url = env_vars.get(migration_spec.database_url_env)
+            if not db_url:
+                error_msg = f"Database URL not found in {migration_spec.database_url_env}"
+                self.hooks.emit_metric(
+                    "amprealize.apply.migration.failed",
+                    plan_id=plan_id,
+                    amp_run_id=amp_run_id,
+                    migration_name=migration_spec.name,
+                    error=error_msg,
+                )
+                results.append({
+                    "name": migration_spec.name,
+                    "status": "failed",
+                    "error": error_msg,
+                })
+                continue
+
+            # Build Alembic command
+            cmd = [
+                "alembic",
+                "-c", str(alembic_config_path),
+                "upgrade",
+                migration_spec.target_revision,
+            ]
+
+            # Set DATABASE_URL in subprocess environment
+            run_env = env_vars.copy()
+            run_env["DATABASE_URL"] = db_url
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=str(working_dir),
+                    env=run_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # 5 minute timeout
+                )
+
+                if result.returncode == 0:
+                    self.hooks.emit_metric(
+                        "amprealize.apply.migration.completed",
+                        plan_id=plan_id,
+                        amp_run_id=amp_run_id,
+                        migration_name=migration_spec.name,
+                        output_preview=result.stdout[:500] if result.stdout else "",
+                    )
+                    results.append({
+                        "name": migration_spec.name,
+                        "status": "completed",
+                        "output": result.stdout,
+                    })
+                else:
+                    error_output = result.stderr or result.stdout
+                    self.hooks.emit_metric(
+                        "amprealize.apply.migration.failed",
+                        plan_id=plan_id,
+                        amp_run_id=amp_run_id,
+                        migration_name=migration_spec.name,
+                        error=error_output[:500] if error_output else "Unknown error",
+                        return_code=result.returncode,
+                    )
+                    results.append({
+                        "name": migration_spec.name,
+                        "status": "failed",
+                        "error": error_output,
+                        "return_code": result.returncode,
+                    })
+
+            except subprocess.TimeoutExpired as e:
+                error_msg = f"Migration timed out after 300s"
+                self.hooks.emit_metric(
+                    "amprealize.apply.migration.timeout",
+                    plan_id=plan_id,
+                    amp_run_id=amp_run_id,
+                    migration_name=migration_spec.name,
+                    error=error_msg,
+                )
+                results.append({
+                    "name": migration_spec.name,
+                    "status": "timeout",
+                    "error": error_msg,
+                })
+
+            except Exception as e:
+                error_msg = str(e)
+                self.hooks.emit_metric(
+                    "amprealize.apply.migration.error",
+                    plan_id=plan_id,
+                    amp_run_id=amp_run_id,
+                    migration_name=migration_spec.name,
+                    error=error_msg,
+                )
+                results.append({
+                    "name": migration_spec.name,
+                    "status": "error",
+                    "error": error_msg,
+                })
+
+        return results
 
     # =========================================================================
     # Core Operations
@@ -1960,6 +2152,7 @@ class AmprealizeService:
                     environment=spec.get("environment", {}),
                     volumes=spec.get("volumes", []),
                     command=spec.get("command"),
+                    workdir=spec.get("workdir"),
                     detach=True,
                     network=network_name,
                     network_aliases=[name] if network_name else [],
@@ -2079,8 +2272,38 @@ class AmprealizeService:
                 )
             raise
 
+        # Run database migrations after all containers are healthy
+        # Migrations run from host using Alembic against the database container
+        environment_name = manifest.get("environment", "")
+        env_def = self.environments.get(environment_name)
+        migration_results: List[Dict[str, Any]] = []
+        if env_def and env_def.migrations:
+            migration_results = self._run_migrations(
+                env_def=env_def,
+                manifest=manifest,
+                plan_id=plan_id,
+                amp_run_id=amp_run_id,
+            )
+            # Check for any failed migrations
+            if migration_results:
+                failed_migrations = [m for m in migration_results if m.get("status") in ("failed", "error", "timeout")]
+                if failed_migrations:
+                    error_msg = f"Migration(s) failed: {[m['name'] for m in failed_migrations]}"
+                    self.hooks.emit_metric(
+                        "amprealize.apply.migrations_failed",
+                        plan_id=plan_id,
+                        amp_run_id=amp_run_id,
+                        failed_count=len(failed_migrations),
+                        failed_names=[m["name"] for m in failed_migrations],
+                    )
+                    # Don't raise - migrations failure is non-fatal but logged
+                    print(f"Warning: {error_msg}", file=sys.stderr)
+
         manifest["phase"] = "APPLIED"
         manifest["environment_outputs"] = outputs
+        # Store migration results separately (not in environment_outputs to avoid CLI parsing issues)
+        if migration_results:
+            manifest["migration_results"] = migration_results
 
         # Save environment state
         env_path = self.environments_dir / f"{amp_run_id}.json"

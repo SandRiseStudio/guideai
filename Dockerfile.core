@@ -21,11 +21,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml ./
 COPY docs/README.md ./README.md
 COPY guideai/__init__.py guideai/__init__.py
+COPY packages/ ./packages/
 
-# Install Python dependencies
+# Install Python dependencies (excluding ML deps to reduce image size)
+# Note: Local packages (raze, amprealize) are required for the API
+# Using non-editable installs so packages are copied to site-packages
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -e .[telemetry,postgres] && \
-    pip install --no-cache-dir faiss-cpu sentence-transformers numpy
+    pip install --no-cache-dir ./packages/raze && \
+    pip install --no-cache-dir ./packages/amprealize && \
+    pip install --no-cache-dir -e .[telemetry,postgres,redis]
 
 # ============================================================================
 # Stage 2: Runtime - Minimal production image
@@ -53,6 +57,12 @@ COPY --chown=guideai:guideai guideai/ ./guideai/
 COPY --chown=guideai:guideai schema/ ./schema/
 COPY --chown=guideai:guideai pyproject.toml ./
 COPY --chown=guideai:guideai docs/README.md ./README.md
+
+# Copy Alembic migrations (required for post_start_commands)
+COPY --chown=guideai:guideai migrations/ ./migrations/
+COPY --chown=guideai:guideai migrations_telemetry/ ./migrations_telemetry/
+COPY --chown=guideai:guideai alembic.ini ./
+COPY --chown=guideai:guideai alembic.telemetry.ini ./
 
 # Create necessary directories
 RUN mkdir -p data/behaviors data/workflows data/actions data/runs data/compliance && \

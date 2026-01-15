@@ -941,9 +941,25 @@ class RestAgentRegistryAdapter:
             visibility=self._coerce_enum(AgentVisibility, payload.get("visibility"))
             or AgentVisibility.PRIVATE.value,
             metadata=dict(payload.get("metadata", {})),
+            request_api_credentials=bool(payload.get("request_api_credentials", False)),
         )
-        agent = self._service.create_agent(request, actor, org_id=payload.get("org_id"))
-        return agent.to_dict() if hasattr(agent, "to_dict") else cast(Dict[str, Any], agent)
+        response = self._service.create_agent(request, actor, org_id=payload.get("org_id"))
+
+        # Build response with agent and optional credentials
+        result: Dict[str, Any] = {}
+        if hasattr(response, "agent"):
+            # New CreateAgentResponse format
+            result = response.agent.to_dict() if hasattr(response.agent, "to_dict") else cast(Dict[str, Any], response.agent)
+            if response.client_id:
+                result["credentials"] = {
+                    "client_id": response.client_id,
+                    "client_secret": response.client_secret,
+                }
+        else:
+            # Legacy Agent format (for backwards compatibility)
+            result = response.to_dict() if hasattr(response, "to_dict") else cast(Dict[str, Any], response)
+
+        return result
 
     def search_agents(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         from .agent_registry_contracts import (
@@ -1616,6 +1632,49 @@ class RestRunServiceAdapter(BaseRunServiceAdapter):
     def delete_run(self, run_id: str) -> None:
         self._service.delete_run(run_id)
 
+    def update_status(self, run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Update only the status of a run (convenience wrapper around update_run).
+
+        Args:
+            run_id: Run identifier.
+            payload: Dict containing 'status' and optional 'message'.
+
+        Returns:
+            Updated run as dict.
+        """
+        update = RunProgressUpdate(
+            status=payload["status"],
+            message=payload.get("message"),
+        )
+        run = self._service.update_run(run_id, update)
+        return self._format_run(run)
+
+    async def fetch_logs(
+        self, run_id: str, payload: Dict[str, Any], raze_service: Any = None
+    ) -> Dict[str, Any]:
+        """Fetch execution logs for a run from Raze.
+
+        Args:
+            run_id: Run identifier.
+            payload: Query parameters (level, start_time, end_time, limit, after, search, include_steps).
+            raze_service: RazeService instance for querying logs.
+
+        Returns:
+            RunLogsResponse as dict.
+        """
+        response = await self._service.fetch_logs(
+            run_id=run_id,
+            raze_service=raze_service,
+            level=payload.get("level"),
+            start_time=payload.get("start_time"),
+            end_time=payload.get("end_time"),
+            limit=min(payload.get("limit", 100), 1000),
+            after=payload.get("after"),
+            search=payload.get("search"),
+            include_steps=payload.get("include_steps", True),
+        )
+        return response.to_dict()
+
 
 class MCPRunServiceAdapter(BaseRunServiceAdapter):
     """Adapter simulating MCP tool interactions for runs."""
@@ -1685,6 +1744,49 @@ class MCPRunServiceAdapter(BaseRunServiceAdapter):
 
     def delete(self, run_id: str) -> None:
         self._service.delete_run(run_id)
+
+    def update_status(self, run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Update only the status of a run (convenience wrapper around update).
+
+        Args:
+            run_id: Run identifier.
+            payload: Dict containing 'status' and optional 'message'.
+
+        Returns:
+            Updated run as dict.
+        """
+        update = RunProgressUpdate(
+            status=payload["status"],
+            message=payload.get("message"),
+        )
+        run = self._service.update_run(run_id, update)
+        return self._format_run(run)
+
+    async def fetch_logs(
+        self, run_id: str, payload: Dict[str, Any], raze_service: Any = None
+    ) -> Dict[str, Any]:
+        """Fetch execution logs for a run from Raze.
+
+        Args:
+            run_id: Run identifier.
+            payload: Query parameters (level, start_time, end_time, limit, after, search, include_steps).
+            raze_service: RazeService instance for querying logs.
+
+        Returns:
+            RunLogsResponse as dict.
+        """
+        response = await self._service.fetch_logs(
+            run_id=run_id,
+            raze_service=raze_service,
+            level=payload.get("level"),
+            start_time=payload.get("start_time"),
+            end_time=payload.get("end_time"),
+            limit=min(payload.get("limit", 100), 1000),
+            after=payload.get("after"),
+            search=payload.get("search"),
+            include_steps=payload.get("include_steps", True),
+        )
+        return response.to_dict()
 
 
 # Workflow Service Adapters
@@ -2873,6 +2975,264 @@ class MCPAgentOrchestratorAdapter(BaseAgentOrchestratorAdapter):
             assignment_id=payload.get("assignment_id"),
         )
         return self._format_assignment(assignment) if assignment else None
+
+    def delegate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP agents.delegate tool - delegate subtask to another agent."""
+        response = self._service.delegate_subtask(
+            delegating_run_id=payload.get("run_id", "unknown"),
+            target_agent_id=payload["agent_id"],
+            subtask=payload["subtask"],
+            context=payload.get("context"),
+            timeout_seconds=payload.get("timeout_seconds", 300),
+            wait_for_completion=payload.get("wait_for_completion", True),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+    def consult(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP agents.consult tool - get advisory input from another agent."""
+        response = self._service.consult_agent(
+            requesting_run_id=payload.get("run_id", "unknown"),
+            target_agent_id=payload["agent_id"],
+            question=payload["question"],
+            context=payload.get("context"),
+            max_tokens=payload.get("max_tokens", 2000),
+            depth=payload.get("_depth", 0),  # Internal depth tracking
+        )
+        return response.to_dict()
+
+    def handoff(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP agents.handoff tool - transfer execution to another agent."""
+        response = self._service.handoff_execution(
+            source_run_id=payload.get("run_id", "unknown"),
+            target_agent_id=payload["agent_id"],
+            reason=payload["reason"],
+            transfer_context=payload.get("transfer_context", True),
+            transfer_outputs=payload.get("transfer_outputs", True),
+            issued_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+
+class RestAgentOrchestratorAdapter(BaseAgentOrchestratorAdapter):
+    """Adapter for REST API agent orchestration endpoints."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="api")
+
+    def delegate(
+        self,
+        agent_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """REST POST /api/v1/agents/{agent_id}/delegate"""
+        response = self._service.delegate_subtask(
+            delegating_run_id=payload.get("run_id", "unknown"),
+            target_agent_id=agent_id,
+            subtask=payload["subtask"],
+            context=payload.get("context"),
+            timeout_seconds=payload.get("timeout_seconds", 300),
+            wait_for_completion=payload.get("wait_for_completion", True),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+    def consult(
+        self,
+        agent_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """REST POST /api/v1/agents/{agent_id}/consult"""
+        response = self._service.consult_agent(
+            requesting_run_id=payload.get("run_id", "unknown"),
+            target_agent_id=agent_id,
+            question=payload["question"],
+            context=payload.get("context"),
+            max_tokens=payload.get("max_tokens", 2000),
+            depth=0,
+        )
+        return response.to_dict()
+
+    def handoff(
+        self,
+        agent_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """REST POST /api/v1/agents/{agent_id}/handoff"""
+        response = self._service.handoff_execution(
+            source_run_id=payload.get("run_id", "unknown"),
+            target_agent_id=agent_id,
+            reason=payload["reason"],
+            transfer_context=payload.get("transfer_context", True),
+            transfer_outputs=payload.get("transfer_outputs", True),
+            issued_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+
+# =============================================================================
+# Escalation Adapters (Section 11.4 - Human Escalation)
+# =============================================================================
+
+
+class BaseEscalationAdapter:
+    """Base adapter for escalation operations across surfaces."""
+
+    def __init__(self, service: Any, surface: str = "UNKNOWN") -> None:
+        self._service = service
+        self.surface = surface
+
+
+class MCPEscalationAdapter(BaseEscalationAdapter):
+    """Adapter for MCP escalation tool invocations."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="mcp")
+
+    def request_help(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP escalation.requestHelp tool - request non-blocking human guidance."""
+        response = self._service.request_help(
+            run_id=payload.get("run_id", "unknown"),
+            reason=payload["reason"],
+            context=payload.get("context"),
+            work_item_id=payload.get("work_item_id"),
+            urgency=payload.get("urgency", "normal"),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+    def request_approval(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP escalation.requestApproval tool - request blocking human approval."""
+        response = self._service.request_approval(
+            run_id=payload.get("run_id", "unknown"),
+            decision=payload["decision"],
+            options=payload["options"],
+            context=payload.get("context"),
+            work_item_id=payload.get("work_item_id"),
+            timeout_seconds=payload.get("timeout_seconds", 3600),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+    def notify_blocked(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP escalation.notifyBlocked tool - notify execution is blocked."""
+        response = self._service.notify_blocked(
+            run_id=payload.get("run_id", "unknown"),
+            reason=payload["reason"],
+            blocker_details=payload.get("blocker_details"),
+            work_item_id=payload.get("work_item_id"),
+            suggested_actions=payload.get("suggested_actions"),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+
+class RestEscalationAdapter(BaseEscalationAdapter):
+    """Adapter for REST API escalation endpoints."""
+
+    def __init__(self, service: Any) -> None:
+        super().__init__(service, surface="api")
+
+    def request_help(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """REST POST /api/v1/escalations:help"""
+        response = self._service.request_help(
+            run_id=payload.get("run_id", "unknown"),
+            reason=payload["reason"],
+            context=payload.get("context"),
+            work_item_id=payload.get("work_item_id"),
+            urgency=payload.get("urgency", "normal"),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+    def request_approval(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """REST POST /api/v1/escalations:approval"""
+        response = self._service.request_approval(
+            run_id=payload.get("run_id", "unknown"),
+            decision=payload["decision"],
+            options=payload["options"],
+            context=payload.get("context"),
+            work_item_id=payload.get("work_item_id"),
+            timeout_seconds=payload.get("timeout_seconds", 3600),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+    def notify_blocked(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """REST POST /api/v1/escalations:blocked"""
+        response = self._service.notify_blocked(
+            run_id=payload.get("run_id", "unknown"),
+            reason=payload["reason"],
+            blocker_details=payload.get("blocker_details"),
+            work_item_id=payload.get("work_item_id"),
+            suggested_actions=payload.get("suggested_actions"),
+            requested_by={"surface": self.surface},
+        )
+        return response.to_dict()
+
+    def resolve_help(
+        self,
+        escalation_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """REST POST /api/v1/escalations/{escalation_id}:resolve"""
+        response = self._service.resolve_help(
+            escalation_id=escalation_id,
+            guidance=payload["guidance"],
+            resolved_by=payload.get("resolved_by"),
+        )
+        return response.to_dict()
+
+    def resolve_approval(
+        self,
+        escalation_id: str,
+        approved: bool,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """REST POST /api/v1/escalations/{escalation_id}:approve or :reject"""
+        response = self._service.resolve_approval(
+            escalation_id=escalation_id,
+            approved=approved,
+            selected_option=payload.get("selected_option"),
+            reason=payload.get("reason"),
+            resolved_by=payload.get("resolved_by"),
+        )
+        return response.to_dict()
+
+    def acknowledge_blocked(
+        self,
+        escalation_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """REST POST /api/v1/escalations/{escalation_id}:acknowledge"""
+        response = self._service.acknowledge_blocked(
+            escalation_id=escalation_id,
+            acknowledged_by=payload.get("acknowledged_by"),
+            resolution=payload.get("resolution"),
+        )
+        return response.to_dict()
+
+    def get_escalation(self, escalation_id: str) -> Optional[Dict[str, Any]]:
+        """REST GET /api/v1/escalations/{escalation_id}"""
+        esc = self._service.get_escalation(escalation_id)
+        if esc is None:
+            return None
+
+        # Get the appropriate response based on type
+        from guideai.agent_orchestrator_service import EscalationType
+
+        if esc.escalation_type == EscalationType.HELP:
+            response = self._service.get_help_response(escalation_id)
+        elif esc.escalation_type == EscalationType.APPROVAL:
+            response = self._service.get_approval_response(escalation_id)
+        elif esc.escalation_type == EscalationType.BLOCKED:
+            response = self._service.get_blocked_response(escalation_id)
+        else:
+            return None
+
+        if response:
+            return response.to_dict()
+        return None
 
 
 # =============================================================================

@@ -150,7 +150,12 @@ class McpClient extends events_1.EventEmitter {
             this.outputChannel.appendLine('Starting MCP server...');
             this.process = (0, child_process_1.spawn)(this.pythonPath, ['-m', 'guideai.mcp_server'], {
                 stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env }
+                // Avoid blocking OS keychain prompts when running in a background
+                // stdio subprocess (common cause of "hanging" authStatus/device flow).
+                env: {
+                    ...process.env,
+                    GUIDEAI_ALLOW_PLAINTEXT_TOKENS: process.env.GUIDEAI_ALLOW_PLAINTEXT_TOKENS ?? '1'
+                }
             });
             // Handle stdout (MCP responses)
             this.process.stdout?.on('data', (data) => {

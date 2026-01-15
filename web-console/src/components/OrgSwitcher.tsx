@@ -11,8 +11,8 @@ import './OrgSwitcher.css';
 
 interface OrgSwitcherProps {
   organizations: Organization[];
-  currentOrgId?: string;
-  onSelect: (orgId?: string) => void;
+  currentOrgId: string | null;
+  onSelect: (orgId: string | null) => void;
 }
 
 const ChevronDownIcon = () => (
@@ -34,6 +34,7 @@ export const OrgSwitcher = memo(function OrgSwitcher({
 }: OrgSwitcherProps) {
   const [isOpen, setIsOpen] = useState(false);
   const currentOrg = organizations.find((o) => o.id === currentOrgId);
+  const currentLabel = currentOrg?.name ?? 'Personal workspace';
 
   return (
     <div className="org-switcher">
@@ -45,7 +46,7 @@ export const OrgSwitcher = memo(function OrgSwitcher({
         aria-haspopup="menu"
         data-haptic="light"
       >
-        <span className="org-switcher-label">{currentOrg?.name ?? 'Personal'}</span>
+        <span className="org-switcher-label" title={currentLabel}>{currentLabel}</span>
         <ChevronDownIcon />
       </button>
       {isOpen && (
@@ -55,11 +56,11 @@ export const OrgSwitcher = memo(function OrgSwitcher({
             role="menuitem"
             className={`org-switcher-option ${!currentOrgId ? 'active' : ''}`}
             onClick={() => {
-              onSelect(undefined);
+              onSelect(null);
               setIsOpen(false);
             }}
           >
-            Personal
+            Personal workspace
           </button>
           {organizations.map((org) => (
             <button

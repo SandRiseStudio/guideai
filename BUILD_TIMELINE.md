@@ -1,3 +1,303 @@
+| 153 | Work Item Comments UI + API | ### #153 - Work Item Comments UI + API COMPLETE ✅ (2026-01-14)
+**Milestone:** SaaS Web Console & Real-Time Collaboration
+**Context:** Work item comments existed in BoardService and MCP tooling but were not visible in the web console work item drawer.
+
+**Implementation:**
+1. **REST API Endpoints** (`guideai/services/board_api_v2.py`):
+   - `GET /v1/work-items/{item_id}/comments` list endpoint with pagination
+   - `POST /v1/work-items/{item_id}/comments` create endpoint with author resolution
+2. **Web Console Comment Panel** (`web-console/src/components/boards/WorkItemDrawer.tsx` + `.css`):
+   - First-class comment feed with filters, author badges, run references, and empty/error states
+   - Comment composer with optimistic updates and keyboard send (Cmd/Ctrl+Enter)
+3. **API Hooks + Telemetry** (`web-console/src/api/boards.ts`):
+   - `useWorkItemComments` and `usePostWorkItemComment` hooks with optimistic caching
+   - Raze logging for comment creation and failures
+
+**Files Modified:**
+- `guideai/services/board_api_v2.py` - Comment request/response models + REST routes
+- `web-console/src/api/boards.ts` - Comment types + hooks + raze logging
+- `web-console/src/components/boards/WorkItemDrawer.tsx` - Comment UI + composer
+- `web-console/src/components/boards/WorkItemDrawer.css` - Comment styling
+
+**Validation:**
+- Not run (UI change only)
+
+**Behaviors:** `behavior_prefer_mcp_tools`, `behavior_use_raze_for_logging`, `behavior_update_docs_after_changes`
+
+| 152 | Amprealize Web Console Collab Client Mount | ### #152 - Amprealize Web Console Collab Client Mount COMPLETE ✅ (2026-01-12)
+**Milestone:** Local Dev Environment
+**Context:** Web console container only mounted `/app` (web-console), so Vite could not resolve `@guideai/collab-client` from the monorepo.
+
+**Implementation:**
+1. **Blueprint Mount** (`packages/amprealize/src/amprealize/blueprints/local-test-suite.yaml`):
+   - Mount `packages/collab-client` into `/app/packages/collab-client`
+   - Set `GUIDEAI_REPO_ROOT=/app` for Vite alias resolution
+
+**Outcome:**
+- Web console can resolve `@guideai/collab-client` when running via Amprealize local-test-suite.
+
+| 151 | Work Item Execution MCP Integration | ### #151 - Work Item Execution MCP Integration COMPLETE ✅ (2026-01-12)
+**Milestone:** GuideAI Execution Protocol (GEP) MCP Integration
+**Context:** Work Item execution handlers existed but weren't accessible via MCP protocol. This prevented IDE extensions and MCP clients from starting/monitoring/controlling GEP executions.
+
+**Implementation:**
+1. **JSON Tool Manifests Created** (5 files in `mcp/tools/`):
+   - `workItems.execute.json` - Start GEP execution with optional agent/model overrides
+   - `workItems.executionStatus.json` - Get status with metrics (iterations, tokens, LLM calls)
+   - `workItems.cancelExecution.json` - Cancel active execution with reason
+   - `workItems.provideClarification.json` - Provide clarification during CLARIFYING phase
+   - `workItems.listExecutions.json` - List/filter executions with pagination
+
+2. **MCP Server Routing** (`guideai/mcp_server.py` lines 3105-3161):
+   - Intelligent namespace split: execution tools vs board CRUD tools
+   - Checks tool name against `execution_tools` set
+   - Imports `create_work_item_execution_handlers()` factory
+   - Calls async handlers with proper error handling
+   - Wraps results in MCP content format
+
+3. **Service Factory Method** (`guideai/mcp_server.py` lines 693-722):
+   - Added `work_item_execution_service()` to MCPServiceRegistry
+   - Uses `GUIDEAI_EXECUTION_PG_DSN` or falls back to `GUIDEAI_PG_DSN`
+   - Applies host overrides for container environments
+   - Returns WorkItemExecutionService singleton
+
+**Files Modified:**
+- `guideai/mcp_server.py` - Added routing (lines 3105-3161), service factory (lines 693-722), instance variable (line 118)
+- `docs/WORK_ITEM_EXECUTION_PLAN.md` - Updated status to "✅ Core Implementation Complete"
+
+**Validation:**
+- ✅ Python import test passed (no syntax errors)
+- ✅ JSON syntax validation passed (all 5 manifests valid)
+- ✅ File listing confirmed all 5 files created with correct names
+
+**Cross-Surface Parity:**
+- MCP tools: `workItems.{execute, executionStatus, cancelExecution, provideClarification, listExecutions}`
+- REST API: `POST /v1/work-items/{id}:execute`, `GET /v1/work-items/{id}/execution`, etc.
+- Both surfaces route to same WorkItemExecutionService
+
+| 150 | Project-Agent Assignment Junction Table | ### #150 - Project-Agent Assignment Junction Table COMPLETE ✅ (2026-01-12)
+**Milestone:** Data Model Alignment
+**Context:** 500 error when assigning AI Research agent to project: `column "project_id" of relation "agents" does not exist`. Root cause was architectural mismatch - `organization_service.py` expected a non-existent table schema while actual agents live in `execution.agents` with completely different structure.
+
+**Problem Analysis:**
+- Two different Agent concepts conflated:
+  1. `execution.agents` (AgentRegistryService) - marketplace/registry agents with slug, description, tags, visibility, versions
+  2. `multi_tenant/contracts.Agent` - simpler model expecting agent_type, config, capabilities that was never backed by actual table
+- `create_personal_agent()` and related methods tried to INSERT into columns that don't exist
+- Frontend sends `registry_agent_id` in config, but backend tried to create new agent rows instead of linking
+
+**Best Practice Solution - Junction Table Pattern:**
+1. **New Migration** (`20260112_create_project_agent_assignments.py`):
+   - Creates `execution.project_agent_assignments` junction table
+   - Links projects to agents from registry with many-to-many relationship
+   - Supports per-project config overrides, roles (primary/supporting/specialist/reviewer), status
+   - FK constraint to `execution.agents`, indexes on project_id and agent_id
+
+2. **New Contract Models** (`guideai/multi_tenant/contracts.py`):
+   - `ProjectAgentRole` enum (primary, supporting, specialist, reviewer)
+   - `ProjectAgentStatus` enum (active, paused, disabled)
+   - `ProjectAgentAssignment` - junction model with config_overrides
+   - `AssignAgentToProjectRequest`, `UpdateProjectAgentAssignmentRequest`
+   - `ProjectAgentAssignmentResponse` - includes agent details from registry
+
+3. **New Service Methods** (`organization_service.py`):
+   - `assign_registry_agent_to_project()` - creates junction record
+   - `list_project_agent_assignments()` - lists with agent details
+   - `list_user_project_agent_assignments()` - lists for user's projects
+   - `update_project_agent_assignment()` - update config/role/status
+   - `remove_project_agent_assignment()` / `remove_agent_from_project()`
+
+4. **API Updates** (`projects_api.py`):
+   - `POST /v1/projects/agents` extracts `registry_agent_id` from config, creates assignment
+   - `GET /v1/projects/agents` returns `ProjectAgentAssignmentResponse` with agent details
+   - `DELETE /v1/projects/agents/{id}` removes assignment by ID
+
+**Table Schema:**
+```sql
+CREATE TABLE execution.project_agent_assignments (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL REFERENCES execution.agents(id),
+    assigned_by TEXT,
+    config_overrides JSONB DEFAULT '{}',
+    role TEXT DEFAULT 'primary',
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(project_id, agent_id)
+);
+```
+
+**Key Design Decisions:**
+- Junction table allows many-to-many: one agent can serve multiple projects
+- Per-project config_overrides enable customization without modifying registry agent
+- Soft-delete via status='disabled' preserves audit trail
+- Response includes agent details (name, slug, description) for frontend display
+
+**Behaviors:** `behavior_migrate_postgres_schema`, `behavior_design_api_contract`, `behavior_align_storage_layers`, `behavior_update_docs_after_changes`
+**Status:** COMPLETE ✅ - Frontend agent assignment should now work correctly |
+| 149 | Amprealize Auto-Migration Support | ### #149 - Amprealize Auto-Migration Support COMPLETE ✅ (2026-01-09)
+**Milestone:** Infrastructure Automation
+**Context:** Database tables weren't auto-created after `amprealize apply`, causing 500 errors on dashboard. Added declarative migration support to run Alembic from host after containers are healthy.
+
+**Root Cause:**
+- `amprealize apply` started containers but didn't run Alembic migrations
+- `post_start_commands` in blueprint ran inside containers where migrations weren't accessible
+- Migrations needed to run from host (where alembic.ini and migration files live)
+
+**Implementation:**
+1. **New Models** (`packages/amprealize/src/amprealize/models.py`):
+   - `MigrationSpec`: Individual migration config (name, alembic_config, database_url_env, target_revision, enabled)
+   - `MigrationConfig`: Container for auto_run flag and list of MigrationSpec
+   - Added `migrations: Optional[MigrationConfig]` to `EnvironmentDefinition`
+
+2. **Service Changes** (`packages/amprealize/src/amprealize/service.py`):
+   - Added `_run_migrations()` method to execute Alembic migrations from host
+   - Updated `load_environments()` to parse migrations YAML into Pydantic models
+   - Integrated migration call in `apply()` after containers healthy, before APPLIED phase
+   - Migrations run with proper DATABASE_URL from environment variables
+   - Results stored in `outputs["_migrations"]` for visibility
+
+3. **Environment Config** (`environments.yaml`):
+   - Added `migrations` section to development environment
+   - Configured two migration specs: guideai-main (alembic.ini) and guideai-telemetry
+
+**Configuration Example:**
+```yaml
+migrations:
+  auto_run: true
+  migrations:
+    - name: "guideai-main"
+      alembic_config: "alembic.ini"
+      database_url_env: "GUIDEAI_PG_DSN"
+      target_revision: "head"
+      enabled: true
+```
+
+**Behaviors:** `behavior_migrate_postgres_schema`, `behavior_use_amprealize_for_environments`, `behavior_update_docs_after_changes`
+**Status:** COMPLETE ✅ - Migrations auto-run on apply, dashboard endpoints working |
+| 148 | ServicePrincipal API & Agent Integration | ### #148 - ServicePrincipal API & Agent Integration COMPLETE ✅ (2026-01-08)
+**Milestone:** Auth Architecture Cleanup
+**Context:** Following auth model consolidation (#147), added REST endpoints for service principals and integrated with AgentRegistryService so agents can automatically get API credentials.
+
+**Implementation:**
+1. **REST Endpoints** (`guideai/api.py`):
+   - `POST /api/v1/auth/service-principals` - Create service principal
+   - `GET /api/v1/auth/service-principals` - List all service principals
+   - `GET /api/v1/auth/service-principals/{sp_id}` - Get by ID
+   - `PUT /api/v1/auth/service-principals/{sp_id}` - Update service principal
+   - `DELETE /api/v1/auth/service-principals/{sp_id}` - Delete
+   - `POST /api/v1/auth/service-principals/{sp_id}:deactivate` - Soft deactivate
+   - `POST /api/v1/auth/service-principals/{sp_id}:rotate-secret` - Rotate credentials
+   - `POST /api/v1/auth/service-principals:authenticate` - Authenticate client credentials
+
+2. **AgentRegistryService Integration** (`guideai/agent_registry_service.py`):
+   - Added `request_api_credentials: bool` field to `CreateAgentRequest`
+   - Added `CreateAgentResponse` with optional `client_id`/`client_secret`
+   - `create_agent()` now creates ServicePrincipal when requested
+   - Added `service_principal_id` field to `Agent` dataclass
+   - Updated `_row_to_agent()` to include service_principal_id
+   - ServicePrincipalService injected via constructor
+
+3. **REST Adapter** (`guideai/adapters.py`):
+   - `RestAgentRegistryAdapter.create_agent()` handles new response format
+   - Returns `credentials` object when agent requests API credentials
+
+4. **Deprecation Notices** (`guideai/auth/user_service*.py`):
+   - Added `DeprecationWarning` to `UserService` constructor
+   - Both `user_service.py` and `user_service_postgres.py` emit warnings
+   - Files NOT deleted yet (InternalAuthProvider still depends on them)
+
+**API Example:**
+```bash
+# Create agent with API credentials
+POST /api/v1/agents
+{
+  "name": "My Agent",
+  "request_api_credentials": true,
+  ...
+}
+# Response includes credentials.client_id, credentials.client_secret
+```
+
+**Behaviors:** `behavior_design_api_contract`, `behavior_integrate_vscode_extension`, `behavior_update_docs_after_changes`
+**Status:** COMPLETE ✅ - All endpoints functional, integration tested |
+| 147 | Auth Model Consolidation | ### #147 - Auth Model Consolidation COMPLETE ✅ (2026-01-08)
+**Milestone:** Auth Architecture Cleanup
+**Context:** Consolidated authentication model per user approval: separate tables for humans vs machines, proper FK on agents.owner_id, optional service_principal for agents.
+
+**Root Cause:**
+- Had confusing dual user tables (`auth.users` + `auth.internal_users`)
+- `execution.agents.owner_id` was loose text without FK constraint
+- No proper way for agents to have their own API credentials
+
+**Implementation:**
+1. **Alembic Migration** (`migrations/versions/20260108_consolidate_auth_model.py`):
+   - Created `auth.service_principals` table for machine/agent API credentials
+   - Added `execution.agents.service_principal_id` nullable FK
+   - Added FK from `execution.agents.owner_id` to `auth.users`
+   - Created system user (`id='system'`) for builtin agents
+   - Dropped deprecated tables: `internal_users`, `internal_sessions`, `password_reset_tokens`
+
+2. **ServicePrincipalService** (`guideai/auth/service_principal_service.py`):
+   - Full CRUD: create, get_by_id, get_by_client_id, list_all, update, delete
+   - Authentication: `authenticate(client_id, client_secret)` with bcrypt
+   - Security: `rotate_secret()`, `deactivate()`
+   - Role support: STRATEGIST, TEACHER, STUDENT, ADMIN, OBSERVER
+
+3. **Updated Models** (`guideai/auth/models.py`):
+   - Removed dead `PasswordResetToken`, `InternalSession` models
+   - Added `ServicePrincipal` dataclass and `AgentRole` enum
+   - Updated `User` model to match `auth.users` schema
+   - Added SQL schema documentation for all auth tables
+
+4. **Documentation** (`docs/AGENT_AUTH_ARCHITECTURE.md`):
+   - Added Section 0: Database Schema with table relationships
+   - Diagram showing auth.users vs auth.service_principals flow
+   - Documented deprecation of removed tables
+
+**Schema:**
+```sql
+auth.users           -- Human users (OAuth)
+auth.service_principals -- Machine credentials (client_credentials)
+auth.federated_identities -- OAuth provider links
+
+execution.agents.owner_id -> auth.users.id (CASCADE)
+execution.agents.service_principal_id -> auth.service_principals.id (SET NULL)
+```
+
+**Behaviors:** `behavior_migrate_postgres_schema`, `behavior_update_docs_after_changes`
+**Status:** COMPLETE ✅ - Migration applied, services created |
+| 146 | Dockerfile Telemetry Migrations Fix | ### #146 - Dockerfile Telemetry Migrations Fix COMPLETE ✅ (2026-01-08)
+**Milestone:** Environment Reliability
+**Context:** OAuth login was failing with `relation "telemetry_events" does not exist` because the Docker images were missing the telemetry Alembic config and migrations folder, preventing `post_start_commands` from running telemetry migrations.
+
+**Root Cause:**
+- `Dockerfile.core.simple` only copied `alembic.ini` but NOT `alembic.telemetry.ini`
+- No Dockerfiles copied `migrations_telemetry/` folder
+- This meant the blueprint's `post_start_commands` couldn't run telemetry migrations inside containers
+
+**Implementation:**
+1. **deployment/Dockerfile.core.simple** - Added:
+   - `COPY --chown=guideai:guideai migrations_telemetry/ ./migrations_telemetry/`
+   - `COPY --chown=guideai:guideai alembic.telemetry.ini ./`
+
+2. **deployment/Dockerfile.core** - Added:
+   - `COPY --chown=guideai:guideai migrations/ ./migrations/`
+   - `COPY --chown=guideai:guideai migrations_telemetry/ ./migrations_telemetry/`
+   - `COPY --chown=guideai:guideai alembic.ini ./`
+   - `COPY --chown=guideai:guideai alembic.telemetry.ini ./`
+
+3. **Dockerfile.core** (root) - Added same migration files
+
+**Validation:**
+- Rebuilt container with `podman build -t guideai-core:local -f deployment/Dockerfile.core.simple .`
+- Verified `migrations_telemetry/` and both alembic configs present in container
+- Ran `alembic -c alembic.telemetry.ini upgrade head` successfully
+- Confirmed `telemetry_events` table exists in telemetry-db
+
+**Behaviors:** `behavior_use_amprealize_for_environments`, `behavior_update_docs_after_changes`
+**Status:** COMPLETE ✅ - All Dockerfiles updated with telemetry migration support |
 | 145 | MCP Server Parity Validation Complete | ### #145 - MCP Server Parity Validation COMPLETE ✅ (2025-12-02)
 **Milestone:** Epic 6 - MCP Server (100% Complete)
 **Context:** Full validation of 5 core MCP namespaces with 96/96 parity tests passing. Session completed PostgreSQL unification, MCP outputSchema additions, embedding blueprint, and test isolation fixes.
@@ -1867,3 +2167,4 @@ _Last Updated: 2025-12-21_
 | 133 | 🎨 run_tests.sh Terminal Output Style Alignment with Amprealize CLI | **Achievement:** ✅ **run_tests.sh styled to match amprealize CLI output patterns** – Rewrote `scripts/run_tests.sh` (940 lines, ~430 lines shorter) with Rich-inspired bash output using box-drawing characters, semantic color coding, consolidated helper functions, and actionable error hints for improved developer experience.<br><br>**What shipped:**<br>- ✅ **Styled helper functions:** `print_header()` (box-drawing borders with centered title), `print_section()` (cyan bold section headers), `print_success/error/warning/info()` (color-coded status with ✓/✗/⚠ symbols), `print_kv()` (key-value pairs with proper alignment using `printf %b`)<br>- ✅ **Consolidated functions:** Merged 7 separate resource reporting functions into single `report_resources()`, merged 3 `ensure_*_schema` functions into generic `ensure_schema()`<br>- ✅ **Actionable error hints:** Added contextual hints like "Start with: podman machine start" when Podman machine not running<br>- ✅ **Removed redundant output:** Eliminated verbose configuration dumps, kept essential status information only<br>- ✅ **Style patterns aligned:** UTF-8 box drawing (━), semantic colors (GREEN=✓/success, RED=✗/error, YELLOW=⚠/warning, BLUE=headers, DIM=secondary), symbols matching amprealize Rich panels<br><br>**Files created:**<br>- `scripts/run_tests.sh.backup` (1371 lines) – Original preserved via mv<br><br>**Files modified:**<br>- `scripts/run_tests.sh` (940 lines, ~430 lines shorter than original)<br><br>**Validation:**<br>- ✅ `./scripts/run_tests.sh --help` displays styled help output<br>- ✅ `./scripts/run_tests.sh --check-only` displays styled infrastructure check with actionable hints<br>- ✅ `bash -n scripts/run_tests.sh` syntax validation passed<br><br>**Behaviors applied:** `behavior_update_docs_after_changes`, `behavior_handbook_compliance_prompt`<br><br>**Impact:** Developer experience improved with consistent terminal output styling across CLI tools. Test runner output now matches amprealize CLI aesthetics – user-friendly, beautiful, and actionable. Reduced output noise by ~30% while maintaining all critical functionality.<br><br>**References:** `scripts/run_tests.sh`, `scripts/run_tests.sh.backup`, `guideai/amprealize/cli.py` (style reference).<br><br>_Last Updated: 2025-11-24_ | 2025-11-24 |
 
 | 134 | ✅ 8.8.2 Telemetry Surface Parity COMPLETE | **Achievement:** ✅ **Telemetry query/dashboard across CLI and MCP surfaces** – Implemented telemetry query/dashboard CLI commands with RazeService integration, MCP tool manifests, and parity test suite (15 tests passing).<br><br>**What shipped:**<br>- ✅ **CLI telemetry query:** `guideai telemetry query --event-type <type> --from <date> --to <date> --run-id <id> --limit N --format json/table` with relative date parsing ("7d", "24h")<br>- ✅ **CLI telemetry dashboard:** `guideai telemetry dashboard --run-id <id> --from <date> --to <date> --watch` with 5s polling, Rich console table output, daily/run summary views<br>- ✅ **MCP tool telemetry.query:** `mcp/tools/telemetry.query.json` with filters (event_type, from, to, run_id, action_id, session_id, actor_surface, level, search, limit, offset)<br>- ✅ **MCP tool telemetry.dashboard:** `mcp/tools/telemetry.dashboard.json` with run_id, from, to, format parameters<br>- ✅ **Parity test suite:** `tests/test_telemetry_parity.py` (15 unit tests) validating CLI/MCP schema alignment, date parsing, output formats<br><br>**Behaviors applied:** `behavior_validate_cross_surface_parity`, `behavior_use_raze_for_logging`, `behavior_update_docs_after_changes`<br><br>**Files created:**<br>- `mcp/tools/telemetry.query.json` (MCP tool manifest)<br>- `mcp/tools/telemetry.dashboard.json` (MCP tool manifest)<br>- `tests/test_telemetry_parity.py` (404 lines, 15 tests)<br><br>**Files modified:**<br>- `guideai/cli.py` (added telemetry query/dashboard subcommands)<br>- `guideai/mcp_server.py` (added telemetry tool handlers)<br>- `WORK_STRUCTURE.md` (marked 8.8.2 complete)<br><br>**Impact:** Telemetry observability now available across all surfaces. Developers can query logs and view dashboards via CLI (`guideai telemetry query`) or MCP tools (`telemetry.query`, `telemetry.dashboard`). Test suite validates parity between surfaces.<br><br>_Last Updated: 2025-12-02_ | 2025-12-02 |
+| 135 | 🧩 Agent assignment schema alignment | **Achievement:** Added `project_id` support to `public.agents` and aligned personal agent listing with org/project assignment storage to fix assignment failures.<br><br>**What shipped:**<br>- **Migration:** `migrations/versions/20260111_add_project_id_to_agents.py` adds `project_id` + index to `public.agents`.<br>- **Service fix:** `guideai/multi_tenant/organization_service.py` now reads personal agents from `public.agents` with optional `project_id` filter.<br><br>**Behaviors applied:** `behavior_migrate_postgres_schema`, `behavior_update_docs_after_changes`<br><br>**Impact:** Assigning agents to projects no longer fails with missing `project_id` column; personal agent assignment now aligns with org/project agent storage.<br><br>_Last Updated: 2026-01-11_ | 2026-01-11 |

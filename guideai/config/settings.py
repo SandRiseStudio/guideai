@@ -11,9 +11,25 @@ Behaviors referenced:
 - behavior_lock_down_security_surface: Secrets abstraction layer
 """
 
+import os
+from pathlib import Path
 from typing import Literal, Optional
+
+from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Load .env file BEFORE any pydantic-settings classes are instantiated.
+# This ensures nested configs (DatabaseConfig, CacheConfig, etc.) pick up
+# environment variables from .env since they don't inherit env_file from parent.
+# Search order: .env in cwd, then .env in project root (guideai/)
+_env_loaded = False
+for _env_path in [Path(".env"), Path(__file__).parent.parent.parent / ".env"]:
+    if _env_path.exists():
+        load_dotenv(_env_path, override=False)  # Don't override existing env vars
+        _env_loaded = True
+        break
 
 
 class StorageConfig(BaseSettings):
@@ -48,7 +64,7 @@ class DatabaseConfig(BaseSettings):
 
     provider: Literal["local", "rds", "cloud-sql", "azure-db"] = "local"
     postgres_url: str = Field(
-        default="postgresql://guideai_user:local_dev_pw@localhost:5432/guideai",
+        default="postgresql://guideai:guideai_dev@localhost:5432/guideai",
         validation_alias="DATABASE_URL"
     )
     pool_size: int = 10
@@ -495,13 +511,15 @@ class Settings(BaseSettings):
     opensearch: OpenSearchConfig = Field(default_factory=OpenSearchConfig)
 
     # Legacy database DSN strings (backward compatibility)
-    guideai_behavior_pg_dsn: str = "postgresql://guideai_behavior:dev_behavior_pass@localhost:6433/behaviors"
-    guideai_workflow_pg_dsn: str = "postgresql://guideai_workflow:dev_workflow_pass@localhost:6434/workflows"
-    guideai_action_pg_dsn: str = "postgresql://guideai_user:local_dev_pw@localhost:6435/guideai_action"
-    guideai_run_pg_dsn: str = "postgresql://guideai_user:local_dev_pw@localhost:6436/guideai_run"
-    guideai_compliance_pg_dsn: str = "postgresql://guideai_user:local_dev_pw@localhost:6437/guideai_compliance"
-    guideai_metrics_pg_dsn: str = "postgresql://guideai_user:local_dev_pw@localhost:5439/guideai_metrics"
-    guideai_telemetry_pg_dsn: str = "postgresql://guideai_telemetry:dev_telemetry_pass@localhost:6432/telemetry"
+    # These all use the consolidated guideai-db on port 5432 with schema-based routing
+    # Credentials: guideai:guideai_dev (matching Amprealize default blueprint)
+    guideai_behavior_pg_dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dbehavior"
+    guideai_workflow_pg_dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dworkflow"
+    guideai_action_pg_dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dexecution"
+    guideai_run_pg_dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dexecution"
+    guideai_compliance_pg_dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dcompliance"
+    guideai_metrics_pg_dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dmetrics"
+    guideai_telemetry_pg_dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dtelemetry"
 
     # API Service
     api_host: str = "0.0.0.0"

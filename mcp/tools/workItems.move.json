@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "name": "workItems.move",
+  "description": "Move a work item between columns or change its position within a column. Used for Kanban-style drag and drop.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "item_id": {
+        "type": "string",
+        "description": "Work item ID to move (required)"
+      },
+      "column_id": {
+        "type": "string",
+        "description": "Target column ID"
+      },
+      "position": {
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "description": "New position within the column (0 = top)"
+      },
+      "user_id": {
+        "type": "string",
+        "description": "ID of the user moving the item"
+      },
+      "org_id": {
+        "type": "string",
+        "description": "Optional organization ID for multi-tenant context"
+      }
+    },
+    "required": ["item_id"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": { "type": "boolean" },
+      "item": {
+        "type": "object",
+        "properties": {
+          "item_id": { "type": "string" },
+          "column_id": { "type": "string" },
+          "position": { "type": "integer" },
+          "status": { "type": "string" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "message": { "type": "string" },
+      "error": { "type": "string" }
+    }
+  }
+}

@@ -137,6 +137,11 @@
   background-color: rgba(245, 158, 11, 0.1);
 }
 
+.document-type-badge.type-org {
+  color: var(--color-info);
+  background-color: rgba(59, 130, 246, 0.12);
+}
+
 .document-presence-dots {
   display: flex;
   align-items: center;

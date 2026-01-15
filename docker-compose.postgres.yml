@@ -221,7 +221,7 @@ services:
     ports:
       - "5438:5432"
     environment:
-      POSTGRES_DB: guideai_agent_orchestrator
+      POSTGRES_DB: guideai
       POSTGRES_USER: guideai_user
       POSTGRES_PASSWORD: local_dev_pw
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
@@ -239,7 +239,7 @@ services:
       - postgres-agent-orchestrator-data:/var/lib/postgresql/data
       - ./schema/migrations/011_create_agent_orchestrator.sql:/docker-entrypoint-initdb.d/011_create_agent_orchestrator.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U guideai_user -d guideai_agent_orchestrator"]
+      test: ["CMD-SHELL", "pg_isready -U guideai_user -d guideai"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -350,7 +350,7 @@ networks:
 #    Action:     postgresql://guideai_user:local_dev_pw@localhost:5435/guideai_action
 #    Run:        postgresql://guideai_user:local_dev_pw@localhost:5436/guideai_run
 #    Compliance: postgresql://guideai_user:local_dev_pw@localhost:5437/guideai_compliance
-#    AgentOrch:  postgresql://guideai_user:local_dev_pw@localhost:5438/guideai_agent_orchestrator
+#    AgentOrch:  postgresql://guideai_user:local_dev_pw@localhost:5438/guideai
 #
 #    Through PgBouncer (recommended for application connections):
 #    postgresql://guideai_behavior:dev_behavior_pass@localhost:6432/behaviors
@@ -358,7 +358,7 @@ networks:
 #    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai_action
 #    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai_run
 #    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai_compliance
-#    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai_agent_orchestrator
+#    postgresql://guideai_user:local_dev_pw@localhost:6432/guideai
 #    postgresql://guideai_telemetry:dev_telemetry_pass@localhost:6432/telemetry
 #
 #    (PgBouncer listens on port 6432 and forwards to the individual service databases.)

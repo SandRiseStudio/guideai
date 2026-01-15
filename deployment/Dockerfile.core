@@ -58,6 +58,12 @@ COPY --chown=guideai:guideai schema/ ./schema/
 COPY --chown=guideai:guideai docs/ ./docs/
 COPY --chown=guideai:guideai pyproject.toml ./
 
+# Copy Alembic migrations (required for post_start_commands)
+COPY --chown=guideai:guideai migrations/ ./migrations/
+COPY --chown=guideai:guideai migrations_telemetry/ ./migrations_telemetry/
+COPY --chown=guideai:guideai alembic.ini ./
+COPY --chown=guideai:guideai alembic.telemetry.ini ./
+
 # Copy deployment scripts
 COPY --chown=guideai:guideai deployment/scripts/init-warehouse.py ./deployment/scripts/init-warehouse.py
 COPY --chown=guideai:guideai deployment/scripts/entrypoint.sh ./deployment/scripts/entrypoint.sh

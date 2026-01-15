@@ -203,27 +203,29 @@ def create_log_routes(
     async def ingest_logs(request: LogIngestRequest) -> LogIngestResponse:
         """Ingest a batch of log events."""
         try:
-            accepted = 0
-            for event_input in request.events:
-                # Convert LogEventInput to LogEvent
-                event = LogEvent(
-                    level=event_input.level,
-                    service=event_input.service,
-                    message=event_input.message,
-                    timestamp=event_input.timestamp,
-                    run_id=event_input.run_id,
-                    action_id=event_input.action_id,
-                    session_id=event_input.session_id,
-                    actor_surface=event_input.actor_surface,
-                    context=event_input.context,
-                    schema_version=event_input.schema_version,
-                )
+            log_ids = []
+            for event_input in request.logs:
+                # Build kwargs, omitting None timestamp to use default
+                event_kwargs = {
+                    "level": event_input.level,
+                    "service": event_input.service,
+                    "message": event_input.message,
+                    "run_id": event_input.run_id,
+                    "action_id": event_input.action_id,
+                    "session_id": event_input.session_id,
+                    "actor_surface": event_input.actor_surface,
+                    "context": event_input.context,
+                }
+                if event_input.timestamp is not None:
+                    event_kwargs["timestamp"] = event_input.timestamp
+
+                event = LogEvent(**event_kwargs)
                 service.ingest(event)
-                accepted += 1
+                log_ids.append(event.log_id)
 
             return LogIngestResponse(
-                accepted=accepted,
-                message=f"Accepted {accepted} events for processing",
+                ingested_count=len(log_ids),
+                log_ids=log_ids,
             )
         except Exception as exc:
             raise HTTPException(

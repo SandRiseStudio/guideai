@@ -4701,8 +4701,14 @@ def _command_auth_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
+# ==============================================================================
+# DEPRECATED: Internal Auth Functions (Kept for backward compatibility)
+# These functions are deprecated as of 2026-01-09. Use OAuth instead.
+# ==============================================================================
+
+
 def _get_internal_auth_api_url() -> str:
-    """Get the internal auth API base URL."""
+    """[DEPRECATED] Get the internal auth API base URL."""
     return os.getenv("GUIDEAI_API_URL", "http://localhost:8000")
 
 
@@ -4712,46 +4718,14 @@ def _internal_auth_register(
     email: Optional[str] = None,
     api_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Register a user with the internal auth API.
+    """[DEPRECATED] Register a user with the internal auth API.
 
-    Args:
-        username: Username to register
-        password: Password for the account
-        email: Optional email address
-        api_url: Optional API URL override
-
-    Returns:
-        Dict with access_token, refresh_token, and token_type on success
-
-    Raises:
-        ValueError: On registration failure (e.g., duplicate username)
+    This function is deprecated. Use OAuth authentication instead.
     """
-    base_url = api_url or _get_internal_auth_api_url()
-    url = f"{base_url}/api/v1/auth/internal/register"
-
-    payload: Dict[str, Any] = {"username": username, "password": password}
-    if email:
-        payload["email"] = email
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    raise ValueError(
+        "Internal authentication has been deprecated. "
+        "Please use OAuth authentication via --provider=github or --provider=google"
     )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            error_body = json.loads(exc.read().decode("utf-8"))
-            detail = error_body.get("detail", str(exc))
-        except (json.JSONDecodeError, AttributeError):
-            detail = f"HTTP {exc.code}: {exc.reason}"
-        raise ValueError(f"Registration failed: {detail}")
-    except urllib.error.URLError as exc:
-        raise ValueError(f"Cannot connect to API at {base_url}: {exc.reason}")
 
 
 def _internal_auth_login(
@@ -4759,177 +4733,56 @@ def _internal_auth_login(
     password: str,
     api_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Login a user with the internal auth API.
+    """[DEPRECATED] Login a user with the internal auth API.
 
-    Args:
-        username: Username to login
-        password: Password for the account
-        api_url: Optional API URL override
-
-    Returns:
-        Dict with access_token, refresh_token, and token_type on success
-
-    Raises:
-        ValueError: On login failure (e.g., invalid credentials)
+    This function is deprecated. Use OAuth authentication instead.
     """
-    base_url = api_url or _get_internal_auth_api_url()
-    url = f"{base_url}/api/v1/auth/internal/login"
-
-    payload: Dict[str, Any] = {"username": username, "password": password}
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    raise ValueError(
+        "Internal authentication has been deprecated. "
+        "Please use OAuth authentication via --provider=github or --provider=google"
     )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            error_body = json.loads(exc.read().decode("utf-8"))
-            detail = error_body.get("detail", str(exc))
-        except (json.JSONDecodeError, AttributeError):
-            detail = f"HTTP {exc.code}: {exc.reason}"
-        raise ValueError(f"Login failed: {detail}")
-    except urllib.error.URLError as exc:
-        raise ValueError(f"Cannot connect to API at {base_url}: {exc.reason}")
 
 
 def _save_internal_tokens(
     tokens: Dict[str, Any],
     allow_plaintext: bool = False,
 ) -> Path:
-    """Save internal auth tokens to provider-specific file.
+    """[DEPRECATED] Save internal auth tokens to provider-specific file.
 
-    Args:
-        tokens: Token response from API (access_token, refresh_token, token_type)
-        allow_plaintext: Whether to allow plaintext token storage
-
-    Returns:
-        Path to the saved token file
+    This function is deprecated. Use OAuth authentication instead.
     """
-    from guideai.auth_tokens import FileTokenStore
-
-    # Get config directory
-    config_dir = os.getenv("GUIDEAI_CONFIG_DIR")
-    if config_dir:
-        base_dir = Path(config_dir).expanduser()
-    else:
-        base_dir = Path.home() / ".guideai"
-
-    base_dir.mkdir(parents=True, exist_ok=True)
-    token_path = base_dir / "auth_tokens_internal.json"
-
-    # Build token data with provider field
-    now = datetime.now(timezone.utc)
-    token_data = {
-        "access_token": tokens["access_token"],
-        "refresh_token": tokens["refresh_token"],
-        "token_type": tokens.get("token_type", "Bearer"),
-        "provider": "internal",
-        "scopes": tokens.get("scopes", []),
-        "client_id": "guideai-cli",
-        "issued_at": now.isoformat().replace("+00:00", "Z"),
-        # Default token expiry times matching InternalAuthProvider
-        "expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-        "refresh_expires_at": (now + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
-    }
-
-    token_path.write_text(json.dumps(token_data, indent=2), encoding="utf-8")
-    return token_path
+    raise ValueError(
+        "Internal authentication has been deprecated. "
+        "Please use OAuth authentication via --provider=github or --provider=google"
+    )
 
 
 def _command_auth_register(args: argparse.Namespace) -> int:
-    """Register a new user with internal authentication."""
+    """[DEPRECATED] Register a new user with internal authentication.
 
-    # Get credentials - prompt if not provided
-    username = args.username
-    password = args.password
-    email = args.email
-
-    if not username:
-        try:
-            username = input("Username: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nRegistration cancelled.")
-            return 130
-
-    if not username:
-        print("Error: Username is required.", file=sys.stderr)
-        return 1
-
-    if not password:
-        try:
-            import getpass
-            # Use getpass for interactive input, but fall back to stdin for piped input
-            if sys.stdin.isatty():
-                password = getpass.getpass("Password: ")
-                confirm = getpass.getpass("Confirm password: ")
-            else:
-                # When stdin is piped (e.g., in tests), read from stdin directly
-                print("Password: ", end="", flush=True)
-                password = sys.stdin.readline().rstrip('\n')
-                print("Confirm password: ", end="", flush=True)
-                confirm = sys.stdin.readline().rstrip('\n')
-        except (EOFError, KeyboardInterrupt):
-            print("\nRegistration cancelled.")
-            return 130
-
-        if password != confirm:
-            print("Error: Passwords do not match.", file=sys.stderr)
-            return 1
-
-    if not password:
-        print("Error: Password is required.", file=sys.stderr)
-        return 1
-
-    if not email:
-        try:
-            email = input("Email (optional, press Enter to skip): ").strip() or None
-        except (EOFError, KeyboardInterrupt):
-            print("\nRegistration cancelled.")
-            return 130
-
-    # Register with API
-    print(f"\nRegistering user '{username}'...")
-    try:
-        tokens = _internal_auth_register(
-            username=username,
-            password=password,
-            email=email,
-            api_url=args.api_url,
-        )
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    # Save tokens
-    try:
-        token_path = _save_internal_tokens(tokens, allow_plaintext=args.allow_plaintext)
-    except Exception as exc:
-        print(f"Warning: Failed to save tokens: {exc}", file=sys.stderr)
-        return 4
-
-    print("Registration successful!")
-    print(f"You are now authenticated as '{username}'.")
-    print(f"Tokens saved to {token_path}")
-    return 0
+    Internal authentication (username/password) has been deprecated.
+    Please use OAuth authentication instead.
+    """
+    print("Error: Internal user registration has been deprecated.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Please use OAuth authentication instead:", file=sys.stderr)
+    print("  guideai auth login --provider=github", file=sys.stderr)
+    print("  guideai auth login --provider=google", file=sys.stderr)
+    return 1
 
 
 def _command_auth_login(args: argparse.Namespace) -> int:
     """Perform login and cache issued tokens.
 
-    Supports both device flow (github, google) and internal auth (username/password).
+    Uses OAuth device flow with github or google providers.
+    Internal auth (username/password) has been deprecated.
     """
-    # Check if internal auth is requested
-    provider = getattr(args, "provider", "internal")
+    # Check provider - internal auth is deprecated
+    provider = getattr(args, "provider", "github")
     if provider == "internal":
         return _command_auth_login_internal(args)
 
-    # Fall through to device flow for github/google
+    # Device flow for github/google
     manager = _get_device_flow_manager()
     try:
         store = _get_token_store(allow_plaintext=args.allow_plaintext)
@@ -5030,63 +4883,16 @@ def _command_auth_login(args: argparse.Namespace) -> int:
 
 
 def _command_auth_login_internal(args: argparse.Namespace) -> int:
-    """Perform internal auth login with username/password.
+    """[DEPRECATED] Perform internal auth login with username/password.
 
-    Prompts for credentials if not provided via args.
+    Internal authentication has been deprecated. Please use OAuth instead.
     """
-    # Get credentials - prompt if not provided
-    try:
-        username = input("Username: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\nLogin cancelled.")
-        return 130
-
-    if not username:
-        print("Error: Username is required.", file=sys.stderr)
-        return 1
-
-    try:
-        import getpass
-        # Use getpass for interactive input, but fall back to input() for piped stdin
-        if sys.stdin.isatty():
-            password = getpass.getpass("Password: ")
-        else:
-            # When stdin is piped (e.g., in tests), read from stdin directly
-            print("Password: ", end="", flush=True)
-            password = sys.stdin.readline().rstrip('\n')
-    except (EOFError, KeyboardInterrupt):
-        print("\nLogin cancelled.")
-        return 130
-
-    if not password:
-        print("Error: Password is required.", file=sys.stderr)
-        return 1
-
-    # Login with API
-    api_url = getattr(args, "api_url", None)
-    print(f"\nAuthenticating '{username}'...")
-    try:
-        tokens = _internal_auth_login(
-            username=username,
-            password=password,
-            api_url=api_url,
-        )
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    # Save tokens
-    allow_plaintext = getattr(args, "allow_plaintext", False)
-    try:
-        token_path = _save_internal_tokens(tokens, allow_plaintext=allow_plaintext)
-    except Exception as exc:
-        print(f"Warning: Failed to save tokens: {exc}", file=sys.stderr)
-        return 4
-
-    print("Login successful!")
-    print(f"You are now logged in as '{username}'.")
-    print(f"Tokens saved to {token_path}")
-    return 0
+    print("Error: Internal authentication (username/password) has been deprecated.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Please use OAuth authentication instead:", file=sys.stderr)
+    print("  guideai auth login --provider=github", file=sys.stderr)
+    print("  guideai auth login --provider=google", file=sys.stderr)
+    return 1
 
 
 def _command_auth_status(args: argparse.Namespace) -> int:

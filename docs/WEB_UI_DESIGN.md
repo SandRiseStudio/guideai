@@ -5,6 +5,9 @@
 > **Created:** 2025-12-02
 > **Last Updated:** 2025-12-02
 
+
+> **2026-1-09: Please refer to COLLAB_SAAS_REQUIREMENTS.md for updated full feature requirements.**
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -412,7 +415,7 @@ web-console/                      # Existing Preact + Vite app
 
 ### 7. Agent Management
 
-**Route:** `/[org_slug]/agents`
+**Route:** `/agents` (registry) and `/[org_slug]/agents` (org-scoped view)
 
 **Purpose:** Create, configure, and monitor agents
 

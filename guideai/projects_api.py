@@ -4,7 +4,8 @@ Projects are a single resource type that can either:
 - belong to an organization (`org_id` set), or
 - be personal (`owner_id` set).
 
-This module provides `/v1/projects` list/create for personal (and optionally org-scoped) projects.
+This module provides `/v1/projects` list/create for personal (and optionally org-scoped) projects
+and `/v1/projects/agents` for personal agent assignments.
 
 Following:
 - behavior_lock_down_security_surface (Student): require auth; avoid leaking cross-user data.
@@ -16,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 import re
 import uuid
 
@@ -25,6 +26,14 @@ from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from guideai.storage.postgres_pool import PostgresPool
+    from guideai.multi_tenant.organization_service import OrganizationService
+
+from guideai.multi_tenant.contracts import (
+    Agent,
+    AgentType,
+    ProjectAgentAssignmentResponse,
+    ProjectAgentRole,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +78,24 @@ class CreateProjectBody(BaseModel):
     org_id: Optional[str] = None
 
 
+class PersonalAgentListResponse(BaseModel):
+    """Response for listing project-agent assignments.
+
+    Note: Uses ProjectAgentAssignmentResponse for proper junction table pattern.
+    The 'agents' field name is kept for backward compatibility with frontend.
+    """
+    agents: List[ProjectAgentAssignmentResponse]
+    total: int
+
+
+class CreatePersonalAgentBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    project_id: str = Field(..., min_length=1)
+    agent_type: AgentType = AgentType.SPECIALIST
+    config: Dict[str, Any] = Field(default_factory=dict)
+    capabilities: List[str] = Field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class StoredProject:
     id: str
@@ -102,11 +129,67 @@ class InMemoryProjectStore:
 
     When a PostgresPool is provided, projects are also persisted to PostgreSQL
     to satisfy foreign key constraints from other tables (e.g., boards).
+    On startup, projects are loaded from PostgreSQL to restore state.
     """
 
     def __init__(self, pool: Optional["PostgresPool"] = None) -> None:
         self._projects_by_owner: Dict[str, Dict[str, StoredProject]] = {}
         self._pool = pool
+        # Load existing projects from PostgreSQL on startup
+        if self._pool is not None:
+            self._load_from_postgres()
+
+    def _load_from_postgres(self) -> None:
+        """Load all projects from PostgreSQL into memory on startup."""
+        if self._pool is None:
+            return
+
+        loaded_count = 0
+
+        def _execute(conn) -> None:
+            nonlocal loaded_count
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT project_id, org_id, name, slug, description, visibility,
+                           settings, created_by, created_at, updated_at
+                    FROM projects
+                    """
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    project = StoredProject(
+                        id=row[0],
+                        org_id=row[1],
+                        name=row[2],
+                        slug=row[3],
+                        description=row[4],
+                        visibility=row[5],
+                        settings=row[6] if isinstance(row[6], dict) else {},
+                        owner_id=row[7],  # created_by is owner_id
+                        created_at=row[8],
+                        updated_at=row[9],
+                    )
+                    # Add to in-memory store by owner
+                    if project.owner_id not in self._projects_by_owner:
+                        self._projects_by_owner[project.owner_id] = {}
+                    self._projects_by_owner[project.owner_id][project.id] = project
+                    loaded_count += 1
+
+        try:
+            self._pool.run_transaction(
+                operation="project.load_all",
+                service_prefix="project",
+                actor=None,
+                metadata={},
+                executor=_execute,
+                telemetry=None,
+            )
+            if loaded_count > 0:
+                logger.info(f"Loaded {loaded_count} projects from PostgreSQL")
+        except Exception as e:
+            logger.warning(f"Failed to load projects from PostgreSQL: {e}")
+            # Don't fail startup - start with empty store
 
     def get_project(self, *, project_id: str, owner_id: str) -> Optional[StoredProject]:
         """Get a specific project by ID for a given owner."""
@@ -120,27 +203,52 @@ class InMemoryProjectStore:
         return [p for p in projects if p.org_id == org_id]
 
     def _persist_to_postgres(self, project: StoredProject) -> None:
-        """Persist project to PostgreSQL auth.projects table for FK integrity."""
+        """Persist project to PostgreSQL auth.projects table for FK integrity.
+
+        Also creates the owner membership record so the creator has proper access.
+        """
         if self._pool is None:
             return
 
         def _execute(conn) -> None:
             with conn.cursor() as cur:
+                # Insert project
                 cur.execute(
                     """
-                    INSERT INTO projects (id, org_id, name, description, settings, created_by, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO NOTHING
+                    INSERT INTO auth.projects (project_id, org_id, name, slug, description, visibility, settings, created_by, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (project_id) DO NOTHING
                     """,
                     (
                         project.id,
                         project.org_id,
                         project.name,
+                        project.slug,
                         project.description,
+                        project.visibility,
                         "{}",  # settings as JSON string
-                        project.owner_id,  # Now valid - user exists in auth.users via IdentityLinkingService
+                        project.owner_id,  # Now valid - user exists in auth.users (OAuth user ID)
                         project.created_at,
                         project.updated_at,
+                    ),
+                )
+
+                # Add creator as owner in project_memberships
+                import uuid
+                membership_id = f"mem-{uuid.uuid4().hex[:12]}"
+                cur.execute(
+                    """
+                    INSERT INTO auth.project_memberships (membership_id, project_id, user_id, role, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (project_id, user_id) DO NOTHING
+                    """,
+                    (
+                        membership_id,
+                        project.id,
+                        project.owner_id,
+                        "owner",
+                        project.created_at,
+                        project.created_at,
                     ),
                 )
 
@@ -199,6 +307,7 @@ def create_project_routes(
     *,
     store: InMemoryProjectStore,
     get_user_id: Callable[[Request], str],
+    org_service: Optional["OrganizationService"] = None,
     tags: Optional[List[str]] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1/projects", tags=tags or ["projects"])
@@ -208,14 +317,6 @@ def create_project_routes(
         user_id = get_user_id(request)
         projects = store.list_projects(owner_id=user_id, org_id=org_id)
         return ProjectListResponse(items=[p.to_dto() for p in projects])
-
-    @router.get("/{project_id}", response_model=ProjectDTO)
-    def get_project(request: Request, project_id: str) -> ProjectDTO:
-        user_id = get_user_id(request)
-        project = store.get_project(project_id=project_id, owner_id=user_id)
-        if project is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Project {project_id} not found")
-        return project.to_dto()
 
     @router.post("", response_model=ProjectDTO, status_code=status.HTTP_201_CREATED)
     def create_project(request: Request, body: CreateProjectBody) -> ProjectDTO:
@@ -236,6 +337,133 @@ def create_project_routes(
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+        return project.to_dto()
+
+    # -------------------------------------------------------------------------
+    # /agents routes MUST be defined BEFORE /{project_id} to avoid route conflict
+    # (FastAPI matches routes in order; /{project_id} would match "agents" as a project_id)
+    # -------------------------------------------------------------------------
+    if org_service is not None:
+        def _require_personal_project(user_id: str, project_id: str) -> StoredProject:
+            project = store.get_project(project_id=project_id, owner_id=user_id)
+            if project is None or project.org_id is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Project {project_id} not found",
+                )
+            return project
+
+        @router.get("/agents", response_model=PersonalAgentListResponse)
+        def list_personal_agents(
+            request: Request,
+            project_id: Optional[str] = Query(default=None),
+        ) -> PersonalAgentListResponse:
+            """List agent assignments for personal projects.
+
+            Uses the junction table pattern (execution.project_agent_assignments)
+            to return agents assigned to projects owned by the requesting user.
+            """
+            user_id = get_user_id(request)
+            if project_id:
+                _require_personal_project(user_id, project_id)
+            assignments = org_service.list_user_project_agent_assignments(
+                owner_id=user_id,
+                project_id=project_id,
+            )
+            return PersonalAgentListResponse(agents=assignments, total=len(assignments))
+
+        @router.post("/agents", response_model=ProjectAgentAssignmentResponse, status_code=status.HTTP_201_CREATED)
+        def create_personal_agent(request: Request, body: CreatePersonalAgentBody) -> ProjectAgentAssignmentResponse:
+            """Assign a registry agent to a personal project.
+
+            Extracts the registry_agent_id from body.config and creates a
+            project-agent assignment in the junction table.
+
+            For backward compatibility, accepts the legacy body format with
+            registry_agent_id inside config.
+            """
+            user_id = get_user_id(request)
+            _require_personal_project(user_id, body.project_id)
+
+            # Extract registry agent ID from config (frontend sends it there)
+            registry_agent_id = body.config.get("registry_agent_id")
+            if not registry_agent_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="config.registry_agent_id is required",
+                )
+
+            try:
+                assignment = org_service.assign_registry_agent_to_project(
+                    project_id=body.project_id,
+                    agent_id=registry_agent_id,
+                    assigned_by=user_id,
+                    config_overrides=body.config,
+                    role=ProjectAgentRole.PRIMARY,
+                )
+
+                # Fetch with agent details for response
+                assignments = org_service.list_project_agent_assignments(body.project_id)
+                return next((a for a in assignments if a.id == assignment.id), assignment)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(exc),
+                ) from exc
+
+        @router.delete("/agents/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
+        def delete_personal_agent(request: Request, agent_id: str) -> None:
+            """Remove an agent assignment.
+
+            The agent_id here is actually the assignment ID (paa-*).
+            For backward compatibility, we try both removing by assignment ID
+            and by looking up assignments to find a matching agent.
+            """
+            user_id = get_user_id(request)
+
+            # First try to remove by assignment ID directly
+            removed = org_service.remove_project_agent_assignment(
+                assignment_id=agent_id,
+                removed_by=user_id,
+            )
+            if not removed:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Agent assignment {agent_id} not found",
+                )
+    else:
+        # Fallback routes when org_service is not available - return empty results
+        @router.get("/agents", response_model=PersonalAgentListResponse)
+        def list_personal_agents_fallback(
+            request: Request,
+            project_id: Optional[str] = Query(default=None),
+        ) -> PersonalAgentListResponse:
+            _ = get_user_id(request)  # Still require auth
+            return PersonalAgentListResponse(agents=[], total=0)
+
+        @router.post("/agents", response_model=ProjectAgentAssignmentResponse, status_code=status.HTTP_201_CREATED)
+        def create_personal_agent_fallback(request: Request, body: CreatePersonalAgentBody) -> ProjectAgentAssignmentResponse:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Personal agent creation requires multi-tenant service to be configured",
+            )
+
+        @router.delete("/agents/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
+        def delete_personal_agent_fallback(request: Request, agent_id: str) -> None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Personal agent deletion requires multi-tenant service to be configured",
+            )
+
+    # -------------------------------------------------------------------------
+    # /{project_id} routes MUST come AFTER /agents routes
+    # -------------------------------------------------------------------------
+    @router.get("/{project_id}", response_model=ProjectDTO)
+    def get_project(request: Request, project_id: str) -> ProjectDTO:
+        user_id = get_user_id(request)
+        project = store.get_project(project_id=project_id, owner_id=user_id)
+        if project is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Project {project_id} not found")
         return project.to_dto()
 
     return router

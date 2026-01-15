@@ -11,6 +11,8 @@ export * from './types.js';
 // WebSocket Client
 export { CollabClient, ConnectionState, createCollabClient } from './client.js';
 export type { CollabClientConfig } from './client.js';
+export { ExecutionStreamClient, createExecutionStreamClient } from './executionClient.js';
+export type { ExecutionStreamConfig, ExecutionStreamTarget } from './executionClient.js';
 
 // REST API Client
 export { CollabApi, CollabApiError, createCollabApi } from './api.js';
@@ -43,3 +45,15 @@ export type {
 
 // Re-export PresenceInfo type alias for convenience (UserPresence status type)
 export type { UserPresence as PresenceInfo } from './types.js';
+
+// Shared Execution UI Components
+export {
+  ExecutionStatusBadge,
+  ExecutionStatusCard,
+  ExecutionTimeline,
+} from './components/execution/index.js';
+export type {
+  ExecutionStatusBadgeProps,
+  ExecutionStatusCardProps,
+  ExecutionTimelineProps,
+} from './components/execution/index.js';

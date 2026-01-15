@@ -228,7 +228,15 @@ class TelemetryClient:
             session_id=session_id,
             payload=dict(payload),
         )
-        self._sink.write(event)
+        try:
+            self._sink.write(event)
+        except Exception as exc:
+            # Telemetry failures should never crash the main request
+            # Log and continue - data can be recovered from other sources
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Telemetry write failed (event_type={event_type}): {exc}"
+            )
         return event
 
 

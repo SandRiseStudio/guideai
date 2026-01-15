@@ -24,6 +24,13 @@
     border-color var(--duration-fast) var(--ease-out-quart);
 }
 
+.org-switcher-label {
+  max-width: 160px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .org-switcher-trigger:hover {
   background: var(--color-bg-hover);
   border-color: var(--color-border-hover);

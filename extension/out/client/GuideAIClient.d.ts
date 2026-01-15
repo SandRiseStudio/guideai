@@ -74,6 +74,103 @@ export interface BCIBehaviorMatch {
     citation_label?: string;
     metadata?: Record<string, unknown> | null;
 }
+export type AgentStatus = 'draft' | 'active' | 'deprecated' | 'archived';
+export type AgentVisibility = 'private' | 'public' | 'org';
+export type RoleAlignment = 'strict' | 'flexible';
+export interface AgentVersion {
+    version: string;
+    status: AgentStatus;
+    created_at: string;
+    performance_score?: number;
+    change_log?: string;
+}
+export interface Agent {
+    agent_id: string;
+    name: string;
+    description: string;
+    status: AgentStatus;
+    version: string;
+    capabilities: string[];
+    behaviors: string[];
+    tags: string[];
+    mcp_servers: string[];
+    visibility: AgentVisibility;
+    role_alignment: RoleAlignment;
+    versions: AgentVersion[];
+    owner?: string;
+    created_at?: string;
+    updated_at?: string;
+}
+export interface AgentSearchResult {
+    agent: Agent;
+    score: number;
+    match_reason?: string;
+}
+export interface TopPerformer {
+    agentId: string;
+    agentName: string;
+    metricValue: number;
+    metricName: string;
+    changePercent: number;
+    rank?: number;
+}
+export interface PerformanceAlert {
+    id: string;
+    agentId: string;
+    agentName: string;
+    metric: string;
+    threshold: number;
+    value: number;
+    timestamp: string;
+    status: 'active' | 'acknowledged' | 'resolved';
+    severity: 'low' | 'medium' | 'high' | 'critical';
+}
+export interface AgentPerformanceSummary {
+    totalSavings: number;
+    avgLatency: number;
+    successRate: number;
+    activeAgents: number;
+    totalRuns?: number;
+    errorCount?: number;
+}
+export interface ProjectSettings {
+    id?: string;
+    name: string;
+    description?: string;
+    github_repo?: string;
+    default_branch?: string;
+    compliance_tier?: string;
+    cost_budget?: number;
+    allowed_mcp_servers?: string[];
+    members?: any[];
+    created_at?: string;
+    updated_at?: string;
+}
+export interface GithubValidationResult {
+    valid: boolean;
+    repo_name?: string;
+    error?: string;
+    permissions?: string[];
+}
+export interface LLMCredential {
+    credential_id: string;
+    provider: string;
+    name: string;
+    key_prefix: string;
+    is_valid: boolean;
+    failure_count: number;
+    last_used_at?: string;
+    created_at: string;
+    updated_at: string;
+}
+export interface CredentialAuditEntry {
+    audit_id: string;
+    credential_id: string;
+    action: string;
+    actor_id: string;
+    details?: Record<string, unknown>;
+    created_at: string;
+}
 export interface BCIRetrieveOptions {
     query: string;
     topK?: number;
@@ -267,12 +364,17 @@ export declare class GuideAIClient {
     private context;
     private pythonPath;
     private cliPath;
+    private apiBaseUrl;
     private outputChannel;
     private telemetryEnabled;
     private telemetryActorId;
     private telemetryActorRole;
     private readonly telemetrySurface;
     constructor(context: vscode.ExtensionContext);
+    /**
+     * Make an HTTP API call to the guideai backend
+     */
+    private callAPI;
     /**
      * List all behaviors with optional filters
      */
@@ -393,6 +495,65 @@ export declare class GuideAIClient {
     }): Promise<any>;
     bciRetrieve(options: BCIRetrieveOptions): Promise<BCIRetrieveResponse>;
     bciValidateCitations(request: BCIValidateRequest): Promise<BCIValidateResponse>;
+    getAgent(agentId: string, version?: string): Promise<Agent>;
+    listAgents(filters?: {
+        tag?: string;
+        status?: AgentStatus;
+        limit?: number;
+    }): Promise<Agent[]>;
+    searchAgents(query: string, options?: {
+        limit?: number;
+        minScore?: number;
+    }): Promise<AgentSearchResult[]>;
+    publishAgent(agentId: string): Promise<void>;
+    deprecateAgent(agentId: string, reason: string): Promise<void>;
+    updateAgent(agentId: string, updates: Partial<Agent>): Promise<Agent>;
+    getTopPerformers(metric: string, limit?: number, periodDays?: number): Promise<TopPerformer[]>;
+    getAgentPerformanceAlerts(agentId?: string, metric?: string, activeOnly?: boolean, limit?: number): Promise<PerformanceAlert[]>;
+    getAgentPerformanceSummary(agentId?: string, days?: number): Promise<AgentPerformanceSummary>;
+    getProjectSettings(projectId: string): Promise<ProjectSettings>;
+    updateProjectSettings(projectId: string, settings: Partial<ProjectSettings>): Promise<ProjectSettings>;
+    validateGithubRepo(projectId: string, url: string): Promise<GithubValidationResult>;
+    /**
+     * Get all BYOK credentials for a project (keys returned as prefix only)
+     */
+    getProjectCredentials(projectId: string): Promise<LLMCredential[]>;
+    /**
+     * Add or replace a BYOK credential for a project
+     */
+    addProjectCredential(projectId: string, provider: string, apiKey: string, name?: string): Promise<LLMCredential>;
+    /**
+     * Delete a BYOK credential from a project
+     */
+    deleteProjectCredential(projectId: string, credentialId: string): Promise<void>;
+    /**
+     * Re-enable a disabled credential with a new API key
+     */
+    reEnableProjectCredential(projectId: string, credentialId: string, apiKey: string): Promise<LLMCredential>;
+    /**
+     * Get audit log for a specific credential
+     */
+    getProjectCredentialAudit(projectId: string, credentialId: string, limit?: number): Promise<CredentialAuditEntry[]>;
+    /**
+     * Get all BYOK credentials for an organization
+     */
+    getOrgCredentials(orgId: string): Promise<LLMCredential[]>;
+    /**
+     * Add or replace a BYOK credential for an organization
+     */
+    addOrgCredential(orgId: string, provider: string, apiKey: string, name?: string): Promise<LLMCredential>;
+    /**
+     * Delete a BYOK credential from an organization
+     */
+    deleteOrgCredential(orgId: string, credentialId: string): Promise<void>;
+    /**
+     * Re-enable a disabled org credential with a new API key
+     */
+    reEnableOrgCredential(orgId: string, credentialId: string, apiKey: string): Promise<LLMCredential>;
+    /**
+     * Get audit log for an org credential
+     */
+    getOrgCredentialAudit(orgId: string, credentialId: string, limit?: number): Promise<CredentialAuditEntry[]>;
     /**
      * Convert days to start/end date strings for CLI
      */

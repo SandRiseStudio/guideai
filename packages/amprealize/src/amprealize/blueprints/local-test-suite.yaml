@@ -122,50 +122,48 @@ services:
   # ---------------------------------------------------------------------------
 
   guideai-api:
-    image: guideai-core-api:dev
+    image: docker.io/library/python:3.11-slim-bookworm
     module: console
-    build:
-      context: "${GUIDEAI_REPO_ROOT:-.}"
-      dockerfile: "deployment/Dockerfile.core.simple"
-      rebuild: false
     ports:
       - "${GUIDEAI_API_PORT:-8000}:8000"
     depends_on:
       - guideai-db
       - telemetry-db
       - redis
+    volumes:
+      - "${GUIDEAI_REPO_ROOT:-.}:/app"
+      - "guideai-api-pip-cache:/root/.cache/pip"
+    workdir: /app
     command:
-      - "uvicorn"
-      - "guideai.api:app"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8000"
-      - "--workers"
-      - "${GUIDEAI_API_WORKERS:-1}"
-      - "--log-level"
-      - "info"
+      - "sh"
+      - "-c"
+      - "pip install -e . -e ./packages/raze -e ./packages/amprealize && uvicorn guideai.api:app --host 0.0.0.0 --port 8000 --workers ${GUIDEAI_API_WORKERS:-1} --log-level info"
     environment:
       # =========================================================================
       # NEW: Consolidated database connection (schema-based routing)
       # =========================================================================
-      DATABASE_URL: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
+      # Default search_path includes all schemas for maximum compatibility
+      DATABASE_URL: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
       TELEMETRY_DATABASE_URL: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+      # Explicit Org DSN for OrganizationService (auth schema first)
+      GUIDEAI_ORG_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
 
       # =========================================================================
       # LEGACY: Per-service DSNs (for backward compatibility during migration)
-      # These all point to guideai-db now - services use schema search_path
+      # These all point to guideai-db now with search_path including all schemas
       # =========================================================================
-      GUIDEAI_AUTH_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_BOARD_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_ACTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_RUN_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_WORKFLOW_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_BEHAVIOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_COMPLIANCE_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_AGENT_ORCHESTRATOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_AGENT_REGISTRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
-      GUIDEAI_METRICS_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}"
+      # search_path includes: auth, execution, board, behavior, workflow, consent, audit, public
+      GUIDEAI_AUTH_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_BOARD_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dboard,auth,execution,behavior,workflow,consent,audit,public"
+      GUIDEAI_ACTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_RUN_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_EXECUTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_WORKFLOW_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dworkflow,auth,execution,board,behavior,consent,audit,public"
+      GUIDEAI_BEHAVIOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dbehavior,auth,execution,board,workflow,consent,audit,public"
+      GUIDEAI_COMPLIANCE_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dconsent,auth,execution,board,behavior,workflow,audit,public"
+      GUIDEAI_AGENT_ORCHESTRATOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_AGENT_REGISTRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_METRICS_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
       GUIDEAI_TELEMETRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
 
       # =========================================================================
@@ -187,11 +185,24 @@ services:
       GUIDEAI_CORS_ORIGINS: "http://localhost:${GUIDEAI_WEB_CONSOLE_PORT:-5173},http://localhost:5173,http://localhost:3000"
       GUIDEAI_DEVICE_VERIFICATION_URI: "http://localhost:${GUIDEAI_API_PORT:-8000}/v1/device/authorize"
       REDIS_URL: "redis://redis:6379/0"
+
+      # =========================================================================
+      # LLM Provider API Keys (for agent execution)
+      # =========================================================================
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      # BYOK (Bring Your Own Key) credential encryption - required for persistent storage
+      BYOK_ENCRYPTION_KEY: "${BYOK_ENCRYPTION_KEY:-F8mx5M0oI4byBM353Yu5dtcz8d4AxlEKl1cBf2FW0Y4=}"
     healthcheck_timeout_s: 90
     post_start_commands:
       # Run Alembic migrations to create all schemas and tables
-      - command: ["sh", "-c", "alembic -c alembic.ini upgrade head 2>&1 || (echo 'Migration failed, stamping head...' && alembic -c alembic.ini stamp head)"]
+      - command: ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"]
         description: "Run Alembic migrations (creates schemas: auth, board, behavior, execution, workflow, consent, audit)"
+        timeout_s: 120
+      # Run Telemetry Alembic migrations (separate TimescaleDB)
+      - command: ["python", "-m", "alembic", "-c", "alembic.telemetry.ini", "upgrade", "head"]
+        description: "Run Telemetry Alembic migrations (creates TimescaleDB hypertables: telemetry_events, execution_traces)"
         timeout_s: 120
 
   web-console:
@@ -201,9 +212,11 @@ services:
       - "${GUIDEAI_WEB_CONSOLE_PORT:-5173}:5173"
     volumes:
       - "${GUIDEAI_REPO_ROOT:-.}/web-console:/app"
+      - "${GUIDEAI_REPO_ROOT:-.}/packages/collab-client:/app/packages/collab-client"
       - "guideai-web-console-node-modules:/app/node_modules"
     environment:
       VITE_API_BASE_URL: "${VITE_API_BASE_URL:-http://localhost:8000}"
+      GUIDEAI_REPO_ROOT: "/app"
       CHOKIDAR_USEPOLLING: "true"
       CHOKIDAR_INTERVAL: "200"
     command:
@@ -283,3 +296,5 @@ volumes:
   # Application volumes
   guideai-web-console-node-modules:
     name: guideai-local-web-console-node-modules
+  guideai-api-pip-cache:
+    name: guideai-local-api-pip-cache

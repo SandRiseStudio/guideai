@@ -789,6 +789,10 @@ class PodmanExecutor(ResourceCapableExecutor):
         for vol in config.volumes:
             args.extend(["-v", vol])
 
+        # Working directory
+        if config.workdir:
+            args.extend(["-w", config.workdir])
+
         # Image
         args.append(config.image)
 

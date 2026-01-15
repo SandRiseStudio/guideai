@@ -6,12 +6,12 @@
  * Following `COLLAB_SAAS_REQUIREMENTS.md` (Student): fast, floaty, animated.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { ConsoleSidebar } from '../ConsoleSidebar';
-import { OrgSwitcher } from '../OrgSwitcher';
-import { useOrganizations, useProjects, type Project } from '../../api/dashboard';
+import { useProjects, type Project } from '../../api/dashboard';
+import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
 import './ProjectsPage.css';
 
 function getRelativeTime(dateString?: string): string {
@@ -45,38 +45,47 @@ export function ProjectsPage(): React.JSX.Element {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const orgFromQuery = searchParams.get('org') ?? undefined;
-  const [currentOrgId, setCurrentOrgId] = useState<string | undefined>(orgFromQuery);
-
-  const { data: organizations = [] } = useOrganizations();
+  const { currentOrgId } = useOrgContext();
+  const orgFromQuery = searchParams.get('org');
   const {
     data: projects = [],
     isLoading: projectsLoading,
     isFetching: projectsFetching,
     isError: projectsError,
     refetch: refetchProjects,
-  } = useProjects(currentOrgId);
+  } = useProjects(currentOrgId ?? undefined);
 
   const [query, setQuery] = useState('');
 
+  useEffect(() => {
+    if (!orgFromQuery) return;
+    if (orgFromQuery !== currentOrgId) {
+      orgContextStore.setCurrentOrgId(orgFromQuery);
+    }
+  }, [currentOrgId, orgFromQuery]);
 
-  const filteredProjects = useMemo(
-    () => projects.filter((p) => matchesQuery(p, query)),
-    [projects, query]
+  useEffect(() => {
+    const current = searchParams.get('org');
+    const nextValue = currentOrgId ?? null;
+    if ((current ?? null) === nextValue) return;
+    const next = new URLSearchParams(searchParams);
+    if (currentOrgId) {
+      next.set('org', currentOrgId);
+    } else {
+      next.delete('org');
+    }
+    setSearchParams(next, { replace: true });
+  }, [currentOrgId, searchParams, setSearchParams]);
+
+  const scopedProjects = useMemo(
+    () => (currentOrgId ? projects : projects.filter((project) => !project.org_id)),
+    [currentOrgId, projects]
   );
 
-  const handleOrgSelect = useCallback(
-    (orgId?: string) => {
-      setCurrentOrgId(orgId);
-      const next = new URLSearchParams(searchParams);
-      if (orgId) {
-        next.set('org', orgId);
-      } else {
-        next.delete('org');
-      }
-      setSearchParams(next, { replace: true });
-    },
-    [searchParams, setSearchParams]
+
+  const filteredProjects = useMemo(
+    () => scopedProjects.filter((p) => matchesQuery(p, query)),
+    [query, scopedProjects]
   );
 
   const handleNewProject = useCallback(() => {
@@ -88,8 +97,8 @@ export function ProjectsPage(): React.JSX.Element {
     refetchProjects();
   }, [refetchProjects]);
 
-  const showProjectsLoading = projectsLoading || (projectsFetching && projects.length === 0);
-  const showProjectsError = projectsError && projects.length === 0;
+  const showProjectsLoading = projectsLoading || (projectsFetching && scopedProjects.length === 0);
+  const showProjectsError = projectsError && scopedProjects.length === 0;
 
   return (
     <WorkspaceShell
@@ -106,7 +115,6 @@ export function ProjectsPage(): React.JSX.Element {
           </div>
 
           <div className="projects-header-right">
-            <OrgSwitcher organizations={organizations} currentOrgId={currentOrgId} onSelect={handleOrgSelect} />
             <button type="button" className="projects-new-button pressable" onClick={handleNewProject} data-haptic="light">
               New Project
             </button>

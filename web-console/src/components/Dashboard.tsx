@@ -16,11 +16,11 @@
  * - behavior_update_docs_after_changes (Student)
  */
 
-import { memo, useCallback, useMemo, useState } from 'react';
+import { memo, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { WorkspaceShell } from './workspace/WorkspaceShell';
 import { ConsoleSidebar } from './ConsoleSidebar';
-import { OrgSwitcher } from './OrgSwitcher';
+import { orgContextStore, useOrgContext } from '../store/orgContextStore';
 import {
   useDashboardStats,
   useOrganizations,
@@ -115,6 +115,46 @@ const StatCard = memo(function StatCard({
         <span className="stat-card-label">{label}</span>
         {subValue && <span className="stat-card-subvalue">{subValue}</span>}
       </div>
+    </button>
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Workspace Card Component
+// ---------------------------------------------------------------------------
+
+interface WorkspaceCardProps {
+  title: string;
+  subtitle: string;
+  meta?: string;
+  active?: boolean;
+  variant?: 'personal' | 'org' | 'create';
+  onClick: () => void;
+}
+
+const WorkspaceCard = memo(function WorkspaceCard({
+  title,
+  subtitle,
+  meta,
+  active,
+  variant = 'org',
+  onClick,
+}: WorkspaceCardProps) {
+  return (
+    <button
+      className={`workspace-card pressable ${active ? 'active' : ''} variant-${variant} animate-fade-in-up`}
+      onClick={onClick}
+      aria-pressed={active}
+      data-haptic="light"
+    >
+      <div className="workspace-card-header">
+        <span className="workspace-card-title">{title}</span>
+        <span className="workspace-badge">
+          {variant === 'personal' ? 'Personal' : variant === 'create' ? 'Create' : 'Org'}
+        </span>
+      </div>
+      <span className="workspace-card-subtitle">{subtitle}</span>
+      {meta && <span className="workspace-card-meta">{meta}</span>}
     </button>
   );
 });
@@ -369,7 +409,7 @@ const DashboardSidebar = memo(function DashboardSidebar({ onNavigate }: { onNavi
 
 export function Dashboard() {
   const navigate = useNavigate();
-  const [currentOrgId, setCurrentOrgId] = useState<string | undefined>(undefined);
+  const { currentOrgId } = useOrgContext();
 
   // API hooks
   const { data: stats, isLoading: statsLoading } = useDashboardStats();
@@ -380,19 +420,23 @@ export function Dashboard() {
     isFetching: projectsFetching,
     isError: projectsError,
     refetch: refetchProjects,
-  } = useProjects(currentOrgId);
+  } = useProjects(currentOrgId ?? undefined);
   const {
     data: agents = [],
     isLoading: agentsLoading,
     isFetching: agentsFetching,
     isError: agentsError,
-  } = useAgents(currentOrgId);
+  } = useAgents(currentOrgId ?? undefined);
   const {
     data: recentRuns = [],
     isLoading: runsLoading,
     isFetching: runsFetching,
     isError: runsError,
   } = useRecentRuns(5);
+  const sortedOrganizations = useMemo(
+    () => [...organizations].sort((a, b) => a.name.localeCompare(b.name)),
+    [organizations]
+  );
 
   // Navigation handlers
   const handleNavigate = useCallback((path: string) => {
@@ -403,13 +447,35 @@ export function Dashboard() {
     return currentOrgId ? `/projects/new?org=${encodeURIComponent(currentOrgId)}` : '/projects/new';
   }, [currentOrgId]);
 
+  const scopedProjects = useMemo(
+    () => (currentOrgId ? projects : projects.filter((project) => !project.org_id)),
+    [currentOrgId, projects]
+  );
+  const scopedAgents = useMemo(
+    () => (currentOrgId ? agents : agents.filter((agent) => !agent.org_id)),
+    [currentOrgId, agents]
+  );
+  const scopedStats = useMemo(() => {
+    if (!stats) return undefined;
+    const activeAgents = scopedAgents.filter((agent) => agent.status === 'active').length;
+    const busyAgents = scopedAgents.filter((agent) => agent.status === 'busy').length;
+    return {
+      ...stats,
+      total_projects: scopedProjects.length,
+      total_agents: scopedAgents.length,
+      active_agents: activeAgents,
+      busy_agents: busyAgents,
+    };
+  }, [scopedAgents, scopedProjects, stats]);
+
   const handleProjectClick = useCallback((project: Project) => {
     navigate(`/projects/${project.id}`);
   }, [navigate]);
 
   const handleAgentClick = useCallback((agent: Agent) => {
-    // TODO: Wire agent detail page when /agents routes land.
-    navigate(`/agents/${agent.id}`);
+    const config = (agent.config ?? {}) as Record<string, unknown>;
+    const registryAgentId = typeof config.registry_agent_id === 'string' ? config.registry_agent_id : null;
+    navigate(registryAgentId ? `/agents/${registryAgentId}` : '/agents');
   }, [navigate]);
 
   const handleRunClick = useCallback((run: Run) => {
@@ -418,14 +484,14 @@ export function Dashboard() {
   }, [navigate]);
 
   // Limit displayed items
-  const displayedProjects = projects.slice(0, 6);
-  const displayedAgents = agents.slice(0, 5);
+  const displayedProjects = scopedProjects.slice(0, 6);
+  const displayedAgents = scopedAgents.slice(0, 5);
   const showProjectsLoading = projectsLoading
-    || (projectsFetching && projects.length === 0)
-    || (projectsError && projects.length === 0);
+    || (projectsFetching && scopedProjects.length === 0)
+    || (projectsError && scopedProjects.length === 0);
   const showAgentsLoading = agentsLoading
-    || (agentsFetching && agents.length === 0)
-    || (agentsError && agents.length === 0);
+    || (agentsFetching && scopedAgents.length === 0)
+    || (agentsError && scopedAgents.length === 0);
   const showRunsLoading = runsLoading
     || (runsFetching && recentRuns.length === 0)
     || (runsError && recentRuns.length === 0);
@@ -451,13 +517,58 @@ export function Dashboard() {
         <header className="dashboard-header">
           <div className="dashboard-header-left">
             <h1 className="dashboard-title animate-fade-in-up">Dashboard</h1>
-            <OrgSwitcher
-              organizations={organizations}
-              currentOrgId={currentOrgId}
-              onSelect={setCurrentOrgId}
-            />
           </div>
         </header>
+
+        {/* Workspaces */}
+        <section className="dashboard-section dashboard-workspaces" aria-label="Workspaces">
+          <div className="section-header">
+            <h2 className="section-title">Workspaces</h2>
+            <button
+              className="section-action pressable"
+              onClick={() => handleNavigate('/orgs')}
+              data-haptic="light"
+            >
+              Manage orgs
+              <ArrowRightIcon />
+            </button>
+          </div>
+          <div className="workspace-cards">
+            <WorkspaceCard
+              title="Personal workspace"
+              subtitle="Projects you own outside any organization."
+              meta={currentOrgId ? 'Switch to personal' : 'Selected'}
+              active={!currentOrgId}
+              variant="personal"
+              onClick={() => orgContextStore.setCurrentOrgId(null)}
+            />
+            {sortedOrganizations.length === 0 ? (
+              <WorkspaceCard
+                title="Create an organization"
+                subtitle="Invite teammates and manage shared work."
+                meta="Start collaborating"
+                variant="create"
+                onClick={() => handleNavigate('/orgs')}
+              />
+            ) : (
+              sortedOrganizations.map((org) => (
+                <WorkspaceCard
+                  key={org.id}
+                  title={org.name}
+                  subtitle={org.slug}
+                  meta={
+                    org.member_count == null
+                      ? 'Members unknown'
+                      : `${org.member_count} member${org.member_count === 1 ? '' : 's'}`
+                  }
+                  active={currentOrgId === org.id}
+                  variant="org"
+                  onClick={() => orgContextStore.setCurrentOrgId(org.id)}
+                />
+              ))
+            )}
+          </div>
+        </section>
 
         {/* Stats Row */}
         <section className="dashboard-stats" aria-label="Key metrics">
@@ -473,14 +584,14 @@ export function Dashboard() {
               <StatCard
                 icon={<ProjectIcon />}
                 label="Projects"
-                value={stats?.total_projects ?? 0}
+                value={scopedStats?.total_projects ?? 0}
                 onClick={() => handleNavigate('/projects')}
               />
               <StatCard
                 icon={<AgentIcon />}
                 label="Agents"
-                value={stats?.total_agents ?? 0}
-                subValue={`${stats?.active_agents ?? 0} active`}
+                value={scopedStats?.total_agents ?? 0}
+                subValue={`${scopedStats?.active_agents ?? 0} active`}
                 onClick={() => handleNavigate('/agents')}
               />
               <StatCard

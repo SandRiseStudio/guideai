@@ -1,12 +1,11 @@
-"""
-OAuth provider implementations for GuideAI multi-provider authentication.
+"""OAuth provider implementations for GuideAI multi-provider authentication.
 
 Supports:
 - GitHub OAuth (device flow)
-- GitLab OAuth (device flow)
-- Bitbucket OAuth (device flow)
-- Google OAuth (device flow)
-- Internal auth (username/password)
+- Google OAuth (web flow + device flow)
+
+Note: InternalAuthProvider was deprecated on 2026-01-09.
+User authentication is now handled via auth.users table and UserAuthService.
 """
 
 from .base import (
@@ -24,7 +23,6 @@ from .base import (
 )
 from .github import GitHubOAuthProvider
 from .google import GoogleOAuthProvider
-from .internal import InternalAuthProvider
 from .registry import ProviderRegistry
 
 __all__ = [
@@ -41,6 +39,5 @@ __all__ = [
     "OAuthError",
     "GitHubOAuthProvider",
     "GoogleOAuthProvider",
-    "InternalAuthProvider",
     "ProviderRegistry",
 ]

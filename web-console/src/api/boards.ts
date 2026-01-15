@@ -86,6 +86,27 @@ export interface WorkItem {
   org_id?: string | null;
 }
 
+export type WorkItemCommentAuthorType = 'user' | 'agent';
+
+export interface WorkItemComment {
+  comment_id: string;
+  work_item_id: string;
+  author_id: string;
+  author_type: WorkItemCommentAuthorType;
+  content: string;
+  run_id?: string | null;
+  metadata?: Record<string, unknown> | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface CreateWorkItemCommentRequest {
+  body: string;
+  author_type?: WorkItemCommentAuthorType;
+  run_id?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
 export interface CreateBoardRequest {
   project_id: string;
   name: string;
@@ -129,6 +150,17 @@ export interface MoveWorkItemRequest {
   expected_to_column_updated_at?: string | null;
 }
 
+export interface AssignWorkItemRequest {
+  assignee_id: string;
+  assignee_type: 'user' | 'agent';
+  reason?: string;
+}
+
+interface AssignmentResponse {
+  item: WorkItem;
+  message?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Query Keys
 // ---------------------------------------------------------------------------
@@ -139,6 +171,7 @@ export const boardKeys = {
   board: (boardId?: string) => [...boardKeys.all, 'board', boardId] as const,
   items: (boardId?: string) => [...boardKeys.all, 'items', boardId] as const,
   item: (itemId?: string) => [...boardKeys.all, 'item', itemId] as const,
+  comments: (itemId?: string) => [...boardKeys.all, 'comments', itemId] as const,
 };
 
 // ---------------------------------------------------------------------------
@@ -260,6 +293,31 @@ export function useWorkItem(itemId?: string, initialData?: WorkItem) {
     enabled: Boolean(itemId),
     staleTime: 2_000,
     initialData: itemId && initialData ? initialData : undefined,
+  });
+}
+
+export function useWorkItemComments(
+  itemId?: string,
+  options?: { limit?: number; offset?: number; enabled?: boolean }
+) {
+  const limit = options?.limit ?? 200;
+  const offset = options?.offset ?? 0;
+
+  return useQuery({
+    queryKey: boardKeys.comments(itemId),
+    queryFn: async (): Promise<WorkItemComment[]> => {
+      if (!itemId) return [];
+      const params = new URLSearchParams();
+      params.set('limit', String(limit));
+      params.set('offset', String(offset));
+      const suffix = params.toString();
+      const response = await apiClient.get<{ comments: WorkItemComment[] }>(
+        `/v1/work-items/${itemId}/comments${suffix ? `?${suffix}` : ''}`
+      );
+      return response.comments ?? [];
+    },
+    enabled: Boolean(itemId) && (options?.enabled ?? true),
+    staleTime: 2_000,
   });
 }
 
@@ -453,6 +511,226 @@ export function useUpdateWorkItem(boardId?: string) {
       await razeLog('INFO', 'Work item updated', {
         board_id: boardId ?? null,
         item_id: updated.item_id,
+      });
+    },
+  });
+}
+
+export function useAssignWorkItem(boardId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: { itemId: string; assigneeId: string; assigneeType: 'user' | 'agent'; reason?: string }): Promise<WorkItem> => {
+      await razeLog('INFO', 'Work item assign requested', {
+        board_id: boardId ?? null,
+        item_id: input.itemId,
+        assignee_id: input.assigneeId,
+        assignee_type: input.assigneeType,
+      });
+      const payload: AssignWorkItemRequest = {
+        assignee_id: input.assigneeId,
+        assignee_type: input.assigneeType,
+      };
+      if (input.reason) payload.reason = input.reason;
+      const response = await apiClient.post<AssignmentResponse>(`/v1/work-items/${input.itemId}:assign`, payload);
+      return response.item;
+    },
+    onMutate: async (input) => {
+      await queryClient.cancelQueries({ queryKey: boardKeys.item(input.itemId) });
+      if (boardId) {
+        await queryClient.cancelQueries({ queryKey: boardKeys.items(boardId) });
+      }
+
+      const previousItem = queryClient.getQueryData<WorkItem | null>(boardKeys.item(input.itemId)) ?? null;
+      const previousItems = boardId ? (queryClient.getQueryData<WorkItem[]>(boardKeys.items(boardId)) ?? []) : null;
+
+      const applyPatch = (item: WorkItem): WorkItem => ({
+        ...item,
+        assignee_id: input.assigneeId,
+        assignee_type: input.assigneeType,
+      });
+
+      if (previousItem) {
+        queryClient.setQueryData<WorkItem | null>(boardKeys.item(input.itemId), applyPatch(previousItem));
+      }
+
+      if (boardId && previousItems) {
+        queryClient.setQueryData<WorkItem[]>(boardKeys.items(boardId), (current) => {
+          const list = current ?? [];
+          return list.map((item) => (item.item_id === input.itemId ? applyPatch(item) : item));
+        });
+      }
+
+      return { previousItem, previousItems };
+    },
+    onError: async (error, input, context) => {
+      queryClient.setQueryData(boardKeys.item(input.itemId), (context as { previousItem?: WorkItem | null } | undefined)?.previousItem ?? null);
+      if (boardId) {
+        queryClient.setQueryData(boardKeys.items(boardId), (context as { previousItems?: WorkItem[] } | undefined)?.previousItems ?? []);
+      }
+      await razeLog('ERROR', 'Work item assign failed', {
+        board_id: boardId ?? null,
+        item_id: input.itemId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+    onSuccess: async (updated) => {
+      queryClient.setQueryData<WorkItem | null>(boardKeys.item(updated.item_id), updated);
+      if (boardId) {
+        queryClient.setQueryData<WorkItem[]>(boardKeys.items(boardId), (current) => {
+          const list = current ?? [];
+          return list.map((item) => (item.item_id === updated.item_id ? updated : item));
+        });
+      }
+      await razeLog('INFO', 'Work item assigned', {
+        board_id: boardId ?? null,
+        item_id: updated.item_id,
+        assignee_id: updated.assignee_id ?? null,
+        assignee_type: updated.assignee_type ?? null,
+      });
+    },
+  });
+}
+
+export function useUnassignWorkItem(boardId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: { itemId: string; reason?: string }): Promise<WorkItem> => {
+      await razeLog('INFO', 'Work item unassign requested', {
+        board_id: boardId ?? null,
+        item_id: input.itemId,
+      });
+      const reasonParam = input.reason ? `?reason=${encodeURIComponent(input.reason)}` : '';
+      const response = await apiClient.post<AssignmentResponse>(`/v1/work-items/${input.itemId}:unassign${reasonParam}`, {});
+      return response.item;
+    },
+    onMutate: async (input) => {
+      await queryClient.cancelQueries({ queryKey: boardKeys.item(input.itemId) });
+      if (boardId) {
+        await queryClient.cancelQueries({ queryKey: boardKeys.items(boardId) });
+      }
+
+      const previousItem = queryClient.getQueryData<WorkItem | null>(boardKeys.item(input.itemId)) ?? null;
+      const previousItems = boardId ? (queryClient.getQueryData<WorkItem[]>(boardKeys.items(boardId)) ?? []) : null;
+
+      const applyPatch = (item: WorkItem): WorkItem => ({
+        ...item,
+        assignee_id: null,
+        assignee_type: null,
+      });
+
+      if (previousItem) {
+        queryClient.setQueryData<WorkItem | null>(boardKeys.item(input.itemId), applyPatch(previousItem));
+      }
+
+      if (boardId && previousItems) {
+        queryClient.setQueryData<WorkItem[]>(boardKeys.items(boardId), (current) => {
+          const list = current ?? [];
+          return list.map((item) => (item.item_id === input.itemId ? applyPatch(item) : item));
+        });
+      }
+
+      return { previousItem, previousItems };
+    },
+    onError: async (error, input, context) => {
+      queryClient.setQueryData(boardKeys.item(input.itemId), (context as { previousItem?: WorkItem | null } | undefined)?.previousItem ?? null);
+      if (boardId) {
+        queryClient.setQueryData(boardKeys.items(boardId), (context as { previousItems?: WorkItem[] } | undefined)?.previousItems ?? []);
+      }
+      await razeLog('ERROR', 'Work item unassign failed', {
+        board_id: boardId ?? null,
+        item_id: input.itemId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+    onSuccess: async (updated) => {
+      queryClient.setQueryData<WorkItem | null>(boardKeys.item(updated.item_id), updated);
+      if (boardId) {
+        queryClient.setQueryData<WorkItem[]>(boardKeys.items(boardId), (current) => {
+          const list = current ?? [];
+          return list.map((item) => (item.item_id === updated.item_id ? updated : item));
+        });
+      }
+      await razeLog('INFO', 'Work item unassigned', {
+        board_id: boardId ?? null,
+        item_id: updated.item_id,
+      });
+    },
+  });
+}
+
+export function usePostWorkItemComment(itemId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: {
+      body: string;
+      authorId: string;
+      authorType: WorkItemCommentAuthorType;
+      runId?: string | null;
+      metadata?: Record<string, unknown>;
+    }): Promise<WorkItemComment> => {
+      if (!itemId) throw new Error('itemId is required');
+      await razeLog('INFO', 'Work item comment post requested', {
+        item_id: itemId,
+        author_id: input.authorId,
+        author_type: input.authorType,
+      });
+      const response = await apiClient.post<{ comment: WorkItemComment }>(
+        `/v1/work-items/${itemId}/comments`,
+        {
+          body: input.body,
+          author_type: input.authorType,
+          run_id: input.runId ?? undefined,
+          metadata: input.metadata ?? undefined,
+        } satisfies CreateWorkItemCommentRequest
+      );
+      return response.comment;
+    },
+    onMutate: async (input) => {
+      if (!itemId) return {};
+      await queryClient.cancelQueries({ queryKey: boardKeys.comments(itemId) });
+
+      const previous = queryClient.getQueryData<WorkItemComment[]>(boardKeys.comments(itemId)) ?? [];
+      const optimisticId = `temp-comment-${Date.now()}`;
+      const now = new Date().toISOString();
+      const optimistic: WorkItemComment = {
+        comment_id: optimisticId,
+        work_item_id: itemId,
+        author_id: input.authorId,
+        author_type: input.authorType,
+        content: input.body,
+        run_id: input.runId ?? null,
+        metadata: input.metadata ?? {},
+        created_at: now,
+        updated_at: now,
+      };
+      queryClient.setQueryData<WorkItemComment[]>(boardKeys.comments(itemId), [...previous, optimistic]);
+
+      return { previous, optimisticId };
+    },
+    onError: async (error, input, context) => {
+      if (!itemId) return;
+      const previous = (context as { previous?: WorkItemComment[] } | undefined)?.previous ?? [];
+      queryClient.setQueryData(boardKeys.comments(itemId), previous);
+      await razeLog('ERROR', 'Work item comment post failed', {
+        item_id: itemId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+    onSuccess: async (comment, input, context) => {
+      if (!itemId) return;
+      const optimisticId = (context as { optimisticId?: string } | undefined)?.optimisticId ?? null;
+      queryClient.setQueryData<WorkItemComment[]>(boardKeys.comments(itemId), (current) => {
+        const list = current ?? [];
+        if (!optimisticId) return [...list, comment];
+        const replaced = list.map((entry) => (entry.comment_id === optimisticId ? comment : entry));
+        return replaced.some((entry) => entry.comment_id === comment.comment_id) ? replaced : [...replaced, comment];
+      });
+      await razeLog('INFO', 'Work item comment posted', {
+        item_id: itemId,
+        comment_id: comment.comment_id,
       });
     },
   });

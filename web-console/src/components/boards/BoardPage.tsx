@@ -9,10 +9,12 @@
  */
 
 import React, { memo, useCallback, useMemo, useState } from 'react';
+import { ExecutionStatusBadge, type ExecutionListItem } from '@guideai/collab-client';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ConsoleSidebar } from '../ConsoleSidebar';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
-import { useProject } from '../../api/dashboard';
+import { useAgents, useProject } from '../../api/dashboard';
+import { usePersonalAgents } from '../../api/agentRegistry';
 import {
   type BoardColumn,
   type WorkItem,
@@ -22,7 +24,15 @@ import {
   useMoveWorkItem,
   useWorkItems,
 } from '../../api/boards';
-import { WorkItemDrawer } from './WorkItemDrawer';
+import {
+  useCancelWorkItemExecution,
+  useExecuteWorkItem,
+  useExecutionList,
+  useExecutionStream,
+} from '../../api/executions';
+import { useOrgMembers } from '../../api/organizations';
+import { useAuth } from '../../contexts/AuthContext';
+import { WorkItemDrawer, type AssigneeProfile } from './WorkItemDrawer';
 import './BoardPage.css';
 
 function getColumnAccentIndex(index: number): number {
@@ -46,6 +56,24 @@ function getRelativeTime(dateString?: string): string {
   if (diffHours < 24) return `${diffHours}h ago`;
   if (diffDays < 7) return `${diffDays}d ago`;
   return date.toLocaleDateString();
+}
+
+function shortenId(id: string): string {
+  if (id.length <= 8) return id;
+  return id.slice(0, 8);
+}
+
+function getInitials(label: string): string {
+  const parts = label.split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '?';
+  const first = parts[0]?.[0] ?? '';
+  const second = parts[1]?.[0] ?? '';
+  const initials = `${first}${second}`.toUpperCase();
+  return initials || '?';
+}
+
+function assigneeKey(type: 'user' | 'agent', id: string): string {
+  return `${type}:${id}`;
 }
 
 function sortByPosition<T extends { position?: number; updated_at?: string }>(items: T[]): T[] {
@@ -75,8 +103,15 @@ interface WorkItemCardProps {
   item: WorkItem;
   columns: BoardColumn[];
   targetPositions: Record<string, number>;
+  assigneeIndex: Map<string, AssigneeProfile>;
+  execution?: ExecutionListItem | null;
+  orgId?: string | null;
   onMove: (itemId: string, toColumnId: string | null, position: number) => void;
   onOpen: (itemId: string) => void;
+  onStartExecution: (itemId: string) => void;
+  onCancelExecution: (itemId: string) => void;
+  isStartPending: boolean;
+  isCancelPending: boolean;
   onDragStart: (event: React.DragEvent, itemId: string) => void;
   onDragEnd: () => void;
   selected: boolean;
@@ -86,8 +121,15 @@ const WorkItemCard = memo(function WorkItemCard({
   item,
   columns,
   targetPositions,
+  assigneeIndex,
+  execution,
+  orgId,
   onMove,
   onOpen,
+  onStartExecution,
+  onCancelExecution,
+  isStartPending,
+  isCancelPending,
   onDragStart,
   onDragEnd,
   selected,
@@ -95,6 +137,46 @@ const WorkItemCard = memo(function WorkItemCard({
   const moveSelectId = `move-${item.item_id}`;
   const label = item.item_type === 'task' ? 'Task' : item.item_type === 'story' ? 'Story' : 'Epic';
   const draggingRef = React.useRef(false);
+  const assignee = useMemo(() => {
+    if (!item.assignee_id || !item.assignee_type) return null;
+    const key = assigneeKey(item.assignee_type, item.assignee_id);
+    return assigneeIndex.get(key) ?? null;
+  }, [assigneeIndex, item.assignee_id, item.assignee_type]);
+
+  const assigneeLabel = useMemo(() => {
+    if (assignee) return assignee.label;
+    if (item.assignee_id && item.assignee_type) {
+      return item.assignee_type === 'agent'
+        ? `Agent ${shortenId(item.assignee_id)}`
+        : `Member ${shortenId(item.assignee_id)}`;
+    }
+    return 'Unassigned';
+  }, [assignee, item.assignee_id, item.assignee_type]);
+
+  const assigneeAvatar = useMemo(() => {
+    if (!item.assignee_id) return '+';
+    if (assignee?.avatar) return assignee.avatar;
+    return getInitials(assigneeLabel);
+  }, [assignee?.avatar, assigneeLabel, item.assignee_id]);
+
+  const executionState = useMemo(() => {
+    if (!execution?.state) return null;
+    return String(execution.state).toLowerCase();
+  }, [execution?.state]);
+  const isActiveExecution =
+    executionState === 'running' || executionState === 'paused' || executionState === 'pending';
+  const hasAgentAssignment = Boolean(item.assignee_id && item.assignee_type === 'agent');
+  // Orphaned assignment: work item references an agent that no longer exists
+  const isOrphanedAssignment = hasAgentAssignment && !assignee;
+  const canStartExecution = Boolean(hasAgentAssignment && !isActiveExecution && !isOrphanedAssignment);
+  const canCancelExecution = Boolean(isActiveExecution);
+  const startButtonTitle = isOrphanedAssignment
+    ? 'Assigned agent no longer exists. Please re-assign.'
+    : !hasAgentAssignment
+      ? 'Assign an agent to enable execution'
+      : isActiveExecution
+        ? 'Execution already running'
+        : 'Start execution';
 
   const handleMoveChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -136,6 +218,24 @@ const WorkItemCard = memo(function WorkItemCard({
     onDragEnd();
   }, [onDragEnd]);
 
+  const handleStartClick = useCallback(
+    (event: React.MouseEvent) => {
+      event.stopPropagation();
+      if (!canStartExecution) return;
+      onStartExecution(item.item_id);
+    },
+    [canStartExecution, item.item_id, onStartExecution]
+  );
+
+  const handleCancelClick = useCallback(
+    (event: React.MouseEvent) => {
+      event.stopPropagation();
+      if (!canCancelExecution) return;
+      onCancelExecution(item.item_id);
+    },
+    [canCancelExecution, item.item_id, onCancelExecution]
+  );
+
   return (
     <div
       className={`work-item-card work-item-card-${item.item_type} ${selected ? 'work-item-card-selected' : ''} pressable animate-fade-in-up`}
@@ -170,9 +270,60 @@ const WorkItemCard = memo(function WorkItemCard({
         </label>
       </div>
       <div className="work-item-title">{item.title}</div>
+      <div className="work-item-execution">
+        <ExecutionStatusBadge
+          state={executionState ?? 'unknown'}
+          phase={execution?.phase ?? null}
+          statusLabel={execution ? undefined : isOrphanedAssignment ? 'Invalid' : hasAgentAssignment ? 'Ready' : 'Unassigned'}
+          showPhase={Boolean(execution?.phase)}
+          showProgress={false}
+          progressPct={execution?.progressPct ?? null}
+        />
+        <div className="work-item-execution-actions">
+          {hasAgentAssignment && (
+            <button
+              type="button"
+              className="work-item-execution-button pressable"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={handleStartClick}
+              disabled={!canStartExecution || isStartPending}
+              title={startButtonTitle}
+              data-haptic="light"
+            >
+              {isStartPending ? 'Starting...' : 'Start'}
+            </button>
+          )}
+          {isActiveExecution && (
+            <button
+              type="button"
+              className="work-item-execution-button work-item-execution-cancel pressable"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={handleCancelClick}
+              disabled={!canCancelExecution || isCancelPending}
+              data-haptic="light"
+            >
+              {isCancelPending ? 'Cancelling...' : 'Cancel'}
+            </button>
+          )}
+        </div>
+      </div>
       <div className="work-item-meta">
         <span className="work-item-id">{item.item_id.replace('task-', '#').replace('story-', '#').replace('epic-', '#')}</span>
         <span className="work-item-time">{getRelativeTime(item.updated_at)}</span>
+      </div>
+      <div className="work-item-assignment" aria-label={`Assignee: ${assigneeLabel}`}>
+        <div
+          className={`work-item-assignee-pill ${
+            item.assignee_type ? `assignee-pill-${item.assignee_type}` : 'assignee-pill-unassigned'
+          }${isOrphanedAssignment ? ' assignee-pill-orphaned' : ''}`}
+          title={isOrphanedAssignment ? 'Agent no longer exists. Please re-assign.' : undefined}
+        >
+          <span className="assignee-pill-avatar">{assigneeAvatar}</span>
+          <span className="assignee-pill-name">{assigneeLabel}</span>
+          <span className="assignee-pill-type">
+            {isOrphanedAssignment ? '⚠ Missing' : item.assignee_type === 'agent' ? 'Agent' : item.assignee_type === 'user' ? 'Human' : 'Unassigned'}
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -184,9 +335,16 @@ interface ColumnLaneProps {
   items: WorkItem[];
   columns: BoardColumn[];
   targetPositions: Record<string, number>;
+  assigneeIndex: Map<string, AssigneeProfile>;
+  executionByItemId: Map<string, ExecutionListItem>;
+  orgId?: string | null;
   onCreate: (columnId: string, title: string, itemType: WorkItemType) => void;
   onMove: (itemId: string, toColumnId: string | null, position: number) => void;
   onOpen: (itemId: string) => void;
+  onStartExecution: (itemId: string) => void;
+  onCancelExecution: (itemId: string) => void;
+  isStartPending: boolean;
+  isCancelPending: boolean;
   onDropToColumn: (columnId: string, itemId: string) => void;
   onDragStart: (event: React.DragEvent, itemId: string) => void;
   onDragEnd: () => void;
@@ -199,9 +357,16 @@ const ColumnLane = memo(function ColumnLane({
   items,
   columns,
   targetPositions,
+  assigneeIndex,
+  executionByItemId,
+  orgId,
   onCreate,
   onMove,
   onOpen,
+  onStartExecution,
+  onCancelExecution,
+  isStartPending,
+  isCancelPending,
   onDropToColumn,
   onDragStart,
   onDragEnd,
@@ -304,8 +469,15 @@ const ColumnLane = memo(function ColumnLane({
             item={item}
             columns={columns}
             targetPositions={targetPositions}
+            assigneeIndex={assigneeIndex}
+            execution={executionByItemId.get(item.item_id) ?? null}
+            orgId={orgId}
             onMove={onMove}
             onOpen={onOpen}
+            onStartExecution={onStartExecution}
+            onCancelExecution={onCancelExecution}
+            isStartPending={isStartPending}
+            isCancelPending={isCancelPending}
             onDragStart={onDragStart}
             onDragEnd={onDragEnd}
             selected={item.item_id === selectedItemId}
@@ -319,13 +491,109 @@ const ColumnLane = memo(function ColumnLane({
 export function BoardPage(): React.JSX.Element {
   const navigate = useNavigate();
   const { projectId, boardId, itemId } = useParams();
+  const { actor } = useAuth();
 
   const { data: project } = useProject(projectId);
   const { data: board, isLoading: boardLoading } = useBoard(boardId);
   const { data: items = [], isLoading: itemsLoading } = useWorkItems(boardId);
+  const hasOrg = Boolean(project?.org_id);
+  const { data: orgMembers = [] } = useOrgMembers(hasOrg ? project?.org_id : null);
+  const { data: orgAgents = [] } = useAgents(project?.org_id ?? undefined, hasOrg);
+  const { data: personalAgents = [] } = usePersonalAgents(Boolean(projectId) && !hasOrg);
 
   const createItem = useCreateWorkItem();
   const moveItem = useMoveWorkItem(boardId);
+  const executionStream = useExecutionStream({
+    orgId: project?.org_id ?? null,
+    projectId: projectId ?? null,
+    enabled: Boolean(project?.org_id && projectId),
+  });
+  const executionListQuery = useExecutionList(project?.org_id ?? null, projectId ?? null, {
+    limit: 100,
+    refetchInterval: executionStream.isConnected ? false : 4000,
+  });
+  const executeWorkItem = useExecuteWorkItem();
+  const cancelExecution = useCancelWorkItemExecution();
+
+  const assignableHumans = useMemo<AssigneeProfile[]>(() => {
+    const list: AssigneeProfile[] = [];
+    const currentUserId = actor?.type === 'human' ? actor.id : null;
+    const currentLabel = actor?.displayName ?? (currentUserId ? `Member ${shortenId(currentUserId)}` : 'You');
+    const seen = new Set<string>();
+
+    if (currentUserId) {
+      list.push({
+        id: currentUserId,
+        type: 'user',
+        label: currentLabel,
+        subtitle: 'You',
+        avatar: getInitials(currentLabel),
+      });
+      seen.add(currentUserId);
+    }
+
+    orgMembers.forEach((member) => {
+      if (seen.has(member.user_id)) return;
+      const label = `Member ${shortenId(member.user_id)}`;
+      const role = member.role ? member.role.toLowerCase().replace(/_/g, ' ') : 'member';
+      list.push({
+        id: member.user_id,
+        type: 'user',
+        label,
+        subtitle: role,
+        avatar: getInitials(label),
+      });
+      seen.add(member.user_id);
+    });
+
+    return list;
+  }, [actor?.displayName, actor?.id, actor?.type, orgMembers]);
+
+  const assignableAgents = useMemo<AssigneeProfile[]>(() => {
+    const sourceAgents = hasOrg ? orgAgents : personalAgents;
+    const scopedAgents = projectId
+      ? sourceAgents.filter((agent) => {
+          if (hasOrg) {
+            return !agent.project_id || agent.project_id === projectId;
+          }
+          return agent.project_id === projectId;
+        })
+      : [];
+
+    return scopedAgents.map((agent) => {
+      // For personal projects, agents come from project_agent_assignments junction table.
+      // In that case, agent.id is the assignment row ID, NOT the actual agent ID.
+      // The backend populates config.registry_agent_id with the real agent ID.
+      // For org agents, agent.id is the actual agent ID.
+      const actualAgentId =
+        (agent.config?.registry_agent_id as string | undefined) || agent.id;
+      const label = agent.name || `Agent ${shortenId(actualAgentId)}`;
+      const typeLabel = agent.agent_type ? `${agent.agent_type} agent` : 'Agent';
+      return {
+        id: actualAgentId,
+        type: 'agent',
+        label,
+        subtitle: typeLabel,
+        status: agent.status,
+        avatar: getInitials(label),
+      };
+    });
+  }, [hasOrg, orgAgents, personalAgents, projectId]);
+
+  const assigneeIndex = useMemo(() => {
+    const index = new Map<string, AssigneeProfile>();
+    assignableHumans.forEach((profile) => {
+      index.set(assigneeKey(profile.type, profile.id), profile);
+    });
+    assignableAgents.forEach((profile) => {
+      index.set(assigneeKey(profile.type, profile.id), profile);
+    });
+    return index;
+  }, [assignableAgents, assignableHumans]);
+
+  const assignmentHint = useMemo(() => {
+    return hasOrg ? 'Org agents + project pins' : 'Personal project agents';
+  }, [hasOrg]);
 
   const columns = useMemo(() => {
     const cols = board?.columns ?? [];
@@ -352,6 +620,49 @@ export function BoardPage(): React.JSX.Element {
     }
     return positions;
   }, [columns, itemsByColumnId]);
+
+  const executionByItemId = useMemo(() => {
+    const map = new Map<string, ExecutionListItem>();
+    const executions = executionListQuery.data?.executions ?? [];
+    executions.forEach((execution) => {
+      const current = map.get(execution.workItemId);
+      if (!current) {
+        map.set(execution.workItemId, execution);
+        return;
+      }
+      const currentStarted = new Date(current.startedAt).getTime();
+      const nextStarted = new Date(execution.startedAt).getTime();
+      if (Number.isNaN(currentStarted) || nextStarted > currentStarted) {
+        map.set(execution.workItemId, execution);
+      }
+    });
+    return map;
+  }, [executionListQuery.data?.executions]);
+
+  const handleStartExecution = useCallback(
+    (itemIdValue: string) => {
+      if (!projectId) return;
+      executeWorkItem.mutate({
+        itemId: itemIdValue,
+        orgId: project?.org_id ?? null,
+        projectId,
+      });
+    },
+    [executeWorkItem, project?.org_id, projectId]
+  );
+
+  const handleCancelExecution = useCallback(
+    (itemIdValue: string) => {
+      if (!projectId) return;
+      cancelExecution.mutate({
+        itemId: itemIdValue,
+        orgId: project?.org_id ?? null,
+        projectId,
+        reason: 'User requested cancellation',
+      });
+    },
+    [cancelExecution, project?.org_id, projectId]
+  );
 
   const onDragStart = useCallback((event: React.DragEvent, itemId: string) => {
     event.dataTransfer.effectAllowed = 'move';
@@ -510,9 +821,16 @@ export function BoardPage(): React.JSX.Element {
                 items={itemsByColumnId[col.column_id] ?? []}
                 columns={columns}
                 targetPositions={targetPositions}
+                assigneeIndex={assigneeIndex}
+                executionByItemId={executionByItemId}
+                orgId={project?.org_id ?? null}
                 onCreate={onCreate}
                 onMove={onMove}
                 onOpen={onOpen}
+                onStartExecution={handleStartExecution}
+                onCancelExecution={handleCancelExecution}
+                isStartPending={executeWorkItem.isPending}
+                isCancelPending={cancelExecution.isPending}
                 onDropToColumn={onDropToColumn}
                 onDragStart={onDragStart}
                 onDragEnd={onDragEnd}
@@ -525,11 +843,16 @@ export function BoardPage(): React.JSX.Element {
         {itemId && (
           <WorkItemDrawer
             projectId={projectId}
+            orgId={project?.org_id ?? null}
             boardId={boardId}
             itemId={itemId}
             columns={columns}
             targetPositions={targetPositions}
             initialItem={selectedItem}
+            assigneeIndex={assigneeIndex}
+            assignableHumans={assignableHumans}
+            assignableAgents={assignableAgents}
+            assignmentHint={assignmentHint}
             onMove={onMove}
             onRequestClose={onCloseDrawer}
           />

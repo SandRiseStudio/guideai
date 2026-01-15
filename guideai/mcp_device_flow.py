@@ -108,6 +108,116 @@ class MCPDeviceFlowService:
             self._token_store = get_default_token_store()
         return self._token_store
 
+    async def device_init(
+        self,
+        *,
+        client_id: str = "guideai-mcp-client",
+        scopes: Optional[List[str]] = None,
+        poll_interval: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Initiate device authorization flow (non-blocking).
+
+        Returns device code and verification URI immediately.
+        """
+        if scopes is None:
+            scopes = ["behaviors.read", "workflows.read", "runs.create"]
+
+        metadata = {
+            "hostname": platform.node(),
+            "platform": sys.platform,
+            "mcp_client": "guideai-mcp",
+        }
+
+        # Emit telemetry
+        if self._telemetry:
+            self._telemetry.emit_event(
+                event_type="device_flow.mcp.init",
+                payload={"client_id": client_id, "scopes": scopes},
+            )
+
+        session_data = self._adapter.start_authorization(
+            client_id=client_id,
+            scopes=scopes,
+            metadata=metadata,
+        )
+
+        return {
+            "device_code": session_data["device_code"],
+            "user_code": session_data["user_code"],
+            "verification_uri": session_data["verification_uri"],
+            "verification_uri_complete": session_data.get("verification_uri_complete"),
+            "expires_in": session_data.get("expires_in", 600),
+            "interval": session_data.get("poll_interval", poll_interval),
+        }
+
+    async def device_poll(
+        self,
+        *,
+        device_code: str,
+        client_id: str = "guideai-mcp-client",
+        store_tokens: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Poll for device authorization status (single check).
+        """
+        try:
+            poll_result = self._adapter.poll(device_code)
+            status_value = poll_result["status"]
+
+            # Map status to standard values
+            status_normalized = {
+                "APPROVED": "authorized",
+                "DENIED": "denied",
+                "EXPIRED": "expired",
+                "PENDING": "pending",
+            }.get(status_value.upper(), status_value.lower())
+
+            result: Dict[str, Any] = {"status": status_normalized}
+
+            if status_value.upper() == "APPROVED":
+                result.update({
+                    "access_token": poll_result["access_token"],
+                    "refresh_token": poll_result["refresh_token"],
+                    "token_type": poll_result.get("token_type", "Bearer"),
+                    "scopes": poll_result["scopes"],
+                    "expires_in": poll_result.get("expires_in", 3600),
+                })
+
+                if store_tokens:
+                    try:
+                        store = self._get_token_store()
+                        bundle = AuthTokenBundle(
+                            access_token=poll_result["access_token"],
+                            refresh_token=poll_result["refresh_token"],
+                            token_type=poll_result.get("token_type", "Bearer"),
+                            scopes=poll_result["scopes"],
+                            client_id=poll_result.get("client_id", client_id),
+                            issued_at=datetime.now(timezone.utc),
+                            expires_at=datetime.fromisoformat(poll_result["access_token_expires_at"]),
+                            refresh_expires_at=datetime.fromisoformat(poll_result["refresh_token_expires_at"]),
+                        )
+                        store.save(bundle)
+                    except TokenStoreError as exc:
+                        result["error"] = "storage_failed"
+                        result["error_description"] = str(exc)
+
+            elif status_value.upper() == "DENIED":
+                result["error"] = "access_denied"
+                result["error_description"] = poll_result.get("denied_reason", "Denied")
+
+            elif status_value.upper() == "EXPIRED":
+                result["error"] = "expired_token"
+
+            return result
+
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": "poll_failed",
+                "error_description": str(exc)
+            }
+
     async def device_login(
         self,
         *,
@@ -665,13 +775,27 @@ class MCPDeviceFlowHandler:
                 store_tokens=params.get("store_tokens", True),
             )
 
-        elif tool_name == "auth.authStatus":
+        elif tool_name == "auth.deviceInit":
+            return await self._service.device_init(
+                client_id=params.get("client_id", "guideai-mcp-client"),
+                scopes=params.get("scopes"),
+                poll_interval=params.get("poll_interval", 5),
+            )
+
+        elif tool_name == "auth.devicePoll":
+            return await self._service.device_poll(
+                device_code=params.get("device_code"),
+                client_id=params.get("client_id", "guideai-mcp-client"),
+                store_tokens=params.get("store_tokens", True),
+            )
+
+        elif tool_name == "auth.authStatus" or tool_name == "auth.devicePoll" or tool_name == "device_poll":
             return await self._service.auth_status(
                 client_id=params.get("client_id", "guideai-mcp-client"),
                 validate_remote=params.get("validate_remote", False),
             )
 
-        elif tool_name == "auth.refreshToken":
+        elif tool_name == "auth.refreshToken" or tool_name == "auth.refresh":
             return await self._service.refresh_token(
                 client_id=params.get("client_id", "guideai-mcp-client"),
                 store_tokens=params.get("store_tokens", True),
@@ -860,7 +984,7 @@ class MCPDeviceFlowHandler:
 
             return result
 
-        elif tool_name == "auth.consentLookup":
+        elif tool_name == "auth.consentLookup" or tool_name == "consent.lookup":
             # Lookup consent request details by user code
             user_code = params.get("user_code")
             if not user_code:
@@ -887,7 +1011,7 @@ class MCPDeviceFlowHandler:
             except Exception as e:
                 return {"error": f"Consent lookup failed: {str(e)}"}
 
-        elif tool_name == "auth.consentApprove":
+        elif tool_name == "auth.consentApprove" or tool_name == "consent.approve":
             # Approve a consent request via user code
             user_code = params.get("user_code")
             approver = params.get("approver")
@@ -915,7 +1039,7 @@ class MCPDeviceFlowHandler:
             except Exception as e:
                 return {"success": False, "error": f"Consent approval failed: {str(e)}"}
 
-        elif tool_name == "auth.consentDeny":
+        elif tool_name == "auth.consentDeny" or tool_name == "consent.deny":
             # Deny a consent request via user code
             user_code = params.get("user_code")
             approver = params.get("approver")

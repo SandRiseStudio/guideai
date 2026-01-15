@@ -8,10 +8,13 @@
  * - Optimized rendering via memo + refs
  */
 
-import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useCollabStore, collabStore, usePresenceList } from '../../store/collabStore';
 import { useAuth } from '../../auth';
+import { useOrganizations } from '../../api/dashboard';
+import { OrgSwitcher } from '../OrgSwitcher';
+import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
 import './WorkspaceShell.css';
 
 // ---------------------------------------------------------------------------
@@ -120,6 +123,12 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
   const { actor, logout, isAuthenticated } = useAuth();
   const navigate = useNavigate();
   const presenceList = usePresenceList();
+  const { data: organizations = [] } = useOrganizations();
+  const { currentOrgId } = useOrgContext();
+  const sortedOrganizations = useMemo(
+    () => [...organizations].sort((a, b) => a.name.localeCompare(b.name)),
+    [organizations]
+  );
   const [commandPaletteHint, setCommandPaletteHint] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const profileMenuRef = useRef<HTMLDivElement>(null);
@@ -156,11 +165,23 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
     };
   }, [profileMenuOpen]);
 
+  useEffect(() => {
+    if (!currentOrgId) return;
+    const orgExists = organizations.some((org) => org.id === currentOrgId);
+    if (!orgExists) {
+      orgContextStore.setCurrentOrgId(null);
+    }
+  }, [currentOrgId, organizations]);
+
   return (
     <header className="workspace-header">
       <div className="header-left">
         <div className="header-breadcrumb">
-          <span className="breadcrumb-item">My Workspace</span>
+          <OrgSwitcher
+            organizations={sortedOrganizations}
+            currentOrgId={currentOrgId}
+            onSelect={(orgId) => orgContextStore.setCurrentOrgId(orgId)}
+          />
           <span className="breadcrumb-separator">/</span>
           <span className="breadcrumb-item current">{documentTitle ?? 'Untitled'}</span>
         </div>

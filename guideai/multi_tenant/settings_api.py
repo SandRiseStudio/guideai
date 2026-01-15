@@ -124,14 +124,25 @@ class UpdateProjectSettingsRequest(BaseModel):
     inherit_org_settings: Optional[bool] = None
     branding: Optional[UpdateBrandingRequest] = None
     workflow: Optional[UpdateWorkflowRequest] = None
-    repository_url: Optional[str] = Field(None, description="GitHub repository URL")
-    default_branch: Optional[str] = None
+    repository_url: Optional[str] = Field(
+        None,
+        alias="github_repo_url",
+        validation_alias="github_repo_url",
+        description="GitHub repository URL",
+    )
+    default_branch: Optional[str] = Field(
+        None,
+        alias="github_default_branch",
+        validation_alias="github_default_branch",
+    )
     protected_branches: Optional[List[str]] = None
     local_project_path: Optional[str] = Field(None, description="Local filesystem path to project root")
     environments: Optional[List[str]] = None
     active_environment: Optional[str] = None
     features: Optional[Dict[str, bool]] = None
     custom: Optional[Dict[str, Any]] = None
+
+    model_config = {"populate_by_name": True}
 
 
 class UpdateIntegrationsRequest(BaseModel):
@@ -254,6 +265,9 @@ def create_settings_routes(
     """
     router = APIRouter(tags=tags or ["settings"])
 
+    # Use the pool from settings_service for permission lookups
+    _pool = settings_service.pool
+
     def _get_user_id(request: Request) -> str:
         """Extract user_id from request state or raise 401."""
         if get_user_id:
@@ -311,24 +325,94 @@ def create_settings_routes(
             detail="Organization access required",
         )
 
+    def _get_user_project_role(user_id: str, project_id: str) -> Optional[ProjectRole]:
+        """Look up user's role in a project from the database.
+
+        Checks:
+        1. Direct project membership in auth.project_memberships
+        2. Project creator (created_by in auth.projects)
+
+        Args:
+            user_id: User ID to check
+            project_id: Project ID to check
+
+        Returns:
+            ProjectRole or None if no access
+        """
+        if _pool is None:
+            return None
+
+        try:
+            with _pool.connection() as conn:
+                cursor = conn.cursor()
+
+                # Check direct project membership
+                cursor.execute(
+                    """
+                    SELECT role FROM auth.project_memberships
+                    WHERE project_id = %s AND user_id = %s
+                    """,
+                    (project_id, user_id)
+                )
+                row = cursor.fetchone()
+                if row:
+                    role_str = row[0].lower()
+                    role_map = {
+                        "owner": ProjectRole.OWNER,
+                        "maintainer": ProjectRole.MAINTAINER,
+                        "contributor": ProjectRole.CONTRIBUTOR,
+                        "viewer": ProjectRole.VIEWER,
+                    }
+                    return role_map.get(role_str)
+
+                # Check if user is project creator (treat as owner)
+                cursor.execute(
+                    """
+                    SELECT created_by FROM auth.projects
+                    WHERE project_id = %s
+                    """,
+                    (project_id,)
+                )
+                row = cursor.fetchone()
+                if row and row[0] == user_id:
+                    return ProjectRole.OWNER
+
+                return None
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Error checking project role: {e}")
+            return None
+
     def _require_project_maintainer(request: Request, project_id: str) -> str:
         """Require maintainer role in project.
+
+        Checks in order:
+        1. Request state project_context (from middleware)
+        2. Database lookup of project membership
+        3. Project creator check
 
         Returns:
             user_id if authorized.
         """
         user_id = _get_user_id(request)
 
+        role_hierarchy = {
+            ProjectRole.VIEWER: 0,
+            ProjectRole.CONTRIBUTOR: 1,
+            ProjectRole.MAINTAINER: 2,
+            ProjectRole.OWNER: 3,
+        }
+
+        # Check middleware-provided context first
         ctx = getattr(request.state, "project_context", None)
         if ctx and ctx.project_id == project_id:
-            role_hierarchy = {
-                ProjectRole.VIEWER: 0,
-                ProjectRole.CONTRIBUTOR: 1,
-                ProjectRole.MAINTAINER: 2,
-                ProjectRole.OWNER: 3,
-            }
             if role_hierarchy.get(ctx.role, 0) >= role_hierarchy.get(ProjectRole.MAINTAINER, 0):
                 return user_id
+
+        # Fall back to database lookup
+        db_role = _get_user_project_role(user_id, project_id)
+        if db_role and role_hierarchy.get(db_role, 0) >= role_hierarchy.get(ProjectRole.MAINTAINER, 0):
+            return user_id
 
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -343,6 +427,7 @@ def create_settings_routes(
         """
         user_id = _get_user_id(request)
 
+        # Check middleware-provided context first
         ctx = getattr(request.state, "project_context", None)
         if ctx and ctx.project_id == project_id:
             return user_id
@@ -350,6 +435,11 @@ def create_settings_routes(
         # Fall back to org context check for org-owned projects
         org_ctx = getattr(request.state, "org_context", None)
         if org_ctx:
+            return user_id
+
+        # Fall back to database lookup
+        db_role = _get_user_project_role(user_id, project_id)
+        if db_role is not None:
             return user_id
 
         raise HTTPException(

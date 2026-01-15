@@ -300,7 +300,7 @@ export function useProject(projectId?: string) {
 /**
  * Fetch agents (optionally filtered by organization)
  */
-export function useAgents(orgId?: string) {
+export function useAgents(orgId?: string, enabled = true) {
   return useQuery({
     queryKey: dashboardKeys.agents(orgId),
     queryFn: async (): Promise<Agent[]> => {
@@ -326,6 +326,7 @@ export function useAgents(orgId?: string) {
     },
     refetchInterval: POLLING_INTERVAL,
     staleTime: POLLING_INTERVAL / 2,
+    enabled,
   });
 }
 

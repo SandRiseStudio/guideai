@@ -1,0 +1,10 @@
+# Gitleaks ignore file
+# Ignore test fixtures with dummy token patterns
+
+# Test file with dummy GitHub token prefixes for testing token detection
+tests/test_github_credentials.py:ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+tests/test_github_credentials.py:github_pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+tests/test_github_credentials.py:ghs_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Model catalog with legitimate Anthropic model names (not secrets)
+guideai/work_item_execution_contracts.py:claude-opus-4-20250514

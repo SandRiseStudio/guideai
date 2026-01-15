@@ -55,6 +55,7 @@ class PostgresRunService:
         dsn: str,
         *,
         telemetry: Optional[TelemetryClient] = None,
+        event_hub: Optional[Any] = None,
         min_conn: int = 2,
         max_conn: int = 10,
     ) -> None:
@@ -66,6 +67,7 @@ class PostgresRunService:
 
         self._dsn = dsn
         self._telemetry = telemetry or TelemetryClient.noop()
+        self._event_hub = event_hub
         self._extras: Any = pg_extras
         self._pool = PostgresPool(dsn)
 
@@ -96,45 +98,30 @@ class PostgresRunService:
                 cur.execute(
                     """
                     INSERT INTO runs (
-                        run_id, created_at, updated_at,
-                        actor_id, actor_role, actor_surface,
+                        id, created_at, updated_at,
+                        user_id, project_id, session_id, actor_surface,
                         status, workflow_id, workflow_name,
-                        template_id, template_name,
-                        behavior_ids, current_step, progress_pct,
-                        message, started_at, completed_at, duration_ms,
-                        outputs, error, metadata
+                        context, error
                     ) VALUES (
                         %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s,
-                        %s, %s, %s,
                         %s, %s, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s,
+                        %s, %s
                     )
                     """,
                     (
                         run_id,
                         created_at,
                         created_at,
-                        actor.id,
-                        actor.role,
+                        actor.id if actor.id != "api-user" else None,  # Only set if real user
+                        metadata.get("project_id"),
+                        metadata.get("session_id"),
                         actor.surface,
                         RunStatus.PENDING,
                         request.workflow_id,
                         request.workflow_name,
-                        request.template_id,
-                        request.template_name,
-                        self._extras.Json(request.behavior_ids),
-                        None,  # current_step
-                        0.0,  # progress_pct
-                        request.initial_message,
-                        None,  # started_at
-                        None,  # completed_at
-                        None,  # duration_ms
-                        self._extras.Json({}),  # outputs
-                        None,  # error
                         self._extras.Json(metadata),
+                        None,  # error
                     ),
                 )
 
@@ -242,30 +229,32 @@ class PostgresRunService:
 
         def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
+                # Store progress_pct, message, current_step, duration_ms in context
+                context = dict(metadata)
+                context["progress_pct"] = progress_pct
+                if message:
+                    context["message"] = message
+                if update.step_id or run.current_step:
+                    context["current_step"] = update.step_id or run.current_step
+                if duration_ms is not None:
+                    context["duration_ms"] = duration_ms
+
                 cur.execute(
                     """
                     UPDATE runs
                     SET
                         status = %s,
-                        progress_pct = %s,
-                        message = %s,
-                        current_step = %s,
                         started_at = %s,
                         completed_at = %s,
-                        duration_ms = %s,
-                        metadata = %s,
+                        context = %s,
                         updated_at = %s
-                    WHERE run_id = %s
+                    WHERE id = %s
                     """,
                     (
                         new_status,
-                        progress_pct,
-                        message,
-                        update.step_id or run.current_step,
                         started_at,
                         completed_at,
-                        duration_ms,
-                        self._extras.Json(metadata),
+                        self._extras.Json(context),
                         now,
                         run_id,
                     ),
@@ -302,6 +291,7 @@ class PostgresRunService:
                 "message": updated_run.message,
             },
         )
+        self._publish_run_events(updated_run, update.step_id)
         return updated_run
 
     def complete_run(self, run_id: str, completion: RunCompletion) -> Run:
@@ -320,30 +310,32 @@ class PostgresRunService:
 
         def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
+                # Store progress_pct, duration_ms, message in context
+                context = dict(merged_metadata)
+                context["progress_pct"] = progress_pct
+                if duration_ms is not None:
+                    context["duration_ms"] = duration_ms
+                if completion.message:
+                    context["message"] = completion.message
+
                 cur.execute(
                     """
                     UPDATE runs
                     SET
                         status = %s,
-                        progress_pct = %s,
                         completed_at = %s,
-                        duration_ms = %s,
-                        outputs = %s,
-                        message = %s,
+                        result = %s,
                         error = %s,
-                        metadata = %s,
+                        context = %s,
                         updated_at = %s
-                    WHERE run_id = %s
+                    WHERE id = %s
                     """,
                     (
                         status,
-                        progress_pct,
                         completed_at,
-                        duration_ms,
                         self._extras.Json(completion.outputs or {}),
-                        completion.message,
                         completion.error,
-                        self._extras.Json(merged_metadata),
+                        self._extras.Json(context),
                         now,
                         run_id,
                     ),
@@ -369,6 +361,7 @@ class PostgresRunService:
                 "error": updated_run.error,
             },
         )
+        self._publish_run_events(updated_run, None)
         return updated_run
 
     def cancel_run(self, run_id: str, reason: Optional[str] = None) -> Run:
@@ -379,12 +372,69 @@ class PostgresRunService:
         )
         return self.complete_run(run_id, completion)
 
+    def update_progress(
+        self,
+        run_id: str,
+        *,
+        status: Optional[str] = None,
+        progress: Optional[float] = None,
+        current_step: Optional[str] = None,
+        message: Optional[str] = None,
+        outputs: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Run:
+        """Convenience wrapper for updating run progress."""
+        if outputs is not None or error is not None:
+            completion = RunCompletion(
+                status=status or (RunStatus.FAILED if error else RunStatus.COMPLETED),
+                outputs=outputs or {},
+                message=message,
+                error=error,
+                metadata=metadata or {},
+            )
+            return self.complete_run(run_id, completion)
+
+        update = RunProgressUpdate(
+            status=status,
+            progress_pct=progress,
+            message=message,
+            step_id=current_step,
+            step_name=current_step,
+            metadata=metadata or {},
+        )
+        return self.update_run(run_id, update)
+
+    def add_step(
+        self,
+        run_id: str,
+        *,
+        action: str,
+        outcome: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None,
+    ) -> RunStep:
+        """Append a run step entry."""
+        step_id = str(uuid.uuid4())
+        update = RunProgressUpdate(
+            step_id=step_id,
+            step_name=action,
+            step_status=status or RunStatus.RUNNING,
+            metadata=metadata or {},
+        )
+        self.update_run(run_id, update)
+        run = self.get_run(run_id)
+        for step in run.steps:
+            if step.step_id == step_id:
+                return step
+        return RunStep(step_id=step_id, name=action, status=status or RunStatus.RUNNING, metadata=metadata or {})
+
     def delete_run(self, run_id: str) -> None:
         """Delete a run (CASCADE will remove run_steps)."""
 
         def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
+                cur.execute("DELETE FROM runs WHERE id = %s", (run_id,))
                 if cur.rowcount == 0:
                     raise RunNotFoundError(f"Run '{run_id}' not found")
 
@@ -404,46 +454,47 @@ class PostgresRunService:
         """Fetch a single run row as a dict."""
         with self._connection() as conn:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM runs WHERE run_id = %s", (run_id,))
+                cur.execute("SELECT * FROM runs WHERE id = %s", (run_id,))
                 row = cur.fetchone()
                 return dict(row) if row else None
 
     def _row_to_run(self, row: Dict[str, Any]) -> Run:
         """Convert a PostgreSQL row dict to a Run dataclass."""
-        actor = Actor(
-            id=row["actor_id"],
-            role=row["actor_role"],
-            surface=row["actor_surface"],
-        )
-        # Convert UUID to string before passing to _fetch_steps
-        run_id_str = str(row["run_id"])
-        steps = self._fetch_steps(run_id_str)
+        # Extract context (stores extra fields)
+        context = row.get("context") if isinstance(row.get("context"), dict) else {}
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
 
-        # JSONB columns are already deserialized
-        behavior_ids = row["behavior_ids"] if isinstance(row["behavior_ids"], list) else []
-        outputs = row["outputs"] if isinstance(row["outputs"], dict) else {}
-        metadata = row["metadata"] if isinstance(row["metadata"], dict) else {}
+        # Build actor from user_id and actor_surface
+        actor = Actor(
+            id=row.get("user_id") or "system",
+            role=context.get("actor_role", "user"),
+            surface=row.get("actor_surface", "api"),
+        )
+
+        # Convert UUID to string
+        run_id_str = str(row["id"])
+        steps = self._fetch_steps(run_id_str)
 
         return Run(
             run_id=run_id_str,
-            created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else row["created_at"],
-            updated_at=row["updated_at"].isoformat() if hasattr(row["updated_at"], "isoformat") else row["updated_at"],
+            created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+            updated_at=row["updated_at"].isoformat() if hasattr(row["updated_at"], "isoformat") else str(row["updated_at"]),
             actor=actor,
             status=row["status"],
-            workflow_id=row["workflow_id"],
-            workflow_name=row["workflow_name"],
-            template_id=row["template_id"],
-            template_name=row["template_name"],
-            behavior_ids=behavior_ids,
-            current_step=row["current_step"],
-            progress_pct=row["progress_pct"],
-            message=row["message"],
-            started_at=row["started_at"].isoformat() if row["started_at"] and hasattr(row["started_at"], "isoformat") else row["started_at"],
-            completed_at=row["completed_at"].isoformat() if row["completed_at"] and hasattr(row["completed_at"], "isoformat") else row["completed_at"],
-            duration_ms=row["duration_ms"],
-            outputs=outputs,
-            error=row["error"],
-            metadata=metadata,
+            workflow_id=row.get("workflow_id"),
+            workflow_name=row.get("workflow_name"),
+            template_id=context.get("template_id"),
+            template_name=context.get("template_name"),
+            behavior_ids=context.get("behavior_ids", []),
+            current_step=context.get("current_step"),
+            progress_pct=context.get("progress_pct", 0.0),
+            message=context.get("message"),
+            started_at=row["started_at"].isoformat() if row.get("started_at") and hasattr(row["started_at"], "isoformat") else row.get("started_at"),
+            completed_at=row["completed_at"].isoformat() if row.get("completed_at") and hasattr(row["completed_at"], "isoformat") else row.get("completed_at"),
+            duration_ms=context.get("duration_ms"),
+            outputs=result,
+            error=row.get("error"),
+            metadata=context,
             steps=steps,
         )
 
@@ -453,9 +504,9 @@ class PostgresRunService:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT * FROM run_steps
+                    SELECT * FROM execution.run_steps
                     WHERE run_id = %s
-                    ORDER BY started_at ASC, step_id ASC
+                    ORDER BY started_at ASC, step_number ASC
                     """,
                     (run_id,),
                 )
@@ -463,15 +514,19 @@ class PostgresRunService:
 
         steps = []
         for row in rows:
-            metadata = row["metadata"] if isinstance(row["metadata"], dict) else {}
+            # run_steps uses input_data/output_data, not metadata
+            input_data = row.get("input_data") if isinstance(row.get("input_data"), dict) else {}
+            output_data = row.get("output_data") if isinstance(row.get("output_data"), dict) else {}
+            metadata = {"input_data": input_data, "output_data": output_data}
+
             steps.append(
                 RunStep(
-                    step_id=str(row["step_id"]),
+                    step_id=str(row["id"]),
                     name=row["name"],
                     status=row["status"],
-                    started_at=row["started_at"].isoformat() if row["started_at"] and hasattr(row["started_at"], "isoformat") else row["started_at"],
-                    completed_at=row["completed_at"].isoformat() if row["completed_at"] and hasattr(row["completed_at"], "isoformat") else row["completed_at"],
-                    progress_pct=row["progress_pct"],
+                    started_at=row["started_at"].isoformat() if row.get("started_at") and hasattr(row["started_at"], "isoformat") else row.get("started_at"),
+                    completed_at=row["completed_at"].isoformat() if row.get("completed_at") and hasattr(row["completed_at"], "isoformat") else row.get("completed_at"),
+                    progress_pct=0.0,  # not in schema, default to 0
                     metadata=metadata,
                 )
             )
@@ -492,61 +547,62 @@ class PostgresRunService:
         now = utc_now_iso()
         metadata_dict = metadata or {}
 
-        # Check if step exists
+        # Check if step exists (using id column)
         cur.execute(
-            "SELECT metadata, progress_pct, completed_at FROM run_steps WHERE run_id = %s AND step_id = %s",
-            (run_id, step_id),
+            "SELECT id, input_data, completed_at FROM run_steps WHERE run_id = %s AND name = %s ORDER BY step_number DESC LIMIT 1",
+            (run_id, name),
         )
         row = cur.fetchone()
 
         if row:
             # Update existing step
-            existing_metadata = row[0] if isinstance(row[0], dict) else {}
-            merged_metadata = self._merge_metadata(existing_metadata, metadata_dict)
-            updated_progress = progress_pct if progress_pct is not None else row[1]
-            completed_at = row[2]
+            step_db_id = row[0]
+            existing_input = row[1] if isinstance(row[1], dict) else {}
+            merged_input = self._merge_metadata(existing_input, metadata_dict)
+            completed_at_val = row[2]
             if status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
-                completed_at = now
+                completed_at_val = now
 
             cur.execute(
                 """
                 UPDATE run_steps
                 SET name = %s,
                     status = %s,
-                    progress_pct = %s,
-                    metadata = %s,
+                    input_data = %s,
                     completed_at = %s
-                WHERE run_id = %s AND step_id = %s
+                WHERE id = %s
                 """,
                 (
                     name,
                     status,
-                    updated_progress,
-                    self._extras.Json(merged_metadata),
-                    completed_at,
-                    run_id,
-                    step_id,
+                    self._extras.Json(merged_input),
+                    completed_at_val,
+                    step_db_id,
                 ),
             )
         else:
-            # Insert new step
+            # Insert new step - get next step_number
+            cur.execute(
+                "SELECT COALESCE(MAX(step_number), 0) + 1 FROM run_steps WHERE run_id = %s",
+                (run_id,),
+            )
+            next_step_number = cur.fetchone()[0]
+
             cur.execute(
                 """
                 INSERT INTO run_steps (
-                    run_id, step_id, name, status, started_at, completed_at, progress_pct, metadata
+                    run_id, step_number, name, status, started_at, completed_at, input_data
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s
                 )
-                ON CONFLICT (run_id, step_id) DO NOTHING
                 """,
                 (
                     run_id,
-                    step_id,
+                    next_step_number,
                     name,
                     status,
                     now,
                     None,
-                    progress_pct,
                     self._extras.Json(metadata_dict),
                 ),
             )
@@ -568,6 +624,44 @@ class PostgresRunService:
         if additional:
             merged.update(additional)
         return merged
+
+    def _publish_run_events(self, run: Run, step_id: Optional[str]) -> None:
+        if not self._event_hub:
+            return
+        metadata = run.metadata or {}
+        payload = {
+            "run_id": run.run_id,
+            "work_item_id": metadata.get("work_item_id"),
+            "org_id": metadata.get("org_id"),
+            "project_id": metadata.get("project_id"),
+            "agent_id": metadata.get("agent_id"),
+            "model_id": metadata.get("model_id"),
+            "cycle_id": metadata.get("cycle_id"),
+            "status": run.status,
+            "phase": metadata.get("phase"),
+            "progress_pct": run.progress_pct,
+            "current_step": run.current_step,
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+            "error": run.error,
+            "step_count": len(run.steps),
+            "updated_at": run.updated_at,
+        }
+        self._event_hub.publish_status(payload)
+
+        if not step_id:
+            return
+        for step in run.steps:
+            if step.step_id == step_id:
+                step_payload = {
+                    "run_id": run.run_id,
+                    "work_item_id": metadata.get("work_item_id"),
+                    "org_id": metadata.get("org_id"),
+                    "project_id": metadata.get("project_id"),
+                    "step": step.to_dict(),
+                }
+                self._event_hub.publish_step(step_payload)
+                break
 
     @staticmethod
     def _calculate_duration_ms(start_iso: Optional[str], end_iso: str) -> Optional[int]:

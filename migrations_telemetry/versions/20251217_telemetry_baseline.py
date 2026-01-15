@@ -224,97 +224,21 @@ def upgrade() -> None:
     # =========================================================================
     # Step 6: Create continuous aggregates
     # =========================================================================
-
-    # Hourly telemetry events aggregate
-    conn.execute(text("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS telemetry_events_hourly
-        WITH (timescaledb.continuous) AS
-        SELECT
-            time_bucket('1 hour', event_timestamp) AS bucket,
-            event_type,
-            actor_role,
-            actor_surface,
-            COUNT(*) AS event_count,
-            COUNT(DISTINCT actor_id) AS unique_actors,
-            COUNT(DISTINCT run_id) AS unique_runs,
-            COUNT(DISTINCT session_id) AS unique_sessions
-        FROM telemetry_events
-        GROUP BY bucket, event_type, actor_role, actor_surface
-    """))
-
-    # Hourly execution traces aggregate
-    conn.execute(text("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS execution_traces_hourly
-        WITH (timescaledb.continuous) AS
-        SELECT
-            time_bucket('1 hour', trace_timestamp) AS bucket,
-            operation_name,
-            service_name,
-            status,
-            COUNT(*) AS span_count,
-            AVG(duration_ms)::INTEGER AS avg_duration_ms,
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms)::INTEGER AS p50_duration_ms,
-            percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)::INTEGER AS p95_duration_ms,
-            percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms)::INTEGER AS p99_duration_ms,
-            MAX(duration_ms) AS max_duration_ms,
-            SUM(total_tokens) AS total_tokens
-        FROM execution_traces
-        WHERE duration_ms IS NOT NULL
-        GROUP BY bucket, operation_name, service_name, status
-    """))
-
-    # Daily telemetry events aggregate
-    conn.execute(text("""
-        CREATE MATERIALIZED VIEW IF NOT EXISTS telemetry_events_daily
-        WITH (timescaledb.continuous) AS
-        SELECT
-            time_bucket('1 day', event_timestamp) AS bucket,
-            event_type,
-            actor_role,
-            actor_surface,
-            COUNT(*) AS event_count,
-            COUNT(DISTINCT actor_id) AS unique_actors,
-            COUNT(DISTINCT run_id) AS unique_runs,
-            COUNT(DISTINCT session_id) AS unique_sessions
-        FROM telemetry_events
-        GROUP BY bucket, event_type, actor_role, actor_surface
-    """))
-
-    # Add continuous aggregate policies
-    conn.execute(text("""
-        SELECT add_continuous_aggregate_policy(
-            'telemetry_events_hourly',
-            start_offset => INTERVAL '3 hours',
-            end_offset => INTERVAL '1 hour',
-            schedule_interval => INTERVAL '1 hour',
-            if_not_exists => TRUE
-        )
-    """))
-    conn.execute(text("""
-        SELECT add_continuous_aggregate_policy(
-            'execution_traces_hourly',
-            start_offset => INTERVAL '3 hours',
-            end_offset => INTERVAL '1 hour',
-            schedule_interval => INTERVAL '1 hour',
-            if_not_exists => TRUE
-        )
-    """))
-    conn.execute(text("""
-        SELECT add_continuous_aggregate_policy(
-            'telemetry_events_daily',
-            start_offset => INTERVAL '3 days',
-            end_offset => INTERVAL '1 day',
-            schedule_interval => INTERVAL '1 day',
-            if_not_exists => TRUE
-        )
-    """))
+    # NOTE: Continuous aggregates must be created OUTSIDE a transaction.
+    # Run these manually after migration:
+    #
+    #   psql $TELEMETRY_DATABASE_URL -f schema/telemetry_aggregates.sql
+    #
+    # Or create a separate migration with autocommit=True in env.py
+    # See: https://docs.timescale.com/timescaledb/latest/how-to-guides/continuous-aggregates/
+    pass
 
 
 def downgrade() -> None:
     """Remove telemetry schema."""
     conn = op.get_bind()
 
-    # Remove continuous aggregates
+    # Remove continuous aggregates (if they exist - created manually post-migration)
     conn.execute(text("DROP MATERIALIZED VIEW IF EXISTS telemetry_events_daily CASCADE"))
     conn.execute(text("DROP MATERIALIZED VIEW IF EXISTS execution_traces_hourly CASCADE"))
     conn.execute(text("DROP MATERIALIZED VIEW IF EXISTS telemetry_events_hourly CASCADE"))

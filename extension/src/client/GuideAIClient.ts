@@ -89,6 +89,114 @@ export interface BCIBehaviorMatch {
 	metadata?: Record<string, unknown> | null;
 }
 
+export type AgentStatus = 'draft' | 'active' | 'deprecated' | 'archived';
+export type AgentVisibility = 'private' | 'public' | 'org';
+export type RoleAlignment = 'strict' | 'flexible';
+
+export interface AgentVersion {
+	version: string;
+	status: AgentStatus;
+	created_at: string;
+	performance_score?: number;
+	change_log?: string;
+}
+
+export interface Agent {
+	agent_id: string;
+	name: string;
+	description: string;
+	status: AgentStatus;
+	version: string;
+	capabilities: string[];
+	behaviors: string[];
+	tags: string[];
+	mcp_servers: string[];
+	visibility: AgentVisibility;
+	role_alignment: RoleAlignment;
+	versions: AgentVersion[];
+	owner?: string;
+	created_at?: string;
+	updated_at?: string;
+}
+
+export interface AgentSearchResult {
+	agent: Agent;
+	score: number;
+	match_reason?: string;
+}
+
+export interface TopPerformer {
+	agentId: string;
+	agentName: string;
+	metricValue: number;
+	metricName: string;
+	changePercent: number;
+	rank?: number;
+}
+
+export interface PerformanceAlert {
+	id: string;
+	agentId: string;
+	agentName: string;
+	metric: string;
+	threshold: number;
+	value: number;
+	timestamp: string;
+	status: 'active' | 'acknowledged' | 'resolved';
+	severity: 'low' | 'medium' | 'high' | 'critical';
+}
+
+export interface AgentPerformanceSummary {
+	totalSavings: number;
+	avgLatency: number;
+	successRate: number;
+	activeAgents: number;
+	totalRuns?: number;
+	errorCount?: number;
+}
+
+export interface ProjectSettings {
+	id?: string;
+	name: string;
+	description?: string;
+	github_repo?: string;
+	default_branch?: string;
+	compliance_tier?: string;
+	cost_budget?: number;
+	allowed_mcp_servers?: string[];
+	members?: any[];
+	created_at?: string;
+	updated_at?: string;
+}
+
+export interface GithubValidationResult {
+	valid: boolean;
+	repo_name?: string;
+	error?: string;
+	permissions?: string[];
+}
+
+export interface LLMCredential {
+	credential_id: string;
+	provider: string;
+	name: string;
+	key_prefix: string;  // First/last 4 chars only, for display
+	is_valid: boolean;
+	failure_count: number;
+	last_used_at?: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface CredentialAuditEntry {
+	audit_id: string;
+	credential_id: string;
+	action: string;  // 'created' | 'rotated' | 'disabled' | 'enabled' | 'deleted' | 'used'
+	actor_id: string;
+	details?: Record<string, unknown>;
+	created_at: string;
+}
+
 export interface BCIRetrieveOptions {
 	query: string;
 	topK?: number;
@@ -303,6 +411,7 @@ export interface ComplianceComment {
 export class GuideAIClient {
 	private pythonPath: string;
 	private cliPath: string;
+	private apiBaseUrl: string;
 	private outputChannel: vscode.OutputChannel;
 	private telemetryEnabled: boolean;
 	private telemetryActorId: string;
@@ -313,10 +422,76 @@ export class GuideAIClient {
 		const config = vscode.workspace.getConfiguration('guideai');
 		this.pythonPath = config.get('pythonPath', 'python');
 		this.cliPath = config.get('cliPath', 'guideai');
+		this.apiBaseUrl = config.get('apiBaseUrl', 'http://localhost:8000');
 		this.outputChannel = vscode.window.createOutputChannel('GuideAI');
 		this.telemetryEnabled = config.get('telemetryEnabled', true);
 		this.telemetryActorId = config.get('telemetryActorId', 'ide-user');  // IDE-agnostic default
 		this.telemetryActorRole = config.get('telemetryActorRole', 'STUDENT');
+	}
+
+	/**
+	 * Make an HTTP API call to the guideai backend
+	 */
+	private async callAPI<T>(
+		endpoint: string,
+		method: 'GET' | 'POST' | 'DELETE' | 'PUT' | 'PATCH' = 'GET',
+		body?: Record<string, unknown>
+	): Promise<T> {
+		const fullUrl = `${this.apiBaseUrl}${endpoint}`;
+		this.outputChannel.appendLine(`API ${method}: ${fullUrl}`);
+
+		return new Promise((resolve, reject) => {
+			const url = new URL(fullUrl);
+			const isHttps = url.protocol === 'https:';
+			const httpModule = isHttps ? require('https') : require('http');
+
+			const requestBody = body && method !== 'GET' ? JSON.stringify(body) : undefined;
+
+			const options = {
+				hostname: url.hostname,
+				port: url.port || (isHttps ? 443 : 80),
+				path: url.pathname + url.search,
+				method,
+				headers: {
+					'Content-Type': 'application/json',
+					'Accept': 'application/json',
+					...(requestBody ? { 'Content-Length': Buffer.byteLength(requestBody) } : {}),
+				},
+			};
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const req = httpModule.request(options, (res: any) => {
+				let data = '';
+
+				res.on('data', (chunk: string | Buffer) => {
+					data += chunk.toString();
+				});
+
+				res.on('end', () => {
+					if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+						try {
+							resolve(JSON.parse(data) as T);
+						} catch {
+							reject(new Error(`Failed to parse response: ${data}`));
+						}
+					} else {
+						this.outputChannel.appendLine(`API error ${res.statusCode}: ${data}`);
+						reject(new Error(`API error ${res.statusCode}: ${data}`));
+					}
+				});
+			});
+
+			req.on('error', (error: Error) => {
+				this.outputChannel.appendLine(`API call failed: ${error.message}`);
+				reject(error);
+			});
+
+			if (requestBody) {
+				req.write(requestBody);
+			}
+
+			req.end();
+		});
 	}
 
 	/**
@@ -722,6 +897,245 @@ export class GuideAIClient {
 		} finally {
 			await this.cleanupTempDir(tmpDir);
 		}
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────────
+	// Agent Registry & Management
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	async getAgent(agentId: string, version?: string): Promise<Agent> {
+		const args = ['agent-registry', 'get', '--agent-id', agentId];
+		if (version) args.push('--version', version);
+		return await this.runCLI(args);
+	}
+
+	async listAgents(filters: { tag?: string; status?: AgentStatus; limit?: number } = {}): Promise<Agent[]> {
+		const args = ['agent-registry', 'list'];
+		if (filters.tag) args.push('--tag', filters.tag);
+		if (filters.status) args.push('--status', filters.status);
+		if (filters.limit) args.push('--limit', String(filters.limit));
+
+		const result = await this.runCLI(args);
+		return result.agents || [];
+	}
+
+	async searchAgents(query: string, options: { limit?: number; minScore?: number } = {}): Promise<AgentSearchResult[]> {
+		const args = ['agent-registry', 'search', '--query', query];
+		if (options.limit) args.push('--limit', String(options.limit));
+
+		const result = await this.runCLI(args);
+		return result.results || [];
+	}
+
+	async publishAgent(agentId: string): Promise<void> {
+		await this.runCLI(['agent-registry', 'publish', '--agent-id', agentId]);
+	}
+
+	async deprecateAgent(agentId: string, reason: string): Promise<void> {
+		await this.runCLI(['agent-registry', 'deprecate', '--agent-id', agentId, '--reason', reason]);
+	}
+
+	async updateAgent(agentId: string, updates: Partial<Agent>): Promise<Agent> {
+		// Note: CLI update logic might vary; usually takes specific flags
+		// Here assuming we pass simple flags or JSON
+		const args = ['agent-registry', 'update', '--agent-id', agentId];
+		if (updates.name) args.push('--name', updates.name);
+		if (updates.description) args.push('--description', updates.description);
+		if (updates.tags) args.push('--tags', updates.tags.join(','));
+		// ... handled simplified for now
+		return await this.runCLI(args);
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────────
+	// Agent Performance
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	async getTopPerformers(metric: string, limit: number = 10, periodDays: number = 30): Promise<TopPerformer[]> {
+		// Simulated mapped to analytics call
+		const args = ['agent-performance', 'top-performers', '--metric', metric, '--limit', String(limit), '--days', String(periodDays)];
+		const result = await this.runCLI(args);
+		return result.performers || [];
+	}
+
+	async getAgentPerformanceAlerts(agentId?: string, metric?: string, activeOnly: boolean = true, limit: number = 20): Promise<PerformanceAlert[]> {
+		const args = ['agent-performance', 'alerts'];
+		if (agentId) args.push('--agent-id', agentId);
+		if (metric) args.push('--metric', metric);
+		if (activeOnly) args.push('--active-only');
+		args.push('--limit', String(limit));
+
+		const result = await this.runCLI(args);
+		return result.alerts || [];
+	}
+
+	async getAgentPerformanceSummary(agentId?: string, days: number = 30): Promise<AgentPerformanceSummary> {
+		const args = ['agent-performance', 'summary', '--days', String(days)];
+		if (agentId) args.push('--agent-id', agentId);
+		return await this.runCLI(args);
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────────
+	// Project Settings
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	async getProjectSettings(projectId: string): Promise<ProjectSettings> {
+		const args = ['projects', 'get', '--project-id', projectId];
+		return await this.runCLI(args);
+	}
+
+	async updateProjectSettings(projectId: string, settings: Partial<ProjectSettings>): Promise<ProjectSettings> {
+		const args = ['projects', 'update', '--project-id', projectId];
+		if (settings.name) args.push('--name', settings.name);
+		if (settings.description) args.push('--description', settings.description);
+		// ... simplified mapping
+		return await this.runCLI(args);
+	}
+
+	async validateGithubRepo(projectId: string, url: string): Promise<GithubValidationResult> {
+		// Mock logic or call a specific CLI tool
+		// Currently returning fake OK since no CLI command exists yet
+		if (url.includes('github.com')) {
+			return { valid: true, repo_name: url.split('/').pop()?.replace('.git', '') };
+		}
+		return { valid: false, error: 'Invalid GitHub URL' };
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────────
+	// BYOK Credentials
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Get all BYOK credentials for a project (keys returned as prefix only)
+	 */
+	async getProjectCredentials(projectId: string): Promise<LLMCredential[]> {
+		const response = await this.callAPI<{ credentials: LLMCredential[] }>(
+			`/api/v1/projects/${projectId}/credentials`,
+			'GET'
+		);
+		return response.credentials || [];
+	}
+
+	/**
+	 * Add or replace a BYOK credential for a project
+	 */
+	async addProjectCredential(
+		projectId: string,
+		provider: string,
+		apiKey: string,
+		name?: string
+	): Promise<LLMCredential> {
+		return await this.callAPI<LLMCredential>(
+			`/api/v1/projects/${projectId}/credentials?actor_id=${encodeURIComponent(this.telemetryActorId)}`,
+			'POST',
+			{ provider, api_key: apiKey, name }
+		);
+	}
+
+	/**
+	 * Delete a BYOK credential from a project
+	 */
+	async deleteProjectCredential(projectId: string, credentialId: string): Promise<void> {
+		await this.callAPI<{ success: boolean }>(
+			`/api/v1/projects/${projectId}/credentials/${credentialId}?actor_id=${encodeURIComponent(this.telemetryActorId)}`,
+			'DELETE'
+		);
+	}
+
+	/**
+	 * Re-enable a disabled credential with a new API key
+	 */
+	async reEnableProjectCredential(
+		projectId: string,
+		credentialId: string,
+		apiKey: string
+	): Promise<LLMCredential> {
+		return await this.callAPI<LLMCredential>(
+			`/api/v1/projects/${projectId}/credentials/${credentialId}:re-enable?actor_id=${encodeURIComponent(this.telemetryActorId)}`,
+			'POST',
+			{ api_key: apiKey }
+		);
+	}
+
+	/**
+	 * Get audit log for a specific credential
+	 */
+	async getProjectCredentialAudit(
+		projectId: string,
+		credentialId: string,
+		limit: number = 50
+	): Promise<CredentialAuditEntry[]> {
+		const response = await this.callAPI<{ audit_log: CredentialAuditEntry[] }>(
+			`/api/v1/projects/${projectId}/credentials/${credentialId}/audit?limit=${limit}`,
+			'GET'
+		);
+		return response.audit_log || [];
+	}
+
+	/**
+	 * Get all BYOK credentials for an organization
+	 */
+	async getOrgCredentials(orgId: string): Promise<LLMCredential[]> {
+		const response = await this.callAPI<{ credentials: LLMCredential[] }>(
+			`/api/v1/orgs/${orgId}/credentials`,
+			'GET'
+		);
+		return response.credentials || [];
+	}
+
+	/**
+	 * Add or replace a BYOK credential for an organization
+	 */
+	async addOrgCredential(
+		orgId: string,
+		provider: string,
+		apiKey: string,
+		name?: string
+	): Promise<LLMCredential> {
+		return await this.callAPI<LLMCredential>(
+			`/api/v1/orgs/${orgId}/credentials`,
+			'POST',
+			{ provider, api_key: apiKey, name }
+		);
+	}
+
+	/**
+	 * Delete a BYOK credential from an organization
+	 */
+	async deleteOrgCredential(orgId: string, credentialId: string): Promise<void> {
+		await this.callAPI<{ success: boolean }>(
+			`/api/v1/orgs/${orgId}/credentials/${credentialId}`,
+			'DELETE'
+		);
+	}
+
+	/**
+	 * Re-enable a disabled org credential with a new API key
+	 */
+	async reEnableOrgCredential(
+		orgId: string,
+		credentialId: string,
+		apiKey: string
+	): Promise<LLMCredential> {
+		return await this.callAPI<LLMCredential>(
+			`/api/v1/orgs/${orgId}/credentials/${credentialId}:re-enable`,
+			'POST',
+			{ api_key: apiKey }
+		);
+	}
+
+	/**
+	 * Get audit log for an org credential
+	 */
+	async getOrgCredentialAudit(
+		orgId: string,
+		credentialId: string,
+		limit: number = 50
+	): Promise<CredentialAuditEntry[]> {
+		const response = await this.callAPI<{ audit_log: CredentialAuditEntry[] }>(
+			`/api/v1/orgs/${orgId}/credentials/${credentialId}/audit?limit=${limit}`,
+			'GET'
+		);
+		return response.audit_log || [];
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────────

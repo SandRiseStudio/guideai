@@ -8,6 +8,7 @@
  * - /login: Authentication (device flow + OAuth)
  * - /auth/callback: OAuth redirect handler
  * - /: Dashboard (protected)
+ * - /agents: Agent registry (protected)
  * - /bci: BCI Query panel (protected)
  * - /extraction: Behavior extraction (protected)
  *
@@ -33,6 +34,8 @@ import { NewProjectPage } from './components/projects/NewProjectPage';
 import { ProjectPage } from './components/projects/ProjectPage';
 import { ProjectSettingsPage } from './components/projects/ProjectSettingsPage';
 import { BoardPage } from './components/boards/BoardPage';
+import { OrganizationsPage } from './components/orgs/OrganizationsPage';
+import { AgentsPage } from './components/agents/AgentsPage';
 import type { ReflectionCandidate } from './api/reflection';
 import './styles/design-system.css';
 import './App.css';
@@ -133,6 +136,38 @@ function App() {
             />
 
             {/* Project routes */}
+            <Route
+              path="/orgs"
+              element={
+                <ProtectedRoute>
+                  <OrganizationsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/agents"
+              element={
+                <ProtectedRoute>
+                  <AgentsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/agents/new"
+              element={
+                <ProtectedRoute>
+                  <AgentsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/agents/:agentId"
+              element={
+                <ProtectedRoute>
+                  <AgentsPage />
+                </ProtectedRoute>
+              }
+            />
             <Route
               path="/projects"
               element={

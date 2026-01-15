@@ -30,6 +30,10 @@ paths = [
     '''tests?/.*fixtures?/.*\.json$''',
     '''tests?/.*mocks?/.*\.json$''',
     '''test_github_device_flow\.py$''',
+    '''test_github_credentials\.py$''',  # Contains dummy GitHub token prefixes for testing
+
+    # Gitleaks ignore file itself
+    '''\.gitleaksignore$''',
 
     # Documentation (may contain example secret patterns for illustration)
     '''docs/.*\.md$''',
@@ -60,6 +64,13 @@ regexes = [
     '''<.*_SECRET>''',
     '''<INSERT_.*>''',
     '''REPLACE_WITH_.*''',
+
+    # Anthropic model names (not secrets)
+    '''claude-opus-4-20250514''',
+
+    # Test token patterns with all x's (dummy tokens)
+    '''gh[ps]_x+''',
+    '''github_pat_x+''',
 ]
 
 # =============================================================================

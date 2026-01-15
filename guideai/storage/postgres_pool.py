@@ -306,6 +306,10 @@ class PostgresPool:
             user_id: User ID to set as current_user_id
         """
         with conn.cursor() as cur:
+            # Set search_path to include all application schemas
+            # This allows unqualified table names to work across schemas
+            cur.execute("SET LOCAL search_path = board, auth, execution, workflow, public")
+
             # Set org context for RLS policies
             if org_id:
                 cur.execute("SET LOCAL app.current_org_id = %s", (org_id,))

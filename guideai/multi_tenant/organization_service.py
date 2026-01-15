@@ -70,6 +70,13 @@ from .contracts import (
     AgentStatusEvent,
     AgentStatusHistory,
     is_valid_status_transition,
+    # Project-Agent assignment (junction table)
+    ProjectAgentAssignment,
+    ProjectAgentRole,
+    ProjectAgentStatus,
+    AssignAgentToProjectRequest,
+    UpdateProjectAgentAssignmentRequest,
+    ProjectAgentAssignmentResponse,
 )
 from .board_contracts import CreateBoardRequest
 
@@ -498,6 +505,46 @@ class OrganizationService:
     # =========================================================================
     # Membership Management
     # =========================================================================
+
+    def get_membership(
+        self,
+        org_id: str,
+        user_id: str,
+    ) -> Optional[OrgMembership]:
+        """Get a user's membership in an organization.
+
+        Args:
+            org_id: Organization ID.
+            user_id: User ID.
+
+        Returns:
+            The membership if found, None otherwise.
+        """
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT membership_id, org_id, user_id, role, invited_by, invited_at, created_at, updated_at
+                FROM org_memberships
+                WHERE org_id = %s AND user_id = %s
+                """,
+                (org_id, user_id),
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        return OrgMembership(
+            id=row[0],
+            org_id=row[1],
+            user_id=row[2],
+            role=MemberRole(row[3]) if row[3] else MemberRole.MEMBER,
+            invited_by=row[4],
+            invited_at=row[5],
+            created_at=row[6],
+            updated_at=row[7],
+        )
 
     def add_member(
         self,
@@ -2361,6 +2408,400 @@ class OrganizationService:
             )
             for row in rows
         ]
+
+    def delete_personal_agent(self, agent_id: str, owner_id: str) -> bool:
+        """Soft-delete (archive) a personal agent owned by a user."""
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE agents
+                SET status = 'archived', updated_at = %s
+                WHERE agent_id = %s AND owner_id = %s AND status != 'archived'
+                """,
+                (datetime.utcnow(), agent_id, owner_id),
+            )
+            deleted = cursor.rowcount > 0
+            conn.commit()
+
+        if deleted:
+            logger.info(f"Soft-deleted personal agent {agent_id} for user {owner_id}")
+
+        return deleted
+
+    # =========================================================================
+    # Project-Agent Assignments (Junction Table Pattern)
+    # =========================================================================
+    # These methods use the execution.project_agent_assignments junction table
+    # to link projects with agents from the execution.agents registry.
+    # This is the preferred approach for assigning registry agents to projects.
+
+    def assign_registry_agent_to_project(
+        self,
+        project_id: str,
+        agent_id: str,
+        assigned_by: str,
+        config_overrides: Optional[Dict[str, Any]] = None,
+        role: ProjectAgentRole = ProjectAgentRole.PRIMARY,
+    ) -> ProjectAgentAssignment:
+        """Assign a registry agent to a project.
+
+        Creates a junction record linking a project to an agent from the
+        execution.agents registry. Allows per-project config overrides.
+
+        Args:
+            project_id: Project ID.
+            agent_id: Agent ID from execution.agents registry.
+            assigned_by: User ID making the assignment.
+            config_overrides: Optional project-specific config overrides.
+            role: Role of the agent in this project.
+
+        Returns:
+            The created ProjectAgentAssignment.
+
+        Raises:
+            ValueError: If agent doesn't exist or assignment already exists.
+        """
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+
+            # Verify the agent exists in execution.agents
+            cursor.execute(
+                "SELECT agent_id FROM execution.agents WHERE agent_id = %s",
+                (agent_id,),
+            )
+            if cursor.fetchone() is None:
+                raise ValueError(f"Agent {agent_id} not found in registry")
+
+            # Check for existing assignment
+            cursor.execute(
+                """
+                SELECT id FROM execution.project_agent_assignments
+                WHERE project_id = %s AND agent_id = %s AND status != 'removed'
+                """,
+                (project_id, agent_id),
+            )
+            if cursor.fetchone() is not None:
+                raise ValueError(f"Agent {agent_id} is already assigned to project {project_id}")
+
+            # Insert the assignment - let DB generate UUID and return it
+            cursor.execute(
+                """
+                INSERT INTO execution.project_agent_assignments
+                (project_id, agent_id, assigned_by, config_overrides, role, status)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id, created_at
+                """,
+                (
+                    project_id,
+                    agent_id,
+                    assigned_by,
+                    _jsonb(config_overrides or {}),
+                    role.value,
+                    ProjectAgentStatus.ACTIVE.value,
+                ),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+
+        assignment = ProjectAgentAssignment(
+            id=str(row[0]),  # UUID to string
+            project_id=project_id,
+            agent_id=agent_id,
+            assigned_by=assigned_by,
+            assigned_at=row[1],
+            config_overrides=config_overrides or {},
+            role=role,
+            status=ProjectAgentStatus.ACTIVE,
+        )
+
+        logger.info(
+            f"Assigned registry agent {agent_id} to project {project_id} "
+            f"(assignment {assignment.id}) by user {assigned_by}"
+        )
+        return assignment
+
+    def list_project_agent_assignments(
+        self,
+        project_id: str,
+        include_disabled: bool = False,
+    ) -> List[ProjectAgentAssignmentResponse]:
+        """List all agent assignments for a project.
+
+        Returns assignments with agent details from the registry.
+
+        Args:
+            project_id: Project ID.
+            include_disabled: Whether to include disabled assignments.
+
+        Returns:
+            List of ProjectAgentAssignmentResponse with agent details.
+        """
+        status_filter = "" if include_disabled else "AND paa.status != 'removed'"
+
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT
+                    paa.id,
+                    paa.project_id,
+                    paa.agent_id,
+                    a.name,
+                    a.slug,
+                    a.description,
+                    paa.assigned_by,
+                    paa.created_at,
+                    paa.config_overrides,
+                    paa.role,
+                    paa.status
+                FROM execution.project_agent_assignments paa
+                JOIN execution.agents a ON paa.agent_id = a.agent_id
+                WHERE paa.project_id = %s {status_filter}
+                ORDER BY paa.created_at DESC
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+
+        result = []
+        for row in rows:
+            agent_id = row[2]
+            agent_name = row[3]
+            agent_slug = row[4]
+            stored_config = row[8] or {}
+            # Merge registry_agent_id into config for frontend compatibility
+            config = {
+                **stored_config,
+                "registry_agent_id": agent_id,
+                "registry_agent_slug": agent_slug,
+            }
+            result.append(
+                ProjectAgentAssignmentResponse(
+                    id=str(row[0]),  # UUID to string
+                    project_id=row[1],
+                    agent_id=agent_id,
+                    name=agent_name or "",
+                    agent_name=agent_name,
+                    agent_slug=agent_slug,
+                    agent_description=row[5],
+                    assigned_by=row[6],
+                    assigned_at=row[7],
+                    config=config,
+                    role=ProjectAgentRole(row[9]),
+                    status=ProjectAgentStatus(row[10]),
+                )
+            )
+        return result
+
+    def list_user_project_agent_assignments(
+        self,
+        owner_id: str,
+        project_id: Optional[str] = None,
+    ) -> List[ProjectAgentAssignmentResponse]:
+        """List agent assignments for a user's projects.
+
+        For personal projects (user-owned, no org), list all agent assignments
+        the user has made across their projects.
+
+        Args:
+            owner_id: User ID (project owner).
+            project_id: Optional specific project ID to filter by.
+
+        Returns:
+            List of ProjectAgentAssignmentResponse with agent details.
+        """
+        project_filter = "AND paa.project_id = %s" if project_id else ""
+        params = [owner_id] + ([project_id] if project_id else [])
+
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            # Join to auth.projects to verify ownership
+            cursor.execute(
+                f"""
+                SELECT
+                    paa.id,
+                    paa.project_id,
+                    paa.agent_id,
+                    a.name,
+                    a.slug,
+                    a.description,
+                    paa.assigned_by,
+                    paa.created_at,
+                    paa.config_overrides,
+                    paa.role,
+                    paa.status
+                FROM execution.project_agent_assignments paa
+                JOIN execution.agents a ON paa.agent_id = a.agent_id
+                JOIN auth.projects p ON paa.project_id = p.project_id
+                WHERE p.created_by = %s AND paa.status != 'removed' {project_filter}
+                ORDER BY paa.created_at DESC
+                """,
+                tuple(params),
+            )
+            rows = cursor.fetchall()
+
+        result = []
+        for row in rows:
+            agent_id = row[2]
+            agent_name = row[3]
+            agent_slug = row[4]
+            stored_config = row[8] or {}
+            # Merge registry_agent_id into config for frontend compatibility
+            # Frontend checks config.registry_agent_id to match assignments
+            config = {
+                **stored_config,
+                "registry_agent_id": agent_id,
+                "registry_agent_slug": agent_slug,
+            }
+            result.append(
+                ProjectAgentAssignmentResponse(
+                    id=str(row[0]),  # UUID to string
+                    project_id=row[1],
+                    agent_id=agent_id,
+                    name=agent_name or "",
+                    agent_name=agent_name,
+                    agent_slug=agent_slug,
+                    agent_description=row[5],
+                    assigned_by=row[6],
+                    assigned_at=row[7],
+                    config=config,
+                    role=ProjectAgentRole(row[9]),
+                    status=ProjectAgentStatus(row[10]),
+                )
+            )
+        return result
+
+    def update_project_agent_assignment(
+        self,
+        assignment_id: str,
+        request: UpdateProjectAgentAssignmentRequest,
+        updated_by: str,
+    ) -> Optional[ProjectAgentAssignmentResponse]:
+        """Update a project-agent assignment.
+
+        Args:
+            assignment_id: Assignment ID.
+            request: Update request with fields to change.
+            updated_by: User ID making the update.
+
+        Returns:
+            Updated assignment if found, None otherwise.
+        """
+        updates = []
+        params = []
+
+        if request.config_overrides is not None:
+            updates.append("config_overrides = %s")
+            params.append(_jsonb(request.config_overrides))
+
+        if request.role is not None:
+            updates.append("role = %s")
+            params.append(request.role.value)
+
+        if request.status is not None:
+            updates.append("status = %s")
+            params.append(request.status.value)
+
+        if not updates:
+            return None
+
+        updates.append("updated_at = %s")
+        params.append(datetime.utcnow())
+        params.append(assignment_id)
+
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                UPDATE execution.project_agent_assignments
+                SET {", ".join(updates)}
+                WHERE id = %s
+                RETURNING project_id
+                """,
+                tuple(params),
+            )
+            result = cursor.fetchone()
+            conn.commit()
+
+            if result is None:
+                return None
+
+            project_id = result[0]
+
+        logger.info(f"Updated project-agent assignment {assignment_id} by {updated_by}")
+
+        # Fetch and return the updated assignment with agent details
+        assignments = self.list_project_agent_assignments(project_id, include_disabled=True)
+        return next((a for a in assignments if a.id == assignment_id), None)
+
+    def remove_project_agent_assignment(
+        self,
+        assignment_id: str,
+        removed_by: str,
+    ) -> bool:
+        """Remove (disable) a project-agent assignment.
+
+        Soft-deletes by setting status to 'removed'.
+
+        Args:
+            assignment_id: Assignment ID.
+            removed_by: User ID making the removal.
+
+        Returns:
+            True if removed, False if not found.
+        """
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE execution.project_agent_assignments
+                SET status = 'removed', updated_at = %s
+                WHERE id = %s AND status != 'removed'
+                """,
+                (datetime.utcnow(), assignment_id),
+            )
+            removed = cursor.rowcount > 0
+            conn.commit()
+
+        if removed:
+            logger.info(f"Removed project-agent assignment {assignment_id} by {removed_by}")
+
+        return removed
+
+    def remove_agent_from_project(
+        self,
+        project_id: str,
+        agent_id: str,
+        removed_by: str,
+    ) -> bool:
+        """Remove an agent assignment from a project by agent ID.
+
+        Args:
+            project_id: Project ID.
+            agent_id: Agent ID to remove.
+            removed_by: User ID making the removal.
+
+        Returns:
+            True if removed, False if not found.
+        """
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE execution.project_agent_assignments
+                SET status = 'removed', updated_at = %s
+                WHERE project_id = %s AND agent_id = %s AND status != 'removed'
+                """,
+                (datetime.utcnow(), project_id, agent_id),
+            )
+            removed = cursor.rowcount > 0
+            conn.commit()
+
+        if removed:
+            logger.info(f"Removed agent {agent_id} from project {project_id} by {removed_by}")
+
+        return removed
 
     # =========================================================================
     # Project Collaborators (Share personal projects without creating an org)

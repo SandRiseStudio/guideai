@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from typing import Optional, List, Dict, Any, Set
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import uuid
 
 
@@ -344,6 +344,100 @@ class UpdateAgentRequest(BaseModel):
     status: Optional[AgentStatus] = None
     config: Optional[Dict[str, Any]] = None
     capabilities: Optional[List[str]] = None
+
+
+# =============================================================================
+# Project-Agent Assignment Models (Junction Table)
+# =============================================================================
+
+
+class ProjectAgentRole(str, Enum):
+    """Role of an agent within a project context."""
+
+    PRIMARY = "primary"  # Main agent for the project
+    SUPPORTING = "supporting"  # Helper/secondary agent
+    SPECIALIST = "specialist"  # Domain-specific specialist
+    REVIEWER = "reviewer"  # Code review, compliance, etc.
+
+
+class ProjectAgentStatus(str, Enum):
+    """Status of an agent assignment to a project.
+
+    Must match CHECK constraint in execution.project_agent_assignments:
+    status IN ('active', 'inactive', 'removed')
+    """
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    REMOVED = "removed"
+
+
+class ProjectAgentAssignment(TimestampMixin):
+    """Represents assignment of a registry agent to a project.
+
+    This is a junction table model that links execution.agents (the registry)
+    to projects. It allows:
+    - Many-to-many: One agent can serve multiple projects
+    - Per-project config overrides: Customize agent behavior per project
+    - Role assignment: Define agent's role in the project context
+    - Status management: Enable/disable agents per project
+    """
+
+    id: str = Field(default_factory=lambda: f"paa-{uuid.uuid4().hex[:12]}")
+    project_id: str
+    agent_id: str  # References execution.agents.agent_id
+    assigned_by: str  # User who made the assignment (required in DB)
+    config_overrides: Dict[str, Any] = Field(default_factory=dict)
+    role: ProjectAgentRole = ProjectAgentRole.PRIMARY
+    status: ProjectAgentStatus = ProjectAgentStatus.ACTIVE
+
+    class Config:
+        from_attributes = True
+
+
+class AssignAgentToProjectRequest(BaseModel):
+    """Request to assign a registry agent to a project."""
+
+    agent_id: str = Field(..., description="ID of the agent from the registry (execution.agents)")
+    config_overrides: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Project-specific configuration overrides"
+    )
+    role: ProjectAgentRole = Field(
+        default=ProjectAgentRole.PRIMARY,
+        description="Agent's role within this project"
+    )
+
+
+class UpdateProjectAgentAssignmentRequest(BaseModel):
+    """Request to update an existing agent assignment."""
+
+    config_overrides: Optional[Dict[str, Any]] = None
+    role: Optional[ProjectAgentRole] = None
+    status: Optional[ProjectAgentStatus] = None
+
+
+class ProjectAgentAssignmentResponse(BaseModel):
+    """Response model for project-agent assignments with agent details.
+
+    Designed to be compatible with the frontend Agent interface which expects
+    fields like `config.registry_agent_id` and `project_id`.
+    """
+
+    id: str
+    project_id: str
+    agent_id: str
+    name: str = ""  # Frontend expects 'name' at top level
+    agent_name: Optional[str] = None  # Also keep for explicitness
+    agent_slug: Optional[str] = None
+    agent_description: Optional[str] = None
+    assigned_by: Optional[str] = None
+    assigned_at: datetime
+    config: Dict[str, Any] = Field(default_factory=dict)  # Frontend expects 'config'
+    role: ProjectAgentRole
+    status: ProjectAgentStatus
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =============================================================================

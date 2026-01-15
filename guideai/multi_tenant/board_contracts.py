@@ -132,8 +132,12 @@ VALID_STATUS_TRANSITIONS: dict[WorkItemStatus, list[WorkItemStatus]] = {
 
 
 def is_valid_status_transition(from_status: WorkItemStatus, to_status: WorkItemStatus) -> bool:
-    """Check if a status transition is valid."""
-    return to_status in VALID_STATUS_TRANSITIONS.get(from_status, [])
+    """Check if a status transition is valid.
+
+    Note: All transitions are allowed - work items can be moved directly
+    from any status to any other status (drag-and-drop across columns).
+    """
+    return True  # Allow all transitions
 
 
 # =============================================================================

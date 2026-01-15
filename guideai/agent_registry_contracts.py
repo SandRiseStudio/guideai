@@ -54,6 +54,7 @@ class Agent:
     org_id: Optional[str] = None       # Organization for RLS
     published_at: Optional[str] = None  # When made public
     is_builtin: bool = False           # True for system agents from playbooks
+    service_principal_id: Optional[str] = None  # FK to auth.service_principals for API access
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -71,6 +72,7 @@ class Agent:
             "org_id": self.org_id,
             "published_at": self.published_at,
             "is_builtin": self.is_builtin,
+            "service_principal_id": self.service_principal_id,
         }
 
 
@@ -148,6 +150,16 @@ class CreateAgentRequest:
     tags: List[str] = field(default_factory=list)
     visibility: str = AgentVisibility.PRIVATE.value
     metadata: Dict[str, Any] = field(default_factory=dict)
+    request_api_credentials: bool = False  # If True, create ServicePrincipal for API access
+
+
+@dataclass
+class CreateAgentResponse:
+    """Response from creating an agent."""
+    agent: Agent
+    # API credentials (only present if request_api_credentials=True)
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None  # Plain text secret, only returned on creation
 
 
 @dataclass
@@ -163,6 +175,7 @@ class UpdateAgentRequest:
     default_behaviors: Optional[List[str]] = None
     playbook_content: Optional[str] = None
     tags: Optional[List[str]] = None
+    visibility: Optional[str] = None   # New visibility level
     metadata: Optional[Dict[str, Any]] = None
 
 

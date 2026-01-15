@@ -72,7 +72,7 @@ from guideai.utils.dsn import resolve_postgres_dsn
 logger = logging.getLogger(__name__)
 
 _BOARD_PG_DSN_ENV = "GUIDEAI_BOARD_PG_DSN"
-_DEFAULT_PG_DSN = "postgresql://guideai:guideai@localhost:5432/guideai"
+_DEFAULT_PG_DSN = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
 
 
 def _now() -> datetime:
@@ -136,12 +136,22 @@ class ColumnNotFoundError(BoardServiceError):
     """Column not found."""
 
 
+class AuthorNotFoundError(BoardServiceError):
+    """Author (user or agent) not found."""
+
+
+class AssigneeNotFoundError(BoardServiceError):
+    """Assignee (user or agent) not found during assignment validation."""
+
+
 class ConcurrencyConflictError(BoardServiceError):
     """Optimistic concurrency conflict."""
 
 
-# Event handler type
+# Callback types
 BoardEventHandler = Callable[[BoardEvent], None]
+# Agent validator: (agent_id, org_id) -> bool (returns True if agent exists)
+AgentValidator = Callable[[str, Optional[str]], bool]
 
 
 class BoardService:
@@ -152,6 +162,7 @@ class BoardService:
         dsn: Optional[str] = None,
         pool: Optional[PostgresPool] = None,
         telemetry: Optional[TelemetryClient] = None,
+        agent_validator: Optional[AgentValidator] = None,
     ) -> None:
         if pool is None:
             if dsn is None:
@@ -165,6 +176,11 @@ class BoardService:
         self._pool = pool
         self._telemetry = telemetry
         self._event_handlers: List[BoardEventHandler] = []
+        self._agent_validator = agent_validator
+
+    def set_agent_validator(self, validator: AgentValidator) -> None:
+        """Set the agent validator callback for verifying agent existence during assignment."""
+        self._agent_validator = validator
 
     def register_event_handler(self, handler: BoardEventHandler) -> None:
         """Register a callback for board events."""
@@ -424,10 +440,21 @@ class BoardService:
         )
         if not result:
             raise ColumnNotFoundError(f"Column {column_id} not found")
+
+        # Parse status_mapping from DB if present, fallback to TODO
+        status_mapping_val = result.get("status_mapping")
+        if status_mapping_val:
+            try:
+                status_mapping = WorkItemStatus(status_mapping_val)
+            except ValueError:
+                status_mapping = WorkItemStatus.TODO
+        else:
+            status_mapping = WorkItemStatus.TODO
+
         return BoardColumn(
             column_id=str(result["id"]), board_id=str(result["board_id"]),
             name=result["name"], position=result["position"],
-            status_mapping=WorkItemStatus.TODO,  # Default, status_mapping not in schema
+            status_mapping=status_mapping,
             wip_limit=result.get("wip_limit"),
             settings={},  # settings not in schema
             created_at=result["created_at"],
@@ -1166,6 +1193,22 @@ class BoardService:
     ) -> WorkItem:
         """Assign a work item to a user or agent."""
         item = self.get_work_item(item_id, org_id=org_id)
+
+        # Validate agent exists before assignment
+        if request.assignee_type == AssigneeType.AGENT and request.assignee_id:
+            if self._agent_validator:
+                if not self._agent_validator(request.assignee_id, org_id):
+                    raise AssigneeNotFoundError(
+                        f"Agent '{request.assignee_id}' not found. "
+                        "The agent may have been deleted or is not accessible in this context."
+                    )
+            else:
+                # No validator configured - log warning but allow (backward compatibility)
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"No agent validator configured - skipping validation for agent {request.assignee_id}"
+                )
+
         timestamp = _now()
         previous_assignee = item.assignee_id
         previous_type = item.assignee_type
@@ -1928,4 +1971,257 @@ class BoardService:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             created_by=row.get("created_by"),
+        )
+
+    # =========================================================================
+    # Work Item Comments
+    # =========================================================================
+
+    def validate_author(
+        self,
+        author_id: str,
+        author_type: str,
+        *,
+        org_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Validate that an author_id exists in the appropriate table.
+
+        Args:
+            author_id: The ID to validate
+            author_type: Either "user" or "agent"
+            org_id: Optional organization context
+
+        Returns:
+            True if author exists, raises AuthorNotFoundError otherwise.
+        """
+        if author_type not in ("user", "agent"):
+            raise BoardServiceError(f"Invalid author_type '{author_type}', must be 'user' or 'agent'")
+
+        def _query(conn: Any) -> bool:
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                if author_type == "user":
+                    cur.execute(
+                        "SELECT 1 FROM auth.users WHERE user_id = %s",
+                        (author_id,),
+                    )
+                else:  # agent
+                    cur.execute(
+                        "SELECT 1 FROM execution.agents WHERE agent_id = %s",
+                        (author_id,),
+                    )
+                return cur.fetchone() is not None
+
+        exists = self._pool.run_query(
+            operation="author.validate",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+        if not exists:
+            raise AuthorNotFoundError(
+                f"Author {author_id} not found in {author_type}s table"
+            )
+        return True
+
+    def add_comment(
+        self,
+        work_item_id: str,
+        author_id: str,
+        author_type: str,
+        content: str,
+        actor: Actor,
+        *,
+        run_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Add a comment to a work item.
+
+        Args:
+            work_item_id: The work item to comment on
+            author_id: ID of the comment author (user or agent)
+            author_type: "user" or "agent"
+            content: Comment text
+            actor: The actor performing the operation
+            run_id: Optional link to an execution run
+            metadata: Optional extra data
+            org_id: Organization context
+
+        Returns:
+            Dict with comment data including comment_id
+        """
+        # Validate work item exists
+        self.get_work_item(work_item_id, org_id=org_id)
+
+        # Validate author exists
+        self.validate_author(author_id, author_type, org_id=org_id)
+
+        comment_id = str(uuid.uuid4())  # Use UUID instead of short ID
+        timestamp = _now()
+        meta_json = json.dumps(metadata or {})
+
+        result_holder: List[Dict] = []
+
+        def _execute(conn: Any) -> None:
+            self._pool.set_tenant_context(conn, org_id, actor.id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO board.work_item_comments
+                        (id, work_item_id, author_id, author_type, content, run_id, metadata, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                    RETURNING id, work_item_id, author_id, author_type, content, run_id, metadata, created_at, updated_at
+                    """,
+                    (comment_id, work_item_id, author_id, author_type, content, run_id, meta_json, timestamp, timestamp),
+                )
+                cols = [d[0] for d in cur.description]
+                row = cur.fetchone()
+                if row:
+                    result_holder.append(dict(zip(cols, row)))
+
+        self._pool.run_transaction(
+            operation="comment.add",
+            service_prefix="board",
+            actor=_actor_payload(actor),
+            metadata={"work_item_id": work_item_id, "comment_id": comment_id},
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
+
+        if not result_holder:
+            raise BoardServiceError(f"Failed to create comment for work item {work_item_id}")
+
+        result = result_holder[0]
+        return {
+            "comment_id": str(result["id"]),
+            "work_item_id": str(result["work_item_id"]),
+            "author_id": result["author_id"],
+            "author_type": result["author_type"],
+            "content": result["content"],
+            "run_id": result.get("run_id"),
+            "metadata": _parse_jsonb(result.get("metadata"), {}),
+            "created_at": result["created_at"].isoformat() if result.get("created_at") else None,
+            "updated_at": result["updated_at"].isoformat() if result.get("updated_at") else None,
+        }
+
+    def list_comments(
+        self,
+        work_item_id: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        org_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        List comments on a work item.
+
+        Args:
+            work_item_id: The work item to get comments for
+            limit: Maximum number of comments to return
+            offset: Number of comments to skip
+            org_id: Organization context
+
+        Returns:
+            List of comment dicts, ordered by created_at ascending (oldest first)
+        """
+        # Validate work item exists
+        self.get_work_item(work_item_id, org_id=org_id)
+
+        def _query(conn: Any) -> List[Dict]:
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, work_item_id, author_id, author_type, content, run_id, metadata, created_at, updated_at
+                    FROM board.work_item_comments
+                    WHERE work_item_id = %s
+                    ORDER BY created_at ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (work_item_id, limit, offset),
+                )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        rows = self._pool.run_query(
+            operation="comment.list",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
+        return [
+            {
+                "comment_id": str(row["id"]),
+                "work_item_id": str(row["work_item_id"]),
+                "author_id": row["author_id"],
+                "author_type": row["author_type"],
+                "content": row["content"],
+                "run_id": str(row["run_id"]) if row.get("run_id") else None,
+                "metadata": _parse_jsonb(row.get("metadata"), {}),
+                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+            }
+            for row in rows
+        ]
+
+    def get_column_by_status_mapping(
+        self,
+        board_id: str,
+        status_mapping: WorkItemStatus,
+        *,
+        org_id: Optional[str] = None,
+    ) -> Optional[BoardColumn]:
+        """
+        Get a column by its status mapping.
+
+        Args:
+            board_id: The board to search
+            status_mapping: The WorkItemStatus to find
+            org_id: Organization context
+
+        Returns:
+            BoardColumn if found, None otherwise
+        """
+        def _query(conn: Any) -> Optional[Dict]:
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM columns
+                    WHERE board_id = %s::uuid AND status_mapping = %s
+                    ORDER BY position ASC
+                    LIMIT 1
+                    """,
+                    (board_id, status_mapping.value),
+                )
+                row = cur.fetchone()
+                if row:
+                    cols = [d[0] for d in cur.description]
+                    return dict(zip(cols, row))
+            return None
+
+        result = self._pool.run_query(
+            operation="column.get_by_status",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
+        if not result:
+            return None
+
+        return BoardColumn(
+            column_id=str(result["id"]),
+            board_id=str(result["board_id"]),
+            name=result["name"],
+            position=result["position"],
+            status_mapping=WorkItemStatus(result["status_mapping"]) if result.get("status_mapping") else WorkItemStatus.TODO,
+            wip_limit=result.get("wip_limit"),
+            settings={},
+            created_at=result["created_at"],
+            updated_at=result.get("updated_at") or result["created_at"],
         )

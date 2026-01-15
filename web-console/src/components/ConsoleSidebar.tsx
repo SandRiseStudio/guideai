@@ -7,7 +7,14 @@
 import { memo, useCallback } from 'react';
 import { DocumentList } from './workspace/DocumentList';
 
-export type ConsoleSidebarSelectedId = 'dashboard' | 'projects' | 'projects-new' | 'bci' | 'extraction';
+export type ConsoleSidebarSelectedId =
+  | 'dashboard'
+  | 'orgs'
+  | 'projects'
+  | 'projects-new'
+  | 'agents'
+  | 'bci'
+  | 'extraction';
 
 interface ConsoleSidebarProps {
   selectedId: ConsoleSidebarSelectedId;
@@ -16,11 +23,13 @@ interface ConsoleSidebarProps {
 
 export const ConsoleSidebar = memo(function ConsoleSidebar({ selectedId, onNavigate }: ConsoleSidebarProps) {
   const sidebarItems = [
-    { id: 'dashboard', title: 'Dashboard', type: 'dashboard', updated_at: new Date().toISOString() },
-    { id: 'projects', title: 'Projects', type: 'folder', updated_at: new Date().toISOString() },
-    { id: 'projects-new', title: 'New Project', type: 'plan', updated_at: new Date().toISOString() },
-    { id: 'bci', title: 'BCI Query', type: 'plan', updated_at: new Date().toISOString() },
-    { id: 'extraction', title: 'Extraction', type: 'workflow', updated_at: new Date().toISOString() },
+    { id: 'dashboard', title: 'Dashboard', document_type: 'plan', updated_at: new Date().toISOString() },
+    { id: 'orgs', title: 'Organizations', document_type: 'org', updated_at: new Date().toISOString() },
+    { id: 'projects', title: 'Projects', document_type: 'workflow', updated_at: new Date().toISOString() },
+    { id: 'agents', title: 'Agents', document_type: 'agent', updated_at: new Date().toISOString() },
+    { id: 'projects-new', title: 'New Project', document_type: 'plan', updated_at: new Date().toISOString() },
+    { id: 'bci', title: 'BCI Query', document_type: 'plan', updated_at: new Date().toISOString() },
+    { id: 'extraction', title: 'Extraction', document_type: 'workflow', updated_at: new Date().toISOString() },
   ];
 
   const handleSelect = useCallback(
@@ -31,6 +40,12 @@ export const ConsoleSidebar = memo(function ConsoleSidebar({ selectedId, onNavig
           break;
         case 'projects':
           onNavigate('/projects');
+          break;
+        case 'orgs':
+          onNavigate('/orgs');
+          break;
+        case 'agents':
+          onNavigate('/agents');
           break;
         case 'projects-new':
           onNavigate('/projects/new');

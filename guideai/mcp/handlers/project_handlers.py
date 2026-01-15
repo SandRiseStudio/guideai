@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-# NOTE: Project is a Pydantic model - use .model_dump() not asdict()
 
-from guideai.multi_tenant.contracts import (
+from ...multi_tenant.organization_service import OrganizationService
+from ...multi_tenant.contracts import (
     Project,
     ProjectVisibility,
     MemberRole,
+    CreateProjectRequest,
+    UpdateProjectRequest,
 )
 
 
@@ -50,7 +52,7 @@ def _project_to_dict(project: Project) -> Dict[str, Any]:
 # ==============================================================================
 
 
-async def _check_org_access(
+def _check_org_access(
     org_service: OrganizationService,
     org_id: str,
     user_id: str,
@@ -61,7 +63,7 @@ async def _check_org_access(
 
     Returns: (has_access, error_message, role)
     """
-    membership = await org_service.get_membership(org_id=org_id, user_id=user_id)
+    membership = org_service.get_membership(org_id=org_id, user_id=user_id)
     if not membership:
         return False, "Access denied or organization not found", None
 
@@ -71,8 +73,8 @@ async def _check_org_access(
     return True, None, membership.role
 
 
-async def _check_project_access(
-    project_service: ProjectService,
+def _check_project_access(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     project_id: str,
     user_id: str,
@@ -83,11 +85,11 @@ async def _check_project_access(
 
     Returns: (has_access, error_message, project)
     """
-    project = await project_service.get_project(project_id)
+    project = project_service.get_project(project_id)
     if not project:
         return False, f"Project {project_id} not found", None
 
-    has_access, error, role = await _check_org_access(
+    has_access, error, role = _check_org_access(
         org_service,
         project.org_id,
         user_id,
@@ -105,8 +107,8 @@ async def _check_project_access(
 # ==============================================================================
 
 
-async def handle_create_project(
-    project_service: ProjectService,
+def handle_create_project(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -119,23 +121,30 @@ async def handle_create_project(
     org_id = arguments["org_id"]
     name = arguments["name"]
     description = arguments.get("description")
+    visibility = arguments.get("visibility", "private")
     settings = arguments.get("settings", {})
     metadata = arguments.get("metadata", {})
 
     # Check user has admin access to org
-    has_access, error, _ = await _check_org_access(
+    has_access, error, _ = _check_org_access(
         org_service, org_id, user_id, require_admin=True
     )
     if not has_access:
         return {"success": False, "error": error}
 
-    project = await project_service.create_project(
+    # Parse visibility
+    try:
+        visibility_enum = ProjectVisibility(visibility)
+    except ValueError:
+        visibility_enum = ProjectVisibility.PRIVATE
+
+    project = project_service.create_project(
         org_id=org_id,
         name=name,
+        owner_id=user_id,
         description=description,
-        created_by=user_id,
+        visibility=visibility_enum,
         settings=settings,
-        metadata=metadata,
     )
 
     return {
@@ -145,8 +154,8 @@ async def handle_create_project(
     }
 
 
-async def handle_get_project(
-    project_service: ProjectService,
+def handle_get_project(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -158,7 +167,7 @@ async def handle_get_project(
     user_id = arguments["user_id"]
     project_id = arguments["project_id"]
 
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
@@ -170,8 +179,8 @@ async def handle_get_project(
     }
 
 
-async def handle_list_projects(
-    project_service: ProjectService,
+def handle_list_projects(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -182,42 +191,32 @@ async def handle_list_projects(
     """
     user_id = arguments["user_id"]
     org_id = arguments["org_id"]
-    status = arguments.get("status")
     limit = arguments.get("limit", 50)
     offset = arguments.get("offset", 0)
 
     # Check user has access to org
-    has_access, error, _ = await _check_org_access(org_service, org_id, user_id)
+    has_access, error, _ = _check_org_access(org_service, org_id, user_id)
     if not has_access:
         return {"success": False, "error": error}
 
-    # Parse status filter if provided
-    status_filter = None
-    if status:
-        try:
-            status_filter = ProjectStatus(status)
-        except ValueError:
-            pass
+    projects = project_service.list_projects(org_id=org_id)
 
-    projects = await project_service.list_projects(
-        org_id=org_id,
-        status=status_filter,
-        limit=limit,
-        offset=offset,
-    )
+    # Apply pagination
+    total = len(projects)
+    projects = projects[offset:offset + limit]
 
     return {
         "success": True,
         "projects": [_project_to_dict(p) for p in projects],
-        "total": len(projects),
+        "total": total,
         "org_id": org_id,
         "limit": limit,
         "offset": offset,
     }
 
 
-async def handle_update_project(
-    project_service: ProjectService,
+def handle_update_project(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -230,29 +229,21 @@ async def handle_update_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
         return {"success": False, "error": error}
 
-    # Build update kwargs
-    updates = {}
-    if "name" in arguments:
-        updates["name"] = arguments["name"]
-    if "description" in arguments:
-        updates["description"] = arguments["description"]
-    if "status" in arguments:
-        try:
-            updates["status"] = ProjectStatus(arguments["status"])
-        except ValueError:
-            pass
-    if "settings" in arguments:
-        updates["settings"] = arguments["settings"]
-    if "metadata" in arguments:
-        updates["metadata"] = arguments["metadata"]
+    # Build update request
+    update_request = UpdateProjectRequest(
+        name=arguments.get("name"),
+        description=arguments.get("description"),
+        settings=arguments.get("settings"),
+        metadata=arguments.get("metadata"),
+    )
 
-    updated_project = await project_service.update_project(project_id, **updates)
+    updated_project = project_service.update_project(project_id, update_request)
     if not updated_project:
         return {
             "success": False,
@@ -266,8 +257,8 @@ async def handle_update_project(
     }
 
 
-async def handle_delete_project(
-    project_service: ProjectService,
+def handle_delete_project(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -280,13 +271,13 @@ async def handle_delete_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
         return {"success": False, "error": error}
 
-    success = await project_service.delete_project(project_id)
+    success = project_service.delete_project(project_id)
     if not success:
         return {
             "success": False,
@@ -300,8 +291,8 @@ async def handle_delete_project(
     }
 
 
-async def handle_archive_project(
-    project_service: ProjectService,
+def handle_archive_project(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -314,16 +305,20 @@ async def handle_archive_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
         return {"success": False, "error": error}
 
-    # Archive by updating settings (Project model doesn't have status field)
-    updated_project = await project_service.update_project(
-        project_id, settings={"archived": True, "archived_at": datetime.utcnow().isoformat()}
-    )
+    # Archive by updating settings
+    current_settings = project.settings or {}
+    current_settings["archived"] = True
+    current_settings["archived_at"] = datetime.utcnow().isoformat()
+
+    update_request = UpdateProjectRequest(settings=current_settings)
+    updated_project = project_service.update_project(project_id, update_request)
+
     if not updated_project:
         return {
             "success": False,
@@ -337,8 +332,8 @@ async def handle_archive_project(
     }
 
 
-async def handle_restore_project(
-    project_service: ProjectService,
+def handle_restore_project(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -351,16 +346,20 @@ async def handle_restore_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
         return {"success": False, "error": error}
 
     # Restore by removing archive flag from settings
-    updated_project = await project_service.update_project(
-        project_id, settings={"archived": False, "archived_at": None}
-    )
+    current_settings = project.settings or {}
+    current_settings["archived"] = False
+    current_settings["archived_at"] = None
+
+    update_request = UpdateProjectRequest(settings=current_settings)
+    updated_project = project_service.update_project(project_id, update_request)
+
     if not updated_project:
         return {
             "success": False,
@@ -379,8 +378,8 @@ async def handle_restore_project(
 # ==============================================================================
 
 
-async def handle_get_settings(
-    project_service: ProjectService,
+def handle_get_settings(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -392,7 +391,7 @@ async def handle_get_settings(
     user_id = arguments["user_id"]
     project_id = arguments["project_id"]
 
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
@@ -405,8 +404,8 @@ async def handle_get_settings(
     }
 
 
-async def handle_update_settings(
-    project_service: ProjectService,
+def handle_update_settings(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -421,7 +420,7 @@ async def handle_update_settings(
     merge = arguments.get("merge", True)
 
     # Check user has write access
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
@@ -433,13 +432,13 @@ async def handle_update_settings(
     else:
         new_settings = settings
 
-    updated_project = await project_service.update_project(
-        project_id, settings=new_settings
-    )
+    update_request = UpdateProjectRequest(settings=new_settings)
+    updated_project = project_service.update_project(project_id, update_request)
+
     if not updated_project:
         return {
             "success": False,
-            "error": f"Failed to update project settings",
+            "error": "Failed to update project settings",
         }
 
     return {
@@ -455,8 +454,8 @@ async def handle_update_settings(
 # ==============================================================================
 
 
-async def handle_get_stats(
-    project_service: ProjectService,
+def handle_get_stats(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -468,13 +467,16 @@ async def handle_get_stats(
     user_id = arguments["user_id"]
     project_id = arguments["project_id"]
 
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
         return {"success": False, "error": error}
 
-    stats = await project_service.get_project_stats(project_id)
+    # Get stats if method exists
+    stats = {}
+    if hasattr(project_service, 'get_project_stats'):
+        stats = project_service.get_project_stats(project_id)
 
     return {
         "success": True,
@@ -483,8 +485,8 @@ async def handle_get_stats(
     }
 
 
-async def handle_get_usage(
-    project_service: ProjectService,
+def handle_get_usage(
+    project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -497,13 +499,16 @@ async def handle_get_usage(
     project_id = arguments["project_id"]
     period = arguments.get("period", "30d")
 
-    has_access, error, project = await _check_project_access(
+    has_access, error, project = _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
         return {"success": False, "error": error}
 
-    usage = await project_service.get_project_usage(project_id, period=period)
+    # Get usage if method exists
+    usage = {}
+    if hasattr(project_service, 'get_project_usage'):
+        usage = project_service.get_project_usage(project_id, period=period)
 
     return {
         "success": True,

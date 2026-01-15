@@ -19,6 +19,8 @@ from ...multi_tenant.contracts import (
     MemberRole,
     Invitation,
     InvitationStatus,
+    CreateOrgRequest,
+    UpdateOrgRequest,
 )
 
 
@@ -67,7 +69,7 @@ def _invitation_to_dict(invitation: Invitation) -> Dict[str, Any]:
 # ==============================================================================
 
 
-async def handle_create_org(
+def handle_create_org(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -78,6 +80,11 @@ async def handle_create_org(
     """
     user_id = arguments["user_id"]
     name = arguments["name"]
+    # Slug is required - auto-generate from name if not provided
+    slug = arguments.get("slug") or name.lower().replace(" ", "-").replace("_", "-")
+    # Ensure slug is URL-safe (only lowercase alphanumeric and hyphens)
+    import re
+    slug = re.sub(r"[^a-z0-9-]", "", slug)
     display_name = arguments.get("display_name")
     plan = arguments.get("plan", "free")
     settings = arguments.get("settings", {})
@@ -89,13 +96,19 @@ async def handle_create_org(
     except ValueError:
         plan_enum = OrgPlan.FREE
 
-    org = await service.create_organization(
+    # Create request object
+    request = CreateOrgRequest(
         name=name,
-        owner_id=user_id,
+        slug=slug,
         display_name=display_name,
         plan=plan_enum,
         settings=settings,
         metadata=metadata,
+    )
+
+    org = service.create_organization(
+        request=request,
+        owner_id=user_id,
     )
 
     return {
@@ -105,7 +118,7 @@ async def handle_create_org(
     }
 
 
-async def handle_get_org(
+def handle_get_org(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -118,14 +131,14 @@ async def handle_get_org(
     user_id = arguments["user_id"]
 
     # Check user has access to this org
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership:
         return {
             "success": False,
             "error": "Access denied or organization not found",
         }
 
-    org = await service.get_organization(org_id)
+    org = service.get_organization(org_id)
     if not org:
         return {
             "success": False,
@@ -138,7 +151,7 @@ async def handle_get_org(
     }
 
 
-async def handle_list_orgs(
+def handle_list_orgs(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -160,12 +173,20 @@ async def handle_list_orgs(
         except ValueError:
             pass
 
-    orgs = await service.list_user_organizations(
-        user_id=user_id,
-        role=role_filter,
-        limit=limit,
-        offset=offset,
-    )
+    orgs = service.list_user_organizations(user_id=user_id)
+
+    # Apply role filter if specified
+    if role_filter:
+        # Filter orgs where user has the specified role
+        filtered_orgs = []
+        for org in orgs:
+            membership = service.get_membership(org_id=org.id, user_id=user_id)
+            if membership and membership.role == role_filter:
+                filtered_orgs.append(org)
+        orgs = filtered_orgs
+
+    # Apply pagination
+    orgs = orgs[offset:offset + limit]
 
     return {
         "success": True,
@@ -176,7 +197,7 @@ async def handle_list_orgs(
     }
 
 
-async def handle_update_org(
+def handle_update_org(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -189,35 +210,22 @@ async def handle_update_org(
     org_id = arguments["org_id"]
 
     # Check user has admin access
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership or membership.role not in [MemberRole.OWNER, MemberRole.ADMIN]:
         return {
             "success": False,
             "error": "Access denied. Requires admin or owner role.",
         }
 
-    # Build update kwargs
-    updates = {}
-    if "name" in arguments:
-        updates["name"] = arguments["name"]
-    if "display_name" in arguments:
-        updates["display_name"] = arguments["display_name"]
-    if "plan" in arguments:
-        try:
-            updates["plan"] = OrgPlan(arguments["plan"])
-        except ValueError:
-            pass
-    if "status" in arguments:
-        try:
-            updates["status"] = OrgStatus(arguments["status"])
-        except ValueError:
-            pass
-    if "settings" in arguments:
-        updates["settings"] = arguments["settings"]
-    if "metadata" in arguments:
-        updates["metadata"] = arguments["metadata"]
+    # Build update request
+    update_request = UpdateOrgRequest(
+        name=arguments.get("name"),
+        display_name=arguments.get("display_name"),
+        settings=arguments.get("settings"),
+        metadata=arguments.get("metadata"),
+    )
 
-    org = await service.update_organization(org_id, **updates)
+    org = service.update_organization(org_id, update_request)
     if not org:
         return {
             "success": False,
@@ -231,7 +239,7 @@ async def handle_update_org(
     }
 
 
-async def handle_delete_org(
+def handle_delete_org(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -244,14 +252,14 @@ async def handle_delete_org(
     org_id = arguments["org_id"]
 
     # Check user is owner
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership or membership.role != MemberRole.OWNER:
         return {
             "success": False,
             "error": "Access denied. Only the owner can delete an organization.",
         }
 
-    success = await service.delete_organization(org_id)
+    success = service.delete_organization(org_id)
     if not success:
         return {
             "success": False,
@@ -265,7 +273,7 @@ async def handle_delete_org(
     }
 
 
-async def handle_switch_org(
+def handle_switch_org(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -278,22 +286,23 @@ async def handle_switch_org(
     org_id = arguments["org_id"]
 
     # Verify user has access to this org
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership:
         return {
             "success": False,
             "error": "Access denied or organization not found",
         }
 
-    org = await service.get_organization(org_id)
+    org = service.get_organization(org_id)
     if not org:
         return {
             "success": False,
             "error": f"Organization {org_id} not found",
         }
 
-    # Set as current org in user preferences
-    await service.set_user_current_org(user_id=user_id, org_id=org_id)
+    # Set as current org in user preferences (if method exists)
+    if hasattr(service, 'set_user_current_org'):
+        service.set_user_current_org(user_id=user_id, org_id=org_id)
 
     return {
         "success": True,
@@ -307,7 +316,7 @@ async def handle_switch_org(
     }
 
 
-async def handle_get_context(
+def handle_get_context(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -319,14 +328,14 @@ async def handle_get_context(
     user_id = arguments["user_id"]
     org_id = arguments["org_id"]
 
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership:
         return {
             "success": False,
             "error": "User is not a member of this organization",
         }
 
-    org = await service.get_organization(org_id)
+    org = service.get_organization(org_id)
     if not org:
         return {
             "success": False,
@@ -350,7 +359,7 @@ async def handle_get_context(
 # ==============================================================================
 
 
-async def handle_list_members(
+def handle_list_members(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -366,7 +375,7 @@ async def handle_list_members(
     offset = arguments.get("offset", 0)
 
     # Check user has access to this org
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership:
         return {
             "success": False,
@@ -381,23 +390,26 @@ async def handle_list_members(
         except ValueError:
             pass
 
-    members = await service.list_members(
-        org_id=org_id,
-        role=role_filter,
-        limit=limit,
-        offset=offset,
-    )
+    members = service.list_memberships(org_id=org_id)
+
+    # Apply role filter if specified
+    if role_filter:
+        members = [m for m in members if m.role == role_filter]
+
+    # Apply pagination
+    total = len(members)
+    members = members[offset:offset + limit]
 
     return {
         "success": True,
         "members": [_membership_to_dict(m) for m in members],
-        "total": len(members),
+        "total": total,
         "limit": limit,
         "offset": offset,
     }
 
 
-async def handle_add_member(
+def handle_add_member(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -412,7 +424,7 @@ async def handle_add_member(
     role = arguments.get("role", "member")
 
     # Check user has admin access
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership or membership.role not in [MemberRole.OWNER, MemberRole.ADMIN]:
         return {
             "success": False,
@@ -425,7 +437,7 @@ async def handle_add_member(
     except ValueError:
         role_enum = MemberRole.MEMBER
 
-    new_membership = await service.add_member(
+    new_membership = service.add_member(
         org_id=org_id,
         user_id=target_user_id,
         role=role_enum,
@@ -444,7 +456,7 @@ async def handle_add_member(
     }
 
 
-async def handle_remove_member(
+def handle_remove_member(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -458,7 +470,7 @@ async def handle_remove_member(
     target_user_id = arguments["target_user_id"]
 
     # Check user has admin access
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership or membership.role not in [MemberRole.OWNER, MemberRole.ADMIN]:
         return {
             "success": False,
@@ -466,14 +478,14 @@ async def handle_remove_member(
         }
 
     # Cannot remove owner
-    target_membership = await service.get_membership(org_id=org_id, user_id=target_user_id)
+    target_membership = service.get_membership(org_id=org_id, user_id=target_user_id)
     if target_membership and target_membership.role == MemberRole.OWNER:
         return {
             "success": False,
             "error": "Cannot remove the organization owner.",
         }
 
-    success = await service.remove_member(org_id=org_id, user_id=target_user_id)
+    success = service.remove_member(org_id=org_id, user_id=target_user_id)
     if not success:
         return {
             "success": False,
@@ -487,7 +499,7 @@ async def handle_remove_member(
     }
 
 
-async def handle_update_member_role(
+def handle_update_member_role(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -502,7 +514,7 @@ async def handle_update_member_role(
     role = arguments["role"]
 
     # Check user has admin access
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership or membership.role not in [MemberRole.OWNER, MemberRole.ADMIN]:
         return {
             "success": False,
@@ -525,7 +537,7 @@ async def handle_update_member_role(
             "error": "Only the current owner can transfer ownership.",
         }
 
-    updated = await service.update_member_role(
+    updated = service.update_member_role(
         org_id=org_id,
         user_id=target_user_id,
         role=role_enum,
@@ -549,7 +561,7 @@ async def handle_update_member_role(
 # ==============================================================================
 
 
-async def handle_invite_member(
+def handle_invite_member(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -564,7 +576,7 @@ async def handle_invite_member(
     role = arguments.get("role", "member")
 
     # Check user has admin access
-    membership = await service.get_membership(org_id=org_id, user_id=user_id)
+    membership = service.get_membership(org_id=org_id, user_id=user_id)
     if not membership or membership.role not in [MemberRole.OWNER, MemberRole.ADMIN]:
         return {
             "success": False,
@@ -577,7 +589,7 @@ async def handle_invite_member(
     except ValueError:
         role_enum = MemberRole.MEMBER
 
-    invitation = await service.create_invitation(
+    invitation = service.create_invitation(
         org_id=org_id,
         email=email,
         role=role_enum,
@@ -597,7 +609,7 @@ async def handle_invite_member(
     }
 
 
-async def handle_accept_invitation(
+def handle_accept_invitation(
     service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -609,7 +621,7 @@ async def handle_accept_invitation(
     user_id = arguments["user_id"]
     token = arguments["token"]
 
-    result = await service.accept_invitation(
+    result = service.accept_invitation(
         token=token,
         user_id=user_id,
     )

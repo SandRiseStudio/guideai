@@ -7,12 +7,10 @@
  * - GitHub branch selection
  */
 import * as vscode from 'vscode';
-import { GuideAIClient } from '../client/GuideAIClient';
-export interface ProjectSettings {
-    project_id: string;
-    name: string;
+import { GuideAIClient, ProjectSettings as ClientProjectSettings, LLMCredential as ClientLLMCredential } from '../client/GuideAIClient';
+export interface ProjectSettings extends ClientProjectSettings {
+    project_id?: string;
     local_path?: string;
-    github_repo?: string;
     github_branch?: string;
 }
 export interface GitHubValidationResult {
@@ -22,6 +20,7 @@ export interface GitHubValidationResult {
     branches?: string[];
     error?: string;
 }
+export type LLMCredential = ClientLLMCredential;
 export declare class ProjectSettingsPanel {
     static currentPanel: ProjectSettingsPanel | undefined;
     static readonly viewType = "guideai.projectSettings";
@@ -32,6 +31,7 @@ export declare class ProjectSettingsPanel {
     private _projectId;
     private _settings;
     private _validatedGithub;
+    private _credentials;
     private constructor();
     static createOrShow(extensionUri: vscode.Uri, client: GuideAIClient, projectId: string, projectName?: string): void;
     static revive(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, client: GuideAIClient, projectId: string): void;
@@ -39,6 +39,9 @@ export declare class ProjectSettingsPanel {
     private _detectWorkspace;
     private _validateGithub;
     private _saveSettings;
+    private _addCredential;
+    private _deleteCredential;
+    private _reEnableCredential;
     private _update;
     private _getHtmlForWebview;
     dispose(): void;

@@ -41,9 +41,11 @@ from .action_service import (
 )
 from .action_contracts import Actor
 from .action_service_postgres import PostgresActionService
+from .execution_event_hub import ExecutionEventHub
 from .adapters import (
     RestActionServiceAdapter,
     RestAgentAuthServiceAdapter,
+    RestAgentOrchestratorAdapter,
     RestAgentRegistryAdapter,
     RestAmprealizeAdapter,
     RestBehaviorServiceAdapter,
@@ -94,9 +96,13 @@ from .compliance_service import (
 )
 from .agent_auth import AgentAuthClient
 from .auth.providers import InvalidCredentialsError, OAuthError
-from .auth.providers.internal import InternalAuthProvider
 from .auth.providers.github import GitHubOAuthProvider
 from .auth.providers.google import GoogleOAuthProvider
+from .auth.user_auth_service import UserAuthService
+from .auth.service_principal_service import (
+    ServicePrincipalService,
+    CreateServicePrincipalRequest,
+)
 from .device_flow import (
     DeviceAuthorizationStatus,
     DeviceAuthorizationSession,
@@ -135,6 +141,17 @@ from .utils.dsn import resolve_optional_postgres_dsn
 from .services.board_service import BoardService
 from .services.assignment_service import AssignmentService
 from .services.board_api_v2 import create_board_routes
+from .services.work_item_execution_api import create_work_item_execution_routes
+
+# Work Item Execution Service (optional - requires dependencies)
+try:
+    from .work_item_execution_service import WorkItemExecutionService
+    from .execution_wiring import wire_execution_service
+    WORK_ITEM_EXECUTION_AVAILABLE = True
+except ImportError:
+    WORK_ITEM_EXECUTION_AVAILABLE = False
+    WorkItemExecutionService = None  # type: ignore[assignment, misc]
+    wire_execution_service = None  # type: ignore[assignment, misc]
 
 # Raze structured logging (optional dependency)
 try:
@@ -151,13 +168,17 @@ except ImportError:
 try:
     from .multi_tenant.organization_service import OrganizationService
     from .multi_tenant.invitation_service import InvitationService
+    from .multi_tenant.settings import SettingsService
     from .multi_tenant.api import create_org_routes
+    from .multi_tenant.settings_api import create_settings_routes
     MULTI_TENANT_AVAILABLE = True
 except ImportError:
     MULTI_TENANT_AVAILABLE = False
     OrganizationService = None  # type: ignore[assignment, misc]
     InvitationService = None  # type: ignore[assignment, misc]
+    SettingsService = None  # type: ignore[assignment, misc]
     create_org_routes = None  # type: ignore[assignment, misc]
+    create_settings_routes = None  # type: ignore[assignment, misc]
 
 # Billing service (optional - requires billing package)
 try:
@@ -202,6 +223,7 @@ class _ServiceContainer:
         *,
         behavior_db_path: Optional[Path] = None,
         workflow_db_path: Optional[Path] = None,
+        execution_event_hub: Optional[ExecutionEventHub] = None,
     ) -> None:
         logger = logging.getLogger(__name__)
         telemetry = TelemetryClient(
@@ -238,6 +260,15 @@ class _ServiceContainer:
         )
         self.behavior_adapter = RestBehaviorServiceAdapter(self.behavior_service)
 
+        # Initialize ServicePrincipalService early so it can be injected into AgentRegistryService
+        # Uses auth schema for persistence
+        try:
+            self.service_principal_service = ServicePrincipalService()
+            logger.info("ServicePrincipalService initialized for agent API credentials")
+        except Exception as exc:
+            self.service_principal_service = None  # type: ignore[assignment]
+            logger.warning("ServicePrincipalService unavailable: %s", exc)
+
         # AgentRegistryService uses PostgreSQL DSN from environment
         self.agent_registry_service = None
         self.agent_registry_adapter = None
@@ -251,6 +282,7 @@ class _ServiceContainer:
                 self.agent_registry_service = AgentRegistryService(
                     dsn=agent_dsn,
                     telemetry=telemetry,
+                    service_principal_service=self.service_principal_service,
                 )
                 self.agent_registry_adapter = RestAgentRegistryAdapter(self.agent_registry_service)
             else:
@@ -318,25 +350,27 @@ class _ServiceContainer:
         )
         self.amprealize_adapter = RestAmprealizeAdapter(self.amprealize_service)
 
+        self.execution_event_hub = execution_event_hub
+
         # Initialize AgentAuth client and adapter
         self.agent_auth_client = AgentAuthClient(telemetry=telemetry)
         self.agent_auth_adapter = RestAgentAuthServiceAdapter(self.agent_auth_client)
 
-        # Initialize internal auth provider for username/password authentication.
-        # This is optional; device-flow prototype auth can run without it.
-        internal_provider: Optional[InternalAuthProvider]
+        # Initialize UserAuthService for user lookup and management.
+        # This uses auth.users table and replaces the deprecated InternalAuthProvider.
+        user_auth_service: Optional[UserAuthService]
         try:
-            internal_provider = InternalAuthProvider(dsn=None)
+            user_auth_service = UserAuthService(dsn=None)
         except Exception as exc:
-            internal_provider = None
-            logger.warning("InternalAuthProvider unavailable; continuing without internal auth: %s", exc)
+            user_auth_service = None
+            logger.warning("UserAuthService unavailable; continuing without user auth: %s", exc)
 
         # Store for use by identity linking and other services
-        self.internal_auth_provider = internal_provider
+        self.user_auth_service = user_auth_service
 
         self.device_flow_manager = DeviceFlowManager(
             telemetry=telemetry,
-            provider=internal_provider,
+            provider=None,  # InternalAuthProvider removed - device flow uses OAuth only
         )
 
         # Initialize OAuth providers for social login (GitHub, Google)
@@ -373,9 +407,9 @@ class _ServiceContainer:
             env_var="GUIDEAI_RUN_PG_DSN",
         )
         if run_dsn:
-            self.run_service = PostgresRunService(dsn=run_dsn, telemetry=telemetry)
+            self.run_service = PostgresRunService(dsn=run_dsn, telemetry=telemetry, event_hub=execution_event_hub)
         else:
-            self.run_service = RunService(telemetry=telemetry)
+            self.run_service = RunService(telemetry=telemetry, event_hub=execution_event_hub)
         self.run_adapter = RestRunServiceAdapter(self.run_service)
 
         # CollaborationService uses PostgreSQL DSN from environment or falls back to in-memory.
@@ -407,6 +441,27 @@ class _ServiceContainer:
 
         # Board/Assignment services for agent suggestions
         self.board_service = BoardService(pool=None, telemetry=telemetry)
+
+        # Wire up agent validator to prevent orphaned agent assignments
+        # This validates that assigned agents actually exist in the registry
+        def _validate_agent_exists(agent_id: str, org_id: Optional[str]) -> bool:
+            """Check if an agent exists in the registry (execution.agents table)."""
+            if not self.agent_registry_service:
+                logger.warning("Agent validation skipped: AgentRegistryService not available")
+                return True  # Permissive fallback if service unavailable
+            try:
+                # Try to fetch the agent - if it exists, validation passes
+                self.agent_registry_service.get_agent(agent_id)
+                return True
+            except AgentNotFoundError:
+                logger.warning(f"Agent validation failed: Agent '{agent_id}' not found in registry")
+                return False
+            except Exception as e:
+                logger.warning(f"Agent validation error for {agent_id}: {e}")
+                return False
+
+        self.board_service.set_agent_validator(_validate_agent_exists)
+
         self.assignment_service = AssignmentService(
             dsn=None,
             telemetry=telemetry,
@@ -417,6 +472,7 @@ class _ServiceContainer:
         # Multi-tenant organization services (requires PostgreSQL)
         self.org_service: Optional[Any] = None
         self.invitation_service: Optional[Any] = None
+        self.settings_service: Optional[Any] = None
         if MULTI_TENANT_AVAILABLE:
             org_dsn = resolve_optional_postgres_dsn(
                 service="ORG",
@@ -432,6 +488,7 @@ class _ServiceContainer:
                     dsn=org_dsn,
                     base_url=os.getenv("GUIDEAI_BASE_URL", "https://guideai.dev"),
                 )
+                self.settings_service = SettingsService(dsn=org_dsn)
 
         # Billing service (uses Stripe if credentials provided, otherwise mock)
         self.billing_service: Optional[Any] = None
@@ -486,6 +543,31 @@ class _ServiceContainer:
                 batch_size=1000,
                 linger_ms=100,
             )
+
+        # Work Item Execution Service (optional - uses PostgreSQL)
+        # Uses wire_execution_service to connect AgentExecutionLoop + AgentLLMClient
+        self.work_item_execution_service: Optional[Any] = None
+        if WORK_ITEM_EXECUTION_AVAILABLE and wire_execution_service is not None:
+            execution_dsn = resolve_optional_postgres_dsn(
+                service="EXECUTION",
+                explicit_dsn=os.getenv("GUIDEAI_EXECUTION_PG_DSN"),
+                env_var="GUIDEAI_EXECUTION_PG_DSN",
+            )
+            # Fall back to DATABASE_URL if specific env var not set
+            if not execution_dsn:
+                execution_dsn = os.getenv("DATABASE_URL")
+            try:
+                # Use wire_execution_service to create fully-wired service
+                # This connects AgentExecutionLoop + AgentLLMClient for real execution
+                self.work_item_execution_service = wire_execution_service(
+                    dsn=execution_dsn,
+                    board_service=self.board_service,
+                    run_service=self.run_service,
+                    telemetry=telemetry,
+                )
+                logger.info("WorkItemExecutionService initialized with AgentExecutionLoop wired")
+            except Exception as exc:
+                logger.warning(f"WorkItemExecutionService unavailable: {exc}")
 
 
 def _normalize_user_code(user_code: str) -> str:
@@ -898,9 +980,13 @@ def create_app(
             headers=cors_headers,
         )
 
+    execution_event_hub = ExecutionEventHub()
+    app.state.execution_event_hub = execution_event_hub
+
     container = _ServiceContainer(
         behavior_db_path=behavior_db_path,
         workflow_db_path=workflow_db_path,
+        execution_event_hub=execution_event_hub,
     )
 
     # ------------------------------------------------------------------
@@ -1334,6 +1420,1334 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------
+    # Agent Interaction (Delegate, Consult, Handoff)
+    # ------------------------------------------------------------------
+
+    @app.post("/api/v1/agents/{agent_id}:delegate", status_code=status.HTTP_201_CREATED)
+    def delegate_to_agent(agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Delegate a subtask to another agent.
+
+        Creates a child run that executes under the target agent's persona.
+        When wait_for_completion=true (default), blocks until subtask completes.
+
+        Args:
+            agent_id: Target agent to delegate the subtask to
+            payload: {
+                "run_id": Optional parent run ID,
+                "subtask": Required task description,
+                "context": Optional additional context dict,
+                "timeout_seconds": Optional timeout (default 300),
+                "wait_for_completion": Whether to wait for result (default true)
+            }
+
+        Returns:
+            DelegationResponse with delegation_id, delegated_run_id, status, result
+        """
+        service = container.services.agent_orchestrator_service()
+        adapter = RestAgentOrchestratorAdapter(service=service)
+        try:
+            return adapter.delegate(agent_id, payload)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/api/v1/agents/{agent_id}:consult")
+    def consult_agent(agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Get advisory input from another agent without delegation.
+
+        Lightweight query for expert opinion without creating a separate run.
+        Respects MAX_CONSULTATION_DEPTH (3) to prevent infinite loops.
+
+        Args:
+            agent_id: Target agent to consult
+            payload: {
+                "run_id": Optional requesting run ID,
+                "question": Required question to ask,
+                "context": Optional additional context dict,
+                "max_tokens": Optional response length limit (default 2000)
+            }
+
+        Returns:
+            ConsultationResponse with consultation_id, response, confidence, depth
+        """
+        service = container.services.agent_orchestrator_service()
+        adapter = RestAgentOrchestratorAdapter(service=service)
+        try:
+            return adapter.consult(agent_id, payload)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+        except ValueError as exc:
+            if "depth" in str(exc).lower():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(exc),
+                ) from exc
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/api/v1/agents/{agent_id}:handoff")
+    def handoff_to_agent(agent_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Transfer execution to another agent.
+
+        Terminates current run and creates a new run under target agent.
+        Optionally transfers context and outputs from the source run.
+
+        Args:
+            agent_id: Target agent to hand off to
+            payload: {
+                "run_id": Optional source run ID,
+                "reason": Required explanation for the handoff,
+                "transfer_context": Whether to pass context (default true),
+                "transfer_outputs": Whether to pass outputs (default true)
+            }
+
+        Returns:
+            HandoffResponse with handoff_id, new_run_id, previous_run_id, status
+        """
+        service = container.services.agent_orchestrator_service()
+        adapter = RestAgentOrchestratorAdapter(service=service)
+        try:
+            return adapter.handoff(agent_id, payload)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Escalations (Section 11.4 - Human Escalation)
+    # ------------------------------------------------------------------
+
+    @app.post("/api/v1/escalations:help", status_code=status.HTTP_201_CREATED)
+    def request_help(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Request non-blocking human guidance.
+
+        Creates an escalation that allows execution to continue
+        while awaiting human input.
+
+        Args:
+            payload: {
+                "reason": Required - why help is needed,
+                "context": Optional additional context,
+                "run_id": Optional run ID for tracking,
+                "work_item_id": Optional associated work item,
+                "urgency": "low" | "normal" | "high" | "urgent" (default: normal)
+            }
+
+        Returns:
+            HelpResponse with escalation_id, status, notification_sent
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        try:
+            return adapter.request_help(payload)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+
+    @app.post("/api/v1/escalations:approval", status_code=status.HTTP_201_CREATED)
+    def request_approval(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Request blocking human approval.
+
+        Creates an escalation that pauses execution until a human
+        approves or rejects the decision.
+
+        Args:
+            payload: {
+                "decision": Required - what decision needs approval,
+                "options": Required - list of choices (min 2),
+                "context": Optional additional context,
+                "run_id": Optional run ID for tracking,
+                "work_item_id": Optional associated work item,
+                "timeout_seconds": How long to wait (default: 3600 = 1 hour)
+            }
+
+        Returns:
+            ApprovalResponse with escalation_id, status, expires_at
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        try:
+            return adapter.request_approval(payload)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/api/v1/escalations:blocked", status_code=status.HTTP_201_CREATED)
+    def notify_blocked(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Notify that execution is blocked.
+
+        Creates an escalation to inform humans that the agent
+        cannot proceed without external intervention.
+
+        Args:
+            payload: {
+                "reason": Required - why execution is blocked,
+                "blocker_details": Optional details about the blocker,
+                "suggested_actions": Optional list of actions to resolve,
+                "run_id": Optional run ID for tracking,
+                "work_item_id": Optional associated work item
+            }
+
+        Returns:
+            BlockedResponse with escalation_id, status, notification_sent
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        try:
+            return adapter.notify_blocked(payload)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+
+    @app.get("/api/v1/escalations/{escalation_id}")
+    def get_escalation(escalation_id: str) -> Dict[str, Any]:
+        """Get escalation details by ID.
+
+        Args:
+            escalation_id: The escalation ID
+
+        Returns:
+            Escalation response (Help, Approval, or Blocked depending on type)
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        result = adapter.get_escalation(escalation_id)
+        if result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Escalation not found: {escalation_id}",
+            )
+        return result
+
+    @app.post("/api/v1/escalations/{escalation_id}:resolve")
+    def resolve_help_escalation(escalation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve a help escalation with guidance.
+
+        Args:
+            escalation_id: The help escalation ID
+            payload: {
+                "guidance": Required - the human's guidance,
+                "resolved_by": Optional user identifier
+            }
+
+        Returns:
+            Updated HelpResponse with status=resolved
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        try:
+            return adapter.resolve_help(escalation_id, payload)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/api/v1/escalations/{escalation_id}:approve")
+    def approve_escalation(escalation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Approve an approval escalation.
+
+        Args:
+            escalation_id: The approval escalation ID
+            payload: {
+                "selected_option": Optional which option was chosen,
+                "reason": Optional explanation,
+                "resolved_by": Optional user identifier
+            }
+
+        Returns:
+            Updated ApprovalResponse with status=approved, approved=true
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        try:
+            return adapter.resolve_approval(escalation_id, approved=True, payload=payload)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/api/v1/escalations/{escalation_id}:reject")
+    def reject_escalation(escalation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Reject an approval escalation.
+
+        Args:
+            escalation_id: The approval escalation ID
+            payload: {
+                "selected_option": Optional which option was chosen,
+                "reason": Optional explanation,
+                "resolved_by": Optional user identifier
+            }
+
+        Returns:
+            Updated ApprovalResponse with status=rejected, approved=false
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        try:
+            return adapter.resolve_approval(escalation_id, approved=False, payload=payload)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/api/v1/escalations/{escalation_id}:acknowledge")
+    def acknowledge_blocked_escalation(escalation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Acknowledge a blocked escalation.
+
+        Args:
+            escalation_id: The blocked escalation ID
+            payload: {
+                "acknowledged_by": Optional user identifier,
+                "resolution": Optional how the blocker was/will be resolved
+            }
+
+        Returns:
+            Updated BlockedResponse with status=acknowledged or resolved
+        """
+        from .adapters import RestEscalationAdapter
+
+        service = container.services.agent_orchestrator_service()
+        adapter = RestEscalationAdapter(service=service)
+        try:
+            return adapter.acknowledge_blocked(escalation_id, payload)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Config / Models (Section 11.6)
+    # ------------------------------------------------------------------
+
+    @app.get("/api/v1/projects/{project_id}/models")
+    def get_project_model_availability(
+        project_id: str,
+        org_id: Optional[str] = Query(None, description="Organization ID (if project belongs to an org)"),
+        include_pricing: bool = Query(True, description="Include pricing information"),
+        provider_filter: Optional[str] = Query(None, description="Filter by provider (anthropic, openai, openrouter, local)"),
+    ) -> Dict[str, Any]:
+        """Get available LLM models for a project.
+
+        Returns models based on credential resolution order:
+        1. Project credential (BYOK) - highest priority
+        2. Org credential (BYOK) - if project belongs to an org
+        3. Platform credential - admin-managed defaults
+
+        Works for both personal projects and org projects.
+        """
+        from .work_item_execution_service import CredentialStore
+        from .mcp.handlers.config_handlers import handle_get_model_availability
+
+        credential_store = CredentialStore()
+
+        try:
+            return handle_get_model_availability(
+                credential_store,
+                {
+                    "project_id": project_id,
+                    "org_id": org_id,
+                    "include_pricing": include_pricing,
+                    "provider_filter": provider_filter,
+                },
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required field: {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/config/models")
+    def list_all_available_models(
+        include_pricing: bool = Query(True, description="Include pricing information"),
+        provider_filter: Optional[str] = Query(None, description="Filter by provider"),
+    ) -> Dict[str, Any]:
+        """List all models available at the platform level.
+
+        Returns models that have platform-level credentials configured.
+        Use /api/v1/projects/{project_id}/models for project-specific availability.
+        """
+        from .work_item_execution_service import CredentialStore
+        from .mcp.handlers.config_handlers import handle_get_model_availability
+
+        credential_store = CredentialStore()
+
+        try:
+            return handle_get_model_availability(
+                credential_store,
+                {
+                    "project_id": "_platform",  # Special ID for platform-level query
+                    "include_pricing": include_pricing,
+                    "provider_filter": provider_filter,
+                },
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # BYOK Credentials (Section 11.6 - Credential Management)
+    # ------------------------------------------------------------------
+
+    @app.post("/api/v1/projects/{project_id}/credentials", status_code=status.HTTP_201_CREATED)
+    def create_project_credential(
+        project_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user creating the credential"),
+    ) -> Dict[str, Any]:
+        """Add or replace a BYOK credential for a project.
+
+        Args:
+            project_id: Project ID
+            payload: {
+                "provider": "anthropic" | "openai" | "openrouter",
+                "api_key": "sk-xxx...",
+                "name": Optional display name
+            }
+            actor_id: User creating the credential
+
+        Returns:
+            Created credential info (without the key itself)
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CreateCredentialRequest,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        try:
+            provider = payload.get("provider")
+            api_key = payload.get("api_key")
+            name = payload.get("name")
+
+            if not provider:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="provider is required",
+                )
+            if not api_key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="api_key is required",
+                )
+
+            # Default name if not provided
+            if not name:
+                name = f"{provider} API Key"
+
+            request = CreateCredentialRequest(
+                scope_type=CredentialScopeType.PROJECT,
+                scope_id=project_id,
+                provider=provider,
+                api_key=api_key,
+                name=name,
+                created_by=actor_id,
+            )
+
+            credential = repo.create(request)
+            return credential.to_dict()
+
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/projects/{project_id}/credentials")
+    def list_project_credentials(project_id: str) -> List[Dict[str, Any]]:
+        """List BYOK credentials for a project.
+
+        Returns credentials without the actual API keys (only prefix shown).
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        credentials = repo.get_for_scope(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+            decrypt=False,
+        )
+        return [cred.to_dict() for cred in credentials]
+
+    @app.delete("/api/v1/projects/{project_id}/credentials/{credential_id}")
+    def delete_project_credential(
+        project_id: str,
+        credential_id: str,
+        actor_id: str = Query(..., description="ID of the user deleting the credential"),
+    ) -> Dict[str, Any]:
+        """Delete a BYOK credential from a project.
+
+        Args:
+            project_id: Project ID (used for authorization check)
+            credential_id: Credential ID to delete
+            actor_id: User deleting the credential
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        # Verify credential belongs to this project
+        credential = repo.get_by_id(credential_id)
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+        if credential.scope_type != CredentialScopeType.PROJECT or credential.scope_id != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Credential does not belong to this project",
+            )
+
+        if repo.delete(credential_id, actor_id=actor_id):
+            return {"deleted": True, "credential_id": credential_id}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+
+    @app.post("/api/v1/projects/{project_id}/credentials/{credential_id}:re-enable")
+    def reenable_project_credential(
+        project_id: str,
+        credential_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user re-enabling the credential"),
+    ) -> Dict[str, Any]:
+        """Re-enable a disabled BYOK credential after providing a new key.
+
+        Args:
+            project_id: Project ID
+            credential_id: Credential ID to re-enable
+            payload: {"api_key": "new-sk-xxx..."}
+            actor_id: User re-enabling the credential
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        # Verify credential belongs to this project
+        credential = repo.get_by_id(credential_id)
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+        if credential.scope_type != CredentialScopeType.PROJECT or credential.scope_id != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Credential does not belong to this project",
+            )
+
+        new_api_key = payload.get("api_key")
+        if not new_api_key:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="api_key is required to re-enable a credential",
+            )
+
+        updated = repo.re_enable(credential_id, new_api_key, actor_id=actor_id)
+        if updated:
+            return updated.to_dict()
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+
+    @app.get("/api/v1/projects/{project_id}/credentials/{credential_id}/audit")
+    def get_project_credential_audit_log(
+        project_id: str,
+        credential_id: str,
+        limit: int = Query(50, ge=1, le=500, description="Max entries to return"),
+    ) -> List[Dict[str, Any]]:
+        """Get audit log for a project credential.
+
+        Returns recent operations on this credential for compliance/debugging.
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        # Verify credential belongs to this project
+        credential = repo.get_by_id(credential_id)
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+        if credential.scope_type != CredentialScopeType.PROJECT or credential.scope_id != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Credential does not belong to this project",
+            )
+
+        return repo.get_audit_log(credential_id, limit=limit)
+
+    # --- Organization Credentials ---
+
+    @app.post("/api/v1/orgs/{org_id}/credentials", status_code=status.HTTP_201_CREATED)
+    def create_org_credential(
+        org_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user creating the credential"),
+    ) -> Dict[str, Any]:
+        """Add or replace a BYOK credential for an organization.
+
+        Args:
+            org_id: Organization ID
+            payload: {
+                "provider": "anthropic" | "openai" | "openrouter",
+                "api_key": "sk-xxx...",
+                "name": Optional display name
+            }
+            actor_id: User creating the credential
+
+        Returns:
+            Created credential info (without the key itself)
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CreateCredentialRequest,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        try:
+            provider = payload.get("provider")
+            api_key = payload.get("api_key")
+            name = payload.get("name")
+
+            if not provider:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="provider is required",
+                )
+            if not api_key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="api_key is required",
+                )
+
+            # Default name if not provided
+            if not name:
+                name = f"{provider} API Key"
+
+            request = CreateCredentialRequest(
+                scope_type=CredentialScopeType.ORG,
+                scope_id=org_id,
+                provider=provider,
+                api_key=api_key,
+                name=name,
+                created_by=actor_id,
+            )
+
+            credential = repo.create(request)
+            return credential.to_dict()
+
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/orgs/{org_id}/credentials")
+    def list_org_credentials(org_id: str) -> List[Dict[str, Any]]:
+        """List BYOK credentials for an organization.
+
+        Returns credentials without the actual API keys (only prefix shown).
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        credentials = repo.get_for_scope(
+            scope_type=CredentialScopeType.ORG,
+            scope_id=org_id,
+            decrypt=False,
+        )
+        return [cred.to_dict() for cred in credentials]
+
+    @app.delete("/api/v1/orgs/{org_id}/credentials/{credential_id}")
+    def delete_org_credential(
+        org_id: str,
+        credential_id: str,
+        actor_id: str = Query(..., description="ID of the user deleting the credential"),
+    ) -> Dict[str, Any]:
+        """Delete a BYOK credential from an organization.
+
+        Args:
+            org_id: Organization ID (used for authorization check)
+            credential_id: Credential ID to delete
+            actor_id: User deleting the credential
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        # Verify credential belongs to this org
+        credential = repo.get_by_id(credential_id)
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+        if credential.scope_type != CredentialScopeType.ORG or credential.scope_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Credential does not belong to this organization",
+            )
+
+        if repo.delete(credential_id, actor_id=actor_id):
+            return {"deleted": True, "credential_id": credential_id}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+
+    @app.post("/api/v1/orgs/{org_id}/credentials/{credential_id}:re-enable")
+    def reenable_org_credential(
+        org_id: str,
+        credential_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user re-enabling the credential"),
+    ) -> Dict[str, Any]:
+        """Re-enable a disabled BYOK credential after providing a new key.
+
+        Args:
+            org_id: Organization ID
+            credential_id: Credential ID to re-enable
+            payload: {"api_key": "new-sk-xxx..."}
+            actor_id: User re-enabling the credential
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        # Verify credential belongs to this org
+        credential = repo.get_by_id(credential_id)
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+        if credential.scope_type != CredentialScopeType.ORG or credential.scope_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Credential does not belong to this organization",
+            )
+
+        new_api_key = payload.get("api_key")
+        if not new_api_key:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="api_key is required to re-enable a credential",
+            )
+
+        updated = repo.re_enable(credential_id, new_api_key, actor_id=actor_id)
+        if updated:
+            return updated.to_dict()
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+
+    @app.get("/api/v1/orgs/{org_id}/credentials/{credential_id}/audit")
+    def get_org_credential_audit_log(
+        org_id: str,
+        credential_id: str,
+        limit: int = Query(50, ge=1, le=500, description="Max entries to return"),
+    ) -> List[Dict[str, Any]]:
+        """Get audit log for an organization credential.
+
+        Returns recent operations on this credential for compliance/debugging.
+        """
+        from .auth.llm_credential_repository import (
+            LLMCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = LLMCredentialRepository(pool)
+
+        # Verify credential belongs to this org
+        credential = repo.get_by_id(credential_id)
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+        if credential.scope_type != CredentialScopeType.ORG or credential.scope_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Credential does not belong to this organization",
+            )
+
+        return repo.get_audit_log(credential_id, limit=limit)
+
+    # ------------------------------------------------------------------
+    # GitHub Credentials (BYOK)
+    # ------------------------------------------------------------------
+
+    @app.post("/api/v1/projects/{project_id}/github-credential", status_code=status.HTTP_201_CREATED)
+    def create_project_github_credential(
+        project_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user creating the credential"),
+    ) -> Dict[str, Any]:
+        """Add or replace a BYOK GitHub PAT for a project.
+
+        The token will be validated against GitHub API before saving.
+        Token type is auto-detected from prefix (ghp_, github_pat_, ghs_).
+
+        Args:
+            project_id: Project ID
+            payload: {
+                "token": "ghp_xxx..." or "github_pat_xxx...",
+                "name": Optional display name (defaults to "GitHub PAT (username)")
+            }
+            actor_id: User creating the credential
+
+        Returns:
+            Created credential info (without the token itself), plus scope warning if applicable
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CreateGitHubCredentialRequest,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        try:
+            token = payload.get("token")
+            name = payload.get("name")
+
+            if not token:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="token is required",
+                )
+
+            request = CreateGitHubCredentialRequest(
+                scope_type=CredentialScopeType.PROJECT,
+                scope_id=project_id,
+                token=token,
+                name=name,
+                created_by=actor_id,
+            )
+
+            credential, warning = repo.create(request)
+            result = credential.to_dict()
+            if warning:
+                result["warning"] = warning
+            return result
+
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/projects/{project_id}/github-credential")
+    def get_project_github_credential(project_id: str) -> Dict[str, Any]:
+        """Get the GitHub credential for a project.
+
+        Returns credential without the actual token (only prefix shown).
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+            decrypt=False,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this project",
+            )
+        return credential.to_dict()
+
+    @app.delete("/api/v1/projects/{project_id}/github-credential")
+    def delete_project_github_credential(
+        project_id: str,
+        actor_id: str = Query(..., description="ID of the user deleting the credential"),
+    ) -> Dict[str, Any]:
+        """Delete the GitHub credential from a project.
+
+        Args:
+            project_id: Project ID
+            actor_id: User deleting the credential
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        # Get the credential for this project
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this project",
+            )
+
+        if repo.delete(credential.id, actor_id=actor_id):
+            return {"deleted": True, "credential_id": credential.id}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+
+    @app.post("/api/v1/projects/{project_id}/github-credential:re-enable")
+    def reenable_project_github_credential(
+        project_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user re-enabling the credential"),
+    ) -> Dict[str, Any]:
+        """Re-enable a disabled GitHub credential with a new token.
+
+        The new token will be validated against GitHub API.
+
+        Args:
+            project_id: Project ID
+            payload: {"token": "new-ghp_xxx..."}
+            actor_id: User re-enabling the credential
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        # Get the credential for this project
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this project",
+            )
+
+        new_token = payload.get("token")
+        if not new_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="token is required to re-enable a credential",
+            )
+
+        try:
+            updated = repo.re_enable(credential.id, new_token, actor_id=actor_id)
+            if updated:
+                return updated.to_dict()
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Credential not found",
+                )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/projects/{project_id}/github-credential/audit")
+    def get_project_github_credential_audit_log(
+        project_id: str,
+        limit: int = Query(50, ge=1, le=500, description="Max entries to return"),
+    ) -> List[Dict[str, Any]]:
+        """Get audit log for a project's GitHub credential.
+
+        Returns recent operations on this credential for compliance/debugging.
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this project",
+            )
+
+        entries = repo.get_audit_log(credential.id, limit=limit)
+        return [
+            {
+                "id": entry.id,
+                "credential_id": entry.credential_id,
+                "action": entry.action.value,
+                "actor_id": entry.actor_id,
+                "actor_type": entry.actor_type.value,
+                "details": entry.details,
+                "created_at": entry.created_at.isoformat() if entry.created_at else None,
+            }
+            for entry in entries
+        ]
+
+    # --- Organization GitHub Credentials ---
+
+    @app.post("/api/v1/orgs/{org_id}/github-credential", status_code=status.HTTP_201_CREATED)
+    def create_org_github_credential(
+        org_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user creating the credential"),
+    ) -> Dict[str, Any]:
+        """Add or replace a BYOK GitHub PAT for an organization.
+
+        The token will be validated against GitHub API before saving.
+        Token type is auto-detected from prefix (ghp_, github_pat_, ghs_).
+
+        Args:
+            org_id: Organization ID
+            payload: {
+                "token": "ghp_xxx..." or "github_pat_xxx...",
+                "name": Optional display name
+            }
+            actor_id: User creating the credential
+
+        Returns:
+            Created credential info (without the token itself), plus scope warning if applicable
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CreateGitHubCredentialRequest,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        try:
+            token = payload.get("token")
+            name = payload.get("name")
+
+            if not token:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="token is required",
+                )
+
+            request = CreateGitHubCredentialRequest(
+                scope_type=CredentialScopeType.ORG,
+                scope_id=org_id,
+                token=token,
+                name=name,
+                created_by=actor_id,
+            )
+
+            credential, warning = repo.create(request)
+            result = credential.to_dict()
+            if warning:
+                result["warning"] = warning
+            return result
+
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/orgs/{org_id}/github-credential")
+    def get_org_github_credential(org_id: str) -> Dict[str, Any]:
+        """Get the GitHub credential for an organization.
+
+        Returns credential without the actual token (only prefix shown).
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.ORG,
+            scope_id=org_id,
+            decrypt=False,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this organization",
+            )
+        return credential.to_dict()
+
+    @app.delete("/api/v1/orgs/{org_id}/github-credential")
+    def delete_org_github_credential(
+        org_id: str,
+        actor_id: str = Query(..., description="ID of the user deleting the credential"),
+    ) -> Dict[str, Any]:
+        """Delete the GitHub credential from an organization.
+
+        Args:
+            org_id: Organization ID
+            actor_id: User deleting the credential
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.ORG,
+            scope_id=org_id,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this organization",
+            )
+
+        if repo.delete(credential.id, actor_id=actor_id):
+            return {"deleted": True, "credential_id": credential.id}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+
+    @app.post("/api/v1/orgs/{org_id}/github-credential:re-enable")
+    def reenable_org_github_credential(
+        org_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="ID of the user re-enabling the credential"),
+    ) -> Dict[str, Any]:
+        """Re-enable a disabled GitHub credential with a new token.
+
+        The new token will be validated against GitHub API.
+
+        Args:
+            org_id: Organization ID
+            payload: {"token": "new-ghp_xxx..."}
+            actor_id: User re-enabling the credential
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.ORG,
+            scope_id=org_id,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this organization",
+            )
+
+        new_token = payload.get("token")
+        if not new_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="token is required to re-enable a credential",
+            )
+
+        try:
+            updated = repo.re_enable(credential.id, new_token, actor_id=actor_id)
+            if updated:
+                return updated.to_dict()
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Credential not found",
+                )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/orgs/{org_id}/github-credential/audit")
+    def get_org_github_credential_audit_log(
+        org_id: str,
+        limit: int = Query(50, ge=1, le=500, description="Max entries to return"),
+    ) -> List[Dict[str, Any]]:
+        """Get audit log for an organization's GitHub credential.
+
+        Returns recent operations on this credential for compliance/debugging.
+        """
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credential = repo.get_for_scope(
+            scope_type=CredentialScopeType.ORG,
+            scope_id=org_id,
+        )
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No GitHub credential configured for this organization",
+            )
+
+        entries = repo.get_audit_log(credential.id, limit=limit)
+        return [
+            {
+                "id": entry.id,
+                "credential_id": entry.credential_id,
+                "action": entry.action.value,
+                "actor_id": entry.actor_id,
+                "actor_type": entry.actor_type.value,
+                "details": entry.details,
+                "created_at": entry.created_at.isoformat() if entry.created_at else None,
+            }
+            for entry in entries
+        ]
+
+    # ------------------------------------------------------------------
     # Workflows
     # ------------------------------------------------------------------
     @app.post("/api/v1/workflows/templates", status_code=status.HTTP_201_CREATED)
@@ -1619,6 +3033,68 @@ def create_app(
             raise
 
     # ------------------------------------------------------------------
+    # Work Item Execution Streaming
+    # ------------------------------------------------------------------
+
+    @app.websocket("/api/v1/executions/ws")
+    async def executions_ws(websocket: WebSocket) -> None:
+        hub: ExecutionEventHub = app.state.execution_event_hub
+
+        run_id = websocket.query_params.get("run_id")
+        org_id = websocket.query_params.get("org_id")
+        project_id = websocket.query_params.get("project_id")
+
+        if not run_id and not (org_id and project_id):
+            await websocket.accept()
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "BAD_REQUEST",
+                    "message": "Provide run_id or org_id + project_id",
+                }
+            )
+            await websocket.close(code=1008)
+            return
+
+        await hub.connect(websocket, run_id=run_id, org_id=org_id, project_id=project_id)
+
+        try:
+            if run_id and container.work_item_execution_service:
+                status = container.work_item_execution_service.get_execution_by_run_id(run_id, org_id)
+                steps = container.work_item_execution_service.get_execution_steps(run_id, org_id)
+                await websocket.send_json(
+                    {
+                        "type": "execution.snapshot",
+                        "payload": {
+                            "run_id": run_id,
+                            "status": status.to_dict() if status else None,
+                            "steps": steps,
+                        },
+                    }
+                )
+            else:
+                await websocket.send_json(
+                    {
+                        "type": "execution.ready",
+                        "payload": {
+                            "run_id": run_id,
+                            "org_id": org_id,
+                            "project_id": project_id,
+                        },
+                    }
+                )
+
+            while True:
+                message = await websocket.receive_json()
+                if message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+        except WebSocketDisconnect:
+            await hub.disconnect(websocket)
+        except Exception:
+            await hub.disconnect(websocket)
+            raise
+
+    # ------------------------------------------------------------------
     # BCI
     # ------------------------------------------------------------------
     @app.post("/api/v1/bci:retrieve")
@@ -1803,6 +3279,53 @@ def create_app(
             container.run_adapter.delete_run(run_id)
         except RunNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    @app.patch("/api/v1/runs/{run_id}/status")
+    def update_run_status(run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Update only the status of a run (convenience endpoint)."""
+        run_id = _validated_uuid(run_id, "Run")
+        if "status" not in payload:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing required field: status",
+            )
+        try:
+            return container.run_adapter.update_status(run_id, payload)
+        except RunNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    @app.get("/api/v1/runs/{run_id}/logs")
+    async def get_run_logs(
+        run_id: str,
+        level: Optional[str] = Query(default=None, description="Minimum log level"),
+        start_time: Optional[str] = Query(default=None, description="Start time (ISO 8601)"),
+        end_time: Optional[str] = Query(default=None, description="End time (ISO 8601)"),
+        limit: int = Query(default=100, ge=1, le=1000, description="Max log entries"),
+        after: Optional[str] = Query(default=None, description="Cursor for pagination"),
+        search: Optional[str] = Query(default=None, description="Full-text search"),
+        include_steps: bool = Query(default=True, description="Include run steps"),
+    ) -> Dict[str, Any]:
+        """Fetch execution logs for a run from Raze logging system."""
+        run_id = _validated_uuid(run_id, "Run")
+        payload = {
+            "level": level,
+            "start_time": start_time,
+            "end_time": end_time,
+            "limit": limit,
+            "after": after,
+            "search": search,
+            "include_steps": include_steps,
+        }
+        try:
+            return await container.run_adapter.fetch_logs(
+                run_id, payload, container.raze_service
+            )
+        except RunNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------
     # Compliance
@@ -2832,9 +4355,8 @@ def create_app(
             )
 
         try:
-            # Get user service from internal auth provider
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            # Get user auth service
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
@@ -2842,13 +4364,13 @@ def create_app(
 
             # Look up user by email if user_id not provided
             if not user_id:
-                user = user_service.get_user_by_email(email)
+                user = container.user_auth_service.get_user_by_email(email)
                 if not user:
                     # Don't reveal if email exists - return success anyway for security
                     return {"status": "sent", "message": "If the email exists, a verification link has been sent"}
                 user_id = user.id
             else:
-                user = user_service.get_user_by_id(user_id)
+                user = container.user_auth_service.get_user_by_id(user_id)
                 if not user or user.email != email:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
@@ -2860,7 +4382,7 @@ def create_app(
                 return {"status": "already_verified", "message": "Email is already verified"}
 
             # Create verification token
-            token = user_service.create_email_verification_token(user_id, email)
+            token = container.user_auth_service.create_email_verification_token(user_id, email)
 
             # TODO: Send email with verification link
             # For now, return the token for testing (in production, this would send an email)
@@ -2902,14 +4424,13 @@ def create_app(
             )
 
         try:
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
                 )
 
-            result = user_service.verify_email_token(token)
+            result = container.user_auth_service.verify_email_token(token)
 
             if not result:
                 raise HTTPException(
@@ -2944,27 +4465,76 @@ def create_app(
 
         Returns:
             Email verification status
+
+        Note:
+            For OAuth users (Google, GitHub), email is verified by the OAuth provider.
+            The internal_users table has been deprecated - all users now use auth.users.
         """
         try:
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="User service not available",
-                )
+            # First try to get from auth.users table (OAuth users)
+            # Try multiple sources for database pool
+            pool = getattr(container.project_store, '_pool', None)
 
-            user = user_service.get_user_by_id(user_id)
-            if not user:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found",
-                )
+            # If no pool from project_store, try DATABASE_URL directly
+            if pool is None:
+                database_url = os.environ.get("DATABASE_URL")
+                if database_url:
+                    try:
+                        import psycopg2
+                        with psycopg2.connect(database_url) as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT email, email_verified FROM auth.users WHERE id = %s",
+                                    (user_id,)
+                                )
+                                row = cur.fetchone()
+                                if row:
+                                    return {
+                                        "user_id": user_id,
+                                        "email": row[0],
+                                        "email_verified": row[1] if row[1] is not None else True,
+                                        "verification_pending": False,
+                                    }
+                    except Exception as e:
+                        logger.warning(f"Failed to query auth.users via DATABASE_URL: {e}")
+            elif pool:
+                try:
+                    with pool.connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT email, email_verified FROM auth.users WHERE id = %s",
+                                (user_id,)
+                            )
+                            row = cur.fetchone()
+                            if row:
+                                return {
+                                    "user_id": user_id,
+                                    "email": row[0],
+                                    "email_verified": row[1] if row[1] is not None else True,
+                                    "verification_pending": False,
+                                }
+                except Exception as e:
+                    logger.warning(f"Failed to query auth.users via pool: {e}")
 
+            # Fallback: use UserAuthService (replaces deprecated internal_users table)
+            if container.user_auth_service:
+                user = container.user_auth_service.get_user_by_id(user_id)
+                if user:
+                    return {
+                        "user_id": user_id,
+                        "email": user.email,
+                        "email_verified": user.email_verified if hasattr(user, 'email_verified') else True,
+                        "verification_pending": False,
+                    }
+
+            # User not found in either system - return default for OAuth
+            # This handles the case where user authenticated via OAuth
+            # but isn't in our user tables yet
             return {
                 "user_id": user_id,
-                "email": user.email,
-                "email_verified": user.email_verified,
-                "email_verified_at": user.email_verified_at.isoformat() if user.email_verified_at else None,
+                "email": None,
+                "email_verified": True,  # OAuth provider verified
+                "verification_pending": False,
             }
 
         except HTTPException:
@@ -3125,30 +4695,10 @@ def create_app(
                 detail=last_error or "Failed to exchange authorization code. Code may be invalid or expired.",
             )
 
-        # Link OAuth identity to internal user (creates user if needed)
-        # This ensures the user exists in PostgreSQL for FK constraints
-        internal_user_id = user_info.user_id  # Default to OAuth ID
-        try:
-            from guideai.auth.identity_linking_service import IdentityLinkingService, LinkingResult
-
-            user_service = container.internal_auth_provider.user_service if container.internal_auth_provider else None
-            if user_service:
-                linking_service = IdentityLinkingService(user_service, require_email_verification=False)
-                link_result = linking_service.link_identity(
-                    oauth_user_info=user_info,
-                    oauth_access_token=token_response.access_token,
-                    oauth_refresh_token=token_response.refresh_token,
-                )
-
-                if link_result.user:
-                    internal_user_id = link_result.user.id
-                    logger.info(f"OAuth user linked: {provider}:{user_info.user_id} → internal user {internal_user_id} (result: {link_result.result.value})")
-                else:
-                    logger.warning(f"OAuth identity linking returned no user: {link_result.result.value} - {link_result.message}")
-            else:
-                logger.warning("User service not available, skipping identity linking")
-        except Exception as e:
-            logger.warning(f"Identity linking failed, will create user directly: {e}")
+        # Use OAuth user ID directly - no more internal_users table
+        # The user is created in auth.users via the SQL insert below
+        internal_user_id = user_info.user_id
+        logger.info(f"OAuth user authenticated: {provider}:{user_info.user_id}")
 
         # Ensure user exists in auth.users for FK constraints (projects, boards, etc.)
         try:
@@ -3210,6 +4760,262 @@ def create_app(
         }
 
     # =========================================================================
+    # SERVICE PRINCIPAL (Machine/Agent API Credentials) ENDPOINTS
+    # =========================================================================
+
+    @app.post("/api/v1/auth/service-principals", status_code=status.HTTP_201_CREATED)
+    def create_service_principal(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create a new service principal for agent/service API authentication.
+
+        Request body:
+            name (str): Display name for the service principal
+            description (str, optional): Brief description
+            allowed_scopes (list[str], optional): Scopes the principal can request (default: ["read", "write"])
+            rate_limit (int, optional): Requests per minute (default: 100)
+            role (str, optional): Role for authorization (STRATEGIST|TEACHER|STUDENT|ADMIN|OBSERVER)
+            metadata (dict, optional): Additional metadata
+
+        Returns:
+            Service principal details including client_id and client_secret (only returned once)
+        """
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        name = payload.get("name")
+        if not name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="name is required",
+            )
+
+        try:
+            request = CreateServicePrincipalRequest(
+                name=name,
+                description=payload.get("description"),
+                allowed_scopes=payload.get("allowed_scopes", ["read", "write"]),
+                rate_limit=payload.get("rate_limit", 100),
+                role=payload.get("role", "STUDENT"),
+                metadata=payload.get("metadata", {}),
+            )
+            created_by = payload.get("created_by")  # User ID of creator
+            response = container.service_principal_service.create(request, created_by=created_by)
+
+            result = response.service_principal.to_dict()
+            result["client_secret"] = response.client_secret
+            return result
+
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to create service principal: {exc}",
+            ) from exc
+
+    @app.get("/api/v1/auth/service-principals")
+    def list_service_principals(
+        created_by: Optional[str] = Query(None, description="Filter by creator user ID"),
+        is_active: Optional[bool] = Query(None, description="Filter by active status"),
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> Dict[str, Any]:
+        """List service principals with optional filtering."""
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        principals = container.service_principal_service.list_all(
+            created_by=created_by,
+            is_active=is_active,
+            limit=limit,
+            offset=offset,
+        )
+
+        return {
+            "items": [sp.to_dict() for sp in principals],
+            "count": len(principals),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/api/v1/auth/service-principals/{sp_id}")
+    def get_service_principal(sp_id: str) -> Dict[str, Any]:
+        """Get a service principal by ID."""
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        sp = container.service_principal_service.get_by_id(sp_id)
+        if not sp:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service principal not found: {sp_id}",
+            )
+
+        return sp.to_dict()
+
+    @app.put("/api/v1/auth/service-principals/{sp_id}")
+    def update_service_principal(sp_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update a service principal.
+
+        Request body:
+            name (str, optional): New display name
+            description (str, optional): New description
+            allowed_scopes (list[str], optional): New allowed scopes
+            rate_limit (int, optional): New rate limit
+            role (str, optional): New role
+            is_active (bool, optional): Active status
+            metadata (dict, optional): New metadata
+        """
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        updated = container.service_principal_service.update(
+            sp_id,
+            name=payload.get("name"),
+            description=payload.get("description"),
+            allowed_scopes=payload.get("allowed_scopes"),
+            rate_limit=payload.get("rate_limit"),
+            role=payload.get("role"),
+            is_active=payload.get("is_active"),
+            metadata=payload.get("metadata"),
+        )
+
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service principal not found: {sp_id}",
+            )
+
+        return updated.to_dict()
+
+    @app.delete("/api/v1/auth/service-principals/{sp_id}")
+    def delete_service_principal(sp_id: str) -> Dict[str, Any]:
+        """Delete a service principal permanently."""
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        deleted = container.service_principal_service.delete(sp_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service principal not found: {sp_id}",
+            )
+
+        return {"status": "deleted", "id": sp_id}
+
+    @app.post("/api/v1/auth/service-principals/{sp_id}/deactivate")
+    def deactivate_service_principal(sp_id: str) -> Dict[str, Any]:
+        """Deactivate a service principal (soft delete)."""
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        deactivated = container.service_principal_service.deactivate(sp_id)
+        if not deactivated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service principal not found: {sp_id}",
+            )
+
+        return deactivated.to_dict()
+
+    @app.post("/api/v1/auth/service-principals/{sp_id}/rotate-secret")
+    def rotate_service_principal_secret(sp_id: str) -> Dict[str, Any]:
+        """
+        Rotate the client secret for a service principal.
+
+        Returns the new client_secret (only returned once).
+        """
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        new_secret = container.service_principal_service.rotate_secret(sp_id)
+        if not new_secret:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Service principal not found: {sp_id}",
+            )
+
+        return {
+            "status": "rotated",
+            "id": sp_id,
+            "client_secret": new_secret,
+        }
+
+    @app.post("/api/v1/auth/service-principals/authenticate")
+    def authenticate_service_principal(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Authenticate a service principal using client credentials.
+
+        This is the OAuth2 client_credentials flow for machine-to-machine auth.
+
+        Request body:
+            client_id (str): Service principal client ID
+            client_secret (str): Service principal client secret
+
+        Returns:
+            Access token and service principal details
+        """
+        if not container.service_principal_service:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service principal management not available",
+            )
+
+        client_id = payload.get("client_id")
+        client_secret = payload.get("client_secret")
+
+        if not client_id or not client_secret:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="client_id and client_secret are required",
+            )
+
+        sp = container.service_principal_service.authenticate(client_id, client_secret)
+        if not sp:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid client credentials",
+            )
+
+        # Generate access token for the service principal
+        # For now, return a simple token structure - can integrate with device_flow_manager
+        # or a dedicated token service later
+        import secrets
+        access_token = secrets.token_urlsafe(32)
+
+        return {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,  # 1 hour
+            "scope": " ".join(sp.allowed_scopes),
+            "service_principal": {
+                "id": sp.id,
+                "name": sp.name,
+                "role": sp.role,
+            },
+        }
+
+    # =========================================================================
     # MFA (Multi-Factor Authentication) ENDPOINTS
     # =========================================================================
 
@@ -3238,15 +5044,14 @@ def create_app(
             from guideai.auth.mfa_service import MfaService
             import os
 
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
                 )
 
             # Get user
-            user = user_service.get_user_by_id(user_id)
+            user = container.user_auth_service.get_user_by_id(user_id)
             if not user:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -3267,7 +5072,7 @@ def create_app(
             encrypted_secret = mfa_service.encrypt_secret(secret)
 
             # Create MFA device record (unverified)
-            device_id = user_service.create_mfa_device(
+            device_id = container.user_auth_service.create_mfa_device(
                 user_id=user_id,
                 secret_encrypted=encrypted_secret,
                 device_type="totp",
@@ -3333,8 +5138,7 @@ def create_app(
             from guideai.auth.mfa_service import MfaService
             import os
 
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
@@ -3351,7 +5155,7 @@ def create_app(
 
             # Get encrypted secret from database
             # Note: We need to get all devices including unverified for setup verification
-            devices = user_service.get_user_mfa_devices(user_id, verified_only=False)
+            devices = container.user_auth_service.get_user_mfa_devices(user_id, verified_only=False)
             device = next((d for d in devices if d["id"] == device_id), None)
 
             if not device:
@@ -3441,8 +5245,7 @@ def create_app(
             from guideai.auth.mfa_service import MfaService
             import os
 
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
@@ -3458,7 +5261,7 @@ def create_app(
             mfa_service = MfaService(mfa_key)
 
             # Get user's verified MFA devices
-            devices = user_service.get_user_mfa_devices(user_id, verified_only=True)
+            devices = container.user_auth_service.get_user_mfa_devices(user_id, verified_only=True)
 
             if not devices:
                 raise HTTPException(
@@ -3509,14 +5312,13 @@ def create_app(
             List of MFA devices (secrets excluded)
         """
         try:
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
                 )
 
-            devices = user_service.get_user_mfa_devices(user_id, verified_only=True)
+            devices = container.user_auth_service.get_user_mfa_devices(user_id, verified_only=True)
 
             return {
                 "user_id": user_id,
@@ -3548,20 +5350,19 @@ def create_app(
             Deletion status
         """
         try:
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
                 )
 
             # Check if this is the only MFA device
-            devices = user_service.get_user_mfa_devices(user_id, verified_only=True)
+            devices = container.user_auth_service.get_user_mfa_devices(user_id, verified_only=True)
             if len(devices) <= 1:
                 # Allow deletion but warn that MFA will be disabled
                 pass
 
-            deleted = user_service.delete_mfa_device(device_id, user_id)
+            deleted = container.user_auth_service.delete_mfa_device(device_id, user_id)
 
             if not deleted:
                 raise HTTPException(
@@ -3569,7 +5370,7 @@ def create_app(
                     detail="MFA device not found",
                 )
 
-            remaining_devices = user_service.get_user_mfa_devices(user_id, verified_only=True)
+            remaining_devices = container.user_auth_service.get_user_mfa_devices(user_id, verified_only=True)
 
             return {
                 "status": "deleted",
@@ -3600,15 +5401,14 @@ def create_app(
             MFA configuration status
         """
         try:
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
                 )
 
-            has_mfa = user_service.user_has_verified_mfa(user_id)
-            devices = user_service.get_user_mfa_devices(user_id, verified_only=True)
+            has_mfa = container.user_auth_service.user_has_verified_mfa(user_id)
+            devices = container.user_auth_service.get_user_mfa_devices(user_id, verified_only=True)
 
             return {
                 "user_id": user_id,
@@ -3646,95 +5446,13 @@ def create_app(
         Returns:
             Linking result with user and identity info
         """
-        try:
-            from guideai.auth.identity_linking_service import IdentityLinkingService, LinkingResult
-            from guideai.auth.providers.github import GitHubProvider
-            from guideai.auth.providers.google import GoogleProvider
-
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="User service not available",
-                )
-
-            # Get the appropriate OAuth provider
-            if provider == "github":
-                oauth_provider = GitHubProvider()
-            elif provider == "google":
-                oauth_provider = GoogleProvider()
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Unsupported OAuth provider: {provider}",
-                )
-
-            # Validate the token and get user info
-            oauth_user_info = oauth_provider.validate_token(oauth_access_token)
-            if not oauth_user_info:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid OAuth token or unable to fetch user info",
-                )
-
-            # Link the identity
-            linking_service = IdentityLinkingService(user_service)
-            result = linking_service.link_identity(
-                oauth_user_info=oauth_user_info,
-                oauth_access_token=oauth_access_token,
-                oauth_refresh_token=oauth_refresh_token,
-                password_confirmation=password_confirmation,
-                target_user_id=target_user_id,
-            )
-
-            # Map result to response
-            if result.result == LinkingResult.REQUIRES_PASSWORD:
-                return {
-                    "status": "requires_confirmation",
-                    "result": result.result.value,
-                    "message": result.message,
-                    "requires_email": result.requires_email,
-                }
-            elif result.result in (LinkingResult.INVALID_PASSWORD, LinkingResult.ERROR):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=result.message,
-                )
-
-            # Success cases
-            response = {
-                "status": "success",
-                "result": result.result.value,
-                "message": result.message,
-            }
-
-            if result.user:
-                response["user"] = {
-                    "id": result.user.id,
-                    "username": result.user.username,
-                    "email": result.user.email,
-                    "email_verified": result.user.email_verified,
-                    "display_name": result.user.display_name,
-                }
-
-            if result.federated_identity:
-                response["identity"] = {
-                    "id": result.federated_identity.id,
-                    "provider": result.federated_identity.provider,
-                    "provider_user_id": result.federated_identity.provider_user_id,
-                    "provider_email": result.federated_identity.provider_email,
-                    "provider_username": result.federated_identity.provider_username,
-                }
-
-            return response
-
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to link identity: {exc}",
-            ) from exc
+        # DEPRECATED: Identity linking has been simplified.
+        # OAuth users are now automatically created in auth.users during OAuth callback.
+        # This endpoint is kept for backwards compatibility but returns a simple response.
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Identity linking has been deprecated. OAuth users are automatically linked during login.",
+        )
 
     @app.post("/api/v1/auth/identity/unlink")
     async def unlink_oauth_identity(
@@ -3751,42 +5469,12 @@ def create_app(
         Returns:
             Unlinking result
         """
-        try:
-            from guideai.auth.identity_linking_service import IdentityLinkingService
-
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="User service not available",
-                )
-
-            linking_service = IdentityLinkingService(user_service)
-            success, message = linking_service.unlink_identity(
-                user_id=user_id,
-                provider=provider,
-                password_confirmation=password_confirmation,
-            )
-
-            if not success:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=message,
-                )
-
-            return {
-                "status": "success",
-                "message": message,
-                "provider": provider,
-            }
-
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to unlink identity: {exc}",
-            ) from exc
+        # DEPRECATED: Identity unlinking has been deprecated with the removal of internal_users.
+        # OAuth is now the primary authentication method.
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Identity unlinking has been deprecated. OAuth is the primary authentication method.",
+        )
 
     @app.get("/api/v1/auth/identity/providers")
     async def list_linked_providers(
@@ -3798,39 +5486,34 @@ def create_app(
         Returns:
             List of linked OAuth identities
         """
+        # DEPRECATED: Identity linking has been deprecated.
+        # OAuth is now the primary authentication method.
+        # Users are stored in auth.users with their OAuth provider ID.
         try:
-            from guideai.auth.identity_linking_service import IdentityLinkingService
-
-            user_service = container.internal_auth_provider.user_service
-            if not user_service:
+            if not container.user_auth_service:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="User service not available",
                 )
 
-            linking_service = IdentityLinkingService(user_service)
-            identities = linking_service.get_user_identities(user_id)
-
-            # Get user info to include in response
-            user = user_service.get_user_by_id(user_id)
+            user = container.user_auth_service.get_user_by_id(user_id)
+            if not user:
+                # Return empty list for unknown users (OAuth users may not be in auth.users yet)
+                return {
+                    "user_id": user_id,
+                    "has_password": False,
+                    "linked_providers": [],
+                    "provider_count": 0,
+                    "message": "OAuth is the primary authentication method. User profiles are stored in auth.users.",
+                }
 
             return {
                 "user_id": user_id,
-                "has_password": user.hashed_password is not None if user else False,
-                "linked_providers": [
-                    {
-                        "id": identity.id,
-                        "provider": identity.provider,
-                        "provider_user_id": identity.provider_user_id,
-                        "provider_email": identity.provider_email,
-                        "provider_username": identity.provider_username,
-                        "provider_display_name": identity.provider_display_name,
-                        "provider_avatar_url": identity.provider_avatar_url,
-                        "created_at": identity.created_at.isoformat() if identity.created_at else None,
-                    }
-                    for identity in identities
-                ],
-                "provider_count": len(identities),
+                "has_password": False,  # Passwords deprecated
+                "linked_providers": [],  # Identity linking deprecated
+                "provider_count": 0,
+                "email": user.email,
+                "message": "OAuth is the primary authentication method. Identity linking has been deprecated.",
             }
 
         except Exception as exc:
@@ -4255,12 +5938,25 @@ def create_app(
         app.include_router(org_routes, prefix="/api")
 
     # ------------------------------------------------------------------
+    # Settings Management (Project and Org settings)
+    # ------------------------------------------------------------------
+    if MULTI_TENANT_AVAILABLE and container.settings_service is not None:
+        # Add settings routes at /api/v1/projects/{project_id}/settings/*
+        settings_routes = create_settings_routes(
+            settings_service=container.settings_service,
+            get_user_id=_require_user_id,
+            tags=["settings"],
+        )
+        app.include_router(settings_routes, prefix="/api")
+
+    # ------------------------------------------------------------------
     # Projects (Personal projects always available)
     # ------------------------------------------------------------------
     app.include_router(
         create_project_routes(
             store=container.project_store,
             get_user_id=_require_user_id,
+            org_service=container.org_service if MULTI_TENANT_AVAILABLE else None,
             tags=["projects"],
         ),
         prefix="/api",
@@ -4277,6 +5973,16 @@ def create_app(
     app.include_router(board_routes, prefix="/api")
 
     # ------------------------------------------------------------------
+    # Work Item Execution (Agent execution of work items)
+    # ------------------------------------------------------------------
+    if WORK_ITEM_EXECUTION_AVAILABLE and container.work_item_execution_service is not None:
+        execution_routes = create_work_item_execution_routes(
+            service=container.work_item_execution_service,
+        )
+        app.include_router(execution_routes, prefix="/api")
+        logger.info("Work item execution routes registered at /api/v1/work-items/*")
+
+    # ------------------------------------------------------------------
     # Billing Service
     # ------------------------------------------------------------------
     if BILLING_AVAILABLE and container.billing_service is not None:
@@ -4285,6 +5991,60 @@ def create_app(
             billing_service=container.billing_service,
         )
         app.include_router(billing_routes, prefix="/api")
+
+    # ------------------------------------------------------------------
+    # Dashboard Stats
+    # ------------------------------------------------------------------
+    @app.get("/api/v1/dashboard/stats")
+    async def dashboard_stats() -> Dict[str, Any]:
+        """
+        Get aggregated dashboard statistics.
+
+        Returns counts and summaries for display on the main dashboard.
+        """
+        from datetime import datetime, timezone
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Get counts from services
+        total_behaviors = 0
+        total_runs = 0
+        running_runs = 0
+        completed_today = 0
+        failed_today = 0
+
+        try:
+            behaviors = container.behavior_service.list_behaviors()
+            total_behaviors = len(behaviors)
+        except Exception:
+            pass
+
+        try:
+            runs = container.run_service.list_runs(limit=1000)
+            total_runs = len(runs)
+            for run in runs:
+                if run.get("status") == "RUNNING":
+                    running_runs += 1
+                started_at = run.get("started_at", "")
+                if started_at and started_at.startswith(today):
+                    if run.get("status") == "COMPLETED":
+                        completed_today += 1
+                    elif run.get("status") == "FAILED":
+                        failed_today += 1
+        except Exception:
+            pass
+
+        return {
+            "total_projects": 0,  # Projects not implemented yet
+            "total_agents": 0,  # Agents not implemented yet
+            "active_agents": 0,
+            "busy_agents": 0,
+            "total_runs": total_runs,
+            "running_runs": running_runs,
+            "completed_runs_today": completed_today,
+            "failed_runs_today": failed_today,
+            "total_behaviors": total_behaviors,
+        }
 
     # ------------------------------------------------------------------
     # Operations & Monitoring
@@ -4316,9 +6076,32 @@ def create_app(
 
         for service_name, service in service_checks:
             try:
-                # Check if service has PostgresPool
+                # Check if service has PostgresPool (may be lazy-initialized)
                 if hasattr(service, "_pool"):
                     pool = service._pool
+                    if pool is None:
+                        # Pool exists but not initialized yet (lazy initialization)
+                        # Try to get pool via _get_pool() if available
+                        if hasattr(service, "_get_pool"):
+                            try:
+                                pool = service._get_pool()
+                            except Exception:
+                                # Pool initialization failed - service not ready
+                                services_health.append({
+                                    "service": service_name,
+                                    "status": "not_initialized",
+                                    "pool": None,
+                                })
+                                continue
+                        else:
+                            # Has _pool attr but it's None and no _get_pool method
+                            services_health.append({
+                                "service": service_name,
+                                "status": "not_initialized",
+                                "pool": None,
+                            })
+                            continue
+
                     pool_stats = pool.get_pool_stats()
                     pools_stats.append(pool_stats)
 

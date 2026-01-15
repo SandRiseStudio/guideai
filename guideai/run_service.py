@@ -17,6 +17,8 @@ from .run_contracts import (
     Run,
     RunCompletion,
     RunCreateRequest,
+    RunLogEntry,
+    RunLogsResponse,
     RunProgressUpdate,
     RunStatus,
     RunStep,
@@ -44,9 +46,11 @@ class RunService:
         *,
         db_path: Optional[Path] = None,
         telemetry: Optional[TelemetryClient] = None,
+        event_hub: Optional[Any] = None,
     ) -> None:
         self._db_path = self._resolve_db_path(db_path)
         self._telemetry = telemetry or TelemetryClient.noop()
+        self._event_hub = event_hub
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -240,6 +244,7 @@ class RunService:
                 "message": updated_run.message,
             },
         )
+        self._publish_run_events(updated_run, update.step_id)
         return updated_run
 
     def complete_run(self, run_id: str, completion: RunCompletion) -> Run:
@@ -295,6 +300,7 @@ class RunService:
                 "error": updated_run.error,
             },
         )
+        self._publish_run_events(updated_run, None)
         return updated_run
 
     def cancel_run(self, run_id: str, reason: Optional[str] = None) -> Run:
@@ -306,11 +312,195 @@ class RunService:
         )
         return self.complete_run(run_id, completion)
 
+    def update_progress(
+        self,
+        run_id: str,
+        *,
+        status: Optional[str] = None,
+        progress: Optional[float] = None,
+        current_step: Optional[str] = None,
+        message: Optional[str] = None,
+        outputs: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Run:
+        """Convenience wrapper for updating run progress."""
+        if outputs is not None or error is not None:
+            completion = RunCompletion(
+                status=status or (RunStatus.FAILED if error else RunStatus.COMPLETED),
+                outputs=outputs or {},
+                message=message,
+                error=error,
+                metadata=metadata or {},
+            )
+            return self.complete_run(run_id, completion)
+
+        update = RunProgressUpdate(
+            status=status,
+            progress_pct=progress,
+            message=message,
+            step_id=current_step,
+            step_name=current_step,
+            metadata=metadata or {},
+        )
+        return self.update_run(run_id, update)
+
+    def add_step(
+        self,
+        run_id: str,
+        *,
+        action: str,
+        outcome: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None,
+    ) -> RunStep:
+        """Append a run step entry."""
+        step_id = str(uuid.uuid4())
+        update = RunProgressUpdate(
+            step_id=step_id,
+            step_name=action,
+            step_status=status or RunStatus.RUNNING,
+            metadata=metadata or {},
+        )
+        self.update_run(run_id, update)
+        run = self.get_run(run_id)
+        for step in run.steps:
+            if step.step_id == step_id:
+                return step
+        return RunStep(step_id=step_id, name=action, status=status or RunStatus.RUNNING, metadata=metadata or {})
+
     def delete_run(self, run_id: str) -> None:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
             if cur.rowcount == 0:
                 raise RunNotFoundError(f"Run '{run_id}' not found")
+
+    async def fetch_logs(
+        self,
+        run_id: str,
+        *,
+        raze_service: Any = None,
+        level: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        limit: int = 100,
+        after: Optional[str] = None,
+        search: Optional[str] = None,
+        include_steps: bool = True,
+    ) -> "RunLogsResponse":
+        """Fetch execution logs for a run from Raze logging system.
+
+        Args:
+            run_id: Run identifier.
+            raze_service: RazeService instance for querying logs.
+            level: Minimum log level (INFO, WARNING, ERROR, etc.).
+            start_time: Start of time range (ISO 8601).
+            end_time: End of time range (ISO 8601).
+            limit: Maximum logs to return (1-1000).
+            after: Cursor for pagination (log_id from previous page).
+            search: Full-text search in message field.
+            include_steps: Whether to include RunSteps in response.
+
+        Returns:
+            RunLogsResponse with logs and optional steps.
+
+        Raises:
+            RunNotFoundError: If run does not exist.
+        """
+        from datetime import datetime, UTC
+        from .run_contracts import RunLogEntry, RunLogsResponse
+
+        # Verify run exists (also enforces access control at caller level)
+        run = self.get_run(run_id)
+
+        logs: List["RunLogEntry"] = []
+        total = 0
+        has_more = False
+        next_cursor: Optional[str] = None
+
+        # Query Raze if service is provided
+        if raze_service is not None:
+            try:
+                # Parse time range
+                if start_time:
+                    start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                else:
+                    start_dt = datetime.fromisoformat(run.created_at.replace("Z", "+00:00"))
+
+                if end_time:
+                    end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+                else:
+                    end_dt = datetime.now(UTC)
+
+                # Map level string to LogLevel if provided
+                level_filter = None
+                if level:
+                    level_filter = level.upper()
+
+                # Calculate offset from cursor if provided
+                offset = 0
+                # Note: For true cursor-based pagination, we'd need to track position
+                # in Raze. For now, use after as a marker and filter client-side.
+
+                # Query Raze
+                response = await raze_service.query(
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    run_id=run_id,
+                    level=level_filter,
+                    search=search,
+                    limit=limit + 1,  # Fetch one extra to detect has_more
+                    offset=offset,
+                    order="asc",
+                )
+
+                # Convert to RunLogEntry
+                for log in response.logs:
+                    # Skip logs until we pass the cursor
+                    if after and log.log_id <= after:
+                        continue
+
+                    log_entry = RunLogEntry(
+                        log_id=log.log_id,
+                        timestamp=log.timestamp.isoformat() if hasattr(log.timestamp, "isoformat") else str(log.timestamp),
+                        level=log.level if isinstance(log.level, str) else log.level.value,
+                        service=log.service,
+                        message=log.message,
+                        action_id=getattr(log, "action_id", None),
+                        session_id=getattr(log, "session_id", None),
+                        actor_surface=getattr(log, "actor_surface", None),
+                        context=getattr(log, "context", {}),
+                    )
+                    logs.append(log_entry)
+
+                    if len(logs) >= limit:
+                        break
+
+                total = response.total_count
+                has_more = len(logs) == limit and response.has_more
+                if logs:
+                    next_cursor = logs[-1].log_id if has_more else None
+
+            except Exception as e:
+                # Log error but don't fail - return empty logs with run steps
+                self._telemetry.emit_event(
+                    event_type="run.fetch_logs.error",
+                    actor={"id": run.actor.id, "role": run.actor.role, "surface": run.actor.surface},
+                    run_id=run_id,
+                    payload={"error": str(e)},
+                )
+
+        # Include run steps if requested
+        steps = run.steps if include_steps else []
+
+        return RunLogsResponse(
+            run_id=run_id,
+            logs=logs,
+            steps=steps,
+            total=total,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -446,6 +636,44 @@ class RunService:
         if request.total_steps is not None:
             metadata.setdefault("execution", {})["total_steps"] = request.total_steps
         return metadata
+
+    def _publish_run_events(self, run: Run, step_id: Optional[str]) -> None:
+        if not self._event_hub:
+            return
+        metadata = run.metadata or {}
+        payload = {
+            "run_id": run.run_id,
+            "work_item_id": metadata.get("work_item_id"),
+            "org_id": metadata.get("org_id"),
+            "project_id": metadata.get("project_id"),
+            "agent_id": metadata.get("agent_id"),
+            "model_id": metadata.get("model_id"),
+            "cycle_id": metadata.get("cycle_id"),
+            "status": run.status,
+            "phase": metadata.get("phase"),
+            "progress_pct": run.progress_pct,
+            "current_step": run.current_step,
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+            "error": run.error,
+            "step_count": len(run.steps),
+            "updated_at": run.updated_at,
+        }
+        self._event_hub.publish_status(payload)
+
+        if not step_id:
+            return
+        for step in run.steps:
+            if step.step_id == step_id:
+                step_payload = {
+                    "run_id": run.run_id,
+                    "work_item_id": metadata.get("work_item_id"),
+                    "org_id": metadata.get("org_id"),
+                    "project_id": metadata.get("project_id"),
+                    "step": step.to_dict(),
+                }
+                self._event_hub.publish_step(step_payload)
+                break
 
     def _merge_metadata(
         self,

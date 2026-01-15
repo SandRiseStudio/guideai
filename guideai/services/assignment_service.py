@@ -25,7 +25,7 @@ from guideai.telemetry import TelemetryClient
 from guideai.utils.dsn import resolve_postgres_dsn
 
 _BOARD_PG_DSN_ENV = "GUIDEAI_BOARD_PG_DSN"
-_DEFAULT_PG_DSN = "postgresql://guideai:guideai@localhost:5432/guideai"
+_DEFAULT_PG_DSN = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
 
 
 class AssignmentServiceError(Exception):

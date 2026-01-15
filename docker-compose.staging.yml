@@ -396,14 +396,14 @@ services:
     ports:
       - "6438:5432"
     environment:
-      POSTGRES_DB: guideai_agent_orchestrator
-      POSTGRES_USER: guideai_agent_orchestrator
+      POSTGRES_DB: guideai
+      POSTGRES_USER: guideai_user
       POSTGRES_PASSWORD: ${GUIDEAI_PG_PASS_AGENT_ORCHESTRATOR:-agent_orchestrator_staging_pass}
     volumes:
       - staging-agent-orchestrator-data:/var/lib/postgresql/data
       - ./schema/migrations/011_create_agent_orchestrator.sql:/docker-entrypoint-initdb.d/011_create_agent_orchestrator.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U guideai_agent_orchestrator -d guideai_agent_orchestrator"]
+      test: ["CMD-SHELL", "pg_isready -U guideai_user -d guideai"]
       interval: 10s
       timeout: 5s
       retries: 5

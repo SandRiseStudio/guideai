@@ -482,6 +482,7 @@ Every feature must pass identical tests on:
 8. **Don't ignore reconnection** — Users will have flaky networks. Reconnection must be seamless.
 
 9. **Don't duplicate shared code** — If code is needed by both web console AND VS Code extension, it MUST go in `@guideai/collab-client`. Never implement the same logic twice in surface-specific locations.
+10. **Don't assume orgs exist** — Personal projects must support agent assignment with the same UX parity as org-backed projects.
 
 ---
 

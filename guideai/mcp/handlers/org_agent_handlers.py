@@ -1,7 +1,11 @@
-"""MCP tool handlers for Organization Agent management.
+"""MCP tool handlers for Agent Registry and Agent Runtime management.
 
-Provides handlers for agent workforce management within organizations.
+Provides handlers for:
+- agentRegistry.*: Agent CRUD operations (create, get, list, update, deprecate)
+- agents.*: Runtime operations (activate, pause, disable, status, assign)
+
 Following `behavior_prefer_mcp_tools` - MCP provides consistent schemas and automatic telemetry.
+Migrated from orgAgents.* namespace (archived 2026-01-07).
 """
 
 from __future__ import annotations
@@ -363,6 +367,26 @@ async def handle_remove_from_project(
 # ==============================================================================
 
 
+# Agent Registry handlers (CRUD operations)
+AGENT_REGISTRY_HANDLERS: Dict[str, Any] = {
+    "agentRegistry.create": handle_create_agent,
+    "agentRegistry.get": handle_get_agent,
+    "agentRegistry.list": handle_list_agents,
+    "agentRegistry.update": handle_update_agent,
+    "agentRegistry.deprecate": handle_delete_agent,  # Semantic match: delete → deprecate
+}
+
+# Agent Runtime handlers (orchestration operations)
+AGENT_RUNTIME_HANDLERS: Dict[str, Any] = {
+    "agents.pause": handle_pause_agent,
+    "agents.activate": handle_resume_agent,  # Resume → activate
+    "agents.disable": handle_stop_agent,     # Stop → disable
+    "agents.status": handle_get_status,      # getStatus → status
+    "agents.assign": handle_assign_to_project,  # Project assignment
+}
+
+# Legacy handlers (DEPRECATED - archived 2026-01-07)
+# Kept for backwards compatibility during migration period
 ORG_AGENT_HANDLERS: Dict[str, Any] = {
     "orgAgents.create": handle_create_agent,
     "orgAgents.get": handle_get_agent,

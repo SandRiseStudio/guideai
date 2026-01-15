@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
@@ -43,6 +44,31 @@ if TYPE_CHECKING:
     from guideai.storage.postgres_pool import PostgresPool
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Enums
+# =============================================================================
+
+
+class ExecutionMode(str, Enum):
+    """Execution mode for work item processing.
+
+    Determines where file changes are written during agent execution:
+    - LOCAL: Changes written directly to local filesystem (requires IDE/CLI)
+    - GITHUB_PR: Changes committed to a branch and opened as PR
+    - LOCAL_AND_PR: Both local changes and PR creation
+    """
+    LOCAL = "local"
+    GITHUB_PR = "github_pr"
+    LOCAL_AND_PR = "local_and_pr"
+
+
+# Surfaces that support local file operations
+LOCAL_CAPABLE_SURFACES = frozenset({"cli", "vscode", "mcp", "codespaces", "gitpod"})
+
+# Surfaces that do NOT support local file operations
+REMOTE_ONLY_SURFACES = frozenset({"web", "api"})
 
 
 # =============================================================================
@@ -307,6 +333,12 @@ class ProjectSettings(BaseModel):
 
     # Local project path (for IDE/CLI integration)
     local_project_path: Optional[str] = Field(None, description="Local filesystem path to project root")
+
+    # Execution mode - determines where file changes are written
+    execution_mode: ExecutionMode = Field(
+        default=ExecutionMode.GITHUB_PR,
+        description="Where file changes are written during execution. 'local' requires IDE/CLI, 'github_pr' works from any surface."
+    )
 
     # Environment settings
     environments: List[str] = Field(default_factory=lambda: ["development", "staging", "production"])

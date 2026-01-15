@@ -419,6 +419,51 @@
   line-height: var(--leading-relaxed);
 }
 
+.work-item-execution {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.work-item-execution-actions {
+  display: inline-flex;
+  gap: var(--space-1);
+}
+
+.work-item-execution-button {
+  border-radius: var(--radius-full);
+  border: 1px solid rgba(59, 130, 246, 0.24);
+  background: rgba(59, 130, 246, 0.12);
+  color: var(--color-text-primary);
+  font-size: var(--text-xs);
+  padding: 2px var(--space-2);
+  transition:
+    background-color var(--duration-fast) var(--ease-out-quart),
+    border-color var(--duration-fast) var(--ease-out-quart),
+    transform var(--duration-fast) var(--ease-spring);
+}
+
+.work-item-execution-button:hover:not(:disabled) {
+  border-color: rgba(59, 130, 246, 0.4);
+  background: rgba(59, 130, 246, 0.2);
+}
+
+.work-item-execution-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.work-item-execution-cancel {
+  border-color: rgba(239, 68, 68, 0.2);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.work-item-execution-cancel:hover:not(:disabled) {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.16);
+}
+
 .work-item-meta {
   display: flex;
   align-items: baseline;
@@ -430,6 +475,84 @@
 
 .work-item-id {
   font-family: var(--font-mono);
+}
+
+.work-item-assignment {
+  display: flex;
+  align-items: center;
+}
+
+.work-item-assignee-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-radius: var(--radius-full);
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  background: rgba(15, 23, 42, 0.04);
+  padding: 2px var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+}
+
+.assignee-pill-user {
+  border-color: rgba(59, 130, 246, 0.25);
+  background: rgba(59, 130, 246, 0.08);
+  color: var(--color-text-primary);
+}
+
+.assignee-pill-agent {
+  border-color: rgba(16, 185, 129, 0.25);
+  background: rgba(16, 185, 129, 0.08);
+  color: var(--color-text-primary);
+}
+
+.assignee-pill-unassigned {
+  border-style: dashed;
+  color: var(--color-text-tertiary);
+  background: rgba(15, 23, 42, 0.03);
+}
+
+.assignee-pill-avatar {
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-full);
+  background: rgba(15, 23, 42, 0.08);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+}
+
+.assignee-pill-name {
+  font-weight: var(--font-medium);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assignee-pill-type {
+  font-size: 10px;
+  color: var(--color-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+/* Orphaned assignment - agent no longer exists */
+.assignee-pill-orphaned {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.assignee-pill-orphaned .assignee-pill-type {
+  color: rgb(239, 68, 68);
+}
+
+.assignee-pill-orphaned .assignee-pill-avatar {
+  background: rgba(239, 68, 68, 0.15);
+  color: rgb(239, 68, 68);
 }
 
 /* Screen reader only */

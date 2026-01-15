@@ -8,13 +8,12 @@
  * follows the repo constraints.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { ConsoleSidebar } from '../ConsoleSidebar';
-import { OrgSwitcher } from '../OrgSwitcher';
-import { useOrganizations } from '../../api/dashboard';
 import { useCreateProject } from '../../api/projects';
+import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
 import './NewProjectPage.css';
 
 function slugify(name: string): string {
@@ -37,13 +36,11 @@ function validateName(name: string): string | null {
 
 export function NewProjectPage(): React.JSX.Element {
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
-
-  const { data: organizations = [] } = useOrganizations();
+  const [searchParams] = useSearchParams();
+  const { currentOrgId } = useOrgContext();
   const mutation = useCreateProject();
 
-  const orgFromQuery = searchParams.get('org') ?? undefined;
-  const [currentOrgId, setCurrentOrgId] = useState<string | undefined>(orgFromQuery);
+  const orgFromQuery = searchParams.get('org');
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -54,20 +51,12 @@ export function NewProjectPage(): React.JSX.Element {
 
   const nameError = useMemo(() => validateName(name), [name]);
   const suggestedSlug = useMemo(() => slugify(name), [name]);
-
-  const handleOrgSelect = useCallback(
-    (orgId?: string) => {
-      setCurrentOrgId(orgId);
-      const next = new URLSearchParams(searchParams);
-      if (orgId) {
-        next.set('org', orgId);
-      } else {
-        next.delete('org');
-      }
-      setSearchParams(next, { replace: true });
-    },
-    [searchParams, setSearchParams]
-  );
+  useEffect(() => {
+    if (!orgFromQuery) return;
+    if (orgFromQuery !== currentOrgId) {
+      orgContextStore.setCurrentOrgId(orgFromQuery);
+    }
+  }, [currentOrgId, orgFromQuery]);
 
   const canContinue = useMemo(() => {
     if (step === 1) return !nameError;
@@ -96,7 +85,7 @@ export function NewProjectPage(): React.JSX.Element {
       github_repo: githubRepo.trim() ? githubRepo.trim() : undefined,
     };
 
-    await mutation.mutateAsync({ orgId: currentOrgId, payload });
+    await mutation.mutateAsync({ orgId: currentOrgId ?? undefined, payload });
     const nextPath = currentOrgId ? `/projects?org=${encodeURIComponent(currentOrgId)}` : '/projects';
     navigate(nextPath, { replace: true });
   }, [currentOrgId, description, mutation, name, nameError, navigate, suggestedSlug, visibility]);
@@ -125,9 +114,6 @@ export function NewProjectPage(): React.JSX.Element {
             </div>
           </div>
 
-          <div className="new-project-header-right">
-            <OrgSwitcher organizations={organizations} currentOrgId={currentOrgId} onSelect={handleOrgSelect} />
-          </div>
         </header>
 
         <section className="new-project-stepper" aria-label="Project creation steps">

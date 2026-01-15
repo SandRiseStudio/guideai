@@ -62,7 +62,7 @@ export function OAuthCallback() {
 
       // If we're already processing THIS code, wait for that result
       if (processingCode === code && processingPromise) {
-        console.log('[OAuthCallback] Code already being processed, waiting...');
+        // StrictMode double-execution detected—silently wait for the first attempt
         try {
           await processingPromise;
           if (mountedRef.current) {

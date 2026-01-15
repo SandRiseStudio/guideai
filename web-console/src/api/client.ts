@@ -14,6 +14,9 @@
 
 const RAW_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
 
+// Base origin of the backend without the "/api" prefix. Useful for fetching non-API endpoints like /openapi.json.
+export const API_ORIGIN = RAW_API_BASE_URL.endsWith('/api') ? RAW_API_BASE_URL.slice(0, -4) : RAW_API_BASE_URL;
+
 // `VITE_API_BASE_URL` is allowed to be either:
 // - "http://localhost:8000"        (host only)
 // - "http://localhost:8000/api"    (includes API prefix)
@@ -127,6 +130,10 @@ class ApiClient {
   getToken(): string | null {
     if (this.token) return this.token;
     return localStorage.getItem(TOKEN_STORAGE_KEY);
+  }
+
+  hasToken(): boolean {
+    return Boolean(this.getToken());
   }
 
   getRefreshToken(): string | null {

@@ -22,7 +22,11 @@ RUN useradd -m -u 1000 -s /bin/bash guideai && \
 COPY --chown=guideai:guideai guideai/ ./guideai/
 COPY --chown=guideai:guideai packages/ ./packages/
 COPY --chown=guideai:guideai schema/ ./schema/
+COPY --chown=guideai:guideai migrations/ ./migrations/
+COPY --chown=guideai:guideai migrations_telemetry/ ./migrations_telemetry/
 COPY --chown=guideai:guideai pyproject.toml ./
+COPY --chown=guideai:guideai alembic.ini ./
+COPY --chown=guideai:guideai alembic.telemetry.ini ./
 
 # Install Python dependencies.
 # Note: This repo is a monorepo; the core service imports local packages like

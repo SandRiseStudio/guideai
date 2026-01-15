@@ -21,7 +21,6 @@ from typing import Dict, List, Optional
 
 from .auth.providers import (
     GitHubOAuthProvider,
-    InternalAuthProvider,
     OAuthProvider,
     AuthorizationPendingError,
     SlowDownError,
@@ -267,81 +266,17 @@ class DeviceFlowManager:
         metadata: Optional[Dict[str, str]] = None,
     ) -> DeviceTokens:
         """
-        Authenticate using internal auth provider (username/password).
+        [DEPRECATED] Internal auth (username/password) has been removed.
 
-        This bypasses the device flow and directly returns tokens for local/air-gapped environments.
-
-        Args:
-            username: Username for internal authentication
-            password: Password for internal authentication
-            surface: Surface initiating auth (CLI, API, IDE)
-            metadata: Optional metadata about the request
-
-        Returns:
-            DeviceTokens: Access and refresh tokens
+        Use OAuth authentication instead via --provider=github or --provider=google.
 
         Raises:
-            InvalidCredentialsError: If credentials are invalid
-            DeviceFlowError: If internal provider not configured
+            DeviceFlowError: Always - this method is deprecated
         """
-        if not self._provider or not isinstance(self._provider, InternalAuthProvider):
-            raise DeviceFlowError("Internal auth provider not configured. Use --provider=internal or set GUIDEAI_AUTH_PROVIDER=internal")
-
-        try:
-            # Login with internal provider
-            token_response = await self._provider.login(username, password)
-
-            # Convert to DeviceTokens
-            created_at = _now()
-            access_expires_at = created_at + timedelta(seconds=token_response.expires_in)
-            # Refresh token typically valid for 30 days for internal auth
-            refresh_expires_at = created_at + timedelta(days=30)
-
-            tokens = DeviceTokens(
-                access_token=token_response.access_token,
-                refresh_token=token_response.refresh_token or "",
-                access_token_expires_at=access_expires_at,
-                refresh_token_expires_at=refresh_expires_at,
-                token_type=token_response.token_type,
-            )
-
-            self._emit_event(
-                "auth_internal_login",
-                None,
-                extra={
-                    "username": username,
-                    "surface": surface,
-                    "provider": "internal",
-                    "expires_at": _isoformat(access_expires_at),
-                },
-            )
-
-            return tokens
-
-        except InvalidCredentialsError as exc:
-            self._emit_event(
-                "auth_internal_login_failed",
-                None,
-                extra={
-                    "username": username,
-                    "surface": surface,
-                    "provider": "internal",
-                    "error": str(exc),
-                },
-            )
-            raise
-        except Exception as exc:
-            self._emit_event(
-                "auth_internal_login_error",
-                None,
-                extra={
-                    "username": username,
-                    "surface": surface,
-                    "provider": "internal",
-                    "error": str(exc),
-                },
-            )
-            raise DeviceFlowError(f"Internal authentication failed: {exc}") from exc
+        raise DeviceFlowError(
+            "Internal authentication (username/password) has been deprecated. "
+            "Please use OAuth authentication via --provider=github or --provider=google"
+        )
 
     async def register_internal_user(
         self,
@@ -353,79 +288,17 @@ class DeviceFlowManager:
         metadata: Optional[Dict[str, str]] = None,
     ) -> DeviceTokens:
         """
-        Register a new user with internal auth provider.
+        [DEPRECATED] Internal user registration has been removed.
 
-        Args:
-            username: Desired username
-            password: Password (min 8 chars)
-            email: Optional email address
-            surface: Surface initiating registration (CLI, API, IDE)
-            metadata: Optional metadata about the request
-
-        Returns:
-            DeviceTokens: Access and refresh tokens for the new user
+        Use OAuth authentication instead via --provider=github or --provider=google.
 
         Raises:
-            OAuthError: If registration fails (e.g., duplicate username)
-            DeviceFlowError: If internal provider not configured
+            DeviceFlowError: Always - this method is deprecated
         """
-        if not self._provider or not isinstance(self._provider, InternalAuthProvider):
-            raise DeviceFlowError("Internal auth provider not configured")
-
-        try:
-            # Register with internal provider
-            token_response = await self._provider.register(username, password, email or "")
-
-            # Convert to DeviceTokens
-            created_at = _now()
-            access_expires_at = created_at + timedelta(seconds=token_response.expires_in)
-            refresh_expires_at = created_at + timedelta(days=30)
-
-            tokens = DeviceTokens(
-                access_token=token_response.access_token,
-                refresh_token=token_response.refresh_token or "",
-                access_token_expires_at=access_expires_at,
-                refresh_token_expires_at=refresh_expires_at,
-                token_type=token_response.token_type,
-            )
-
-            self._emit_event(
-                "auth_internal_registration",
-                None,
-                extra={
-                    "username": username,
-                    "email": email or "",
-                    "surface": surface,
-                    "provider": "internal",
-                },
-            )
-
-            return tokens
-
-        except OAuthError as exc:
-            self._emit_event(
-                "auth_internal_registration_failed",
-                None,
-                extra={
-                    "username": username,
-                    "surface": surface,
-                    "provider": "internal",
-                    "error": str(exc),
-                },
-            )
-            raise
-        except Exception as exc:
-            self._emit_event(
-                "auth_internal_registration_error",
-                None,
-                extra={
-                    "username": username,
-                    "surface": surface,
-                    "provider": "internal",
-                    "error": str(exc),
-                },
-            )
-            raise DeviceFlowError(f"Internal user registration failed: {exc}") from exc
+        raise DeviceFlowError(
+            "Internal user registration has been deprecated. "
+            "Please use OAuth authentication via --provider=github or --provider=google"
+        )
 
     def start_authorization(
         self,

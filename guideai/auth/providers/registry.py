@@ -1,8 +1,10 @@
 """Provider registry for managing OAuth providers.
 
 This module provides a centralized registry for OAuth provider implementations,
-enabling pluggable authentication across different platforms (GitHub, GitLab,
-Bitbucket, Google, Internal).
+enabling pluggable authentication across different platforms (GitHub, Google).
+
+Note: InternalAuthProvider was deprecated on 2026-01-09.
+User authentication is now handled via auth.users table and UserAuthService.
 """
 
 from __future__ import annotations
@@ -13,7 +15,6 @@ from typing import Dict, List, Optional, Type
 from .base import OAuthProvider
 from .github import GitHubOAuthProvider
 from .google import GoogleOAuthProvider
-from .internal import InternalAuthProvider
 
 
 class ProviderRegistry:
@@ -126,10 +127,6 @@ class ProviderRegistry:
         provider_class = cls.get(name)
         provider_name = name or cls._default_provider or "oauth"
 
-        # Internal auth doesn't require OAuth credentials
-        if provider_name == "internal":
-            return provider_class(**kwargs)  # type: ignore[call-arg]
-
         # Auto-detect credentials from environment if not provided
         if client_id is None:
             client_id = os.getenv(f"{provider_name.upper()}_CLIENT_ID") or os.getenv("OAUTH_CLIENT_ID")
@@ -149,8 +146,9 @@ class ProviderRegistry:
 # Register built-in providers
 ProviderRegistry.register("github", GitHubOAuthProvider, default=True)
 ProviderRegistry.register("google", GoogleOAuthProvider)
-ProviderRegistry.register("internal", InternalAuthProvider)
 
+# Note: InternalAuthProvider was deprecated on 2026-01-09.
+# User authentication is now handled via auth.users table and UserAuthService.
 # Future OAuth providers will be registered here:
 # ProviderRegistry.register("gitlab", GitLabOAuthProvider)
 # ProviderRegistry.register("bitbucket", BitbucketOAuthProvider)

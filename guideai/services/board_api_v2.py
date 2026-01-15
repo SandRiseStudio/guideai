@@ -29,6 +29,10 @@ Endpoints:
     POST   /v1/work-items/{item_id}:assign      - Assign to user/agent
     POST   /v1/work-items/{item_id}:unassign    - Unassign
 
+    # Comments
+    GET    /v1/work-items/{item_id}/comments    - List comments on a work item
+    POST   /v1/work-items/{item_id}/comments    - Add a comment to a work item
+
     # Sprints
     POST   /v1/sprints                          - Create sprint
     GET    /v1/sprints                          - List sprints
@@ -48,7 +52,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -96,6 +100,8 @@ from guideai.services.board_service import (
     ColumnNotFoundError,
     WorkItemNotFoundError,
     WorkItemTransitionError,
+    AssigneeNotFoundError,
+    AuthorNotFoundError,
     Actor,
 )
 
@@ -172,6 +178,38 @@ class AssignmentResponse(BaseModel):
     message: str
 
 
+class WorkItemComment(BaseModel):
+    """Comment attached to a work item."""
+    comment_id: str
+    work_item_id: str
+    author_id: str
+    author_type: str
+    content: str
+    run_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class WorkItemCommentResponse(BaseModel):
+    """Response for comment operations."""
+    comment: WorkItemComment
+
+
+class WorkItemCommentListResponse(BaseModel):
+    """Response for listing comments."""
+    comments: List[WorkItemComment]
+    total: int
+
+
+class CreateWorkItemCommentRequest(BaseModel):
+    """Request to add a comment to a work item."""
+    body: str = Field(..., min_length=1, max_length=4000)
+    author_type: Optional[Literal["user", "agent"]] = None
+    run_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 # =============================================================================
 # Router Factory
 # =============================================================================
@@ -204,6 +242,41 @@ def create_board_routes(
     def _get_org_id(request: Request) -> Optional[str]:
         """Extract org_id from request state."""
         return getattr(request.state, "org_id", None)
+
+    def _post_comment_with_author_type(
+        *,
+        work_item_id: str,
+        author_id: str,
+        requested_type: Optional[str],
+        body: CreateWorkItemCommentRequest,
+        actor: Actor,
+        org_id: Optional[str],
+    ) -> Dict[str, Any]:
+        preferred_type = requested_type or "user"
+        try:
+            return board_service.add_comment(
+                work_item_id=work_item_id,
+                author_id=author_id,
+                author_type=preferred_type,
+                content=body.body,
+                actor=actor,
+                run_id=body.run_id,
+                metadata=body.metadata,
+                org_id=org_id,
+            )
+        except AuthorNotFoundError as exc:
+            if requested_type:
+                raise exc
+            return board_service.add_comment(
+                work_item_id=work_item_id,
+                author_id=author_id,
+                author_type="agent",
+                content=body.body,
+                actor=actor,
+                run_id=body.run_id,
+                metadata=body.metadata,
+                org_id=org_id,
+            )
 
     # =========================================================================
     # Board CRUD
@@ -679,6 +752,12 @@ def create_board_routes(
             )
         except WorkItemNotFoundError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        except AssigneeNotFoundError as e:
+            # Agent or user not found - return 400 with helpful message
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(e),
+            )
         except BoardServiceError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -701,6 +780,67 @@ def create_board_routes(
             return AssignmentResponse(item=item, message="Work item unassigned")
         except WorkItemNotFoundError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        except BoardServiceError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # =========================================================================
+    # Comments
+    # =========================================================================
+
+    @router.get(
+        "/v1/work-items/{item_id}/comments",
+        response_model=WorkItemCommentListResponse,
+        summary="List work item comments",
+        description="List comments on a work item, ordered oldest first.",
+    )
+    async def list_work_item_comments(
+        request: Request,
+        item_id: str,
+        limit: int = Query(50, ge=1, le=200, description="Max comments to return"),
+        offset: int = Query(0, ge=0, description="Comments to skip"),
+    ) -> WorkItemCommentListResponse:
+        org_id = _get_org_id(request)
+
+        try:
+            comments = board_service.list_comments(
+                work_item_id=item_id,
+                limit=limit,
+                offset=offset,
+                org_id=org_id,
+            )
+            return WorkItemCommentListResponse(comments=comments, total=len(comments))
+        except WorkItemNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    @router.post(
+        "/v1/work-items/{item_id}/comments",
+        response_model=WorkItemCommentResponse,
+        status_code=status.HTTP_201_CREATED,
+        summary="Add work item comment",
+        description="Add a comment to a work item.",
+    )
+    async def add_work_item_comment(
+        request: Request,
+        item_id: str,
+        body: CreateWorkItemCommentRequest,
+    ) -> WorkItemCommentResponse:
+        actor = _get_actor(request)
+        org_id = _get_org_id(request)
+
+        try:
+            comment = _post_comment_with_author_type(
+                work_item_id=item_id,
+                author_id=actor.id,
+                requested_type=body.author_type,
+                body=body,
+                actor=actor,
+                org_id=org_id,
+            )
+            return WorkItemCommentResponse(comment=comment)
+        except WorkItemNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        except AuthorNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         except BoardServiceError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 

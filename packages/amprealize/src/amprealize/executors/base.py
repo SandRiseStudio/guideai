@@ -21,6 +21,7 @@ class ContainerRunConfig:
         environment: Environment variables
         volumes: Volume/bind mount specifications
         command: Optional command to run
+        workdir: Optional working directory inside container
         detach: Whether to run in detached mode (default True)
         network: Optional network name to attach container to
         network_aliases: Optional list of DNS aliases for the container on the network
@@ -31,6 +32,7 @@ class ContainerRunConfig:
     environment: Dict[str, str] = field(default_factory=dict)
     volumes: List[str] = field(default_factory=list)
     command: Optional[List[str]] = None
+    workdir: Optional[str] = None
     detach: bool = True
     network: Optional[str] = None
     network_aliases: List[str] = field(default_factory=list)

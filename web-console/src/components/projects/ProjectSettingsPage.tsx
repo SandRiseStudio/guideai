@@ -1,23 +1,33 @@
 /**
  * Project Settings Page
  *
- * Configure project settings including local project path and GitHub repository.
- * Provides GitHub API validation for repository and branch selection.
+ * Configure project settings including local project path, GitHub repository,
+ * and LLM API keys (BYOK - Bring Your Own Key).
  *
  * Following:
  * - behavior_design_api_contract (Student)
  * - behavior_use_raze_for_logging (Student)
- * - COLLAB_SAAS_REQUIREMENTS.md (Student): fast, floaty, animated
+ * - COLLAB_SAAS_REQUIREMENTS.md (Student): fast, floaty, animated, 60fps
+ * - behavior_prevent_secret_leaks (Student): secure key handling
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { ConsoleSidebar } from '../ConsoleSidebar';
-import { OrgSwitcher } from '../OrgSwitcher';
-import { useOrganizations, useProject } from '../../api/dashboard';
+import { useProject } from '../../api/dashboard';
 import { apiClient } from '../../api/client';
 import { razeLog } from '../../telemetry/raze';
+import { useAuth } from '../../contexts/AuthContext';
+import {
+  useProjectCredentials,
+  useAddProjectCredential,
+  useDeleteProjectCredential,
+  useReEnableProjectCredential,
+  LLM_PROVIDERS,
+  type LLMCredential,
+  type LLMProvider,
+} from '../../api/credentials';
 import './ProjectSettingsPage.css';
 
 // ---------------------------------------------------------------------------
@@ -64,13 +74,8 @@ interface GitHubBranchListResponse {
 export function ProjectSettingsPage(): React.JSX.Element {
   const navigate = useNavigate();
   const { projectId } = useParams<{ projectId: string }>();
-  const [searchParams, setSearchParams] = useSearchParams();
-
-  const orgFromQuery = searchParams.get('org') ?? undefined;
-  const [currentOrgId, setCurrentOrgId] = useState<string | undefined>(orgFromQuery);
-
-  const { data: organizations = [] } = useOrganizations();
   const { data: project, isLoading: projectLoading } = useProject(projectId);
+  const { actor } = useAuth();
 
   // Form state
   const [localPath, setLocalPath] = useState('');
@@ -91,6 +96,23 @@ export function ProjectSettingsPage(): React.JSX.Element {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
+  // Credentials (BYOK) state
+  const [credProvider, setCredProvider] = useState<LLMProvider>('anthropic');
+  const [credApiKey, setCredApiKey] = useState('');
+  const [credName, setCredName] = useState('');
+  const [credToReEnable, setCredToReEnable] = useState<LLMCredential | null>(null);
+  const [showReEnableModal, setShowReEnableModal] = useState(false);
+
+  // Credentials hooks
+  const {
+    data: credentials,
+    isLoading: credentialsLoading,
+    refetch: refetchCredentials,
+  } = useProjectCredentials(projectId ?? '');
+  const addCredential = useAddProjectCredential(projectId ?? '', actor?.id);
+  const deleteCredential = useDeleteProjectCredential(projectId ?? '', actor?.id);
+  const reEnableCredential = useReEnableProjectCredential(projectId ?? '', actor?.id);
+
   // Load existing settings
   useEffect(() => {
     if (project?.settings) {
@@ -105,20 +127,6 @@ export function ProjectSettingsPage(): React.JSX.Element {
       }
     }
   }, [project]);
-
-  const handleOrgSelect = useCallback(
-    (orgId?: string) => {
-      setCurrentOrgId(orgId);
-      const next = new URLSearchParams(searchParams);
-      if (orgId) {
-        next.set('org', orgId);
-      } else {
-        next.delete('org');
-      }
-      setSearchParams(next, { replace: true });
-    },
-    [searchParams, setSearchParams]
-  );
 
   // Validate GitHub repository
   const validateGithubRepo = useCallback(async (url: string) => {
@@ -213,6 +221,61 @@ export function ProjectSettingsPage(): React.JSX.Element {
     }
   }, [projectId, localPath, githubUrl, selectedBranch]);
 
+  // Add credential
+  const handleAddCredential = useCallback(async () => {
+    if (!credApiKey.trim()) return;
+
+    try {
+      await razeLog('INFO', 'Adding credential', { project_id: projectId, provider: credProvider });
+      await addCredential.mutateAsync({
+        provider: credProvider,
+        api_key: credApiKey.trim(),
+        name: credName.trim() || undefined,
+      });
+      // Reset form
+      setCredApiKey('');
+      setCredName('');
+      await refetchCredentials();
+      await razeLog('INFO', 'Credential added', { project_id: projectId, provider: credProvider });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to add credential';
+      await razeLog('ERROR', 'Failed to add credential', { project_id: projectId, error: message });
+    }
+  }, [projectId, credProvider, credApiKey, credName, addCredential, refetchCredentials]);
+
+  // Delete credential
+  const handleDeleteCredential = useCallback(async (credentialId: string) => {
+    try {
+      await razeLog('INFO', 'Deleting credential', { project_id: projectId, credential_id: credentialId });
+      await deleteCredential.mutateAsync(credentialId);
+      await refetchCredentials();
+      await razeLog('INFO', 'Credential deleted', { project_id: projectId, credential_id: credentialId });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to delete credential';
+      await razeLog('ERROR', 'Failed to delete credential', { project_id: projectId, error: message });
+    }
+  }, [projectId, deleteCredential, refetchCredentials]);
+
+  // Re-enable credential
+  const handleReEnableCredential = useCallback(async (newApiKey: string) => {
+    if (!credToReEnable || !newApiKey.trim()) return;
+
+    try {
+      await razeLog('INFO', 'Re-enabling credential', { project_id: projectId, credential_id: credToReEnable.id });
+      await reEnableCredential.mutateAsync({
+        credentialId: credToReEnable.id,
+        apiKey: newApiKey.trim(),
+      });
+      setShowReEnableModal(false);
+      setCredToReEnable(null);
+      await refetchCredentials();
+      await razeLog('INFO', 'Credential re-enabled', { project_id: projectId, credential_id: credToReEnable.id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to re-enable credential';
+      await razeLog('ERROR', 'Failed to re-enable credential', { project_id: projectId, error: message });
+    }
+  }, [projectId, credToReEnable, reEnableCredential, refetchCredentials]);
+
   // Validation status
   const isGithubValid = useMemo(() => githubValidation?.valid === true, [githubValidation]);
 
@@ -268,13 +331,6 @@ export function ProjectSettingsPage(): React.JSX.Element {
             </div>
           </div>
 
-          <div className="project-settings-header-right">
-            <OrgSwitcher
-              organizations={organizations}
-              currentOrgId={currentOrgId}
-              onSelect={handleOrgSelect}
-            />
-          </div>
         </header>
 
         <section className="project-settings-card" aria-label="Project settings form">
@@ -376,6 +432,192 @@ export function ProjectSettingsPage(): React.JSX.Element {
               </label>
             )}
           </div>
+
+          {/* LLM API Keys (BYOK) */}
+          <div className="settings-section credentials-section">
+            <h2 className="settings-section-title">LLM API Keys (BYOK)</h2>
+            <p className="settings-section-description">
+              Add your own API keys for LLM providers. Keys are encrypted at rest and never leave your project.
+            </p>
+
+            {/* Add Credential Form */}
+            <div className="credential-form animate-fade-in-up">
+              <div className="credential-form-row">
+                <label className="field credential-provider-field">
+                  <span className="field-label">Provider</span>
+                  <select
+                    className="field-select"
+                    value={credProvider}
+                    onChange={(e) => setCredProvider(e.target.value as LLMProvider)}
+                  >
+                    {LLM_PROVIDERS.map((provider) => (
+                      <option key={provider.id} value={provider.id}>
+                        {provider.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="field credential-key-field">
+                  <span className="field-label">API Key</span>
+                  <input
+                    type="password"
+                    className="field-input"
+                    value={credApiKey}
+                    onChange={(e) => setCredApiKey(e.target.value)}
+                    placeholder="sk-..."
+                    autoComplete="off"
+                  />
+                </label>
+
+                <label className="field credential-name-field">
+                  <span className="field-label">Name (optional)</span>
+                  <input
+                    className="field-input"
+                    value={credName}
+                    onChange={(e) => setCredName(e.target.value)}
+                    placeholder="Personal key"
+                  />
+                </label>
+
+                <button
+                  type="button"
+                  className="action primary pressable credential-add-btn"
+                  onClick={() => void handleAddCredential()}
+                  disabled={!credApiKey.trim() || addCredential.isPending}
+                  data-haptic="light"
+                >
+                  {addCredential.isPending ? 'Adding…' : 'Add Key'}
+                </button>
+              </div>
+              <span className="field-hint credential-hint">
+                Your API key is encrypted before storage. We recommend using a dedicated key for GuideAI.
+              </span>
+            </div>
+
+            {/* Credentials List */}
+            <div className="credentials-list">
+              {credentialsLoading ? (
+                <div className="credentials-loading">Loading credentials…</div>
+              ) : credentials && credentials.length > 0 ? (
+                credentials.map((cred, index) => (
+                  <div
+                    key={cred.id}
+                    className="credential-card animate-scale-in"
+                    style={{ animationDelay: `${index * 50}ms` }}
+                  >
+                    <div className="credential-info">
+                      <div className="credential-header">
+                        <span className="credential-provider">
+                          {LLM_PROVIDERS.find((p) => p.id === cred.provider)?.name ?? cred.provider}
+                        </span>
+                        <span
+                          className={`credential-status ${cred.is_valid ? 'active' : 'disabled'}`}
+                          title={cred.is_valid ? 'Active' : 'Disabled - Re-enable required'}
+                        >
+                          {cred.is_valid ? '● Active' : '○ Disabled'}
+                        </span>
+                      </div>
+                      {cred.name && <div className="credential-name">{cred.name}</div>}
+                      <div className="credential-meta">
+                        <span className="credential-key-preview">
+                          {cred.masked_key}
+                        </span>
+                        <span className="credential-created">
+                          Added {new Date(cred.created_at).toLocaleDateString()}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="credential-actions">
+                      {!cred.is_valid && (
+                        <button
+                          type="button"
+                          className="action secondary pressable credential-reenable-btn"
+                          onClick={() => {
+                            setCredToReEnable(cred);
+                            setShowReEnableModal(true);
+                          }}
+                          data-haptic="light"
+                        >
+                          Re-enable
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="action danger pressable credential-delete-btn"
+                        onClick={() => void handleDeleteCredential(cred.id)}
+                        disabled={deleteCredential.isPending}
+                        data-haptic="medium"
+                        aria-label={`Delete ${cred.name ?? cred.provider} credential`}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="credentials-empty">
+                  <span className="credentials-empty-icon">🔑</span>
+                  <span className="credentials-empty-text">
+                    No API keys configured yet. Add your first key above.
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Re-enable Modal */}
+          {showReEnableModal && credToReEnable && (
+            <div className="modal-overlay animate-fade-in" onClick={() => setShowReEnableModal(false)}>
+              <div
+                className="modal-content animate-scale-in"
+                onClick={(e) => e.stopPropagation()}
+                role="dialog"
+                aria-labelledby="reenable-modal-title"
+                aria-modal="true"
+              >
+                <h3 id="reenable-modal-title" className="modal-title">
+                  Re-enable {credToReEnable.name ?? credToReEnable.provider}
+                </h3>
+                <p className="modal-description">
+                  This credential was disabled due to repeated failures.
+                  Enter a new API key to re-enable it.
+                </p>
+                <label className="field">
+                  <span className="field-label">New API Key</span>
+                  <input
+                    type="password"
+                    className="field-input"
+                    id="reenable-api-key"
+                    placeholder="sk-..."
+                    autoComplete="off"
+                    autoFocus
+                  />
+                </label>
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="action secondary pressable"
+                    onClick={() => setShowReEnableModal(false)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="action primary pressable"
+                    onClick={() => {
+                      const input = document.getElementById('reenable-api-key') as HTMLInputElement;
+                      void handleReEnableCredential(input?.value ?? '');
+                    }}
+                    disabled={reEnableCredential.isPending}
+                    data-haptic="medium"
+                  >
+                    {reEnableCredential.isPending ? 'Re-enabling…' : 'Re-enable'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Save Actions */}
           <div className="settings-actions">

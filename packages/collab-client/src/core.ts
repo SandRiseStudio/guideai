@@ -11,6 +11,8 @@ export * from './types.js';
 // WebSocket Client
 export { CollabClient, ConnectionState, createCollabClient } from './client.js';
 export type { CollabClientConfig } from './client.js';
+export { ExecutionStreamClient, createExecutionStreamClient } from './executionClient.js';
+export type { ExecutionStreamConfig, ExecutionStreamTarget } from './executionClient.js';
 
 // REST API Client
 export { CollabApi, CollabApiError, createCollabApi } from './api.js';

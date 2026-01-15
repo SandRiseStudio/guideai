@@ -71,6 +71,7 @@ class ServiceSpec(BaseModel):
     environment: Dict[str, str] = Field(default_factory=dict)
     volumes: List[str] = Field(default_factory=list)
     command: Optional[List[str]] = None
+    workdir: Optional[str] = Field(None, description="Working directory for container")
     cpu_cores: Optional[float] = Field(None, description="Number of CPU cores required")
     memory_mb: Optional[int] = Field(None, description="Memory required in MB")
     bandwidth_mbps: Optional[int] = Field(None, description="Estimated network bandwidth in Mbps")
@@ -172,6 +173,38 @@ class InfrastructureConfig(BaseModel):
     teardown_on_exit: bool = True
 
 
+class MigrationSpec(BaseModel):
+    """Specification for a database migration to run after environment apply.
+
+    Attributes:
+        name: Human-readable migration name
+        alembic_config: Path to Alembic config file (e.g., "alembic.ini")
+        database_url_env: Environment variable name for the database URL
+        target_revision: Target revision (default: "head")
+        enabled: Whether this migration is enabled
+    """
+    name: str
+    alembic_config: str = "alembic.ini"
+    database_url_env: str = "DATABASE_URL"
+    target_revision: str = "head"
+    enabled: bool = True
+
+
+class MigrationConfig(BaseModel):
+    """Configuration for database migrations to run after apply.
+
+    Migrations run from the host machine after containers are healthy.
+    This ensures database schemas are created before the API container
+    starts handling requests.
+
+    Attributes:
+        auto_run: Whether to automatically run migrations on apply
+        migrations: List of migration specifications
+    """
+    auto_run: bool = True
+    migrations: List[MigrationSpec] = Field(default_factory=list)
+
+
 class EnvironmentDefinition(BaseModel):
     """Complete environment definition.
 
@@ -186,6 +219,7 @@ class EnvironmentDefinition(BaseModel):
         active_modules: List of modules to activate
         runtime: Runtime configuration
         infrastructure: Infrastructure configuration
+        migrations: Database migration configuration (auto-runs on apply)
         variables: Environment variables for substitution
     """
     name: str
@@ -195,6 +229,7 @@ class EnvironmentDefinition(BaseModel):
     active_modules: Optional[List[str]] = None
     runtime: RuntimeConfig = Field(default_factory=lambda: RuntimeConfig())
     infrastructure: InfrastructureConfig = Field(default_factory=lambda: InfrastructureConfig())
+    migrations: Optional[MigrationConfig] = None
     variables: Dict[str, Any] = Field(default_factory=dict)
 
 

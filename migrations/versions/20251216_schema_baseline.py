@@ -62,9 +62,14 @@ def upgrade() -> None:
     conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
     conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
 
-    # pgvector - for behavior embeddings
+    # pgvector - for behavior embeddings (optional, use savepoint to avoid aborting transaction)
     try:
-        conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS vector"))
+        # Check if vector extension is available before trying to create it
+        result = conn.execute(sa.text(
+            "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'"
+        ))
+        if result.fetchone():
+            conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS vector"))
     except Exception:
         pass  # May not be available in all environments
 
@@ -78,7 +83,12 @@ def upgrade() -> None:
         sa.Column("id", sa.String(36), nullable=False),
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("slug", sa.String(128), nullable=False),
+        sa.Column("display_name", sa.String(255), nullable=True),
+        sa.Column("plan", sa.String(64), server_default="free"),
+        sa.Column("status", sa.String(64), server_default="active"),
+        sa.Column("stripe_customer_id", sa.String(255), nullable=True),
         sa.Column("settings", postgresql.JSONB(), server_default="{}"),
+        sa.Column("metadata", postgresql.JSONB(), server_default="{}"),
         sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
         sa.Column("updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
         sa.PrimaryKeyConstraint("id"),
@@ -110,12 +120,15 @@ def upgrade() -> None:
     # auth.org_memberships
     op.create_table(
         "org_memberships",
-        sa.Column("id", sa.String(36), nullable=False),
+        sa.Column("membership_id", sa.String(36), nullable=False),
         sa.Column("org_id", sa.String(36), nullable=False),
         sa.Column("user_id", sa.String(36), nullable=False),
         sa.Column("role", sa.String(64), server_default="member"),
-        sa.Column("joined_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
-        sa.PrimaryKeyConstraint("id"),
+        sa.Column("invited_by", sa.String(36), nullable=True),
+        sa.Column("invited_at", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
+        sa.Column("updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
+        sa.PrimaryKeyConstraint("membership_id"),
         sa.ForeignKeyConstraint(["org_id"], ["auth.organizations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["user_id"], ["auth.users.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("org_id", "user_id", name="uq_org_memberships_org_user"),
@@ -126,21 +139,62 @@ def upgrade() -> None:
     # auth.projects
     op.create_table(
         "projects",
-        sa.Column("id", sa.String(36), nullable=False),
+        sa.Column("project_id", sa.String(36), nullable=False),
         sa.Column("org_id", sa.String(36), nullable=True),  # NULL for personal projects
         sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("slug", sa.String(128), nullable=True),
         sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("visibility", sa.String(64), server_default="private"),
         sa.Column("local_project_path", sa.Text(), nullable=True),
         sa.Column("settings", postgresql.JSONB(), server_default="{}"),
         sa.Column("created_by", sa.String(36), nullable=True),
         sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
         sa.Column("updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
-        sa.PrimaryKeyConstraint("id"),
+        sa.PrimaryKeyConstraint("project_id"),
         sa.ForeignKeyConstraint(["org_id"], ["auth.organizations.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["created_by"], ["auth.users.id"], ondelete="SET NULL"),
         schema="auth",
     )
     op.create_index("idx_auth_projects_org", "projects", ["org_id"], schema="auth")
+
+    # auth.project_memberships
+    op.create_table(
+        "project_memberships",
+        sa.Column("membership_id", sa.String(36), nullable=False),
+        sa.Column("project_id", sa.String(36), nullable=False),
+        sa.Column("user_id", sa.String(36), nullable=False),
+        sa.Column("role", sa.String(64), server_default="member"),
+        sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
+        sa.Column("updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
+        sa.PrimaryKeyConstraint("membership_id"),
+        sa.ForeignKeyConstraint(["project_id"], ["auth.projects.project_id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["user_id"], ["auth.users.id"], ondelete="CASCADE"),
+        sa.UniqueConstraint("project_id", "user_id", name="uq_project_memberships_project_user"),
+        schema="auth",
+    )
+    op.create_index("idx_auth_project_memberships_user", "project_memberships", ["user_id"], schema="auth")
+    op.create_index("idx_auth_project_memberships_project", "project_memberships", ["project_id"], schema="auth")
+
+    # auth.subscriptions
+    op.create_table(
+        "subscriptions",
+        sa.Column("subscription_id", sa.String(36), nullable=False),
+        sa.Column("org_id", sa.String(36), nullable=True),
+        sa.Column("user_id", sa.String(36), nullable=True),
+        sa.Column("plan", sa.String(64), server_default="free"),
+        sa.Column("status", sa.String(64), server_default="active"),
+        sa.Column("stripe_subscription_id", sa.String(255), nullable=True),
+        sa.Column("current_period_start", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column("current_period_end", sa.TIMESTAMP(timezone=True), nullable=True),
+        sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
+        sa.Column("updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
+        sa.PrimaryKeyConstraint("subscription_id"),
+        sa.ForeignKeyConstraint(["org_id"], ["auth.organizations.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["user_id"], ["auth.users.id"], ondelete="CASCADE"),
+        schema="auth",
+    )
+    op.create_index("idx_auth_subscriptions_org", "subscriptions", ["org_id"], schema="auth")
+    op.create_index("idx_auth_subscriptions_user", "subscriptions", ["user_id"], schema="auth")
 
     # auth.sessions
     op.create_table(
@@ -438,7 +492,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
         sa.PrimaryKeyConstraint("id"),
         sa.ForeignKeyConstraint(["org_id"], ["auth.organizations.id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["project_id"], ["auth.projects.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(["project_id"], ["auth.projects.project_id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["user_id"], ["auth.users.id"], ondelete="SET NULL"),
         schema="execution",
     )
@@ -666,7 +720,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.TIMESTAMP(timezone=True), server_default=sa.text("NOW()")),
         sa.PrimaryKeyConstraint("id"),
         sa.ForeignKeyConstraint(["org_id"], ["auth.organizations.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["project_id"], ["auth.projects.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["project_id"], ["auth.projects.project_id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["created_by"], ["auth.users.id"], ondelete="SET NULL"),
         schema="board",
     )

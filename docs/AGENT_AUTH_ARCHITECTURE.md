@@ -1,5 +1,96 @@
 # Agent Authentication & Authorization Architecture
 
+## 0. Database Schema (Consolidated 2026-01-08)
+
+This section documents the actual database tables backing the authentication system.
+
+### Auth Tables (`auth` schema)
+
+| Table | Purpose | Primary Key |
+|-------|---------|-------------|
+| `auth.users` | Human users authenticated via OAuth | `id` (UUID) |
+| `auth.federated_identities` | OAuth provider links (Google, GitHub) | `id` (UUID) |
+| `auth.service_principals` | Machine/agent API credentials | `id` (UUID) |
+
+### Auth Model Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           AUTHENTICATION                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  HUMAN USERS                           AGENTS/SERVICES                   │
+│  ───────────                           ───────────────                   │
+│  OAuth Device Flow                     Client Credentials Flow           │
+│  (Google, GitHub)                      (client_id + client_secret)       │
+│                                                                          │
+│  ┌────────────────┐                    ┌─────────────────────┐          │
+│  │  auth.users    │◄──owns─────────────│ auth.service_       │          │
+│  │                │                    │ principals          │          │
+│  │  - id          │                    │                     │          │
+│  │  - email       │                    │  - id               │          │
+│  │  - display_name│                    │  - name             │          │
+│  │  - is_active   │                    │  - client_id        │          │
+│  └───────┬────────┘                    │  - client_secret_   │          │
+│          │                             │    hash             │          │
+│          │ 1:N                         │  - role             │          │
+│          │                             │  - allowed_scopes   │          │
+│          ▼                             │  - created_by (FK)  │          │
+│  ┌────────────────────┐                └─────────┬───────────┘          │
+│  │ auth.federated_    │                          │                       │
+│  │ identities         │                          │ optional              │
+│  │                    │                          │ 1:1                   │
+│  │  - provider        │                          ▼                       │
+│  │  - provider_user_id│                ┌─────────────────────┐          │
+│  │  - user_id (FK)    │                │  execution.agents   │          │
+│  └────────────────────┘                │                     │          │
+│                                        │  - owner_id (FK)    │          │
+│                                        │  - service_         │          │
+│                                        │    principal_id     │          │
+│                                        │    (nullable FK)    │          │
+│                                        └─────────────────────┘          │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Design Decisions
+
+1. **Separate tables for humans vs machines**
+   - `auth.users` stores human users who authenticate via OAuth device flow
+   - `auth.service_principals` stores machine credentials for agents needing API access
+   - This keeps the concerns cleanly separated while allowing proper FK relationships
+
+2. **Agent ownership via proper FK**
+   - `execution.agents.owner_id` is a proper FK to `auth.users`
+   - A system user (`id='system'`) owns builtin agents
+   - ON DELETE CASCADE ensures agents are cleaned up when users are removed
+
+3. **Optional agent API identity**
+   - `execution.agents.service_principal_id` is nullable
+   - Only populated when an agent explicitly needs its own API credentials
+   - Follows principle of least privilege - most agents don't need separate auth
+
+4. **Role-based access per AGENTS.md**
+   - `service_principals.role` uses enum: STRATEGIST, TEACHER, STUDENT, ADMIN, OBSERVER
+   - Maps to capabilities defined in the behavior handbook
+
+### Related Services
+
+| Service | Location | Purpose |
+|---------|----------|---------|
+| `ServicePrincipalService` | `guideai/auth/service_principal_service.py` | CRUD for service principals |
+| `api.py` OAuth callback | `guideai/api.py` | Creates `auth.users` on OAuth login |
+| AgentRegistryService | `guideai/actions/agent_registry_service.py` | Agent CRUD with owner_id |
+
+### Deprecated (Removed)
+
+The following tables were removed in the 2026-01-08 consolidation:
+- `auth.internal_users` - Replaced by `auth.users`
+- `auth.internal_sessions` - Replaced by device flow sessions
+- `auth.password_reset_tokens` - OAuth-only, no passwords
+
+---
+
 ## 1. Purpose
 Provide a centralized framework that secures guideAI agents when they act across internal and third-party services. The architecture extends the MCP control plane by introducing a dedicated AgentAuthService that enforces authentication, authorization, auditability, and least-privilege access for every tool invocation across Web, API, CLI, MCP, and IDE surfaces.
 

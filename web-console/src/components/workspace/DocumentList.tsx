@@ -55,6 +55,13 @@ const WorkflowIcon = () => (
   </svg>
 );
 
+const OrgIcon = () => (
+  <svg className="document-icon" viewBox="0 0 16 16" fill="none">
+    <rect x="2" y="3" width="12" height="10" rx="2" stroke="currentColor" strokeWidth="1.5" />
+    <path d="M5 6h2M9 6h2M5 9h2M9 9h2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+  </svg>
+);
+
 const GenericIcon = () => (
   <svg className="document-icon" viewBox="0 0 16 16" fill="none">
     <path
@@ -91,6 +98,8 @@ const getDocumentIcon = (type: string) => {
       return <AgentIcon />;
     case 'workflow':
       return <WorkflowIcon />;
+    case 'org':
+      return <OrgIcon />;
     default:
       return <GenericIcon />;
   }

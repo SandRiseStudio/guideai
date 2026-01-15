@@ -18,6 +18,7 @@ This document catalogs all available MCP tools for the guideAI platform.
 - [Runs Service](#service-runs) (6 tools)
 - [Security Service](#service-security) (1 tools)
 - [Tasks Service](#service-tasks) (1 tools)
+- [Work Items Service](#service-workitems) (6 tools) ⚠️ **Board tasks**
 - [Workflow Service](#service-workflow) (5 tools)
 
 ---
@@ -880,7 +881,10 @@ Execute the GuideAI secret scanning workflow (Gitleaks via pre-commit) and retur
 
 ## Service: tasks
 
-**Tool count**: 1
+**Tool count**: 3
+
+> ⚠️ **Important**: `tasks` tools are for **agent task assignments** (mapping agents to milestones).
+> For **board/kanban tasks** (user-facing work items), use [`workitems.*`](#service-workitems) tools instead.
 
 ### `tasks.listAssignments`
 
@@ -891,6 +895,146 @@ List remaining milestone tasks mapped to functions and agents for planning parit
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `function` | string | optional | Optional function filter (engineering, developer-experience, devops, product, pm, product-analytics, copywriting, compliance). |
+
+---
+
+### `tasks.create`
+
+Create an agent task assignment. **Note**: This assigns a task to an agent for milestone tracking. For board/kanban tasks, use `workitems.create` instead.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `agent_id` | string | **required** | Agent ID to assign the task to |
+| `title` | string | **required** | Task title |
+| `description` | string | optional | Task description |
+| `milestone_id` | string | optional | Associated milestone ID |
+
+---
+
+### `tasks.updateStatus`
+
+Update the status of an agent task assignment.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `task_id` | string | **required** | Task ID to update |
+| `status` | string | **required** | New status (pending, in_progress, completed, blocked) |
+
+---
+
+### `tasks.getStats`
+
+Get statistics about agent task assignments.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `agent_id` | string | optional | Filter by agent ID |
+
+---
+
+## Service: workitems
+
+**Tool count**: 6
+
+> ✅ **Use these tools for board/kanban tasks** - user-facing work items on project boards.
+> For agent task assignments (milestone tracking), use [`tasks.*`](#service-tasks) tools instead.
+
+### `workitems.create`
+
+Create a new work item (task, story, epic, bug) on a board.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `board_id` | string | **required** | Board ID to create the item on |
+| `title` | string | **required** | Work item title |
+| `item_type` | string | optional | Type: task, story, epic, bug (default: task) |
+| `description` | string | optional | Work item description |
+| `status` | string | optional | Status: todo, in_progress, done (default: todo) |
+| `priority` | string | optional | Priority: low, medium, high, critical (default: medium) |
+| `assignee_id` | string | optional | User or agent ID to assign |
+| `labels` | array | optional | Array of label strings |
+
+---
+
+### `workitems.get`
+
+Retrieve a work item by ID.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `item_id` | string | **required** | Work item ID |
+
+---
+
+### `workitems.list`
+
+List work items on a board with optional filters.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `board_id` | string | **required** | Board ID to list items from |
+| `status` | string | optional | Filter by status |
+| `item_type` | string | optional | Filter by type |
+| `assignee_id` | string | optional | Filter by assignee |
+| `limit` | integer | optional | Max items to return (default: 100) |
+| `offset` | integer | optional | Pagination offset |
+
+---
+
+### `workitems.update`
+
+Update an existing work item.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `item_id` | string | **required** | Work item ID to update |
+| `title` | string | optional | New title |
+| `description` | string | optional | New description |
+| `status` | string | optional | New status |
+| `priority` | string | optional | New priority |
+| `assignee_id` | string | optional | New assignee |
+| `labels` | array | optional | New labels (replaces existing) |
+
+---
+
+### `workitems.delete`
+
+Delete a work item.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `item_id` | string | **required** | Work item ID to delete |
+
+---
+
+### `workitems.move`
+
+Move a work item to a different column or board.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `item_id` | string | **required** | Work item ID to move |
+| `column_id` | string | optional | Target column ID |
+| `board_id` | string | optional | Target board ID (for cross-board moves) |
+| `position` | integer | optional | Position in target column |
 
 ---
 
@@ -994,6 +1138,25 @@ The MCP server supports batch requests per JSON-RPC 2.0 spec:
   {"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"behaviors.list"}},
   {"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"runs.list"}}
 ]
+```
+
+## Common Confusion: Tasks vs Work Items
+
+| If you want to... | Use this tool | Why |
+|-------------------|---------------|-----|
+| Create a kanban/board task | `workitems.create` | Board tasks are user-facing work items |
+| List tasks on a project board | `workitems.list` | Board items have board_id, columns, etc. |
+| Assign an agent to a milestone | `tasks.create` | Agent task assignments require agent_id |
+| Check agent workload | `tasks.listAssignments` | Shows milestone→agent mappings |
+
+### Quick Reference
+
+```json
+// ✅ Create a board task (user work item)
+{"name": "workitems_create", "arguments": {"board_id": "...", "title": "My Task"}}
+
+// ❌ WRONG - tasks.create needs agent_id (it's for agent assignments)
+{"name": "tasks_create", "arguments": {"title": "My Task"}}  // Missing agent_id!
 ```
 
 ---
