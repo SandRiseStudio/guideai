@@ -576,6 +576,19 @@ class _ServiceContainer:
                 linger_ms=100,
             )
 
+        # Initialize GateNotifier for execution pipeline notifications (SSE/webhook/Slack)
+        self.gate_notifier: Optional[Any] = None
+        if NOTIFICATIONS_AVAILABLE and execution_event_hub is not None:
+            try:
+                webhook_dispatcher = WebhookDispatcher()
+                self.gate_notifier = GateNotifier(
+                    event_hub=execution_event_hub,
+                    webhook_dispatcher=webhook_dispatcher,
+                )
+                logger.info("GateNotifier initialized for execution notifications")
+            except Exception as exc:
+                logger.warning(f"GateNotifier initialization failed: {exc}")
+
         # Work Item Execution Service (optional - uses PostgreSQL)
         # Uses wire_execution_service to connect AgentExecutionLoop + AgentLLMClient
         self.work_item_execution_service: Optional[Any] = None
@@ -596,6 +609,7 @@ class _ServiceContainer:
                     board_service=self.board_service,
                     run_service=self.run_service,
                     telemetry=telemetry,
+                    gate_notifier=self.gate_notifier,
                 )
                 logger.info("WorkItemExecutionService initialized with AgentExecutionLoop wired")
             except Exception as exc:
@@ -7463,6 +7477,12 @@ def create_app(
         )
         app.include_router(execution_routes, prefix="/api")
         logger.info("Work item execution routes registered at /api/v1/work-items/*")
+
+        # Register SSE endpoint for real-time execution events
+        if container.execution_event_hub is not None:
+            sse_routes = create_run_events_routes(event_hub=container.execution_event_hub)
+            app.include_router(sse_routes, prefix="/api")
+            logger.info("Run events SSE routes registered at /api/v1/runs/{run_id}/events")
 
     # ------------------------------------------------------------------
     # Billing Service
