@@ -12,7 +12,7 @@ import time
 import sys
 import statistics
 
-def run_lightweight_load_test(base_url="http://localhost:8000", num_requests=20):
+def run_lightweight_load_test(base_url="http://localhost:8080", num_requests=20):
     """Run lightweight sequential load test"""
 
     print("=" * 60)
@@ -130,7 +130,7 @@ def run_lightweight_load_test(base_url="http://localhost:8000", num_requests=20)
 
 
 if __name__ == "__main__":
-    base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
+    base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
     num_requests = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 
     passed = run_lightweight_load_test(base_url, num_requests)

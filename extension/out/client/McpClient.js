@@ -62,23 +62,39 @@ class McpClient extends events_1.EventEmitter {
         this.pendingRequests = new Map();
         this.requestId = 0;
         this.buffer = '';
-        this.isConnected = false;
+        this._isConnected = false;
         this.connectionPromise = null;
         // Stability features
         this.connectionState = 'disconnected';
         this.heartbeatInterval = null;
         this.reconnectAttempts = 0;
+        this.heartbeatFailures = 0;
         this.requestQueue = [];
         // Telemetry (behavior_use_raze_for_logging)
         this.razeClient = null;
         const config = vscode.workspace.getConfiguration('guideai');
-        this.pythonPath = config.get('pythonPath', 'python');
+        // Try to find Python in any workspace .venv, fall back to configured or system python
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        let defaultPython = 'python';
+        const fs = require('fs');
+        if (workspaceFolders && workspaceFolders.length > 0) {
+            for (const folder of workspaceFolders) {
+                const venvPython = vscode.Uri.joinPath(folder.uri, '.venv', 'bin', 'python').fsPath;
+                if (fs.existsSync(venvPython)) {
+                    defaultPython = venvPython;
+                    break;
+                }
+            }
+        }
+        this.pythonPath = config.get('pythonPath', defaultPython);
         this.outputChannel = vscode.window.createOutputChannel('GuideAI MCP');
+        this.outputChannel.appendLine(`Using Python: ${this.pythonPath}`);
         // Load stability configuration
+        // NOTE: Auto-reconnect disabled by default to prevent resource exhaustion on failed connections
         this.requestTimeoutMs = config.get('mcpRequestTimeout', 30000);
-        this.heartbeatIntervalMs = config.get('mcpHeartbeatInterval', 30000);
-        this.maxReconnectAttempts = config.get('mcpMaxReconnectAttempts', 10);
-        this.autoReconnect = config.get('mcpAutoReconnect', true);
+        this.heartbeatIntervalMs = config.get('mcpHeartbeatInterval', 60000); // 60s heartbeat (was 30s)
+        this.maxReconnectAttempts = config.get('mcpMaxReconnectAttempts', 3); // Max 3 attempts (was 10)
+        this.autoReconnect = config.get('mcpAutoReconnect', false); // Disabled by default
         // Initialize telemetry (behavior_use_raze_for_logging)
         this.telemetryEnabled = config.get('telemetryEnabled', false);
         if (this.telemetryEnabled) {
@@ -91,9 +107,9 @@ class McpClient extends events_1.EventEmitter {
             if (e.affectsConfiguration('guideai')) {
                 const newConfig = vscode.workspace.getConfiguration('guideai');
                 this.requestTimeoutMs = newConfig.get('mcpRequestTimeout', 30000);
-                this.heartbeatIntervalMs = newConfig.get('mcpHeartbeatInterval', 30000);
-                this.maxReconnectAttempts = newConfig.get('mcpMaxReconnectAttempts', 10);
-                this.autoReconnect = newConfig.get('mcpAutoReconnect', true);
+                this.heartbeatIntervalMs = newConfig.get('mcpHeartbeatInterval', 60000);
+                this.maxReconnectAttempts = newConfig.get('mcpMaxReconnectAttempts', 3);
+                this.autoReconnect = newConfig.get('mcpAutoReconnect', false);
                 // Handle telemetry configuration changes
                 const newTelemetryEnabled = newConfig.get('telemetryEnabled', false);
                 if (newTelemetryEnabled && !this.razeClient) {
@@ -120,10 +136,16 @@ class McpClient extends events_1.EventEmitter {
         };
     }
     /**
+     * Check if the MCP client is connected
+     */
+    isConnected() {
+        return this.connectionState === 'connected';
+    }
+    /**
      * Connect to the MCP server (spawns guideai.mcp_server as subprocess)
      */
     async connect() {
-        if (this.isConnected) {
+        if (this.connectionState === 'connected') {
             return;
         }
         if (this.connectionPromise) {
@@ -148,8 +170,14 @@ class McpClient extends events_1.EventEmitter {
     async doConnect() {
         return new Promise((resolve, reject) => {
             this.outputChannel.appendLine('Starting MCP server...');
+            // Use workspace root if available, fallback to home to avoid temp cleanup
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            const homeDir = process.env.HOME || process.env.USERPROFILE || '/tmp';
+            const cwd = workspaceRoot || homeDir;
+            this.outputChannel.appendLine(`Starting MCP server with cwd: ${cwd}`);
             this.process = (0, child_process_1.spawn)(this.pythonPath, ['-m', 'guideai.mcp_server'], {
                 stdio: ['pipe', 'pipe', 'pipe'],
+                cwd,
                 // Avoid blocking OS keychain prompts when running in a background
                 // stdio subprocess (common cause of "hanging" authStatus/device flow).
                 env: {
@@ -169,7 +197,7 @@ class McpClient extends events_1.EventEmitter {
             // Handle process exit
             this.process.on('close', (code) => {
                 this.outputChannel.appendLine(`MCP server exited with code ${code}`);
-                this.isConnected = false;
+                this._isConnected = false;
                 this.stopHeartbeat();
                 this.setConnectionState('disconnected');
                 this.rejectAllPending(new Error(`MCP server exited with code ${code}`));
@@ -181,12 +209,13 @@ class McpClient extends events_1.EventEmitter {
             });
             this.process.on('error', (err) => {
                 this.outputChannel.appendLine(`MCP server error: ${err.message}`);
-                this.isConnected = false;
+                this._isConnected = false;
                 this.lastError = err.message;
                 this.setConnectionState('disconnected');
                 reject(err);
             });
             // Send initialize request
+            const initTimeoutMs = 30000;
             setTimeout(async () => {
                 try {
                     await this.sendRequestWithTimeout('initialize', {
@@ -196,10 +225,10 @@ class McpClient extends events_1.EventEmitter {
                             name: 'guideai-vscode',
                             version: '1.0.0'
                         }
-                    }, 10000); // 10s timeout for initialization
+                    }, initTimeoutMs); // Allow slow startups
                     // Send initialized notification
                     this.sendNotification('notifications/initialized', {});
-                    this.isConnected = true;
+                    this._isConnected = true;
                     this.setConnectionState('connected');
                     this.outputChannel.appendLine('MCP connection established');
                     this.emit('connected');
@@ -211,7 +240,7 @@ class McpClient extends events_1.EventEmitter {
                     this.lastError = err instanceof Error ? err.message : String(err);
                     reject(err);
                 }
-            }, 100); // Small delay to let process start
+            }, 500); // Give process a bit more time to start
         });
     }
     /**
@@ -226,7 +255,7 @@ class McpClient extends events_1.EventEmitter {
             this.process.kill();
             this.process = null;
         }
-        this.isConnected = false;
+        this._isConnected = false;
         this.setConnectionState('disconnected');
         this.rejectAllPending(new Error('Client disconnected'));
         // Restore auto-reconnect setting
@@ -236,7 +265,7 @@ class McpClient extends events_1.EventEmitter {
      * Check if connected
      */
     get connected() {
-        return this.isConnected;
+        return this._isConnected;
     }
     // ============================================
     // Heartbeat & Reconnection
@@ -269,12 +298,13 @@ class McpClient extends events_1.EventEmitter {
     startHeartbeat() {
         this.stopHeartbeat();
         this.heartbeatInterval = setInterval(async () => {
-            if (!this.isConnected) {
+            if (!this.isConnected()) {
                 return;
             }
             try {
                 await this.ping();
                 this.lastHeartbeat = new Date();
+                this.heartbeatFailures = 0;
                 this.emit('heartbeat', { timestamp: this.lastHeartbeat });
                 // Log heartbeat telemetry (behavior_use_raze_for_logging)
                 this.logTelemetry('debug', 'MCP heartbeat successful', {
@@ -290,9 +320,10 @@ class McpClient extends events_1.EventEmitter {
                     error: errorMessage,
                     autoReconnect: this.autoReconnect,
                 });
-                // Heartbeat failure - server may be unresponsive, trigger reconnect
-                if (this.autoReconnect) {
-                    this.outputChannel.appendLine('Heartbeat failed, initiating reconnect...');
+                // Heartbeat failure - allow a few misses before reconnecting
+                this.heartbeatFailures += 1;
+                if (this.autoReconnect && this.heartbeatFailures >= 3) {
+                    this.outputChannel.appendLine('Heartbeat failed 3 times, initiating reconnect...');
                     this.disconnect();
                 }
             }
@@ -354,7 +385,7 @@ class McpClient extends events_1.EventEmitter {
      * Send a ping to check server health
      */
     async ping() {
-        const result = await this.sendRequestWithTimeout('ping', {}, 5000);
+        const result = await this.sendRequestWithTimeout('ping', {}, 15000);
         return result;
     }
     async flushRequestQueue() {
@@ -409,15 +440,25 @@ class McpClient extends events_1.EventEmitter {
     }
     sendRequestWithTimeout(method, params, timeoutMs) {
         return new Promise((resolve, reject) => {
-            // If not connected and reconnecting, queue the request
-            if (!this.process?.stdin || !this.isConnected) {
+            // If process isn't available, fail fast
+            if (!this.process?.stdin) {
+                reject(new Error('MCP server not connected'));
+                return;
+            }
+            // Allow initialize during connecting before isConnected flips true
+            if (!this.isConnected()) {
                 if (this.connectionState === 'reconnecting') {
                     this.outputChannel.appendLine(`Queuing request during reconnect: ${method}`);
                     this.requestQueue.push({ method, params, resolve, reject });
                     return;
                 }
-                reject(new Error('MCP server not connected'));
-                return;
+                if (this.connectionState === 'connecting' && method === 'initialize') {
+                    this.outputChannel.appendLine('Sending initialize while connecting');
+                }
+                else {
+                    reject(new Error('MCP server not connected'));
+                    return;
+                }
             }
             const id = ++this.requestId;
             const request = {
@@ -471,7 +512,7 @@ class McpClient extends events_1.EventEmitter {
      * Call an MCP tool by name
      */
     async callTool(toolName, args = {}) {
-        if (!this.isConnected) {
+        if (!this.isConnected()) {
             await this.connect();
         }
         const result = await this.sendRequest('tools/call', {
@@ -499,7 +540,7 @@ class McpClient extends events_1.EventEmitter {
      * List available tools
      */
     async listTools() {
-        if (!this.isConnected) {
+        if (!this.isConnected()) {
             await this.connect();
         }
         const result = await this.sendRequest('tools/list', {});

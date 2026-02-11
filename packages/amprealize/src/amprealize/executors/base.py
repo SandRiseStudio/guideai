@@ -25,6 +25,7 @@ class ContainerRunConfig:
         detach: Whether to run in detached mode (default True)
         network: Optional network name to attach container to
         network_aliases: Optional list of DNS aliases for the container on the network
+        privileged: Whether to run container in privileged mode (default False)
     """
     image: str
     name: str
@@ -36,6 +37,7 @@ class ContainerRunConfig:
     detach: bool = True
     network: Optional[str] = None
     network_aliases: List[str] = field(default_factory=list)
+    privileged: bool = False
 
 
 @dataclass

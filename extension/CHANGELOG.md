@@ -5,6 +5,26 @@ All notable changes to the GuideAI IDE Extension will be documented in this file
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-01-22
+
+### Added
+- 🚀 **220 MCP Tools**: Full GuideAI MCP server integration with VS Code Copilot Chat
+- 🔧 **Schema Resolution**: Automatic `$ref` resolution for all tool schemas, enabling native Copilot Chat discovery
+
+### Fixed
+- 🐛 **VS Code Copilot Chat Compatibility**: Fixed `$ref` resolution in MCP tool schemas
+  - External file refs: `../../schema/bci/v1/prompt.json#/definitions/...`
+  - Internal refs: `#/definitions/BehaviorSnippet`
+  - Bare filename refs: `trace.json#/definitions/TraceFormat`
+  - All 220 tools now have fully-inlined JSON schemas
+
+### Technical Details
+- **MCP Server** (`guideai/mcp_server.py`): Added `_resolve_json_refs()` method for recursive schema resolution
+- **Tool Manifests**: 220 tools in `mcp/tools/` now work natively in VS Code Copilot Chat
+- **Affected Tools**: `bci_composeprompt`, `bci_validatecitations`, `reflection_extract`, and 8 other BCI tools
+
+---
+
 ## [1.1.0] - 2025-11-14
 
 ### Added
@@ -43,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ✅ **Compliance Tracker**: Interactive compliance validation with coverage tracking
 - 🔐 **Device Flow Authentication**: OAuth2 integration with GuideAI platform
 - 📊 **Real-time Metrics**: Live telemetry and KPI monitoring
-- 🤖 **64 MCP Tools**: Full Model Context Protocol integration
+- 🤖 **MCP Tools**: Model Context Protocol integration with GuideAI server
 - 🎨 **Professional UI**: Modern dark theme with status indicators
 - 🔄 **Auto-refresh**: Continuous updates for all tracked data
 - 📝 **Command Palette**: Full VS Code command integration

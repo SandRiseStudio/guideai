@@ -7,6 +7,7 @@ using the same token storage as the CLI.
 
 Integration points:
 - DeviceFlowManager (guideai/device_flow.py) for RFC 8628 device auth
+- PostgresDeviceFlowStore (guideai/auth/postgres_device_flow.py) for shared state
 - KeychainTokenStore (guideai/auth_tokens.py) for cross-platform token persistence
 - MCPDeviceFlowAdapter (guideai/adapters.py) for MCP surface-specific operations
 
@@ -40,11 +41,12 @@ Usage:
 """
 
 import asyncio
+import os
 import time
 import platform
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from pathlib import Path
 
 from .device_flow import (
@@ -71,6 +73,9 @@ from .services.agent_auth_service import (
 from .auth.providers.registry import ProviderRegistry
 from .auth.providers.base import OAuthProvider
 
+if TYPE_CHECKING:
+    from .auth.postgres_device_flow import PostgresDeviceFlowStore
+
 
 class MCPDeviceFlowService:
     """
@@ -78,6 +83,10 @@ class MCPDeviceFlowService:
 
     Orchestrates device authorization flow with automatic polling,
     token storage, and telemetry integration.
+
+    When postgres_store is provided, uses PostgreSQL-backed shared state
+    for device sessions. This allows MCP server and REST API to share
+    the same device authorization state for true E2E auth.
     """
 
     def __init__(
@@ -86,6 +95,7 @@ class MCPDeviceFlowService:
         token_store: Optional[TokenStore] = None,
         telemetry: Optional[TelemetryClient] = None,
         agent_auth_service: Optional[AgentAuthService] = None,
+        postgres_store: Optional["PostgresDeviceFlowStore"] = None,
     ) -> None:
         """
         Initialize MCP device flow service.
@@ -95,11 +105,13 @@ class MCPDeviceFlowService:
             token_store: TokenStore instance (uses get_default_token_store if None)
             telemetry: TelemetryClient instance (optional)
             agent_auth_service: AgentAuthService instance for policy enforcement (optional)
+            postgres_store: PostgresDeviceFlowStore for shared device session state (optional)
         """
         self._manager = manager or DeviceFlowManager()
         self._token_store = token_store
         self._telemetry = telemetry
         self._agent_auth_service = agent_auth_service
+        self._postgres_store = postgres_store
         self._adapter = MCPDeviceFlowAdapter(self._manager)
 
     def _get_token_store(self) -> TokenStore:
@@ -119,6 +131,7 @@ class MCPDeviceFlowService:
         Initiate device authorization flow (non-blocking).
 
         Returns device code and verification URI immediately.
+        Uses PostgreSQL store for shared state when available.
         """
         if scopes is None:
             scopes = ["behaviors.read", "workflows.read", "runs.create"]
@@ -136,6 +149,27 @@ class MCPDeviceFlowService:
                 payload={"client_id": client_id, "scopes": scopes},
             )
 
+        # Use PostgreSQL store for shared state if available
+        if self._postgres_store:
+            # Wrap synchronous database call in asyncio.to_thread to avoid blocking event loop
+            session = await asyncio.to_thread(
+                self._postgres_store.create_session,
+                client_id=client_id,
+                scopes=scopes,
+                surface="mcp",
+                metadata=metadata,
+            )
+            verification_uri = os.getenv("GUIDEAI_DEVICE_VERIFICATION_URI", "https://device.guideai.dev/activate")
+            return {
+                "device_code": session.device_code,
+                "user_code": session.user_code,
+                "verification_uri": verification_uri,
+                "verification_uri_complete": f"{verification_uri}?user_code={session.user_code}",
+                "expires_in": int((session.expires_at - session.created_at).total_seconds()),
+                "interval": session.poll_interval,
+            }
+
+        # Fallback to in-memory manager
         session_data = self._adapter.start_authorization(
             client_id=client_id,
             scopes=scopes,
@@ -160,8 +194,84 @@ class MCPDeviceFlowService:
     ) -> Dict[str, Any]:
         """
         Poll for device authorization status (single check).
+        Uses PostgreSQL store for shared state when available.
         """
         try:
+            # Use PostgreSQL store for shared state if available
+            if self._postgres_store:
+                # Wrap synchronous database call in asyncio.to_thread to avoid blocking event loop
+                session = await asyncio.to_thread(
+                    self._postgres_store.get_by_device_code, device_code
+                )
+                if session is None:
+                    return {
+                        "status": "error",
+                        "error": "invalid_device_code",
+                        "error_description": "Device code not found",
+                    }
+
+                status_normalized = {
+                    "approved": "authorized",
+                    "denied": "denied",
+                    "expired": "expired",
+                    "pending": "pending",
+                }.get(session.status.lower(), session.status.lower())
+
+                # Check for expiration
+                if session.expires_at and session.expires_at < datetime.now(timezone.utc):
+                    status_normalized = "expired"
+
+                result: Dict[str, Any] = {"status": status_normalized}
+
+                if status_normalized == "authorized":
+                    if session.access_token is None:
+                        return {
+                            "status": "error",
+                            "error": "tokens_not_ready",
+                            "error_description": "Session approved but tokens not generated",
+                        }
+
+                    # Calculate expires_in
+                    access_expires_in = 3600
+                    if session.access_token_expires_at:
+                        access_expires_in = int((session.access_token_expires_at - datetime.now(timezone.utc)).total_seconds())
+
+                    result.update({
+                        "access_token": session.access_token,
+                        "refresh_token": session.refresh_token,
+                        "token_type": "Bearer",
+                        "scopes": session.scopes or [],
+                        "expires_in": max(0, access_expires_in),
+                    })
+
+                    if store_tokens:
+                        try:
+                            store = self._get_token_store()
+                            bundle = AuthTokenBundle(
+                                access_token=session.access_token,
+                                refresh_token=session.refresh_token,
+                                token_type="Bearer",
+                                scopes=session.scopes or [],
+                                client_id=session.client_id or client_id,
+                                issued_at=session.approved_at or datetime.now(timezone.utc),
+                                expires_at=session.access_token_expires_at or datetime.now(timezone.utc),
+                                refresh_expires_at=session.refresh_token_expires_at,
+                            )
+                            store.save(bundle)
+                        except TokenStoreError as exc:
+                            result["error"] = "storage_failed"
+                            result["error_description"] = str(exc)
+
+                elif status_normalized == "denied":
+                    result["error"] = "access_denied"
+                    result["error_description"] = session.denied_reason or "Denied"
+
+                elif status_normalized == "expired":
+                    result["error"] = "expired_token"
+
+                return result
+
+            # Fallback to in-memory manager
             poll_result = self._adapter.poll(device_code)
             status_value = poll_result["status"]
 

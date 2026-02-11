@@ -27,7 +27,9 @@ export declare class AgentPerformanceTreeDataProvider implements vscode.TreeData
     private refreshTimer?;
     private periodDays;
     constructor(client: GuideAIClient);
-    private initializeDataProvider;
+    /**
+     * Start auto-refresh (call only after user initiates first refresh)
+     */
     private startAutoRefresh;
     private stopAutoRefresh;
     dispose(): void;

@@ -2,6 +2,33 @@
 
 Reference `AGENTS.md` for the full behavior handbook. This file provides quick triggers for common patterns.
 
+## 🚨 GuideAI MCP Tools Work Natively!
+
+**GuideAI MCP tools are available directly in VS Code Copilot Chat.** Use them by name:
+- `mcp_guideai_projects_list` - List projects in an organization
+- `mcp_guideai_behaviors_getfortask` - Retrieve behaviors for a task
+- `mcp_guideai_boards_list` - List boards in a project
+- Plus **220 other tools** for behaviors, runs, compliance, agents, and more!
+
+## 🚨 MANDATORY: Retrieve Behaviors Before Every Task
+
+**Before starting ANY task**, retrieve relevant behaviors using MCP directly:
+
+```bash
+# MCP (preferred - works natively in VS Code Copilot Chat!)
+mcp_guideai_behaviors_getfortask(task_description="<describe your task>", role="Student")
+
+# CLI alternative (when MCP unavailable)
+guideai behaviors get-for-task "<describe your task>" --role Student
+```
+
+Then cite behaviors in your work: `Following behavior_xyz (Student): ...`
+
+**If you observe the same pattern 3+ times** without an existing behavior, propose a new one:
+```bash
+guideai behaviors propose --name behavior_xyz --description "..." --instruction "..." --role STUDENT --confidence 0.8
+```
+
 ## Quick Triggers
 
 | Keywords | Behavior |
@@ -19,9 +46,11 @@ Reference `AGENTS.md` for the full behavior handbook. This file provides quick t
 | CORS, auth decorator, bearer token | `behavior_lock_down_security_surface` |
 | git workflow, branching, merge policy | `behavior_git_governance` |
 | ci pipeline, deployment, rollback | `behavior_orchestrate_cicd` |
+| **pattern observed 3+ times** | `behaviors.propose` → propose new behavior |
 
 ## Key Principles
 
+- **Behavior-first**: ALWAYS retrieve behaviors before starting any task using `behaviors.getForTask`
 - **Logging**: Use **Raze** for all structured logging (`packages/raze/`)
 - **Environments**: Use **Amprealize** for container/resource management (`packages/amprealize/`)
 - **MCP-first**: When MCP tools are available, prefer them over manual CLI/API calls—they provide consistent schemas and automatic telemetry
@@ -29,6 +58,7 @@ Reference `AGENTS.md` for the full behavior handbook. This file provides quick t
 - **Testing**: Run `pytest` or `npm run build` after changes; record outcomes
 - **Secrets**: Never hardcode; run `pre-commit` before pushing
 - **Docs**: Update `README.md`, `PRD.md`, `BUILD_TIMELINE.md` when APIs/workflows change
+- **Behavior proposals**: When pattern repeats 3+ times, propose new behavior with confidence score
 
 ## Standalone Package Pattern
 
@@ -40,4 +70,4 @@ When creating reusable functionality, follow the Raze/Amprealize model:
 
 For detailed behavior steps and compliance checklist, see `AGENTS.md`.
 
-_Last synced with AGENTS.md: 2025-11-24_
+_Last synced with AGENTS.md: 2026-01-16_

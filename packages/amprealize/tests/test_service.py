@@ -362,3 +362,69 @@ class TestBandwidthEnforcer:
         stats = {"container-1": {"net_input_bytes": 1000, "net_output_bytes": 1000}}
         usage = enforcer.get_current_usage_mbps(stats)
         assert isinstance(usage, float)
+
+
+class TestListEnvironmentsReconciliation:
+    """Tests for list_environments reconciliation with container reality."""
+
+    def test_list_environments_empty(self, service):
+        """Returns empty list when no environments."""
+        result = service.list_environments()
+        assert result == []
+
+    def test_list_environments_no_reconcile(self, service):
+        """Can skip reconciliation for faster listing."""
+        result = service.list_environments(reconcile=False)
+        assert isinstance(result, list)
+
+    def test_list_environments_cleans_stale(self, service):
+        """Auto-cleanup removes stale state files."""
+        import json
+
+        # Create a fake stale environment state file
+        stale_path = service.environments_dir / "amp-fake-stale-12345.json"
+        stale_path.write_text(json.dumps({
+            "amp_run_id": "amp-fake-stale-12345",
+            "environment": "development",
+            "phase": "APPLIED",
+            "blueprint_id": "test-blueprint",
+            "created_at": "2025-01-01T00:00:00",
+        }))
+
+        # List with auto_cleanup=True (default)
+        result = service.list_environments(reconcile=True, auto_cleanup=True)
+
+        # Stale file should be removed (no containers match)
+        assert not stale_path.exists()
+        # Result should not include the stale environment
+        assert all(env["amp_run_id"] != "amp-fake-stale-12345" for env in result)
+
+    def test_list_environments_keeps_stale_when_requested(self, service):
+        """Can keep stale entries when auto_cleanup=False."""
+        import json
+
+        # Create a fake stale environment state file
+        stale_path = service.environments_dir / "amp-keep-stale-67890.json"
+        stale_path.write_text(json.dumps({
+            "amp_run_id": "amp-keep-stale-67890",
+            "environment": "development",
+            "phase": "APPLIED",
+            "blueprint_id": "test-blueprint",
+            "created_at": "2025-01-01T00:00:00",
+        }))
+
+        try:
+            # List with auto_cleanup=False
+            result = service.list_environments(reconcile=True, auto_cleanup=False)
+
+            # Stale file should still exist
+            assert stale_path.exists()
+            # Result should include the stale environment with STALE status
+            stale_env = next((e for e in result if e["amp_run_id"] == "amp-keep-stale-67890"), None)
+            assert stale_env is not None
+            assert stale_env.get("actual_status") == "STALE"
+            assert stale_env.get("container_count") == 0
+        finally:
+            # Cleanup
+            if stale_path.exists():
+                stale_path.unlink()

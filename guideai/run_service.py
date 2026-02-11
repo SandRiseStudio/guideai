@@ -635,6 +635,9 @@ class RunService:
         metadata = dict(request.metadata)
         if request.total_steps is not None:
             metadata.setdefault("execution", {})["total_steps"] = request.total_steps
+        # Store triggering_user_id for credential resolution during GitHub operations
+        if request.triggering_user_id:
+            metadata["triggering_user_id"] = request.triggering_user_id
         return metadata
 
     def _publish_run_events(self, run: Run, step_id: Optional[str]) -> None:

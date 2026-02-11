@@ -8,7 +8,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { apiClient } from './client';
+import { apiClient, ApiError } from './client';
 
 // ---------------------------------------------------------------------------
 // Types (aligned with backend llm_credential_repository.py)
@@ -45,6 +45,38 @@ export interface CredentialAuditEntry {
   actor_id: string;
   timestamp: string;
   details?: Record<string, unknown>;
+}
+
+export interface GitHubCredential {
+  id: string;
+  scope_type: 'org' | 'project';
+  scope_id: string;
+  token_type: 'classic' | 'fine_grained' | 'app' | 'unknown';
+  name: string;
+  token_prefix: string;
+  masked_token: string;
+  is_valid: boolean;
+  failure_count: number;
+  scopes?: string[] | null;
+  has_required_scopes?: boolean;
+  scope_warning?: string | null;
+  rate_limit?: number | null;
+  rate_limit_remaining?: number | null;
+  rate_limit_reset?: string | null;
+  last_used_at?: string | null;
+  last_validated_at?: string | null;
+  github_username?: string | null;
+  github_user_id?: number | null;
+  created_by?: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  metadata?: Record<string, unknown>;
+  warning?: string;
+}
+
+export interface CreateGitHubCredentialRequest {
+  token: string;
+  name?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +189,65 @@ export function useReEnableProjectCredential(projectId: string | undefined, acto
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['credentials', 'project', projectId] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// GitHub Credential Hooks
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the BYOK GitHub credential for a project (masked token only)
+ */
+export function useProjectGitHubCredential(projectId: string | undefined) {
+  return useQuery({
+    queryKey: ['github-credential', 'project', projectId],
+    queryFn: async () => {
+      if (!projectId) return null;
+      // Backend returns null (not 404) when no credential exists
+      return await apiClient.get<GitHubCredential | null>(`/v1/projects/${projectId}/github-credential`);
+    },
+    enabled: !!projectId,
+    staleTime: 30000,
+  });
+}
+
+/**
+ * Add or replace the BYOK GitHub credential for a project
+ */
+export function useAddProjectGitHubCredential(projectId: string | undefined, actorId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (request: CreateGitHubCredentialRequest) => {
+      if (!projectId) throw new Error('Project ID required');
+      const actor = actorId || 'web-user';
+      return apiClient.post<GitHubCredential>(
+        `/v1/projects/${projectId}/github-credential?actor_id=${encodeURIComponent(actor)}`,
+        request
+      );
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['github-credential', 'project', projectId] });
+    },
+  });
+}
+
+/**
+ * Delete the BYOK GitHub credential for a project
+ */
+export function useDeleteProjectGitHubCredential(projectId: string | undefined, actorId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async () => {
+      if (!projectId) throw new Error('Project ID required');
+      const actor = actorId || 'web-user';
+      return apiClient.delete(`/v1/projects/${projectId}/github-credential?actor_id=${encodeURIComponent(actor)}`);
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['github-credential', 'project', projectId] });
     },
   });
 }

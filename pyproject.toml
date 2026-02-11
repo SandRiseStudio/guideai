@@ -39,6 +39,7 @@ dependencies = [
   "psycopg2-binary>=2.9,<3.0",  # PostgreSQL adapter
   "redis>=5.0,<6.0",  # Redis cache client
   "alembic>=1.13,<2.0",  # Database migrations
+  "podman>=5.0,<6.0",  # Podman socket API for container management
 ]
 
 [project.urls]

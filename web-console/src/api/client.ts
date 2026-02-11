@@ -12,14 +12,14 @@
  * - behavior_lock_down_security_surface (Student)
  */
 
-const RAW_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+const RAW_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080').replace(/\/+$/, '');
 
 // Base origin of the backend without the "/api" prefix. Useful for fetching non-API endpoints like /openapi.json.
 export const API_ORIGIN = RAW_API_BASE_URL.endsWith('/api') ? RAW_API_BASE_URL.slice(0, -4) : RAW_API_BASE_URL;
 
 // `VITE_API_BASE_URL` is allowed to be either:
-// - "http://localhost:8000"        (host only)
-// - "http://localhost:8000/api"    (includes API prefix)
+// - "http://localhost:8080"        (host only, via gateway)
+// - "http://localhost:8080/api"    (includes API prefix)
 // Normalize to always include a single trailing "/api".
 const API_BASE = RAW_API_BASE_URL.endsWith('/api') ? RAW_API_BASE_URL : `${RAW_API_BASE_URL}/api`;
 const TOKEN_STORAGE_KEY = 'guideai_token';

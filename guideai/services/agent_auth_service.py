@@ -23,6 +23,7 @@ from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..action_contracts import Actor, utc_now_iso
+from ..auth.policy_engine import PolicyEngine, PolicyDecision, get_policy_engine
 from ..storage.postgres_pool import PostgresPool
 from ..surfaces import normalize_actor_surface
 from ..telemetry import TelemetryClient
@@ -682,7 +683,8 @@ class AgentAuthService:
     def policy_preview(self, request: PolicyPreviewRequest) -> PolicyPreviewResponse:
         """Preview policy decision without issuing grant.
 
-        Evaluates RBAC roles, high-risk scopes, and MFA requirements.
+        Uses the PolicyEngine for dynamic YAML-based policy evaluation.
+        Supports RBAC roles, high-risk scopes, MFA requirements, and first-match rules.
 
         Args:
             request: PolicyPreviewRequest with agent/tool/scopes
@@ -690,37 +692,77 @@ class AgentAuthService:
         Returns:
             PolicyPreviewResponse with decision and obligations
         """
-        contains_high_risk = any(scope in CONSENT_SCOPE_TRIGGERS for scope in request.scopes)
-        requires_mfa = any(scope in HIGH_RISK_SCOPES for scope in request.scopes)
-        mfa_verified = request.context.get(MFA_CONTEXT_KEY) == MFA_REQUIRED_VALUE
         actor_payload = {
             "id": request.user_id or request.agent_id,
             "role": request.context.get("roles", "UNKNOWN"),
             "surface": normalize_actor_surface(request.context.get("surface", "API")),
         }
 
-        if contains_high_risk:
-            obligations = [
-                Obligation(type="notification", attributes={"channel": "#agent-reviews"}),
-            ]
-            if requires_mfa:
-                obligations.append(Obligation(type="mfa", attributes={"method": "TOTP"}))
-            response = PolicyPreviewResponse(
-                decision=GrantDecision.CONSENT_REQUIRED,
-                reason=DecisionReason.SCOPE_NOT_APPROVED,
-                bundle_version=request.bundle_version,
-                obligations=obligations,
+        # Use PolicyEngine for dynamic evaluation
+        try:
+            engine = get_policy_engine()
+            role = request.context.get("roles", "OBSERVER")
+            mfa_verified = request.context.get(MFA_CONTEXT_KEY) == MFA_REQUIRED_VALUE
+
+            # Build evaluation context
+            eval_context = {
+                **request.context,
+                "mfa_verified": mfa_verified,
+            }
+
+            # Preview all requested scopes
+            preview_result = engine.preview(
+                role=role,
+                scopes=list(request.scopes),
+                tool_name=request.tool_name,
+                context=eval_context,
             )
-        elif requires_mfa and not mfa_verified:
+
+            # Map PolicyEngine decision to GrantDecision
+            decision_mapping = {
+                PolicyDecision.ALLOW: GrantDecision.ALLOW,
+                PolicyDecision.DENY: GrantDecision.DENY,
+                PolicyDecision.CONSENT_REQUIRED: GrantDecision.CONSENT_REQUIRED,
+            }
+
+            # Determine overall decision (most restrictive)
+            overall_decision = GrantDecision.ALLOW
+            overall_reason = None
+            obligations: List[Obligation] = []
+
+            for scope, result in preview_result.items():
+                mapped_decision = decision_mapping.get(result.decision, GrantDecision.DENY)
+
+                # DENY is most restrictive, then CONSENT_REQUIRED, then ALLOW
+                if mapped_decision == GrantDecision.DENY:
+                    overall_decision = GrantDecision.DENY
+                    overall_reason = DecisionReason(result.reason.value) if result.reason else DecisionReason.SCOPE_NOT_APPROVED
+                    break
+                elif mapped_decision == GrantDecision.CONSENT_REQUIRED and overall_decision == GrantDecision.ALLOW:
+                    overall_decision = GrantDecision.CONSENT_REQUIRED
+                    overall_reason = DecisionReason(result.reason.value) if result.reason else DecisionReason.SCOPE_NOT_APPROVED
+
+                # Collect obligations from all scopes
+                for obl in result.obligations:
+                    obligations.append(Obligation(type=obl.type, attributes=obl.attributes))
+
+            response = PolicyPreviewResponse(
+                decision=overall_decision,
+                reason=overall_reason,
+                bundle_version=engine.bundle_version,
+                obligations=obligations if obligations else None,
+            )
+
+        except Exception as e:
+            # Fallback to deny-by-default if PolicyEngine fails
             response = PolicyPreviewResponse(
                 decision=GrantDecision.DENY,
-                reason=DecisionReason.SECURITY_HOLD,
-                bundle_version=request.bundle_version,
+                reason=DecisionReason.POLICY_CONDITION_FAILED,
+                bundle_version=request.bundle_version or "unknown",
             )
-        else:
-            response = PolicyPreviewResponse(
-                decision=GrantDecision.ALLOW,
-                bundle_version=request.bundle_version,
+            self._telemetry.emit(
+                event_type="auth_policy_engine_error",
+                payload={"error": str(e), "agent_id": request.agent_id},
             )
 
         self._emit_auth_event(
@@ -734,8 +776,8 @@ class AgentAuthService:
                 "agent_id": request.agent_id,
                 "tool_name": request.tool_name,
                 "scopes": list(request.scopes),
-                "bundle_version": request.bundle_version,
-                "mfa_required": requires_mfa,
+                "bundle_version": response.bundle_version,
+                "used_policy_engine": True,
             },
         )
 

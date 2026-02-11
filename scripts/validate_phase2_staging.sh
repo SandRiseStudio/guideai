@@ -10,7 +10,7 @@
 #
 # Usage:
 #   ./scripts/validate_phase2_staging.sh [staging_url]
-#   Example: ./scripts/validate_phase2_staging.sh http://localhost:8000
+#   Example: ./scripts/validate_phase2_staging.sh http://localhost:8080
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-STAGING_URL="${1:-http://localhost:8000}"
+STAGING_URL="${1:-http://localhost:8080}"
 PROMETHEUS_URL="${PROMETHEUS_URL:-http://localhost:9090}"
 
 echo -e "${BLUE}========================================================${NC}"

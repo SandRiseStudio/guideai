@@ -5,6 +5,10 @@
   "inputSchema": {
     "type": "object",
     "properties": {
+      "user_id": {
+        "type": "string",
+        "description": "ID of the user creating the organization (becomes the owner)"
+      },
       "name": {
         "type": "string",
         "minLength": 2,
@@ -45,7 +49,7 @@
         }
       }
     },
-    "required": ["name"]
+    "required": ["user_id", "name"]
   },
   "outputSchema": {
     "type": "object",

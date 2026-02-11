@@ -28,7 +28,7 @@ import type {
 // ---------------------------------------------------------------------------
 
 export interface CollabClientConfig {
-  /** WebSocket endpoint base URL (e.g., ws://localhost:8000) */
+  /** WebSocket endpoint base URL (e.g., ws://localhost:8080) */
   baseUrl: string;
   /** User identifier */
   userId: UserId;

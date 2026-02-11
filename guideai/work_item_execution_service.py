@@ -7,15 +7,20 @@ Features:
 - Validate permissions + project/org tool/model gating
 - Resolve assigned agent and load playbook snapshot
 - Create Run + TaskCycle linked to work item
-- Invoke AgentExecutionLoop until terminal
+- Invoke AgentExecutionLoop until terminal (or enqueue for worker execution)
 - Persist logs to RunService and update Work Item/Board state
 - Post concise summary comment on completion
+
+Execution Modes:
+- EXECUTION_MODE=queue: Enqueue for worker processing (default)
+- EXECUTION_MODE=direct: Run inline (legacy, for development)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -37,6 +42,8 @@ from .task_cycle_contracts import (
     PHASE_GATES,
     SubmitClarificationRequest,
     TimeoutConfig,
+    TransitionPhaseRequest,
+    TriggerType,
 )
 from .task_cycle_service import TaskCycleService
 from .telemetry import TelemetryClient
@@ -67,6 +74,13 @@ from .multi_tenant.settings import (
     LOCAL_CAPABLE_SURFACES,
     REMOTE_ONLY_SURFACES,
     SettingsService,
+)
+from .workspace_agent import (
+    GuideAIWorkspaceClient,
+    WorkspaceConfig,
+    WorkspaceInfo,
+    WorkspaceProvisionError,
+    get_workspace_client,
 )
 
 
@@ -513,6 +527,8 @@ class WorkItemExecutionService:
         telemetry: Optional[TelemetryClient] = None,
         pool: Optional[PostgresPool] = None,
         dsn: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+        queue_publisher: Optional[Any] = None,
     ) -> None:
         """Initialize WorkItemExecutionService.
 
@@ -521,6 +537,8 @@ class WorkItemExecutionService:
             run_service: Service for run tracking
             task_cycle_service: Service for GEP phase management
             agent_registry_service: Service for agent lookup
+            execution_mode: 'direct' (inline) or 'queue' (worker). Env: EXECUTION_MODE
+            queue_publisher: ExecutionQueuePublisher for queue mode
             credential_store: Store for LLM credentials
             internet_resolver: Resolver for internet access permissions
             write_resolver: Resolver for write scope
@@ -549,15 +567,44 @@ class WorkItemExecutionService:
 
         # Initialize sub-services
         self._board_service = board_service or BoardService(pool=pool)
-        self._run_service = run_service or RunService()
+
+        # Initialize run service - prefer PostgreSQL when DSN is available
+        if run_service is not None:
+            self._run_service = run_service
+        elif dsn:
+            from .run_service_postgres import PostgresRunService
+            self._run_service = PostgresRunService(dsn=dsn, telemetry=self._telemetry)
+            logger.info("Created PostgresRunService for WorkItemExecutionService")
+        else:
+            logger.warning("No DSN provided - using SQLite RunService (not recommended for production)")
+            self._run_service = RunService()
+
         self._task_cycle_service = task_cycle_service or TaskCycleService(pool=pool)
         self._agent_registry = agent_registry_service or AgentRegistryService(pool=pool)
         self._credential_store = credential_store or CredentialStore(pool=pool, credential_repository=credential_repo)
         self._internet_resolver = internet_resolver or InternetAccessResolver(pool=pool)
         self._write_resolver = write_resolver or WriteTargetResolver(pool=pool)
 
+        # Initialize workspace client for GitHub repo access during execution
+        # This connects to the workspace-agent gRPC service
+        self._workspace_manager = get_workspace_client()
+
         # Execution loop will be set via setter or import
         self._execution_loop: Optional[Any] = None
+
+        # Execution mode: 'direct' (inline) or 'queue' (worker processing)
+        self._execution_mode = execution_mode or os.environ.get("EXECUTION_MODE", "queue")
+        self._queue_publisher = queue_publisher
+
+        # Lazy-init queue publisher if in queue mode
+        if self._execution_mode == "queue" and self._queue_publisher is None:
+            try:
+                from execution_queue import ExecutionQueuePublisher
+                self._queue_publisher = ExecutionQueuePublisher()
+                logger.info("Initialized ExecutionQueuePublisher for queue mode")
+            except ImportError:
+                logger.warning("execution-queue package not installed, falling back to direct mode")
+                self._execution_mode = "direct"
 
     def set_execution_loop(self, loop: Any) -> None:
         """Set the execution loop (avoids circular import)."""
@@ -685,6 +732,7 @@ class WorkItemExecutionService:
         run = self._run_service.create_run(RunCreateRequest(
             actor=actor,
             workflow_name="work_item_execution",
+            triggering_user_id=user_id,  # For GitHub credential resolution
             metadata={
                 "work_item_id": work_item_id,
                 "agent_id": agent_id,
@@ -749,10 +797,49 @@ class WorkItemExecutionService:
             run_id=run.run_id,
         )
 
-        # Step 11: Start execution loop (async)
+        # Step 11: Start execution loop (async or via queue)
         # The actual execution happens asynchronously
-        if self._execution_loop and cycle_id:
-            # Schedule execution in background
+        if self._execution_mode == "queue" and self._queue_publisher:
+            # Queue mode: enqueue job for worker processing
+            from execution_queue import ExecutionJob, Priority
+
+            # Determine priority based on context
+            priority = Priority.NORMAL
+            if exec_policy and hasattr(exec_policy, 'priority'):
+                priority_str = getattr(exec_policy, 'priority', 'normal').lower()
+                priority = Priority.HIGH if priority_str == 'high' else (
+                    Priority.LOW if priority_str == 'low' else Priority.NORMAL
+                )
+
+            # Resolve GitHub repo for workspace provisioning
+            github_repo = await self._resolve_project_repo(project_id) if project_id else None
+            logger.info(f"Resolved github_repo for project {project_id}: {github_repo}")
+
+            job = ExecutionJob(
+                job_id=run.run_id,  # Use run_id as job_id for correlation
+                run_id=run.run_id,
+                work_item_id=work_item_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                project_id=project_id,
+                priority=priority,
+                org_id=org_id,
+                model_override=model_id,  # model_override maps to model_id
+                cycle_id=cycle_id,  # Top-level field for direct access by worker
+                payload={
+                    "cycle_id": cycle_id,  # Keep in payload for backwards compat
+                    "work_item_title": work_item.title if work_item else None,
+                    "agent_version": agent_version.version if agent_version else None,
+                    "exec_policy": exec_policy.to_dict() if exec_policy else None,
+                    "github_repo": github_repo,  # For workspace provisioning
+                },
+            )
+
+            await self._queue_publisher.enqueue(job)
+            logger.info(f"Enqueued execution job: {run.run_id} (priority={priority.value})")
+
+        elif self._execution_loop and cycle_id:
+            # Direct mode: schedule execution in background
             import asyncio
             asyncio.create_task(self._run_execution_loop(
                 run_id=run.run_id,
@@ -798,9 +885,17 @@ class WorkItemExecutionService:
         Creates a ToolExecutor with the specific ExecutionPolicy for this run.
         When write_scope is PR_ONLY or LOCAL_AND_PR, sets up PR context for
         accumulating file changes and creating a pull request.
+
+        Workspace Setup:
+        - If project has a GitHub repo configured, clones it into an isolated workspace
+        - Uses Amprealize for container isolation (or local directory fallback)
+        - Workspace path is passed to ToolExecutor for filesystem tools
+        - Cleanup: immediate on success, 24h retention on failure for debugging
         """
         pr_context: Optional[PRExecutionContext] = None
         github_service = None
+        workspace_info: Optional[WorkspaceInfo] = None
+        execution_success = False
 
         try:
             if not self._execution_loop:
@@ -824,14 +919,48 @@ class WorkItemExecutionService:
                         f"branch={pr_context.branch_name}, repo={pr_context.repo}"
                     )
 
+            # =========================================================================
+            # Workspace Setup - Clone GitHub repo for agent filesystem access
+            # =========================================================================
+            workspace_path = None
+
+            if project_id:
+                workspace_info = await self._setup_workspace(
+                    run_id=run_id,
+                    project_id=project_id,
+                    org_id=org_id,
+                    user_id=user_id,
+                )
+                if workspace_info:
+                    workspace_path = workspace_info.workspace_path
+                    logger.info(
+                        f"Workspace provisioned for run {run_id}: {workspace_path}"
+                    )
+                    if workspace_info.use_container_exec:
+                        logger.info(
+                            f"Container-based workspace: {workspace_info.container_name}"
+                        )
+
+            # Resolve GitHub repo for API fallback tools
+            github_repo = await self._resolve_project_repo(project_id) if project_id else None
+
             # Create ToolExecutor for this run with the specific execution policy
             # This enforces write scope, internet access, and other permissions
             from .tool_executor import ToolExecutor
             tool_executor = ToolExecutor(
                 policy=exec_policy,
                 telemetry=self._telemetry,
-                project_root=work_item.project_id,  # Use project as context
+                project_root=workspace_path or work_item.project_id,  # Use workspace path if available
                 pr_context=pr_context,
+                github_service=github_service,
+                github_context={
+                    "repo": github_repo,
+                    "project_id": project_id,
+                    "org_id": org_id,
+                    "user_id": user_id,
+                } if github_repo else None,
+                workspace_info=workspace_info,  # Pass workspace info for container exec
+                workspace_manager=self._workspace_manager,  # Pass workspace manager for container operations
             )
             self._execution_loop.set_tool_executor(tool_executor)
             logger.info(f"Created ToolExecutor for run {run_id} with policy: write_scope={exec_policy.write_scope}, internet={exec_policy.internet_access}")
@@ -855,6 +984,9 @@ class WorkItemExecutionService:
                 project_id=project_id,
             )
 
+            # Mark success for cleanup policy
+            execution_success = True
+
             # On success, post summary and move to completed
             # Include PR link if one was created
             pr_url = pr_context.pr_url if pr_context else None
@@ -875,6 +1007,97 @@ class WorkItemExecutionService:
                 error=str(e),
                 org_id=org_id,
             )
+
+        finally:
+            # =========================================================================
+            # Workspace Cleanup
+            # - Immediate cleanup on success
+            # - Retain for 24h on failure for debugging
+            # =========================================================================
+            if workspace_info:
+                try:
+                    await self._workspace_manager.cleanup(
+                        run_id=run_id,
+                        success=execution_success,
+                    )
+                except Exception as cleanup_error:
+                    logger.warning(f"Workspace cleanup failed for run {run_id}: {cleanup_error}")
+
+    async def _setup_workspace(
+        self,
+        run_id: str,
+        project_id: str,
+        org_id: Optional[str],
+        user_id: str,
+    ) -> Optional[WorkspaceInfo]:
+        """Provision an isolated workspace with the project's GitHub repo.
+
+        This method:
+        1. Resolves the project's GitHub repo
+        2. Gets a GitHub token using the credential resolution hierarchy
+        3. Provisions a workspace container with the cloned repo
+
+        Args:
+            run_id: Run ID for tracking
+            project_id: Project to get repo from
+            org_id: Organization ID for token resolution
+            user_id: User ID (triggering_user_id) for token resolution
+
+        Returns:
+            WorkspaceInfo if workspace provisioned, None if no repo configured
+        """
+        try:
+            # Step 1: Get the project's GitHub repo
+            repo = await self._resolve_project_repo(project_id)
+            if not repo:
+                logger.info(
+                    f"No GitHub repo configured for project {project_id}, "
+                    f"skipping workspace provisioning"
+                )
+                return None
+
+            # Step 2: Resolve GitHub token using the credential hierarchy
+            # User-linked credentials take priority, then project, then org, then platform
+            from .services.github_service import GitHubService
+            github_service = GitHubService(pool=self._pool)
+
+            resolved_token = github_service.get_resolved_token(
+                project_id=project_id,
+                org_id=org_id,
+                user_id=user_id,  # triggering_user_id for per-user resolution
+            )
+
+            if not resolved_token:
+                logger.warning(
+                    f"No GitHub token available for project {project_id}, "
+                    f"cannot clone repo"
+                )
+                return None
+
+            logger.info(
+                f"Using GitHub token from '{resolved_token.source}' for repo clone"
+            )
+
+            # Step 3: Provision workspace with cloned repo
+            config = WorkspaceConfig(
+                run_id=run_id,
+                project_id=project_id,
+                github_repo=repo,
+                github_token=resolved_token.token,
+                ttl_hours=24,  # Keep for 24h on failure
+            )
+
+            workspace_info = await self._workspace_manager.provision(config)
+            return workspace_info
+
+        except WorkspaceProvisionError as e:
+            logger.error(f"Failed to provision workspace: {e}")
+            # Don't fail execution - agent can still work without local workspace
+            # It will fall back to GitHub API for file access
+            return None
+        except Exception as e:
+            logger.warning(f"Error setting up workspace for run {run_id}: {e}")
+            return None
 
     async def _setup_pr_context(
         self,
@@ -944,28 +1167,47 @@ class WorkItemExecutionService:
         Returns repo in 'owner/repo' format, or None if not configured.
         """
         try:
-            # Try to get from project settings
+            # Try to get from project settings service first
             if self._write_resolver and self._write_resolver._settings_service:
                 settings = self._write_resolver._settings_service.get_project_settings(project_id)
-                # Look for github_repo in metadata or a dedicated field
+                # Check repository_url field (primary setting)
+                if hasattr(settings, 'repository_url') and settings.repository_url:
+                    repo_url = settings.repository_url
+                    # Extract owner/repo from URL
+                    if repo_url.startswith("https://github.com/"):
+                        return repo_url.replace("https://github.com/", "").rstrip("/")
+                    elif repo_url.startswith("git@github.com:"):
+                        return repo_url.replace("git@github.com:", "").replace(".git", "").rstrip("/")
+                    else:
+                        return repo_url
+                # Fallback to github_repo field
                 if hasattr(settings, 'github_repo') and settings.github_repo:
                     return settings.github_repo
-                if hasattr(settings, 'metadata') and settings.metadata:
-                    return settings.metadata.get('github_repo')
 
-            # Try to get from board/project table directly
-            # This is a fallback for projects that may store repo info differently
+            # Fallback: Direct database query to auth.projects settings JSONB
             query = """
-                SELECT metadata->>'github_repo' as repo
-                FROM projects
+                SELECT
+                    settings->>'repository_url' as repo_url,
+                    settings->>'github_repo' as github_repo
+                FROM auth.projects
                 WHERE project_id = %s
             """
-            with self._pool.get_connection() as conn:
+            with self._pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(query, (project_id,))
                     row = cur.fetchone()
-                    if row and row[0]:
-                        return row[0]
+                    if row:
+                        repo_url = row[0] or row[1]
+                        if repo_url:
+                            # Extract owner/repo from URL if needed
+                            # e.g., "https://github.com/Nas4146/guideai" -> "Nas4146/guideai"
+                            if repo_url.startswith("https://github.com/"):
+                                return repo_url.replace("https://github.com/", "").rstrip("/")
+                            elif repo_url.startswith("git@github.com:"):
+                                return repo_url.replace("git@github.com:", "").replace(".git", "").rstrip("/")
+                            else:
+                                # Assume it's already in owner/repo format
+                                return repo_url
 
             return None
 
@@ -1110,6 +1352,13 @@ class WorkItemExecutionService:
             RunStatus.CANCELLED: ExecutionState.CANCELLED,
         }
 
+        # Extract pending clarifications from run metadata
+        pending_clarifications = None
+        run_metadata = run.metadata or {}
+        clarification_questions = run_metadata.get("clarification_questions")
+        if clarification_questions and isinstance(clarification_questions, list):
+            pending_clarifications = clarification_questions
+
         return ExecutionStatusResponse(
             run_id=run.run_id,
             cycle_id=cycle_id or "",
@@ -1123,6 +1372,7 @@ class WorkItemExecutionService:
             error=run.error,
             model_id=run.metadata.get("model_id"),
             step_count=len(run.steps),
+            pending_clarifications=pending_clarifications,
         )
 
     def cancel(
@@ -1267,6 +1517,217 @@ class WorkItemExecutionService:
         )
 
         return True
+
+    async def approve_gate(
+        self,
+        work_item_id: str,
+        user_id: str,
+        org_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        phase: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Approve a strict gate on a paused execution and re-enqueue for resumption.
+
+        When an execution is paused at a STRICT gate (ARCHITECTING, VERIFYING,
+        COMPLETING), this method approves the gate, transitions the cycle to
+        the next phase, and re-enqueues the execution job so the worker resumes.
+
+        Args:
+            work_item_id: Work item ID
+            user_id: User approving the gate
+            org_id: Organization ID
+            project_id: Project ID
+            phase: Phase to approve (if None, uses current phase)
+            notes: Approval notes/feedback
+
+        Returns:
+            Dict with success, message, run_id, resumed
+        """
+        exec_status = self.get_status(work_item_id, org_id)
+        if not exec_status:
+            return {
+                "success": False,
+                "message": f"No active execution found for work item {work_item_id}",
+            }
+
+        # Must be paused to approve a gate
+        if exec_status.status not in (ExecutionState.PAUSED, ExecutionState.PENDING):
+            return {
+                "success": False,
+                "message": (
+                    f"Execution is {exec_status.status.value}, not paused at a gate. "
+                    f"Only paused executions can have gates approved."
+                ),
+            }
+
+        if not exec_status.cycle_id:
+            return {
+                "success": False,
+                "message": "No task cycle associated with this execution.",
+            }
+
+        # Determine current and next phase
+        cycle = self._task_cycle_service.get_cycle(exec_status.cycle_id)
+        if not cycle:
+            return {
+                "success": False,
+                "message": f"Task cycle {exec_status.cycle_id} not found.",
+            }
+
+        current_phase = cycle.current_phase
+
+        # If caller specified a phase, validate it matches current
+        if phase:
+            try:
+                requested_phase = CyclePhase(phase)
+                if requested_phase != current_phase:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Requested approval for phase '{phase}' but execution "
+                            f"is at '{current_phase.value}'"
+                        ),
+                    }
+            except ValueError:
+                return {
+                    "success": False,
+                    "message": f"Unknown phase: {phase}",
+                }
+
+        # Check this phase actually has a gate
+        gate_type = PHASE_GATES.get(current_phase, GateType.NONE)
+        if gate_type != GateType.STRICT:
+            return {
+                "success": False,
+                "message": (
+                    f"Phase '{current_phase.value}' has gate type {gate_type.value}, "
+                    f"not STRICT. Only STRICT gates require approval."
+                ),
+            }
+
+        # Determine the next phase using valid transitions
+        from .task_cycle_contracts import VALID_TRANSITIONS
+        valid_targets = VALID_TRANSITIONS.get(current_phase, [])
+        # Pick the forward-progressing phase (not CANCELLED/FAILED)
+        next_phase = None
+        for target in valid_targets:
+            if target not in (CyclePhase.CANCELLED, CyclePhase.FAILED):
+                next_phase = target
+                break
+
+        if not next_phase:
+            return {
+                "success": False,
+                "message": f"No valid forward transition from phase '{current_phase.value}'",
+            }
+
+        # Transition the cycle with approval
+        transition_request = TransitionPhaseRequest(
+            cycle_id=exec_status.cycle_id,
+            target_phase=next_phase,
+            triggered_by=user_id,
+            trigger_type=TriggerType.MANUAL,
+            approval_granted=True,
+            notes=notes or f"Gate approved by {user_id}",
+        )
+
+        result = self._task_cycle_service.transition_phase(transition_request)
+        if not result.success:
+            return {
+                "success": False,
+                "message": f"Failed to transition phase: {result.error}",
+            }
+
+        # Re-enqueue execution job so worker resumes from the new phase
+        resumed = False
+        if self._execution_mode == "queue" and self._queue_publisher:
+            try:
+                from execution_queue import ExecutionJob, Priority
+
+                # Get run record for context
+                run = self._run_service.get_run(exec_status.run_id)
+
+                # Get agent info for re-enqueue
+                agent_id = run.metadata.get("agent_id", "") if run else ""
+
+                job = ExecutionJob(
+                    job_id=exec_status.run_id,
+                    run_id=exec_status.run_id,
+                    work_item_id=work_item_id,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    project_id=project_id or "",
+                    priority=Priority.HIGH,  # Gate approvals get high priority
+                    org_id=org_id,
+                    cycle_id=exec_status.cycle_id,
+                    payload={
+                        "cycle_id": exec_status.cycle_id,
+                        "resume_from_phase": next_phase.value,
+                        "gate_approved_by": user_id,
+                        "gate_approved_notes": notes,
+                        "exec_policy": run.metadata.get("execution_policy") if run else None,
+                    },
+                )
+
+                await self._queue_publisher.enqueue(job)
+                resumed = True
+                logger.info(
+                    f"Re-enqueued execution {exec_status.run_id} after gate approval "
+                    f"(phase={next_phase.value})"
+                )
+            except Exception as e:
+                logger.exception(f"Failed to re-enqueue after gate approval: {e}")
+                return {
+                    "success": True,
+                    "message": (
+                        f"Gate approved (phase transitioned to {next_phase.value}) "
+                        f"but failed to re-enqueue execution: {e}"
+                    ),
+                    "run_id": exec_status.run_id,
+                    "resumed": False,
+                }
+
+        # Update run status back to RUNNING
+        try:
+            self._run_service.update_progress(
+                exec_status.run_id,
+                RunProgressUpdate(
+                    status="running",
+                    current_step=f"Gate approved — resuming at {next_phase.value}",
+                    metadata={
+                        "phase": next_phase.value,
+                        "gate_approved_by": user_id,
+                        "step_type": "gate_approved",
+                    },
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update run status after gate approval: {e}")
+
+        # Emit telemetry
+        self._telemetry.emit_event(
+            event_type="work_item.gate.approved",
+            payload={
+                "work_item_id": work_item_id,
+                "run_id": exec_status.run_id,
+                "phase": current_phase.value,
+                "next_phase": next_phase.value,
+                "user_id": user_id,
+                "notes": notes,
+            },
+            run_id=exec_status.run_id,
+        )
+
+        return {
+            "success": True,
+            "message": (
+                f"Gate approved at {current_phase.value}. "
+                f"Execution transitioning to {next_phase.value}."
+            ),
+            "run_id": exec_status.run_id,
+            "resumed": resumed,
+        }
 
     def list_executions(
         self,
@@ -1446,7 +1907,9 @@ class WorkItemExecutionService:
                 "output_tokens": step_metadata.get("output_tokens", 0),
                 "tool_calls": len(step_metadata.get("tool_calls", [])),
                 "content_preview": step_metadata.get("content_preview"),
+                "content_full": step_metadata.get("content_full"),  # Full content for detail view
                 "tool_names": [tc.get("tool_name") for tc in step_metadata.get("tool_calls", [])],
+                "model_id": step_metadata.get("model_id"),
             }
             result.append(step_dict)
 
@@ -1524,19 +1987,36 @@ class WorkItemExecutionService:
         self,
         agent_version: Optional[AgentVersion],
     ) -> ExecutionPolicy:
-        """Get execution policy from agent version metadata."""
+        """Get execution policy from agent version metadata or use preset based on agent type."""
         if not agent_version:
             return ExecutionPolicy()
 
+        # Check for explicit execution policy in agent metadata
         policy_data = agent_version.metadata.get("execution_policy", {})
         if policy_data:
             return ExecutionPolicy.from_dict(policy_data)
 
-        # Check for AI Researcher agent - use fully autonomous
-        if "ai_researcher" in agent_version.agent_id.lower():
-            return ExecutionPolicy.fully_autonomous()
+        # Use agent-specific presets based on agent name/slug
+        agent_id_lower = (agent_version.agent_id or "").lower()
+        agent_slug = agent_version.metadata.get("slug", "").lower()
 
-        return ExecutionPolicy()
+        # Research agents: skip TESTING/FIXING/VERIFYING
+        if any(x in agent_id_lower or x in agent_slug for x in ["research", "ai_research"]):
+            logger.info(f"Using research agent preset for {agent_version.agent_id}")
+            return ExecutionPolicy.for_research_agent()
+
+        # Architect agents: skip TESTING/FIXING
+        if any(x in agent_id_lower or x in agent_slug for x in ["architect", "architecture"]):
+            logger.info(f"Using architect agent preset for {agent_version.agent_id}")
+            return ExecutionPolicy.for_architect_agent()
+
+        # Engineering agents: run all phases
+        if any(x in agent_id_lower or x in agent_slug for x in ["engineer", "developer", "coding"]):
+            logger.info(f"Using engineering agent preset for {agent_version.agent_id}")
+            return ExecutionPolicy.for_engineering_agent()
+
+        # Default: fully autonomous (no gates, all phases)
+        return ExecutionPolicy.fully_autonomous()
 
     def _update_work_item_run(
         self,

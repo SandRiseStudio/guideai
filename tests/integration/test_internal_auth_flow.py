@@ -44,7 +44,7 @@ class InternalAuthAPIClient:
     """Client for testing internal authentication API endpoints."""
 
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url = base_url or os.getenv("GUIDEAI_API_URL", "http://localhost:8000")
+        self.base_url = base_url or os.getenv("GUIDEAI_GATEWAY_URL", "http://localhost:8080")
         self.session = self._create_session()
 
     def _create_session(self) -> requests.Session:

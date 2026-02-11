@@ -116,5 +116,7 @@
       }
     },
     "required": ["run_id", "created_at", "status", "progress_pct"]
-  }
+  },
+  "required_scopes": ["runs.create"],
+  "category": "runs"
 }

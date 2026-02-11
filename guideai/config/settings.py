@@ -482,7 +482,7 @@ class CostOptimizationConfig(BaseSettings):
     smtp_from_name: str = "GuideAI Cost Alerts"
 
     # Alert preferences URL for unsubscribe/manage links
-    alert_preferences_url: str = "http://localhost:8000/settings/alerts"
+    alert_preferences_url: str = "http://localhost:8080/settings/alerts"
 
     model_config = SettingsConfigDict(
         env_prefix="COST_",
@@ -523,11 +523,12 @@ class Settings(BaseSettings):
 
     # API Service
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = 8000  # Internal API port (gateway proxies 8080 -> 8000)
     api_workers: int = 1
     api_log_level: str = "info"
     api_reload: bool = False
-    api_base_url: str = "http://localhost:8000"
+    # Gateway URL - all clients should connect via gateway for auth/rate-limiting
+    gateway_url: str = "http://localhost:8080"
 
     # CORS
     cors_origins: str = "http://localhost:3000"

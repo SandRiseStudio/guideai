@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![GuideAI Logo](resources/icon.svg)
+![GuideAI Logo](resources/icon.png)
 
 **Transform your IDE into an intelligent development companion with AI agent orchestration, real-time monitoring, and compliance validation.**
 
@@ -32,7 +32,7 @@ GuideAI is a comprehensive AI agent orchestration platform that brings intellige
 - **Approval workflows** with comments and decision tracking
 
 ### 🤖 **AI Agent Orchestration**
-- **64 MCP Tools** for comprehensive AI agent management
+- **220 MCP Tools** for comprehensive AI agent management (works natively in VS Code Copilot Chat!)
 - **Behavior management** with semantic search and categorization
 - **Workflow templates** for common development patterns
 - **Multi-agent coordination** for complex development tasks
@@ -72,7 +72,7 @@ GuideAI is a comprehensive AI agent orchestration platform that brings intellige
 | Component | Status | Performance |
 |-----------|--------|-------------|
 | **Backend Services** | 17/17 Operational | P95 <100ms |
-| **MCP Tools** | 64/64 Available | 100% Coverage |
+| **MCP Tools** | 220/220 Available | 100% Coverage |
 | **Test Suite** | 450+ Passing Tests | 95%+ Coverage |
 | **Compliance** | SOC2 Ready | Audit Trail Complete |
 | **Authentication** | OAuth2 Device Flow | Enterprise Grade |

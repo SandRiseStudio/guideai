@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 # =============================================================================
@@ -105,6 +105,18 @@ class ModelDefinition:
 
 # Model Catalog - Static definitions of supported models
 MODEL_CATALOG: Dict[str, ModelDefinition] = {
+    "claude-opus-4-6": ModelDefinition(
+        model_id="claude-opus-4-6",
+        api_name="claude-opus-4-20260201",  # Actual Anthropic API model name
+        provider=LLMProvider.ANTHROPIC,
+        display_name="Claude Opus 4.6",
+        supports_tool_calls=True,
+        context_limit=200000,
+        max_output_tokens=32768,
+        output_limit=32768,
+        input_price_per_m=15.0,
+        output_price_per_m=75.0,
+    ),
     "claude-opus-4-5": ModelDefinition(
         model_id="claude-opus-4-5",
         api_name="claude-opus-4-20250514",  # Actual Anthropic API model name
@@ -186,8 +198,8 @@ def list_models() -> List[ModelDefinition]:
 @dataclass
 class ModelPolicy:
     """Model policy for agent execution."""
-    preferred_model_id: str = "claude-sonnet-4-5"
-    fallback_model_ids: List[str] = field(default_factory=lambda: ["gpt-4o"])
+    preferred_model_id: str = "claude-opus-4-6"
+    fallback_model_ids: List[str] = field(default_factory=lambda: ["claude-sonnet-4-5", "gpt-4o"])
     allow_mid_run_switching: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
@@ -200,7 +212,7 @@ class ModelPolicy:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelPolicy":
         return cls(
-            preferred_model_id=data.get("preferred_model_id", "claude-sonnet-4-5"),
+            preferred_model_id=data.get("preferred_model_id", "claude-opus-4-6"),
             fallback_model_ids=data.get("fallback_model_ids", ["gpt-4o"]),
             allow_mid_run_switching=data.get("allow_mid_run_switching", True),
         )
@@ -242,6 +254,12 @@ class ExecutionPolicy:
     phase_timeout_minutes: int = 60        # Max time per phase
     total_timeout_minutes: int = 480       # Max total execution time (8 hours)
 
+    # Phase skipping (agent-specific)
+    skip_phases: Set[str] = field(default_factory=set)  # Phases to skip (e.g., {"testing", "fixing"})
+
+    # Workspace provisioning (controls whether to provision isolated workspace)
+    require_workspace: bool = True  # False for read-only research tasks
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "phase_gates": {k: v.value for k, v in self.phase_gates.items()},
@@ -252,6 +270,8 @@ class ExecutionPolicy:
             "max_total_steps": self.max_total_steps,
             "phase_timeout_minutes": self.phase_timeout_minutes,
             "total_timeout_minutes": self.total_timeout_minutes,
+            "skip_phases": list(self.skip_phases),
+            "require_workspace": self.require_workspace,
         }
 
     @classmethod
@@ -269,6 +289,8 @@ class ExecutionPolicy:
             max_total_steps=data.get("max_total_steps", 100),
             phase_timeout_minutes=data.get("phase_timeout_minutes", 60),
             total_timeout_minutes=data.get("total_timeout_minutes", 480),
+            skip_phases=set(data.get("skip_phases", [])),
+            require_workspace=data.get("require_workspace", True),
         )
 
     @classmethod
@@ -285,6 +307,74 @@ class ExecutionPolicy:
                 "verifying": GatePolicyType.NONE,
                 "completing": GatePolicyType.NONE,
             }
+        )
+
+    @classmethod
+    def for_research_agent(cls) -> "ExecutionPolicy":
+        """Create execution policy for research agents.
+
+        Research agents skip TESTING/FIXING/VERIFYING phases since they produce
+        analysis and recommendations, not code that needs testing.
+
+        They use the local project directory (no isolated workspace) since
+        research tasks only READ files and don't execute/build code.
+        """
+        return cls(
+            phase_gates={
+                "planning": GatePolicyType.NONE,
+                "clarifying": GatePolicyType.NONE,
+                "architecting": GatePolicyType.NONE,
+                "executing": GatePolicyType.NONE,
+                "testing": GatePolicyType.NONE,
+                "fixing": GatePolicyType.NONE,
+                "verifying": GatePolicyType.NONE,
+                "completing": GatePolicyType.NONE,
+            },
+            skip_phases={"testing", "fixing", "verifying"},
+            internet_access=InternetAccessPolicy.ENABLED,  # Research agents need web access
+            write_scope=WriteScope.READ_ONLY,  # Research agents don't write code
+            require_workspace=False,  # Use local project directory (no container)
+        )
+
+    @classmethod
+    def for_architect_agent(cls) -> "ExecutionPolicy":
+        """Create execution policy for architect agents.
+
+        Architect agents skip TESTING/FIXING phases since they produce ADRs
+        and architectural documents, not executable code.
+        """
+        return cls(
+            phase_gates={
+                "planning": GatePolicyType.NONE,
+                "clarifying": GatePolicyType.SOFT,  # May need clarification
+                "architecting": GatePolicyType.NONE,
+                "executing": GatePolicyType.NONE,
+                "testing": GatePolicyType.NONE,
+                "fixing": GatePolicyType.NONE,
+                "verifying": GatePolicyType.SOFT,  # Review before completing
+                "completing": GatePolicyType.NONE,
+            },
+            skip_phases={"testing", "fixing"},
+        )
+
+    @classmethod
+    def for_engineering_agent(cls) -> "ExecutionPolicy":
+        """Create execution policy for engineering agents.
+
+        Engineering agents run all phases including TESTING/FIXING.
+        """
+        return cls(
+            phase_gates={
+                "planning": GatePolicyType.NONE,
+                "clarifying": GatePolicyType.SOFT,
+                "architecting": GatePolicyType.SOFT,
+                "executing": GatePolicyType.NONE,
+                "testing": GatePolicyType.NONE,
+                "fixing": GatePolicyType.NONE,
+                "verifying": GatePolicyType.STRICT,  # Require verification review
+                "completing": GatePolicyType.NONE,
+            },
+            skip_phases=set(),  # Run all phases
         )
 
 
@@ -401,6 +491,7 @@ class ExecutionStatusResponse:
     error: Optional[str] = None
     model_id: Optional[str] = None
     step_count: int = 0
+    pending_clarifications: Optional[List[Dict[str, Any]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -416,6 +507,7 @@ class ExecutionStatusResponse:
             "error": self.error,
             "model_id": self.model_id,
             "step_count": self.step_count,
+            "pending_clarifications": self.pending_clarifications,
         }
 
 

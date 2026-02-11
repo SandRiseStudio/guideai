@@ -18,7 +18,7 @@ import { ConnectionState } from './client.js';
 // ---------------------------------------------------------------------------
 
 export interface ExecutionStreamConfig {
-  /** WebSocket base URL origin (e.g., http://localhost:8000) */
+  /** WebSocket base URL origin (e.g., http://localhost:8080) */
   baseUrl: string;
   /** Optional auth token passed as a query param */
   authToken?: string;

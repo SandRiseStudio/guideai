@@ -9,6 +9,7 @@ See WORK_ITEM_EXECUTION_PLAN.md for full specification.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import uuid
 from abc import ABC, abstractmethod
@@ -279,7 +280,26 @@ class AnthropicAdapter(ProviderAdapter):
 
         # Check if response indicates completion or clarification needed
         phase_complete = response.stop_reason == "end_turn" and not tool_calls
-        needs_clarification = "clarification" in content.lower() or "question" in content.lower()
+
+        # Only trigger clarification if the LLM is explicitly asking for user input
+        # Look for explicit clarification requests, not just mentions of "question"
+        content_lower = content.lower()
+        needs_clarification = (
+            # Explicit clarification patterns
+            "need clarification" in content_lower or
+            "please clarify" in content_lower or
+            "could you clarify" in content_lower or
+            "can you clarify" in content_lower or
+            "require clarification" in content_lower or
+            "before i proceed" in content_lower or
+            "before proceeding" in content_lower or
+            # Explicit question patterns directed at user
+            "could you please" in content_lower or
+            "can you please" in content_lower or
+            "i need to know" in content_lower or
+            "please let me know" in content_lower or
+            "please provide" in content_lower
+        )
 
         clarification_questions: List[ClarificationQuestion] = []
         if needs_clarification:
@@ -467,7 +487,26 @@ class OpenAIAdapter(ProviderAdapter):
 
         # Check if response indicates completion or clarification needed
         phase_complete = choice.finish_reason == "stop" and not tool_calls
-        needs_clarification = "clarification" in content.lower() or "question" in content.lower()
+
+        # Only trigger clarification if the LLM is explicitly asking for user input
+        # Look for explicit clarification requests, not just mentions of "question"
+        content_lower = content.lower()
+        needs_clarification = (
+            # Explicit clarification patterns
+            "need clarification" in content_lower or
+            "please clarify" in content_lower or
+            "could you clarify" in content_lower or
+            "can you clarify" in content_lower or
+            "require clarification" in content_lower or
+            "before i proceed" in content_lower or
+            "before proceeding" in content_lower or
+            # Explicit question patterns directed at user
+            "could you please" in content_lower or
+            "can you please" in content_lower or
+            "i need to know" in content_lower or
+            "please let me know" in content_lower or
+            "please provide" in content_lower
+        )
 
         clarification_questions: List[ClarificationQuestion] = []
         if needs_clarification:
@@ -563,6 +602,38 @@ class AgentLLMClient:
 
         return None
 
+    @staticmethod
+    def _estimate_tokens_from_text(text: str) -> int:
+        """Estimate token count from text length.
+
+        Uses a conservative heuristic of ~4 characters per token.
+        """
+        if not text:
+            return 0
+        return max(1, math.ceil(len(text) / 4))
+
+    @staticmethod
+    def _estimate_tokens_from_messages(messages: List[Dict[str, Any]]) -> int:
+        """Estimate input tokens from message contents."""
+        if not messages:
+            return 0
+
+        total_chars = 0
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            total_chars += len(text)
+            elif content is not None:
+                total_chars += len(str(content))
+
+        return max(1, math.ceil(total_chars / 4))
+
     def _get_adapter(
         self,
         model_id: str,
@@ -650,6 +721,16 @@ class AgentLLMClient:
         # Track metrics
         metrics = adapter.get_metrics()
         self._call_history.append(metrics)
+
+        # Backfill token counts if provider did not return usage
+        if response.input_tokens == 0 and metrics.input_tokens:
+            response.input_tokens = metrics.input_tokens
+        if response.output_tokens == 0 and metrics.output_tokens:
+            response.output_tokens = metrics.output_tokens
+
+        if response.input_tokens == 0 and response.output_tokens == 0:
+            response.input_tokens = self._estimate_tokens_from_messages(messages)
+            response.output_tokens = self._estimate_tokens_from_text(response.text_output)
 
         # Emit telemetry
         self._telemetry.emit_event(

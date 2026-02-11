@@ -248,10 +248,25 @@ def _get_reflection_adapter() -> CLIReflectionAdapter:
 
 
 def _get_run_adapter() -> CLIRunServiceAdapter:
-    """Get or create CLIRunServiceAdapter singleton."""
+    """Get or create CLIRunServiceAdapter singleton.
+
+    Uses PostgreSQL backend when GUIDEAI_RUN_PG_DSN is set,
+    otherwise falls back to SQLite (not recommended for production).
+    """
     global _RUN_SERVICE, _RUN_ADAPTER
     if _RUN_SERVICE is None:
-        _RUN_SERVICE = RunService()
+        dsn = apply_host_overrides(os.environ.get("GUIDEAI_RUN_PG_DSN"), "RUN")
+        if dsn:
+            from guideai.run_service_postgres import PostgresRunService
+            _RUN_SERVICE = PostgresRunService(dsn=dsn)
+        else:
+            import warnings
+            warnings.warn(
+                "GUIDEAI_RUN_PG_DSN not set - using SQLite RunService (not recommended for production)",
+                UserWarning,
+                stacklevel=2,
+            )
+            _RUN_SERVICE = RunService()
     if _RUN_ADAPTER is None:
         _RUN_ADAPTER = CLIRunServiceAdapter(_RUN_SERVICE)
     return _RUN_ADAPTER
@@ -703,6 +718,90 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     behaviors_delete_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
     behaviors_delete_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
 
+    # Propose: create behavior from observed pattern with confidence scoring
+    behaviors_propose_parser = behaviors_subparsers.add_parser(
+        "propose",
+        help="Propose a new behavior from observed patterns (triggers auto-approval if confidence >= 0.8)",
+    )
+    behaviors_propose_parser.add_argument("--name", required=True, help="Behavior name (must follow behavior_<verb>_<noun> pattern)")
+    behaviors_propose_parser.add_argument("--description", required=True, help="Short description of the behavior")
+    behaviors_propose_parser.add_argument("--instruction", required=True, help="Detailed instruction text")
+    behaviors_propose_parser.add_argument(
+        "--role",
+        dest="role_focus",
+        required=True,
+        choices=["STRATEGIST", "TEACHER", "STUDENT"],
+        help="Primary role this behavior targets",
+    )
+    behaviors_propose_parser.add_argument(
+        "--confidence",
+        dest="confidence_score",
+        type=float,
+        default=0.0,
+        help="Confidence score 0.0-1.0 (>= 0.8 with 3+ validations triggers auto-approval)",
+    )
+    behaviors_propose_parser.add_argument(
+        "--validation",
+        dest="historical_validations",
+        action="append",
+        default=[],
+        help="Run ID that validated this pattern (repeatable, need 3+ for auto-approval)",
+    )
+    behaviors_propose_parser.add_argument(
+        "--keyword",
+        dest="keywords",
+        action="append",
+        default=[],
+        help="Trigger keyword hint (repeatable)",
+    )
+    behaviors_propose_parser.add_argument(
+        "--tag",
+        dest="tags",
+        action="append",
+        default=[],
+        help="Tag to apply (repeatable)",
+    )
+    behaviors_propose_parser.add_argument("--pattern-id", help="TraceAnalysisService pattern ID that triggered proposal")
+    behaviors_propose_parser.add_argument("--rationale", help="Rationale for why this behavior should exist")
+    behaviors_propose_parser.add_argument(
+        "--proposed-by-role",
+        default="Strategist",
+        choices=["Student", "Teacher", "Strategist"],
+        help="Role of the agent proposing this behavior",
+    )
+    behaviors_propose_parser.add_argument("--metadata-file", help="Path to JSON file with metadata object")
+    behaviors_propose_parser.add_argument("--examples-file", help="Path to JSON file with example objects")
+    behaviors_propose_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
+    behaviors_propose_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
+    behaviors_propose_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    # Get-for-task: retrieve relevant behaviors for a task description
+    behaviors_get_for_task_parser = behaviors_subparsers.add_parser(
+        "get-for-task",
+        help="Get relevant behaviors for a task (use before starting any task)",
+    )
+    behaviors_get_for_task_parser.add_argument("task_description", help="Natural language task description")
+    behaviors_get_for_task_parser.add_argument(
+        "--role",
+        default="Student",
+        choices=["Student", "Teacher", "Strategist", "any"],
+        help="Agent's current role (for role-specific advisory)",
+    )
+    behaviors_get_for_task_parser.add_argument("--limit", type=int, default=5, help="Maximum behaviors to return")
+    behaviors_get_for_task_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
+    behaviors_get_for_task_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
+    behaviors_get_for_task_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
     # Compliance subcommands
     compliance_parser = subparsers.add_parser(
         "compliance",
@@ -1019,6 +1118,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=[],
         help="Behavior ID to attach (repeatable)",
     )
+    workflow_run_parser.add_argument(
+        "--no-early-retrieval",
+        dest="no_early_retrieval",
+        action="store_true",
+        default=False,
+        help="Disable Early Knowledge Alignment (EKA) - don't retrieve behaviors before planning",
+    )
     workflow_run_parser.add_argument("--metadata-file", help="Path to JSON metadata object")
     workflow_run_parser.add_argument("--actor-id", default=DEFAULT_ACTOR_ID, help="Actor identifier")
     workflow_run_parser.add_argument("--actor-role", default=DEFAULT_ACTOR_ROLE, help="Actor role")
@@ -1062,6 +1168,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="append",
         default=[],
         help="Behavior ID to use (repeatable)",
+    )
+    run_create_parser.add_argument(
+        "--no-early-retrieval",
+        dest="no_early_retrieval",
+        action="store_true",
+        default=False,
+        help="Disable Early Knowledge Alignment (EKA) - don't retrieve behaviors before planning",
     )
     run_create_parser.add_argument("--metadata-file", help="Path to JSON metadata object")
     run_create_parser.add_argument("--message", help="Initial message/description")
@@ -1878,7 +1991,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--api-url",
         dest="api_url",
         default=None,
-        help="API URL for registration (default: $GUIDEAI_API_URL or http://localhost:8000)",
+        help="Gateway URL (default: $GUIDEAI_GATEWAY_URL or http://localhost:8080)",
     )
 
     # auth status
@@ -2590,6 +2703,243 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Output format",
     )
 
+    # ── Research evaluation commands ────────────────────────────────────────────
+    research_parser = subparsers.add_parser(
+        "research",
+        help="AI research evaluation pipeline - evaluate papers/articles for GuideAI integration",
+    )
+    research_subparsers = research_parser.add_subparsers(dest="research_command")
+
+    research_evaluate_parser = research_subparsers.add_parser(
+        "evaluate",
+        help="Evaluate a research paper or article for GuideAI integration",
+    )
+    research_evaluate_parser.add_argument(
+        "source",
+        help="Source to evaluate: URL, file path (.md/.pdf/.doc), or arXiv ID",
+    )
+    research_evaluate_parser.add_argument(
+        "--title",
+        help="Override paper title (auto-extracted if not specified)",
+    )
+    research_evaluate_parser.add_argument(
+        "--model",
+        default=None,
+        help="LLM model to use (default: ANTHROPIC_MODEL env var or claude-opus-4-20250514)",
+    )
+    research_evaluate_parser.add_argument(
+        "--output",
+        help="Path to save markdown report (defaults to stdout)",
+    )
+    research_evaluate_parser.add_argument(
+        "--phase",
+        choices=["comprehend", "evaluate", "recommend", "full"],
+        default="full",
+        help="Run specific phase only or full pipeline (default: full)",
+    )
+    research_evaluate_parser.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Output format (default: markdown)",
+    )
+    research_evaluate_parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Skip saving evaluation to database",
+    )
+
+    research_list_parser = research_subparsers.add_parser(
+        "list",
+        help="List previously evaluated papers",
+    )
+    research_list_parser.add_argument(
+        "--verdict",
+        choices=["ADOPT", "ADAPT", "DEFER", "REJECT"],
+        help="Filter by verdict",
+    )
+    research_list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of results (default: 20)",
+    )
+    research_list_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    research_get_parser = research_subparsers.add_parser(
+        "get",
+        help="Get details of a previously evaluated paper",
+    )
+    research_get_parser.add_argument(
+        "paper_id",
+        help="Paper ID to retrieve",
+    )
+    research_get_parser.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Output format (default: markdown)",
+    )
+
+    research_export_parser = research_subparsers.add_parser(
+        "export",
+        help="Export evaluations to file",
+    )
+    research_export_parser.add_argument(
+        "output",
+        help="Output file path (.md or .json)",
+    )
+    research_export_parser.add_argument(
+        "--verdict",
+        choices=["ADOPT", "ADAPT", "DEFER", "REJECT"],
+        help="Filter by verdict",
+    )
+    research_export_parser.add_argument(
+        "--since",
+        help="Only include evaluations since date (YYYY-MM-DD)",
+    )
+
+    # research index - regenerate the research index
+    research_index_parser = research_subparsers.add_parser(
+        "index",
+        help="Regenerate the RESEARCH_INDEX.md file",
+    )
+
+    # research handoff - create work items from ADOPT/ADAPT evaluations
+    research_handoff_parser = research_subparsers.add_parser(
+        "handoff",
+        help="Create handoff work items for ADOPT/ADAPT evaluations to the next agent",
+    )
+    research_handoff_parser.add_argument(
+        "paper_id",
+        nargs="?",
+        help="Paper ID to create handoff for (or 'all' for pending handoffs)",
+    )
+    research_handoff_parser.add_argument(
+        "--project-id",
+        help="Project ID to create work items in (required)",
+    )
+    research_handoff_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be created without actually creating",
+    )
+
+    # ── Architect agent commands ────────────────────────────────────────────────
+    architect_parser = subparsers.add_parser(
+        "architect",
+        help="Architect agent - design systems and create ADRs from research handoffs",
+    )
+    architect_subparsers = architect_parser.add_subparsers(dest="architect_command")
+
+    architect_pickup_parser = architect_subparsers.add_parser(
+        "pickup",
+        help="Find and process work items assigned to the architect agent",
+    )
+    architect_pickup_parser.add_argument(
+        "work_item_id",
+        nargs="?",
+        help="Specific work item ID to process (or omit to find pending items)",
+    )
+    architect_pickup_parser.add_argument(
+        "--project-id",
+        help="Project ID to search for work items",
+    )
+    architect_pickup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be processed without executing",
+    )
+    architect_pickup_parser.add_argument(
+        "--output",
+        help="Directory to save ADR output (default: docs/adr/)",
+    )
+
+    architect_list_parser = architect_subparsers.add_parser(
+        "list",
+        help="List pending work items for the architect agent",
+    )
+    architect_list_parser.add_argument(
+        "--project-id",
+        help="Project ID to search for work items",
+    )
+    architect_list_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # ------------------------------------------------------------------
+    # work-item subcommand group
+    # ------------------------------------------------------------------
+    wi_parser = subparsers.add_parser(
+        "work-item",
+        help="Work item execution commands (execute, status, clarify, approve-gate)",
+    )
+    wi_subparsers = wi_parser.add_subparsers(dest="wi_command")
+
+    # work-item execute
+    wi_execute_parser = wi_subparsers.add_parser(
+        "execute",
+        help="Start execution of a work item using its assigned agent",
+    )
+    wi_execute_parser.add_argument("item_id", help="Work item ID")
+    wi_execute_parser.add_argument("--project-id", required=True, help="Project ID")
+    wi_execute_parser.add_argument("--org-id", help="Organization ID")
+    wi_execute_parser.add_argument("--model", help="Model override")
+    wi_execute_parser.add_argument(
+        "--callback-url",
+        help="Webhook URL for gate event notifications",
+    )
+    wi_execute_parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Watch execution events via SSE stream after starting",
+    )
+    wi_execute_parser.add_argument("--format", choices=["table", "json"], default="table")
+
+    # work-item status
+    wi_status_parser = wi_subparsers.add_parser(
+        "status",
+        help="Get execution status of a work item",
+    )
+    wi_status_parser.add_argument("item_id", help="Work item ID")
+    wi_status_parser.add_argument("--project-id", required=True, help="Project ID")
+    wi_status_parser.add_argument("--org-id", help="Organization ID")
+    wi_status_parser.add_argument("--format", choices=["table", "json"], default="table")
+
+    # work-item clarify
+    wi_clarify_parser = wi_subparsers.add_parser(
+        "clarify",
+        help="Provide a clarification response for a paused execution",
+    )
+    wi_clarify_parser.add_argument("item_id", help="Work item ID")
+    wi_clarify_parser.add_argument("--project-id", required=True, help="Project ID")
+    wi_clarify_parser.add_argument("--org-id", help="Organization ID")
+    wi_clarify_parser.add_argument(
+        "--clarification-id", required=True, help="ID of the clarification question",
+    )
+    wi_clarify_parser.add_argument(
+        "--response", required=True, help="Clarification response text",
+    )
+
+    # work-item approve-gate
+    wi_approve_parser = wi_subparsers.add_parser(
+        "approve-gate",
+        help="Approve a strict gate and resume execution",
+    )
+    wi_approve_parser.add_argument("item_id", help="Work item ID")
+    wi_approve_parser.add_argument("--project-id", required=True, help="Project ID")
+    wi_approve_parser.add_argument("--org-id", help="Organization ID")
+    wi_approve_parser.add_argument("--phase", help="Phase gate to approve")
+    wi_approve_parser.add_argument("--notes", help="Approval notes/feedback")
+
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
@@ -2626,6 +2976,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.exit(1)
     if args.command == "migrate" and not getattr(args, "migrate_command", None):
         migrate_parser.print_help()
+        parser.exit(1)
+    if args.command == "research" and not getattr(args, "research_command", None):
+        research_parser.print_help()
+        parser.exit(1)
+    if args.command == "architect" and not getattr(args, "architect_command", None):
+        architect_parser.print_help()
+        parser.exit(1)
+    if args.command == "work-item" and not getattr(args, "wi_command", None):
+        wi_parser.print_help()
         parser.exit(1)
     return args
 
@@ -3031,6 +3390,141 @@ def _command_behaviors_delete_draft(args: argparse.Namespace) -> int:
         _print_json({"status": "deleted", "behavior_id": args.behavior_id, "version": args.version})
     else:
         print(f"Deleted draft version {args.version} for behavior {args.behavior_id}")
+    return 0
+
+
+def _command_behaviors_propose(args: argparse.Namespace) -> int:
+    """Propose a new behavior from observed patterns.
+
+    Implements the behavior proposal workflow from AGENTS.md:
+    - Phase 2 (PROPOSE): Strategist drafts behavior
+    - Auto-approval if confidence >= 0.8 and 3+ validations
+    - Otherwise, creates draft for Teacher review
+    """
+    from guideai.behavior_service import (
+        BehaviorService,
+        ProposeBehaviorRequest,
+        RoleContext,
+    )
+    from guideai.action_contracts import Actor
+
+    try:
+        # Load optional metadata and examples
+        metadata = _load_metadata([], args.metadata_file) if args.metadata_file else {}
+        examples = _load_examples(args.examples_file) if args.examples_file else []
+
+        # Build proposal request
+        request = ProposeBehaviorRequest(
+            name=args.name,
+            description=args.description,
+            instruction=args.instruction,
+            role_focus=args.role_focus,
+            trigger_keywords=args.keywords or [],
+            tags=args.tags or [],
+            examples=examples,
+            metadata=metadata,
+            confidence_score=args.confidence_score,
+            historical_validations=args.historical_validations or [],
+            pattern_id=args.pattern_id,
+            proposed_by_role=args.proposed_by_role,
+            rationale=args.rationale,
+        )
+
+        # Build role context for telemetry (optional but emphasized)
+        role_context = RoleContext(
+            role=args.proposed_by_role,
+            rationale=f"Proposing behavior: {args.name}",
+            behaviors_cited=["behavior_curate_behavior_handbook"],
+        )
+
+        actor = Actor(id=args.actor_id, role=args.actor_role)
+
+        # Get service and propose
+        service = BehaviorService()
+        result = service.propose_behavior(request, actor, role_context)
+
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        # Table format with color indicators
+        if result.get("auto_approved"):
+            print(f"✅ Behavior auto-approved: {result['behavior_id']}")
+            print(f"   Confidence: {result['confidence_score']:.2f}")
+            print(f"   Status: APPROVED")
+        else:
+            print(f"📋 Behavior proposed for Teacher review: {result['behavior_id']}")
+            print(f"   Confidence: {result['confidence_score']:.2f}")
+            print(f"   Status: DRAFT (needs Teacher validation)")
+            print(f"   Message: {result['message']}")
+    return 0
+
+
+def _command_behaviors_get_for_task(args: argparse.Namespace) -> int:
+    """Get relevant behaviors for a task before execution.
+
+    This is the primary command agents should use at the start of any task
+    to retrieve applicable behaviors. Returns role-specific advisory.
+    """
+    from guideai.behavior_service import BehaviorService, RoleContext
+    from guideai.action_contracts import Actor
+
+    try:
+        service = BehaviorService()
+        actor = Actor(id=args.actor_id, role=args.actor_role)
+
+        # Build role context for telemetry
+        role_context = RoleContext(
+            role=args.role,
+            rationale=f"Retrieving behaviors for task: {args.task_description[:50]}...",
+        )
+
+        result = service.get_relevant_behaviors_for_task(
+            task_description=args.task_description,
+            role=args.role,
+            limit=args.limit,
+            actor=actor,
+            role_context=role_context,
+        )
+
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        # Serialize behaviors for JSON output
+        output = {
+            "role": result["role"],
+            "task_description": result["task_description"],
+            "role_advisory": result["role_advisory"],
+            "recommended_behaviors": result["recommended_behaviors"],
+        }
+        _print_json(output)
+    else:
+        # Table format with advisory
+        print(f"\n{result['role_advisory']}\n")
+        print("=" * 60)
+
+        if not result["recommended_behaviors"]:
+            print("No matching behaviors found.")
+        else:
+            for i, behavior in enumerate(result["recommended_behaviors"], 1):
+                print(f"\n{i}. {behavior['name']}")
+                print(f"   Role: {behavior['role_focus']} | Score: {behavior['score']:.2f}")
+                if behavior.get('confidence_score'):
+                    print(f"   Confidence: {behavior['confidence_score']:.2f}")
+                print(f"   Keywords: {', '.join(behavior['trigger_keywords'][:5])}")
+                # Truncate instruction for display
+                instruction = behavior['instruction'][:100]
+                if len(behavior['instruction']) > 100:
+                    instruction += "..."
+                print(f"   Instruction: {instruction}")
+
+        print("\n" + "=" * 60)
+        print("Cite these behaviors in your work output as: Following `behavior_name` (Role)...")
     return 0
 
 
@@ -4709,7 +5203,7 @@ def _command_auth_revoke(args: argparse.Namespace) -> int:
 
 def _get_internal_auth_api_url() -> str:
     """[DEPRECATED] Get the internal auth API base URL."""
-    return os.getenv("GUIDEAI_API_URL", "http://localhost:8000")
+    return os.getenv("GUIDEAI_GATEWAY_URL", "http://localhost:8080")
 
 
 def _internal_auth_register(
@@ -6095,12 +6589,16 @@ def _command_workflow_run(args: argparse.Namespace) -> int:
         if args.metadata_file:
             metadata = _load_metadata([], args.metadata_file)
 
+        # --no-early-retrieval flag disables EKA
+        enable_early_retrieval = not getattr(args, "no_early_retrieval", False)
+
         run = adapter.run_workflow(
             template_id=args.template_id,
             behavior_ids=args.behavior_ids or None,
             metadata=metadata,
             actor_id=args.actor_id,
             actor_role=args.actor_role,
+            enable_early_retrieval=enable_early_retrieval,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -7378,6 +7876,1046 @@ def _command_migrate_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─── Research Evaluation Commands ───────────────────────────────────────────────
+
+
+def _command_research_evaluate(args: argparse.Namespace) -> int:
+    """Evaluate a research paper or article for GuideAI integration."""
+    import asyncio
+    from guideai.research_service import ResearchService
+    from guideai.research.report import render_report
+    from guideai.research_contracts import EvaluatePaperRequest
+
+    async def run_evaluation():
+        service = ResearchService(llm_model=args.model)
+
+        # Run the full evaluation pipeline
+        request = EvaluatePaperRequest(
+            source=args.source,
+            llm_model=args.model,
+            save_to_db=not getattr(args, "no_save", False),
+        )
+
+        phase = getattr(args, "phase", "full")
+
+        # Store title override for phase execution
+        title_override = args.title
+
+        if phase == "full":
+            response = service.evaluate(request)
+
+            if args.format == "json":
+                import json
+                import dataclasses
+
+                def serialize(obj):
+                    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+                        return dataclasses.asdict(obj)
+                    elif hasattr(obj, 'value'):  # Enum
+                        return obj.value
+                    return str(obj)
+
+                output = json.dumps(dataclasses.asdict(response), default=serialize, indent=2)
+            else:
+                output = render_report(
+                    response.ingested_paper,
+                    response.comprehension,
+                    response.evaluation,
+                    response.recommendation,
+                )
+
+            # Output
+            if args.output:
+                Path(args.output).write_text(output, encoding="utf-8")
+                print(f"Report saved to: {args.output}")
+            else:
+                print(output)
+
+            # Already saved if save_to_db=True in request
+            if request.save_to_db:
+                print(f"\n💾 Evaluation saved with paper_id: {response.paper_id}", file=sys.stderr)
+
+            return 0
+        else:
+            # Run specific phase only
+            import dataclasses
+            from guideai.research_contracts import IngestPaperRequest
+
+            print(f"📄 [Ingest] Loading paper from: {args.source}", file=sys.stderr)
+            ingest_request = IngestPaperRequest(
+                source=args.source,
+                title_override=title_override,
+            )
+            paper = service.ingest_paper(ingest_request)
+            print(f"✓ [Ingest] Loaded: {paper.metadata.title} ({paper.word_count:,} words)", file=sys.stderr)
+
+            if phase == "comprehend":
+                print(f"🧠 [Comprehend] Analyzing with {service.llm_model}...", file=sys.stderr)
+                result = service.comprehend_paper(paper)
+                print(f"✓ [Comprehend] Complete. Novelty: {result.novelty_score}/10", file=sys.stderr)
+                _print_json(dataclasses.asdict(result) if hasattr(result, '__dataclass_fields__') else result)
+            elif phase == "evaluate":
+                print(f"🧠 [Comprehend] Analyzing with {service.llm_model}...", file=sys.stderr)
+                comprehension = service.comprehend_paper(paper)
+                print(f"✓ [Comprehend] Complete.", file=sys.stderr)
+                print(f"📊 [Evaluate] Scoring for GuideAI fit...", file=sys.stderr)
+                result = service.evaluate_paper(comprehension)
+                print(f"✓ [Evaluate] Overall score: {result.overall_score:.1f}/10", file=sys.stderr)
+                _print_json(dataclasses.asdict(result) if hasattr(result, '__dataclass_fields__') else result)
+            elif phase == "recommend":
+                print(f"🧠 [Comprehend] Analyzing with {service.llm_model}...", file=sys.stderr)
+                comprehension = service.comprehend_paper(paper)
+                print(f"✓ [Comprehend] Complete.", file=sys.stderr)
+                print(f"📊 [Evaluate] Scoring for GuideAI fit...", file=sys.stderr)
+                evaluation = service.evaluate_paper(comprehension)
+                print(f"✓ [Evaluate] Overall score: {evaluation.overall_score:.1f}/10", file=sys.stderr)
+                print(f"🎯 [Recommend] Generating verdict...", file=sys.stderr)
+                result = service.recommend(paper, comprehension, evaluation)
+                print(f"✓ [Recommend] Verdict: {result.verdict.value}", file=sys.stderr)
+                _print_json(dataclasses.asdict(result) if hasattr(result, '__dataclass_fields__') else result)
+
+            return 0
+
+    return asyncio.run(run_evaluation())
+
+
+def _command_research_list(args: argparse.Namespace) -> int:
+    """List previously evaluated papers."""
+    import asyncio
+    from guideai.research_service import ResearchStorage
+    from guideai.research_contracts import Verdict
+
+    async def run_list():
+        storage = ResearchStorage()
+
+        verdict_filter = None
+        if args.verdict:
+            verdict_filter = Verdict(args.verdict)
+
+        papers = await storage.search_papers(
+            verdict=verdict_filter,
+            limit=args.limit,
+        )
+
+        if args.format == "json":
+            _print_json([p.__dict__ if hasattr(p, '__dict__') else p for p in papers])
+        else:
+            if not papers:
+                print("No evaluated papers found.")
+                return 0
+
+            # Table format
+            print(f"{'ID':<36} {'Title':<40} {'Verdict':<8} {'Score':<6} {'Date'}")
+            print("-" * 100)
+            for p in papers:
+                title = (p.title[:37] + "...") if len(p.title) > 40 else p.title
+                print(f"{p.id:<36} {title:<40} {p.verdict:<8} {p.overall_score:<6.2f} {p.evaluated_at}")
+
+        return 0
+
+    return asyncio.run(run_list())
+
+
+def _command_research_get(args: argparse.Namespace) -> int:
+    """Get details of a previously evaluated paper."""
+    import asyncio
+    from guideai.research_service import ResearchStorage
+    from guideai.research.report import render_report
+
+    async def run_get():
+        storage = ResearchStorage()
+
+        result = await storage.get_paper(args.paper_id)
+
+        if result is None:
+            print(f"Paper not found: {args.paper_id}", file=sys.stderr)
+            return 1
+
+        paper, comprehension, evaluation, recommendation = result
+
+        if args.format == "json":
+            import dataclasses
+            _print_json({
+                "paper": dataclasses.asdict(paper),
+                "comprehension": dataclasses.asdict(comprehension),
+                "evaluation": dataclasses.asdict(evaluation),
+                "recommendation": dataclasses.asdict(recommendation),
+            })
+        else:
+            print(render_report(paper, comprehension, evaluation, recommendation))
+
+        return 0
+
+    return asyncio.run(run_get())
+
+
+def _command_research_export(args: argparse.Namespace) -> int:
+    """Export evaluations to file."""
+    import asyncio
+    from datetime import datetime
+    from guideai.research_service import ResearchStorage
+    from guideai.research.report import render_report
+    from guideai.research_contracts import Verdict
+
+    async def run_export():
+        storage = ResearchStorage()
+
+        verdict_filter = None
+        if args.verdict:
+            verdict_filter = Verdict(args.verdict)
+
+        papers = await storage.search_papers(verdict=verdict_filter, limit=1000)
+
+        # Filter by date if specified
+        if args.since:
+            since_date = datetime.strptime(args.since, "%Y-%m-%d")
+            papers = [p for p in papers if datetime.fromisoformat(p.evaluated_at) >= since_date]
+
+        output_path = Path(args.output)
+
+        if output_path.suffix == ".json":
+            import json
+            import dataclasses
+
+            all_data = []
+            for summary in papers:
+                result = await storage.get_paper(summary.id)
+                if result:
+                    paper, comp, eval_, rec = result
+                    all_data.append({
+                        "paper": dataclasses.asdict(paper),
+                        "comprehension": dataclasses.asdict(comp),
+                        "evaluation": dataclasses.asdict(eval_),
+                        "recommendation": dataclasses.asdict(rec),
+                    })
+
+            output_path.write_text(json.dumps(all_data, indent=2, default=str), encoding="utf-8")
+        else:
+            # Markdown export
+            parts = ["# Research Evaluations Export\n"]
+            for summary in papers:
+                result = await storage.get_paper(summary.id)
+                if result:
+                    paper, comp, eval_, rec = result
+                    parts.append(render_report(paper, comp, eval_, rec))
+                    parts.append("\n---\n")
+
+            output_path.write_text("\n".join(parts), encoding="utf-8")
+
+        print(f"Exported {len(papers)} evaluations to: {output_path}")
+        return 0
+
+    return asyncio.run(run_export())
+
+
+def _command_research_index(args: argparse.Namespace) -> int:
+    """Regenerate the RESEARCH_INDEX.md file."""
+    from guideai.research_service import ResearchStorage
+
+    storage = ResearchStorage()
+    index_path = storage.update_research_index()
+
+    if index_path:
+        print(f"✓ Updated research index: {index_path}")
+        return 0
+    else:
+        print("⚠️  No papers found or could not write to project directory")
+        return 1
+
+
+def _command_research_handoff(args: argparse.Namespace) -> int:
+    """Create handoff work items for ADOPT/ADAPT evaluations."""
+    from guideai.research_service import ResearchService
+    from guideai.research_contracts import SearchPapersRequest, Verdict
+    from guideai.services.board_service import BoardService
+    from guideai.multi_tenant.board_contracts import CreateWorkItemRequest, WorkItemType, WorkItemPriority
+    from guideai.action_contracts import Actor
+
+    project_id = args.project_id
+    dry_run = args.dry_run
+    paper_id = args.paper_id
+
+    if not project_id:
+        print("❌ --project-id is required", file=sys.stderr)
+        print("\nTo find your project ID, run: guideai board list-projects", file=sys.stderr)
+        return 1
+
+    research_service = ResearchService()
+    papers_to_process = []
+
+    # Get papers to process
+    if paper_id and paper_id != "all":
+        # Specific paper
+        result = research_service.get_paper(paper_id)
+        if not result:
+            print(f"❌ Paper not found: {paper_id}", file=sys.stderr)
+            return 1
+        if result.recommendation.verdict not in [Verdict.ADOPT, Verdict.ADAPT]:
+            print(f"⚠️  Paper {paper_id} has verdict {result.recommendation.verdict.value} - handoff only for ADOPT/ADAPT", file=sys.stderr)
+            return 1
+        papers_to_process = [result]
+    else:
+        # All ADOPT/ADAPT papers
+        for verdict in [Verdict.ADOPT, Verdict.ADAPT]:
+            search_result = research_service.search_papers(SearchPapersRequest(verdict=verdict))
+            for summary in search_result.papers:
+                full_paper = research_service.get_paper(summary.paper_id)
+                if full_paper:
+                    papers_to_process.append(full_paper)
+
+    if not papers_to_process:
+        print("ℹ️  No ADOPT/ADAPT papers found to create handoffs for")
+        return 0
+
+    print(f"📋 Found {len(papers_to_process)} paper(s) to create handoffs for")
+
+    if dry_run:
+        print("\n🔍 DRY RUN - would create:")
+        for paper_result in papers_to_process:
+            rec = paper_result.recommendation
+            eval_ = paper_result.evaluation
+            print(f"  • {paper_result.paper_title} ({paper_result.paper_id})")
+            print(f"    Verdict: {rec.verdict.value} ({eval_.overall_score:.1f}/10)")
+            print(f"    Next Agent: {rec.next_agent or 'architect'}")
+        return 0
+
+    # Initialize BoardService (handles its own connection pool)
+    try:
+        board_service = BoardService()
+    except Exception as e:
+        print(f"❌ Failed to connect to database: {e}", file=sys.stderr)
+        print("Make sure PostgreSQL is running and DATABASE_URL is configured", file=sys.stderr)
+        return 1
+
+    # Get the first board for the project
+    boards = board_service.list_boards(project_id=project_id)
+    if not boards:
+        print(f"❌ No boards found for project {project_id}", file=sys.stderr)
+        return 1
+    board = boards[0]
+
+    # Get columns for the board
+    columns = board_service.list_columns(board.board_id)
+    if not columns:
+        print(f"❌ Board {board.board_id} has no columns", file=sys.stderr)
+        return 1
+    first_column = columns[0]
+
+    actor = Actor(id="research-agent", role="STUDENT", surface="cli")
+    created_count = 0
+
+    for paper_result in papers_to_process:
+        try:
+            rec = paper_result.recommendation
+            eval_ = paper_result.evaluation
+            comp = paper_result.comprehension
+            next_agent = rec.next_agent or "architect"
+
+            # Build work item
+            work_item_request = CreateWorkItemRequest(
+                board_id=board.board_id,
+                column_id=first_column.column_id,
+                title=f"[Research Handoff] {paper_result.paper_title}",
+                description=f"""## Research Handoff
+
+**Paper**: {paper_result.paper_title}
+**Paper ID**: {paper_result.paper_id}
+**Verdict**: {rec.verdict.value} ({eval_.overall_score:.1f}/10)
+**Next Agent**: {next_agent}
+
+### Summary
+{comp.core_idea}
+
+### Implementation Notes
+{comp.proposed_solution or 'See full research report for details.'}
+
+### Scores
+- Relevance: {eval_.relevance_score}/10
+- Feasibility: {eval_.feasibility_score}/10
+- Novelty: {eval_.novelty_score}/10
+- ROI: {eval_.roi_score}/10
+- Safety: {eval_.safety_score}/10
+
+---
+*Auto-generated by Research Agent. Awaiting {next_agent} agent processing.*
+""",
+                item_type=WorkItemType.STORY,
+                priority=WorkItemPriority.MEDIUM,
+                labels=["research-handoff", next_agent, rec.verdict.value.lower()],
+                metadata={
+                    "paper_id": paper_result.paper_id,
+                    "research_verdict": rec.verdict.value,
+                    "overall_score": eval_.overall_score,
+                    "next_agent": next_agent,
+                    "source": "research-agent",
+                },
+            )
+
+            work_item = board_service.create_work_item(work_item_request, actor)
+            print(f"✓ Created work item {work_item.item_id} for: {paper_result.paper_title}")
+            created_count += 1
+
+        except Exception as e:
+            print(f"❌ Failed to create work item for {paper_result.paper_id}: {e}", file=sys.stderr)
+
+    print(f"\n✅ Created {created_count} handoff work item(s)")
+    return 0
+
+
+def _command_architect_list(args: argparse.Namespace) -> int:
+    """List pending work items for the architect agent."""
+    from guideai.services.board_service import BoardService
+    from guideai.multi_tenant.board_contracts import WorkItemStatus
+
+    project_id = args.project_id
+    output_format = args.format
+
+    try:
+        board_service = BoardService()
+    except Exception as e:
+        print(f"❌ Failed to connect to database: {e}", file=sys.stderr)
+        return 1
+
+    # Find work items with 'architect' label
+    work_items = board_service.list_work_items(
+        project_id=project_id,
+        labels=["architect"],
+    )
+
+    if not work_items:
+        print("ℹ️  No work items pending for architect agent")
+        return 0
+
+    if output_format == "json":
+        import json
+        items_data = []
+        for item in work_items:
+            items_data.append({
+                "item_id": item.item_id,
+                "title": item.title,
+                "status": item.status.value,
+                "labels": item.labels,
+                "metadata": item.metadata,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+            })
+        print(json.dumps(items_data, indent=2))
+    else:
+        print(f"📋 Found {len(work_items)} work item(s) for architect agent:\n")
+        for item in work_items:
+            paper_id = item.metadata.get("paper_id", "N/A") if item.metadata else "N/A"
+            score = item.metadata.get("overall_score", "N/A") if item.metadata else "N/A"
+            verdict = item.metadata.get("research_verdict", "N/A") if item.metadata else "N/A"
+            print(f"  {item.item_id}")
+            print(f"    Title:   {item.title}")
+            print(f"    Status:  {item.status.value}")
+            print(f"    Paper:   {paper_id}")
+            print(f"    Score:   {score}/10")
+            print(f"    Verdict: {verdict}")
+            print()
+
+    return 0
+
+
+def _command_architect_pickup(args: argparse.Namespace) -> int:
+    """Pick up and process a work item for the architect agent using LLM."""
+    from guideai.services.board_service import BoardService
+    from guideai.services.work_item_assignment import auto_assign_work_item, find_best_agent_for_work_item
+    from guideai.research_service import ResearchService
+    from guideai.research.codebase_analyzer import CodebaseAnalyzer
+    from guideai.multi_tenant.board_contracts import WorkItemStatus, UpdateWorkItemRequest
+    from guideai.multi_tenant.board_contracts import CreateWorkItemRequest, WorkItemType, WorkItemPriority
+    from guideai.multi_tenant.organization_service import OrganizationService
+    from guideai.action_contracts import Actor
+    from guideai.llm_provider import LLMConfig, ProviderType, get_provider, LLMRequest, LLMMessage
+    from datetime import datetime
+    from pathlib import Path
+    import os
+    import json
+    import re
+
+    work_item_id = args.work_item_id
+    project_id = args.project_id
+    dry_run = args.dry_run
+    output_dir = args.output or "docs/adr"
+
+    try:
+        board_service = BoardService()
+    except Exception as e:
+        print(f"❌ Failed to connect to database: {e}", file=sys.stderr)
+        return 1
+
+    # If no specific work item, find the first pending one
+    if not work_item_id:
+        work_items = board_service.list_work_items(
+            project_id=project_id,
+            labels=["architect"],
+            status=WorkItemStatus.BACKLOG,
+        )
+        if not work_items:
+            print("ℹ️  No pending work items for architect agent")
+            return 0
+        work_item = work_items[0]
+        work_item_id = work_item.item_id
+    else:
+        try:
+            work_item = board_service.get_work_item(work_item_id)
+        except Exception as e:
+            print(f"❌ Work item not found: {work_item_id}", file=sys.stderr)
+            return 1
+
+    print(f"🏗️  Architect Agent (LLM-powered) picking up: {work_item.item_id}")
+    print(f"   Title: {work_item.title}")
+
+    # Extract paper_id from metadata
+    if not work_item.metadata or "paper_id" not in work_item.metadata:
+        print(f"❌ Work item missing paper_id in metadata", file=sys.stderr)
+        return 1
+
+    paper_id = work_item.metadata["paper_id"]
+    print(f"   Paper ID: {paper_id}")
+
+    # Load the full research evaluation
+    research_service = ResearchService()
+    paper_result = research_service.get_paper(paper_id)
+
+    if not paper_result:
+        print(f"❌ Research paper not found: {paper_id}", file=sys.stderr)
+        return 1
+
+    print(f"   Paper: {paper_result.paper_title}")
+    print(f"   Verdict: {paper_result.recommendation.verdict.value}")
+    print(f"   Score: {paper_result.evaluation.overall_score:.1f}/10")
+
+    if dry_run:
+        print("\n🔍 DRY RUN - would process:")
+        print(f"  • Load research evaluation from {paper_id}")
+        print(f"  • Analyze codebase with CodebaseAnalyzer")
+        print(f"  • Load AGENT_ARCHITECT.md playbook")
+        print(f"  • Call LLM for deep architectural analysis")
+        print(f"  • Generate ADR in {output_dir}/")
+        print(f"  • Create implementation work items")
+        return 0
+
+    # Update work item status to IN_PROGRESS
+    actor = Actor(id="architect-agent", role="STRATEGIST", surface="cli")
+    try:
+        board_service.update_work_item(
+            work_item_id,
+            UpdateWorkItemRequest(status=WorkItemStatus.IN_PROGRESS),
+            actor
+        )
+        print("\n📋 Status: IN_PROGRESS")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not update status: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 1: Deep Context Gathering
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("Phase 1: DEEP CONTEXT GATHERING")
+    print("="*70)
+
+    # 1.1 Load Architect Agent Playbook
+    print("\n📖 Loading AGENT_ARCHITECT.md playbook...")
+    project_root = Path(__file__).parent.parent
+    architect_playbook_path = project_root / "agents" / "AGENT_ARCHITECT.md"
+    architect_playbook = ""
+    if architect_playbook_path.exists():
+        architect_playbook = architect_playbook_path.read_text(encoding="utf-8")
+        print(f"   ✓ Loaded playbook ({len(architect_playbook)} chars)")
+    else:
+        print(f"   ⚠️ Playbook not found at {architect_playbook_path}")
+
+    # 1.2 Analyze Codebase
+    print("\n🔍 Analyzing codebase structure...")
+    codebase_analyzer = CodebaseAnalyzer(project_root)
+    codebase_snapshot = codebase_analyzer.get_structural_index()
+    codebase_context = codebase_snapshot.to_context_string()
+    print(f"   ✓ Found {len(codebase_snapshot.services)} services")
+    print(f"   ✓ Found {len(codebase_snapshot.behaviors)} behaviors")
+    print(f"   ✓ Found {len(codebase_snapshot.mcp_tools)} MCP tools")
+    print(f"   ✓ Found {len(codebase_snapshot.db_tables)} database tables")
+
+    # 1.3 Load AGENTS.md for behavior context
+    print("\n📚 Loading AGENTS.md for behavior patterns...")
+    agents_md_path = project_root / "AGENTS.md"
+    agents_md_content = ""
+    if agents_md_path.exists():
+        # Only load the behaviors section to save tokens
+        full_agents = agents_md_path.read_text(encoding="utf-8")
+        behaviors_start = full_agents.find("## 📖 Behaviors")
+        if behaviors_start != -1:
+            agents_md_content = full_agents[behaviors_start:behaviors_start + 8000]
+        else:
+            agents_md_content = full_agents[:8000]
+        print(f"   ✓ Loaded behavior patterns ({len(agents_md_content)} chars)")
+
+    # 1.4 Check existing ADRs for precedent
+    print("\n📁 Checking existing ADRs for design precedent...")
+    adr_dir = Path(output_dir)
+    adr_dir.mkdir(parents=True, exist_ok=True)
+    existing_adrs = list(adr_dir.glob("ADR-*.md"))
+    existing_adr_summaries = []
+    for adr_file in existing_adrs[:5]:  # Only recent 5
+        try:
+            content = adr_file.read_text()[:500]  # First 500 chars
+            existing_adr_summaries.append(f"### {adr_file.name}\n{content}")
+        except Exception:
+            pass
+    print(f"   ✓ Found {len(existing_adrs)} existing ADRs")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 2: Prepare Research Context
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("Phase 2: PREPARING RESEARCH CONTEXT")
+    print("="*70)
+
+    rec = paper_result.recommendation
+    eval_ = paper_result.evaluation
+    comp = paper_result.comprehension
+
+    # Build comprehensive research summary
+    research_context = f"""
+## Research Paper Summary
+
+**Title:** {paper_result.paper_title}
+**Paper ID:** {paper_id}
+**Verdict:** {rec.verdict.value} (Overall Score: {eval_.overall_score:.1f}/10)
+
+### Core Idea
+{comp.core_idea}
+
+### Problem Addressed
+{comp.problem_addressed}
+
+### Proposed Solution
+{comp.proposed_solution}
+
+### Evaluation Scores
+- Relevance to GuideAI: {eval_.relevance_score}/10 - {eval_.relevance_rationale}
+- Feasibility: {eval_.feasibility_score}/10 - {eval_.feasibility_rationale}
+- Novelty: {eval_.novelty_score}/10 - {eval_.novelty_rationale}
+- ROI Potential: {eval_.roi_score}/10 - {eval_.roi_rationale}
+- Safety: {eval_.safety_score}/10 - {eval_.safety_rationale}
+
+### Implementation Complexity
+- Implementation: {eval_.implementation_complexity}
+- Maintenance Burden: {eval_.maintenance_burden}
+- Expertise Gap: {eval_.expertise_gap}
+- Estimated Effort: {eval_.estimated_effort}
+
+### Concerns
+{chr(10).join(f'- {c}' for c in eval_.concerns) if eval_.concerns else 'None identified'}
+
+### Risks
+{chr(10).join(f'- {r}' for r in eval_.risks) if eval_.risks else 'None identified'}
+
+### Potential Benefits
+{chr(10).join(f'- {b}' for b in eval_.potential_benefits) if eval_.potential_benefits else 'See core idea'}
+
+### Verdict Rationale
+{rec.verdict_rationale}
+"""
+
+    # Add implementation roadmap if available
+    if rec.implementation_roadmap:
+        roadmap = rec.implementation_roadmap
+        research_context += f"""
+### Implementation Roadmap from Research Agent
+
+**Affected Components:**
+"""
+        for comp_item in (roadmap.affected_components or []):
+            if isinstance(comp_item, dict):
+                research_context += f"- {comp_item.get('path', 'Unknown')}: {comp_item.get('what_changes', '')}\n"
+            else:
+                research_context += f"- {comp_item}\n"
+
+        research_context += "\n**Proposed Steps:**\n"
+        for step in (roadmap.proposed_steps or []):
+            if isinstance(step, dict):
+                research_context += f"- [{step.get('effort', '?')}] {step.get('description', str(step))}\n"
+            else:
+                research_context += f"- {step}\n"
+
+        if roadmap.success_criteria:
+            research_context += "\n**Success Criteria:**\n"
+            for criterion in roadmap.success_criteria:
+                research_context += f"- {criterion}\n"
+
+    print(f"   ✓ Prepared research context ({len(research_context)} chars)")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 3: LLM-Powered Architectural Analysis
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("Phase 3: LLM-POWERED ARCHITECTURAL ANALYSIS")
+    print("="*70)
+
+    # Initialize LLM
+    print("\n🤖 Initializing LLM for architectural analysis...")
+    llm_model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    if not api_key:
+        print("❌ ANTHROPIC_API_KEY not set", file=sys.stderr)
+        return 1
+
+    config = LLMConfig(
+        provider=ProviderType.ANTHROPIC,
+        model=llm_model,
+        api_key=api_key,
+        max_tokens=8000,
+        temperature=0.2,  # Low temperature for precise technical analysis
+    )
+    llm_provider = get_provider(config)
+    print(f"   ✓ Using model: {llm_model}")
+
+    # Build the architect prompt
+    next_adr_num = len(existing_adrs) + 1
+
+    architect_prompt = f"""You are a Staff+ Principal Architect analyzing research for integration into the GuideAI codebase.
+
+{architect_playbook}
+
+---
+
+# YOUR TASK
+
+Generate a comprehensive Architecture Decision Record (ADR) for integrating the following research into GuideAI.
+
+{research_context}
+
+---
+
+# CODEBASE CONTEXT
+
+{codebase_context}
+
+---
+
+# EXISTING BEHAVIORS (from AGENTS.md)
+
+{agents_md_content[:4000]}
+
+---
+
+# EXISTING ADRs FOR PRECEDENT
+
+{chr(10).join(existing_adr_summaries) if existing_adr_summaries else "No existing ADRs found."}
+
+---
+
+# OUTPUT REQUIREMENTS
+
+Generate a complete ADR in markdown format. The ADR number should be {next_adr_num:04d}.
+
+Your ADR MUST include:
+
+1. **Concrete technical decisions** - Not "TBD", but actual design choices with rationale
+2. **Code examples** - Actual Python code showing data models, API signatures, service methods
+3. **At least 2-3 alternatives considered** for each major decision, with pros/cons
+4. **Specific file paths** that need modification (reference the codebase context)
+5. **Migration strategy** for any data model changes
+6. **Trade-offs explicitly stated** - What are we giving up with this approach?
+7. **Risk/mitigation table** with likelihood and impact ratings
+8. **Phased implementation plan** with specific tasks and effort estimates
+
+Remember: You are a senior architect. Don't just reformat the research - add your own technical insights, identify gaps the research didn't consider, and make opinionated decisions about the best integration approach for THIS codebase.
+
+Output ONLY the ADR markdown content, starting with the # ADR header.
+"""
+
+    print("\n📤 Sending to LLM for architectural analysis...")
+    print("   Streaming output (you'll see the ADR as it's generated):\n")
+    print("-" * 70)
+
+    try:
+        request = LLMRequest(
+            messages=[
+                LLMMessage(role="system", content=architect_playbook),
+                LLMMessage(role="user", content=architect_prompt),
+            ],
+            max_tokens=8192,
+            temperature=0.4,
+        )
+
+        # Stream callback to print chunks as they arrive
+        char_count = [0]  # Use list to allow mutation in closure
+        def stream_callback(chunk: str):
+            print(chunk, end="", flush=True)
+            char_count[0] += len(chunk)
+
+        # Use streaming if available (AnthropicProvider has generate_stream)
+        if hasattr(llm_provider, 'generate_stream'):
+            response = llm_provider.generate_stream(request, callback=stream_callback)
+        else:
+            # Fallback to non-streaming
+            print("   (Streaming not available, waiting for complete response...)")
+            response = llm_provider.generate(request)
+            print(response.content)
+            char_count[0] = len(response.content)
+
+        adr_content = response.content
+        print("\n" + "-" * 70)
+        print(f"\n   ✓ Received ADR ({char_count[0]} chars, {response.output_tokens} tokens)")
+        print(f"   ✓ Input tokens: {response.input_tokens}, Latency: {response.latency_ms:.0f}ms")
+    except Exception as e:
+        print(f"\n❌ LLM call failed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 4: Save ADR
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("Phase 4: SAVING ADR")
+    print("="*70)
+
+    # Create slug from paper title
+    title_slug = paper_result.paper_title.lower()
+    title_slug = re.sub(r'[^a-z0-9]+', '-', title_slug)[:50].strip('-')
+
+    adr_filename = f"ADR-{next_adr_num:04d}-{title_slug}.md"
+    adr_path = adr_dir / adr_filename
+
+    # Add metadata footer if not present
+    if "---" not in adr_content[-200:]:
+        adr_content += f"""
+
+---
+*Generated by Architect Agent (LLM-powered) on {datetime.now().isoformat()}*
+*Research Reference: {paper_id}*
+*Work Item: {work_item_id}*
+"""
+
+    adr_path.write_text(adr_content)
+    print(f"\n✅ Generated ADR: {adr_path}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 5: Work Item Decomposition
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("\n" + "="*70)
+    print("Phase 5: WORK ITEM DECOMPOSITION")
+    print("="*70)
+
+    # Extract implementation tasks from ADR using LLM
+    extraction_prompt = f"""Extract implementation tasks from this ADR. Return a JSON array of work items.
+
+ADR Content:
+{adr_content[:6000]}
+
+Return ONLY valid JSON in this format:
+{{
+  "story": {{
+    "title": "Implementation story title (max 60 chars)",
+    "description": "2-3 sentence description"
+  }},
+  "tasks": [
+    {{
+      "title": "Task title (max 50 chars)",
+      "description": "What specifically needs to be done",
+      "effort": "S|M|L",
+      "files": ["path/to/file.py"]
+    }}
+  ]
+}}
+
+Extract 3-6 concrete tasks from the implementation plan in the ADR.
+"""
+
+    print("\n📤 Extracting work items from ADR...")
+    try:
+        extract_request = LLMRequest(
+            messages=[
+                LLMMessage(role="user", content=extraction_prompt),
+            ],
+            max_tokens=2048,
+            temperature=0.2,
+        )
+        extract_response = llm_provider.generate(extract_request)
+        extraction_result = extract_response.content
+        # Parse JSON from response (handle markdown code blocks)
+        json_match = re.search(r'\{[\s\S]*\}', extraction_result)
+        if json_match:
+            work_items_data = json.loads(json_match.group())
+        else:
+            work_items_data = {"story": {"title": f"Implement: {paper_result.paper_title[:50]}", "description": "See ADR"}, "tasks": []}
+    except Exception as e:
+        print(f"   ⚠️ Could not extract work items: {e}")
+        work_items_data = {"story": {"title": f"Implement: {paper_result.paper_title[:50]}", "description": "See ADR"}, "tasks": []}
+
+    # Get board for creating work items
+    boards = board_service.list_boards(project_id=work_item.project_id)
+    if not boards:
+        print("⚠️  No boards found, skipping work item creation")
+    else:
+        board = boards[0]
+        columns = board_service.list_columns(board.board_id)
+        first_column = columns[0] if columns else None
+
+        if first_column:
+            tasks_created = 0
+
+            # Create implementation story
+            story_data = work_items_data.get("story", {})
+            impl_story_request = CreateWorkItemRequest(
+                board_id=board.board_id,
+                column_id=first_column.column_id,
+                title=f"[Implementation] {story_data.get('title', paper_result.paper_title[:60])}",
+                description=f"""## Implementation Story
+
+{story_data.get('description', 'Implement the architectural design from the ADR.')}
+
+### ADR Reference
+- **ADR:** [{adr_filename}]({adr_path})
+- **Research Paper:** {paper_result.paper_title}
+- **Paper ID:** {paper_id}
+- **Verdict:** {rec.verdict.value} ({eval_.overall_score:.1f}/10)
+
+### Source
+- Research Handoff: {work_item_id}
+- Generated by: Architect Agent
+
+---
+See ADR for full technical design and implementation details.
+""",
+                item_type=WorkItemType.STORY,
+                priority=WorkItemPriority.HIGH if eval_.overall_score >= 8 else WorkItemPriority.MEDIUM,
+                labels=["engineering", "implementation", rec.verdict.value.lower()],
+                parent_id=work_item_id,
+                metadata={
+                    "paper_id": paper_id,
+                    "adr": adr_filename,
+                    "source": "architect-agent",
+                },
+            )
+
+            impl_story = board_service.create_work_item(impl_story_request, actor)
+            print(f"\n✅ Created implementation story: {impl_story.item_id}")
+            tasks_created += 1
+
+            # Create individual tasks
+            for task_data in work_items_data.get("tasks", [])[:6]:
+                task_title = task_data.get("title", "Implementation task")[:50]
+                task_desc = task_data.get("description", "")
+                task_effort = task_data.get("effort", "M")
+                task_files = task_data.get("files", [])
+
+                task_request = CreateWorkItemRequest(
+                    board_id=board.board_id,
+                    column_id=first_column.column_id,
+                    title=task_title,
+                    description=f"""## Task: {task_title}
+
+{task_desc}
+
+### Effort Estimate
+{task_effort}
+
+### Files to Modify
+{chr(10).join(f'- `{f}`' for f in task_files) if task_files else '- See ADR for details'}
+
+### Parent Story
+{impl_story.item_id}
+
+### ADR Reference
+{adr_filename}
+
+### Done When
+- [ ] Implementation complete
+- [ ] Tests added/updated
+- [ ] Code reviewed
+""",
+                    item_type=WorkItemType.TASK,
+                    priority=WorkItemPriority.MEDIUM,
+                    labels=["engineering", "implementation"],
+                    parent_id=impl_story.item_id,
+                    metadata={
+                        "effort": task_effort,
+                        "files": task_files,
+                        "source": "architect-agent",
+                    },
+                )
+
+                task = board_service.create_work_item(task_request, actor)
+                print(f"   ✓ Created task: {task.item_id} - {task_title}")
+                tasks_created += 1
+
+            print(f"\n✅ Created {tasks_created} work item(s)")
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # Auto-assign work items to relevant agents
+            # ═══════════════════════════════════════════════════════════════════════
+            print("\n📋 Auto-assigning work items to agents...")
+
+            # Get project agents for assignment
+            project_agents = []
+            project_owner_id = None
+            try:
+                org_service = OrganizationService()
+                # Get agents for this project
+                if work_item.project_id:
+                    # Try to get project's org_id from the board
+                    project_agents = org_service.list_agents(
+                        org_id="default",  # TODO: Get actual org_id from project
+                        project_id=work_item.project_id,
+                    )
+                    if not project_agents:
+                        # Fallback to all org agents
+                        project_agents = org_service.list_agents(org_id="default")
+            except Exception as e:
+                print(f"   ⚠️ Could not load agents: {e}")
+
+            if project_agents:
+                print(f"   Found {len(project_agents)} agents for assignment")
+
+                # Assign the implementation story
+                if impl_story:
+                    success, msg = auto_assign_work_item(
+                        board_service, impl_story, project_agents,
+                        project_owner_id=project_owner_id, actor=actor
+                    )
+                    print(f"   • Story: {msg}")
+
+                # Re-fetch tasks and assign them
+                created_items = board_service.list_work_items(
+                    board_id=board.board_id,
+                    parent_id=impl_story.item_id if impl_story else None,
+                )
+                for item in created_items:
+                    success, msg = auto_assign_work_item(
+                        board_service, item, project_agents,
+                        project_owner_id=project_owner_id, actor=actor
+                    )
+                    print(f"   • {item.title[:40]}: {msg}")
+            else:
+                print("   ⚠️ No agents found for auto-assignment")
+
+    # Mark original handoff work item as DONE
+    try:
+        board_service.update_work_item(
+            work_item_id,
+            UpdateWorkItemRequest(status=WorkItemStatus.DONE),
+            actor
+        )
+        print(f"\n✅ Marked handoff work item {work_item_id} as DONE")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not update status: {e}")
+
+    print("\n" + "="*70)
+    print("✅ ARCHITECT AGENT COMPLETE (LLM-Powered)")
+    print("="*70)
+    print(f"\nArtifacts created:")
+    print(f"  • ADR: {adr_path}")
+    print(f"  • Implementation work items in board")
+    print(f"\nNext: Engineering Agent should pick up implementation story")
+
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
 
@@ -7416,6 +8954,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _command_behaviors_deprecate(args)
         elif args.behaviors_command == "delete-draft":
             return _command_behaviors_delete_draft(args)
+        elif args.behaviors_command == "propose":
+            return _command_behaviors_propose(args)
+        elif args.behaviors_command == "get-for-task":
+            return _command_behaviors_get_for_task(args)
     elif args.command == "compliance":
         if args.compliance_command == "create-checklist":
             return _command_compliance_create_checklist(args)
@@ -7572,10 +9114,297 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _command_migrate_apply(args)
         elif args.migrate_command == "status":
             return _command_migrate_status(args)
+    elif args.command == "research":
+        if args.research_command == "evaluate":
+            return _command_research_evaluate(args)
+        elif args.research_command == "list":
+            return _command_research_list(args)
+        elif args.research_command == "get":
+            return _command_research_get(args)
+        elif args.research_command == "export":
+            return _command_research_export(args)
+        elif args.research_command == "index":
+            return _command_research_index(args)
+        elif args.research_command == "handoff":
+            return _command_research_handoff(args)
+    elif args.command == "architect":
+        if args.architect_command == "pickup":
+            return _command_architect_pickup(args)
+        elif args.architect_command == "list":
+            return _command_architect_list(args)
+    elif args.command == "work-item":
+        if args.wi_command == "execute":
+            return _command_wi_execute(args)
+        elif args.wi_command == "status":
+            return _command_wi_status(args)
+        elif args.wi_command == "clarify":
+            return _command_wi_clarify(args)
+        elif args.wi_command == "approve-gate":
+            return _command_wi_approve_gate(args)
 
     # If no command matched or no subcommand provided
     print("Error: No command specified or command not recognized", file=sys.stderr)
     return 1
+
+
+# ==============================================================================
+# Work Item CLI Commands
+# ==============================================================================
+
+
+def _wi_api_base() -> str:
+    """Get the API base URL from environment."""
+    return os.environ.get("GUIDEAI_API_URL", "http://localhost:8000")
+
+
+def _wi_auth_headers() -> Dict[str, str]:
+    """Get auth headers for API calls."""
+    token = os.environ.get("GUIDEAI_TOKEN") or os.environ.get("GA_TOKEN", "")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _wi_api_call(
+    method: str, path: str, body: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Make an API call and return JSON response."""
+    import urllib.request
+    import json as _json
+
+    url = f"{_wi_api_base()}/api{path}"
+    data = _json.dumps(body).encode() if body else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=_wi_auth_headers(),
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return _json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        try:
+            return _json.loads(error_body)
+        except Exception:
+            return {"error": f"HTTP {e.code}: {error_body[:200]}"}
+
+
+def _command_wi_execute(args: argparse.Namespace) -> int:
+    """Execute a work item."""
+    import json as _json
+
+    body: Dict[str, Any] = {}
+    if args.model:
+        body["model_override"] = args.model
+    if args.callback_url:
+        body["callback_url"] = args.callback_url
+
+    params = f"project_id={args.project_id}"
+    if args.org_id:
+        params += f"&org_id={args.org_id}"
+
+    result = _wi_api_call(
+        "POST",
+        f"/v1/work-items/{args.item_id}:execute?{params}",
+        body or {},
+    )
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        if result.get("success"):
+            print(f"✅ Execution started")
+            print(f"   Run ID:     {result.get('run_id', 'N/A')}")
+            print(f"   Cycle ID:   {result.get('task_cycle_id', 'N/A')}")
+            print(f"   Status:     {result.get('status', 'N/A')}")
+        else:
+            detail = result.get("detail", result)
+            print(f"❌ Execution failed: {detail}", file=sys.stderr)
+            return 1
+
+    # --watch mode: connect to SSE stream
+    if getattr(args, "watch", False) and result.get("run_id"):
+        run_id = result["run_id"]
+        print(f"\n📡 Watching execution events (Ctrl+C to stop)...\n")
+        return _wi_watch_sse(run_id, args)
+
+    return 0
+
+
+def _wi_watch_sse(run_id: str, args: argparse.Namespace) -> int:
+    """Connect to SSE stream and print events."""
+    import urllib.request
+
+    url = f"{_wi_api_base()}/api/v1/runs/{run_id}/events"
+    req = urllib.request.Request(url, headers=_wi_auth_headers())
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            event_type = ""
+            data_lines = []
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").rstrip("\n")
+
+                if line.startswith("event: "):
+                    event_type = line[7:]
+                elif line.startswith("data: "):
+                    data_lines.append(line[6:])
+                elif line == "":
+                    # End of event
+                    if data_lines:
+                        import json as _json
+                        data_str = "\n".join(data_lines)
+                        try:
+                            payload = _json.loads(data_str)
+                        except Exception:
+                            payload = {"raw": data_str}
+
+                        _print_sse_event(event_type, payload)
+
+                        # Stop watching on terminal events
+                        if event_type in ("run.completed", "run.failed"):
+                            return 0 if event_type == "run.completed" else 1
+
+                    event_type = ""
+                    data_lines = []
+                elif line.startswith(":"):
+                    # Comment (keepalive) — ignore
+                    pass
+
+    except KeyboardInterrupt:
+        print("\n⏹  Stopped watching.")
+        return 0
+    except Exception as e:
+        print(f"SSE connection error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _print_sse_event(event_type: str, payload: Dict[str, Any]) -> None:
+    """Pretty-print an SSE event."""
+    emoji = {
+        "execution.status": "📊",
+        "execution.step": "📝",
+        "gate.waiting": "🚧",
+        "gate.clarification_needed": "❓",
+        "gate.approved": "✅",
+        "gate.soft_passed": "⏩",
+        "run.completed": "🎉",
+        "run.failed": "❌",
+    }.get(event_type, "📋")
+
+    phase = payload.get("phase", "")
+    status = payload.get("status", "")
+    current_step = payload.get("current_step", "")
+
+    summary_parts = []
+    if phase:
+        summary_parts.append(f"phase={phase}")
+    if status:
+        summary_parts.append(f"status={status}")
+    if current_step:
+        summary_parts.append(f"step={current_step}")
+
+    summary = " | ".join(summary_parts) if summary_parts else ""
+
+    print(f"  {emoji} {event_type}  {summary}")
+
+    # Show clarification questions if present
+    questions = payload.get("clarification_questions", [])
+    for q in questions:
+        q_text = q.get("question", q.get("text", str(q)))
+        print(f"     ❓ {q_text}")
+
+
+def _command_wi_status(args: argparse.Namespace) -> int:
+    """Get work item execution status."""
+    params = f"project_id={args.project_id}"
+    if args.org_id:
+        params += f"&org_id={args.org_id}"
+
+    result = _wi_api_call("GET", f"/v1/work-items/{args.item_id}/execution?{params}")
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        if not result.get("has_execution"):
+            print(f"No active execution for work item {args.item_id}")
+            return 0
+
+        print(f"📊 Execution Status")
+        print(f"   Run ID:      {result.get('run_id', 'N/A')}")
+        print(f"   Cycle ID:    {result.get('task_cycle_id', 'N/A')}")
+        print(f"   State:       {result.get('state', 'N/A')}")
+        print(f"   Phase:       {result.get('phase', 'N/A')}")
+        print(f"   Progress:    {result.get('progress_pct', 0):.0f}%")
+        print(f"   Step:        {result.get('current_step', 'N/A')}")
+
+        clarifications = result.get("pending_clarifications", [])
+        if clarifications:
+            print(f"\n   ❓ Pending Clarifications:")
+            for c in clarifications:
+                c_id = c.get("id", c.get("clarification_id", "N/A"))
+                q_text = c.get("question", c.get("text", str(c)))
+                print(f"      [{c_id}] {q_text}")
+
+    return 0
+
+
+def _command_wi_clarify(args: argparse.Namespace) -> int:
+    """Provide clarification for a paused execution."""
+    params = f"project_id={args.project_id}"
+    if args.org_id:
+        params += f"&org_id={args.org_id}"
+
+    result = _wi_api_call(
+        "POST",
+        f"/v1/work-items/{args.item_id}:clarify?{params}",
+        {
+            "clarification_id": args.clarification_id,
+            "response": args.response,
+        },
+    )
+
+    if result.get("success"):
+        print(f"✅ Clarification provided")
+    else:
+        print(f"❌ Failed: {result.get('message', result)}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+def _command_wi_approve_gate(args: argparse.Namespace) -> int:
+    """Approve a strict gate and resume execution."""
+    params = f"project_id={args.project_id}"
+    if args.org_id:
+        params += f"&org_id={args.org_id}"
+
+    body: Dict[str, Any] = {}
+    if args.phase:
+        body["phase"] = args.phase
+    if args.notes:
+        body["notes"] = args.notes
+
+    result = _wi_api_call(
+        "POST",
+        f"/v1/work-items/{args.item_id}:approve-gate?{params}",
+        body,
+    )
+
+    if result.get("success"):
+        print(f"✅ Gate approved")
+        print(f"   Run ID:   {result.get('run_id', 'N/A')}")
+        print(f"   Resumed:  {result.get('resumed', False)}")
+        print(f"   Message:  {result.get('message', '')}")
+    else:
+        print(f"❌ Failed: {result.get('message', result)}", file=sys.stderr)
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":

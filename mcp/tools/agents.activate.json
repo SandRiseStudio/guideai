@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "agents.activate",
-  "description": "Activate an agent. Convenience tool that transitions the agent to ACTIVE status. Requires agents.manage scope.",
+  "description": "Activate an agent. Convenience tool that transitions the agent to ACTIVE status. Requires agents.manage scope. Authorization is based on session context.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -11,7 +11,7 @@
       },
       "org_id": {
         "type": "string",
-        "description": "Organization identifier for security validation"
+        "description": "Organization identifier (optional - inferred from session if not provided)"
       },
       "reason": {
         "type": "string",
@@ -19,7 +19,7 @@
         "maxLength": 500
       }
     },
-    "required": ["agent_id", "org_id"]
+    "required": ["agent_id"]
   },
   "outputSchema": {
     "type": "object",

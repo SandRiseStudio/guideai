@@ -514,10 +514,24 @@ class PostgresRunService:
 
         steps = []
         for row in rows:
-            # run_steps uses input_data/output_data, not metadata
+            # run_steps uses input_data/output_data JSONB columns
             input_data = row.get("input_data") if isinstance(row.get("input_data"), dict) else {}
             output_data = row.get("output_data") if isinstance(row.get("output_data"), dict) else {}
-            metadata = {"input_data": input_data, "output_data": output_data}
+
+            # Build metadata with flattened token counts for frontend compatibility
+            # Frontend expects metadata.input_tokens, metadata.output_tokens at top level
+            metadata = {
+                "input_data": input_data,
+                "output_data": output_data,
+                # Flatten token counts to top-level for ExecutionTimeline compatibility
+                "input_tokens": input_data.get("input_tokens", 0),
+                "output_tokens": input_data.get("output_tokens", 0),
+                # Also expose other commonly needed fields
+                "step_type": input_data.get("step_type"),
+                "phase": input_data.get("phase"),
+                "content_preview": input_data.get("content_preview"),
+                "tool_calls": input_data.get("tool_calls"),
+            }
 
             steps.append(
                 RunStep(
@@ -612,6 +626,9 @@ class PostgresRunService:
         metadata = dict(request.metadata)
         if request.total_steps is not None:
             metadata.setdefault("execution", {})["total_steps"] = request.total_steps
+        # Store triggering_user_id for credential resolution during GitHub operations
+        if request.triggering_user_id:
+            metadata["triggering_user_id"] = request.triggering_user_id
         return metadata
 
     def _merge_metadata(

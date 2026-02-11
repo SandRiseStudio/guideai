@@ -33,15 +33,15 @@ export class AgentPerformanceTreeDataProvider implements vscode.TreeDataProvider
 	private periodDays = 30;
 
 	constructor(private client: GuideAIClient) {
-		this.initializeDataProvider();
+		// NOTE: Do NOT auto-initialize - wait for user to manually refresh
+		// This prevents resource exhaustion on startup
 	}
 
-	private async initializeDataProvider(): Promise<void> {
-		await this.refresh();
-		this.startAutoRefresh();
-	}
-
+	/**
+	 * Start auto-refresh (call only after user initiates first refresh)
+	 */
 	private startAutoRefresh(): void {
+		if (this.refreshTimer) return;
 		this.refreshTimer = setInterval(async () => {
 			await this.refresh();
 		}, this.refreshInterval);
@@ -237,12 +237,13 @@ export class AgentPerformanceTreeDataProvider implements vscode.TreeDataProvider
 		}
 
 		return activeAlerts.map((alert) => {
-			const severityIcon = alert.severity === 'CRITICAL' ? 'error' : 'warning';
-			const severityColor = alert.severity === 'CRITICAL' ? 'charts.red' : 'charts.yellow';
+			const severityIcon = alert.severity === 'critical' ? 'error' : 'warning';
+			const severityColor = alert.severity === 'critical' ? 'charts.red' : 'charts.yellow';
 			const contextValue = alert.acknowledgedAt ? 'alert-acknowledged' : 'alert-active';
+			const message = alert.message ?? 'No message';
 
 			return {
-				label: alert.message.slice(0, 50) + (alert.message.length > 50 ? '...' : ''),
+				label: message.slice(0, 50) + (message.length > 50 ? '...' : ''),
 				description: alert.agentId,
 				iconPath: new vscode.ThemeIcon(severityIcon, new vscode.ThemeColor(severityColor)),
 				collapsibleState: vscode.TreeItemCollapsibleState.None,
@@ -254,9 +255,9 @@ export class AgentPerformanceTreeDataProvider implements vscode.TreeDataProvider
 					`**Alert ID**: ${alert.alertId}\n\n` +
 					`**Agent**: ${alert.agentId}\n\n` +
 					`**Metric**: ${alert.metric}\n\n` +
-					`**Message**: ${alert.message}\n\n` +
+					`**Message**: ${message}\n\n` +
 					`**Threshold**: ${alert.thresholdValue} | **Actual**: ${alert.actualValue}\n\n` +
-					`**Created**: ${new Date(alert.createdAt).toLocaleString()}\n\n` +
+					`**Created**: ${alert.createdAt ? new Date(alert.createdAt).toLocaleString() : 'Unknown'}\n\n` +
 					`**Acknowledged**: ${alert.acknowledgedAt ? 'Yes' : 'No'}`
 				),
 				data: alert,

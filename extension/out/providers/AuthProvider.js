@@ -49,16 +49,20 @@ exports.AuthProvider = void 0;
 const vscode = __importStar(require("vscode"));
 const McpClient_1 = require("../client/McpClient");
 class AuthProvider {
-    constructor(client, context) {
+    constructor(client, context, mcpClient) {
         this._onDidChangeSessions = new vscode.EventEmitter();
         this.onDidChangeSessions = this._onDidChangeSessions.event;
         this._sessions = new Map();
         this._mcpClient = null;
         this._client = client;
+        this._context = context;
         // Initialize MCP client if context is provided
         const config = vscode.workspace.getConfiguration('guideai');
         this._useMcp = config.get('useMcpForAuth', true);
-        if (context && this._useMcp) {
+        if (mcpClient && this._useMcp) {
+            this._mcpClient = mcpClient;
+        }
+        else if (context && this._useMcp) {
             this._mcpClient = new McpClient_1.McpClient(context);
         }
         this.loadStoredSessions();
@@ -186,10 +190,12 @@ class AuthProvider {
      */
     async showDeviceFlowUI(deviceCodeResponse) {
         return new Promise((resolve, reject) => {
+            const extensionUri = this._context?.extensionUri
+                ?? vscode.extensions.getExtension('guideai.guideai-ide-extension')?.extensionUri;
             const panel = vscode.window.createWebviewPanel('guideai.deviceFlow', 'GuideAI Authentication', vscode.ViewColumn.One, {
                 enableScripts: true,
                 retainContextWhenHidden: true,
-                localResourceRoots: [vscode.Uri.joinPath(vscode.extensions.getExtension('guideai.guideai-ide-extension').extensionUri, 'src')]
+                localResourceRoots: extensionUri ? [vscode.Uri.joinPath(extensionUri, 'src')] : []
             });
             const webview = panel.webview;
             webview.html = this.getDeviceFlowHTML(webview, deviceCodeResponse);
@@ -385,8 +391,15 @@ class AuthProvider {
      * Get device flow HTML
      */
     getDeviceFlowHTML(webview, deviceCodeResponse) {
-        const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(vscode.extensions.getExtension('guideai.guideai-ide-extension').extensionUri, 'src', 'webviews', 'deviceFlow.js'));
-        const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(vscode.extensions.getExtension('guideai.guideai-ide-extension').extensionUri, 'src', 'styles', 'AuthFlow.css'));
+        const extensionUri = this._context?.extensionUri
+            ?? vscode.extensions.getExtension('guideai.guideai-ide-extension')?.extensionUri;
+        const baseUri = extensionUri ?? webview.options.localResourceRoots?.[0];
+        const scriptUri = baseUri
+            ? webview.asWebviewUri(vscode.Uri.joinPath(baseUri, 'src', 'webviews', 'deviceFlow.js'))
+            : webview.asWebviewUri(vscode.Uri.joinPath(vscode.Uri.file('.'), 'src', 'webviews', 'deviceFlow.js'));
+        const styleUri = baseUri
+            ? webview.asWebviewUri(vscode.Uri.joinPath(baseUri, 'src', 'styles', 'AuthFlow.css'))
+            : webview.asWebviewUri(vscode.Uri.joinPath(vscode.Uri.file('.'), 'src', 'styles', 'AuthFlow.css'));
         return `<!DOCTYPE html>
         <html>
         <head>
@@ -428,7 +441,7 @@ class AuthProvider {
      * Load stored sessions from VS Code storage
      */
     loadStoredSessions() {
-        const globalState = vscode.extensions.getExtension('guideai.guideai-ide-extension')?.exports?.globalState;
+        const globalState = this._context?.globalState;
         if (globalState) {
             const stored = globalState.get('authSessions', '{}');
             try {
@@ -450,7 +463,7 @@ class AuthProvider {
      * Store sessions to VS Code storage
      */
     storeSessions() {
-        const globalState = vscode.extensions.getExtension('guideai.guideai-ide-extension')?.exports?.globalState;
+        const globalState = this._context?.globalState;
         if (globalState) {
             const sessionsData = {};
             for (const [sessionId, session] of this._sessions) {

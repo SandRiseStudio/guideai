@@ -118,11 +118,11 @@ export class AgentDetailPanel {
 
 		try {
 			const result = await this._client.getAgent(this._agent.agent_id);
-			if (result && result.agent) {
-				this._agent = result.agent;
+			if (result) {
+				this._agent = result;
 				this._update();
 				this._panel.webview.postMessage({ type: 'agentUpdated' });
-				vscode.window.showInformationMessage(`Agent "${result.agent.name}" refreshed`);
+				vscode.window.showInformationMessage(`Agent "${result.name}" refreshed`);
 			}
 		} catch (error) {
 			vscode.window.showErrorMessage(`Failed to refresh agent: ${error}`);
@@ -176,7 +176,7 @@ export class AgentDetailPanel {
 		if (confirm !== 'Deprecate') return;
 
 		try {
-			await this._client.deprecateAgent(this._agent.agent_id, reason);
+			await this._client.deprecateAgent(this._agent.agent_id, reason ?? '');
 			await this._refreshAgent();
 			vscode.window.showInformationMessage(`Agent "${this._agent.name}" deprecated`);
 		} catch (error) {
@@ -206,11 +206,11 @@ export class AgentDetailPanel {
 				this._versionHistory = result.versions.map(v => ({
 					...this._agent!,
 					version: v.version,
-					instruction: v.instruction,
-					tags: v.tags,
-					capabilities: v.capabilities,
-					behaviors: v.behaviors,
-					role_alignment: v.role_alignment,
+					instruction: v.instruction ?? '',
+					tags: v.tags ?? [],
+					capabilities: v.capabilities ?? [],
+					behaviors: v.behaviors ?? [],
+					role_alignment: v.role_alignment ?? 'STUDENT',
 					status: v.status,
 					created_at: v.created_at
 				}));
@@ -226,8 +226,8 @@ export class AgentDetailPanel {
 
 		try {
 			const result = await this._client.getAgent(this._agent.agent_id, version);
-			if (result && result.agent) {
-				this._agent = result.agent;
+			if (result) {
+				this._agent = result;
 				this._update();
 			}
 		} catch (error) {
@@ -355,7 +355,7 @@ export class AgentDetailPanel {
 				<div class="version-item ${v.version === agent.version ? 'current' : ''}"
 					 onclick="vscode.postMessage({type: 'viewVersion', version: '${v.version}'})">
 					<span class="version-number">v${v.version}</span>
-					<span class="version-date">${new Date(v.created_at).toLocaleDateString()}</span>
+					<span class="version-date">${v.created_at ? new Date(v.created_at).toLocaleDateString() : 'Unknown'}</span>
 					<span class="version-status status-${v.status.toLowerCase()}">${v.status}</span>
 				</div>
 			`).join('')
@@ -491,15 +491,15 @@ export class AgentDetailPanel {
 				<div class="metadata-grid">
 					<div class="metadata-item">
 						<label>Owner</label>
-						<span>${this._escapeHtml(agent.owner_id)}</span>
+						<span>${this._escapeHtml(agent.owner_id ?? 'Unknown')}</span>
 					</div>
 					<div class="metadata-item">
 						<label>Created</label>
-						<span>${new Date(agent.created_at).toLocaleString()}</span>
+						<span>${agent.created_at ? new Date(agent.created_at).toLocaleString() : 'Unknown'}</span>
 					</div>
 					<div class="metadata-item">
 						<label>Updated</label>
-						<span>${new Date(agent.updated_at).toLocaleString()}</span>
+						<span>${agent.updated_at ? new Date(agent.updated_at).toLocaleString() : 'Unknown'}</span>
 					</div>
 				</div>
 			</section>

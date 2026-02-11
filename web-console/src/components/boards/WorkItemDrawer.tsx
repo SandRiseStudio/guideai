@@ -9,6 +9,8 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ClarificationPanel,
+  type ClarificationQuestion,
   ExecutionStatusCard,
   ExecutionTimeline,
 } from '@guideai/collab-client';
@@ -19,6 +21,7 @@ import {
   type WorkItemComment,
   type WorkItemCommentAuthorType,
   type WorkItemPriority,
+  useWorkItems,
   useAssignWorkItem,
   usePostWorkItemComment,
   useUnassignWorkItem,
@@ -168,7 +171,6 @@ export function WorkItemDrawer({
   const [labels, setLabels] = useState<string[]>(initialItem?.labels ?? []);
   const [newLabelDraft, setNewLabelDraft] = useState('');
   const [assigneeSearch, setAssigneeSearch] = useState('');
-  const [clarificationDraftsByItem, setClarificationDraftsByItem] = useState<Record<string, Record<string, string>>>({});
   const [commentDraft, setCommentDraft] = useState('');
   const [commentFilter, setCommentFilter] = useState<'all' | 'humans' | 'agents'>('all');
 
@@ -176,6 +178,7 @@ export function WorkItemDrawer({
   const assignItem = useAssignWorkItem(boardId);
   const unassignItem = useUnassignWorkItem(boardId);
   const { data: item, isLoading, isError } = useWorkItem(itemId, initialItem);
+  const { data: boardItems = [] } = useWorkItems(boardId);
   const commentsQuery = useWorkItemComments(itemId, { limit: 200 });
   const postComment = usePostWorkItemComment(itemId);
   const executeWorkItem = useExecuteWorkItem();
@@ -193,13 +196,38 @@ export function WorkItemDrawer({
     enabled: Boolean(orgId && projectId),
   });
   const executionStepsQuery = useExecutionSteps(executionStatus?.runId ?? null, orgId, projectId, {
-    enabled: Boolean(executionStatus?.runId),
+    enabled: Boolean(executionStatus?.runId && projectId),
     refetchInterval: executionStream.isConnected ? false : activeExecution ? 2000 : false,
   });
   const executionSteps = executionStepsQuery.data?.steps ?? [];
 
   const isOpen = phase === 'open' || phase === 'entering';
   const typeLabel = useMemo(() => (item ? labelForType(item.item_type) : 'Work item'), [item]);
+  const parentLabel = useMemo(() => (item?.item_type === 'task' ? 'Story' : 'Feature'), [item?.item_type]);
+  const childLabel = useMemo(() => (item?.item_type === 'story' ? 'Tasks' : 'Stories'), [item?.item_type]);
+
+  const parentCandidates = useMemo(() => {
+    if (!item) return [];
+    const targetType = item.item_type === 'task' ? 'story' : item.item_type === 'story' ? 'epic' : null;
+    if (!targetType) return [];
+    return boardItems.filter((candidate) => candidate.item_type === targetType && candidate.item_id !== item.item_id);
+  }, [boardItems, item]);
+
+  const parentItem = useMemo(() => {
+    if (!item?.parent_id) return null;
+    return boardItems.find((candidate) => candidate.item_id === item.parent_id) ?? null;
+  }, [boardItems, item?.parent_id]);
+
+  const childItems = useMemo(() => {
+    if (!item) return [];
+    if (item.item_type === 'story') {
+      return boardItems.filter((candidate) => candidate.parent_id === item.item_id && candidate.item_type === 'task');
+    }
+    if (item.item_type === 'epic') {
+      return boardItems.filter((candidate) => candidate.parent_id === item.item_id && candidate.item_type === 'story');
+    }
+    return [];
+  }, [boardItems, item]);
 
   useEffect(() => {
     prevFocusRef.current = document.activeElement as HTMLElement | null;
@@ -313,6 +341,27 @@ export function WorkItemDrawer({
       doPatch({ priority: next });
     },
     [doPatch]
+  );
+
+  const handleParentChange = useCallback(
+    (e: React.ChangeEvent<HTMLSelectElement>) => {
+      if (!item) return;
+      const value = e.target.value;
+      const nextParent = value === '__none__' ? null : value;
+      if (nextParent === item.parent_id) return;
+      setSaveState('saving');
+      updateItem.mutate(
+        { itemId: item.item_id, patch: { parent_id: nextParent } },
+        {
+          onSuccess: () => {
+            setSaveState('saved');
+            window.setTimeout(() => setSaveState('idle'), 1100);
+          },
+          onError: () => setSaveState('error'),
+        }
+      );
+    },
+    [item, updateItem]
   );
 
   const handleTitleChange = useCallback(
@@ -439,28 +488,26 @@ export function WorkItemDrawer({
     : !hasAgentAssignment
       ? 'Assign an agent to enable execution.'
       : 'Runs update in real time.';
-  const clarificationDrafts = useMemo(
-    () => clarificationDraftsByItem[itemId] ?? {},
-    [clarificationDraftsByItem, itemId]
-  );
 
-  const clarificationRequests = useMemo(() => {
+  const clarificationRequests = useMemo<ClarificationQuestion[]>(() => {
     const raw = executionStatus?.pendingClarifications ?? [];
-    return raw
-      .map((entry, index) => {
-        if (!entry || typeof entry !== 'object') return null;
-        const record = entry as Record<string, unknown>;
-        const id =
-          String(record.clarification_id ?? record.id ?? record.request_id ?? `clarification-${index}`);
-        const prompt =
-          String(record.prompt ?? record.question ?? record.message ?? record.reason ?? '');
-        if (!id) return null;
-        return {
-          id,
-          prompt: prompt || 'Clarification requested',
-        };
-      })
-      .filter((entry): entry is { id: string; prompt: string } => Boolean(entry));
+    const mapped = raw.map((entry, index): ClarificationQuestion | null => {
+      if (!entry || typeof entry !== 'object') return null;
+      const record = entry as Record<string, unknown>;
+      const id =
+        String(record.clarification_id ?? record.id ?? record.request_id ?? `clarification-${index}`);
+      const question =
+        String(record.prompt ?? record.question ?? record.message ?? record.reason ?? '');
+      const context = record.context != null ? String(record.context) : undefined;
+      if (!id) return null;
+      return {
+        id,
+        question: question || 'Clarification requested',
+        context,
+        required: record.required === true,
+      };
+    });
+    return mapped.filter((entry): entry is ClarificationQuestion => entry !== null);
   }, [executionStatus?.pendingClarifications]);
 
   const commentAuthorType = useMemo<WorkItemCommentAuthorType | null>(() => {
@@ -562,28 +609,20 @@ export function WorkItemDrawer({
     cancelExecution.mutate({ itemId, orgId: orgId ?? null, projectId, reason: 'User requested cancellation' });
   }, [cancelExecution, canCancelExecution, itemId, orgId, projectId]);
 
-  const handleClarificationChange = useCallback(
-    (id: string, value: string) => {
-      if (!itemId) return;
-      setClarificationDraftsByItem((current) => {
-        const next = { ...current };
-        const itemDrafts = { ...(next[itemId] ?? {}) };
-        itemDrafts[id] = value;
-        next[itemId] = itemDrafts;
-        return next;
+  // Handler for the shared ClarificationPanel component
+  const handleClarificationSubmit = useCallback(
+    (questionId: string, response: string) => {
+      if (!itemId || !projectId) return;
+      if (!response.trim()) return;
+      provideClarification.mutate({
+        itemId,
+        orgId: orgId ?? null,
+        projectId,
+        clarificationId: questionId,
+        response: response.trim(),
       });
     },
-    [itemId]
-  );
-
-  const handleClarificationSend = useCallback(
-    (clarificationId: string) => {
-      if (!itemId || !projectId) return;
-      const response = clarificationDrafts[clarificationId]?.trim();
-      if (!response) return;
-      provideClarification.mutate({ itemId, orgId: orgId ?? null, projectId, clarificationId, response });
-    },
-    [clarificationDrafts, itemId, orgId, projectId, provideClarification]
+    [itemId, orgId, projectId, provideClarification]
   );
 
   const handleRefreshExecution = useCallback(() => {
@@ -867,6 +906,62 @@ export function WorkItemDrawer({
                 </div>
               </div>
 
+              {item?.item_type !== 'epic' && (
+                <div className="drawer-row">
+                  <div className="drawer-label-row">
+                    <label className="drawer-label">Rolls up to {parentLabel}</label>
+                    <span className="drawer-assignee-hint">Optional</span>
+                  </div>
+                  <div className="hierarchy-panel">
+                    <select
+                      className="drawer-select hierarchy-select"
+                      value={item?.parent_id ?? '__none__'}
+                      onChange={handleParentChange}
+                      disabled={!parentCandidates.length}
+                    >
+                      <option value="__none__">No {parentLabel.toLowerCase()} selected</option>
+                      {parentCandidates.map((candidate) => (
+                        <option key={candidate.item_id} value={candidate.item_id}>
+                          {candidate.title} • {shortId(candidate.item_id)}
+                        </option>
+                      ))}
+                    </select>
+                    {parentItem && (
+                      <div className="hierarchy-parent">
+                        <span className="hierarchy-pill">{parentLabel}: {parentItem.title}</span>
+                        <span className="hierarchy-meta">{shortId(parentItem.item_id)}</span>
+                      </div>
+                    )}
+                    {!parentCandidates.length && (
+                      <div className="hierarchy-empty">No {parentLabel.toLowerCase()}s on this board yet.</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {(item?.item_type === 'story' || item?.item_type === 'epic') && (
+                <div className="drawer-row">
+                  <div className="drawer-label-row">
+                    <label className="drawer-label">{childLabel}</label>
+                    <span className="drawer-assignee-hint">{childItems.length} linked</span>
+                  </div>
+                  <div className="hierarchy-children">
+                    {childItems.length > 0 ? (
+                      childItems.map((child) => (
+                        <div key={child.item_id} className="hierarchy-child">
+                          <span className={`hierarchy-chip hierarchy-chip-${child.item_type}`}>
+                            {child.title}
+                          </span>
+                          <span className="hierarchy-meta">{shortId(child.item_id)}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="hierarchy-empty">No {childLabel.toLowerCase()} linked yet.</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <div className="drawer-row drawer-row-execution">
                 <div className="drawer-label-row">
                   <label className="drawer-label">Execution</label>
@@ -911,32 +1006,12 @@ export function WorkItemDrawer({
                   />
 
                   {clarificationRequests.length > 0 && (
-                    <div className="execution-clarifications">
-                      <div className="execution-clarifications-title">Clarifications</div>
-                      {clarificationRequests.map((request) => (
-                        <div key={request.id} className="execution-clarification-card">
-                          <div className="execution-clarification-prompt">{request.prompt}</div>
-                          <textarea
-                            className="execution-clarification-input"
-                            rows={3}
-                            value={clarificationDrafts[request.id] ?? ''}
-                            onChange={(event) => handleClarificationChange(request.id, event.target.value)}
-                            placeholder="Share context or a decision..."
-                          />
-                          <div className="execution-clarification-actions">
-                            <button
-                              type="button"
-                              className="execution-action-button pressable"
-                              onClick={() => handleClarificationSend(request.id)}
-                              disabled={provideClarification.isPending || !(clarificationDrafts[request.id]?.trim())}
-                              data-haptic="light"
-                            >
-                              {provideClarification.isPending ? 'Sending...' : 'Send response'}
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
+                    <ClarificationPanel
+                      questions={clarificationRequests}
+                      onSubmit={handleClarificationSubmit}
+                      isSubmitting={provideClarification.isPending}
+                      title="Agent needs your input"
+                    />
                   )}
 
                   {clarificationRequests.length === 0 && executionState === 'paused' && (

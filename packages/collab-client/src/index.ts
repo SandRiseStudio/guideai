@@ -48,11 +48,14 @@ export type { UserPresence as PresenceInfo } from './types.js';
 
 // Shared Execution UI Components
 export {
+  ClarificationPanel,
   ExecutionStatusBadge,
   ExecutionStatusCard,
   ExecutionTimeline,
 } from './components/execution/index.js';
 export type {
+  ClarificationPanelProps,
+  ClarificationQuestion,
   ExecutionStatusBadgeProps,
   ExecutionStatusCardProps,
   ExecutionTimelineProps,

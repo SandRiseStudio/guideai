@@ -5,13 +5,17 @@
   "inputSchema": {
     "type": "object",
     "properties": {
+      "user_id": {
+        "type": "string",
+        "description": "ID of the user to list organizations for (required for authorization)"
+      },
       "include_deleted": {
         "type": "boolean",
         "default": false,
         "description": "Include soft-deleted organizations in results"
       }
     },
-    "required": []
+    "required": ["user_id"]
   },
   "outputSchema": {
     "type": "object",

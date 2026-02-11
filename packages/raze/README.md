@@ -104,7 +104,7 @@ app.include_router(create_log_routes(), prefix="/v1/logs")
 ```typescript
 import { RazeClient } from './RazeClient';
 
-const client = new RazeClient('http://localhost:8000');
+const client = new RazeClient('http://localhost:8080');
 
 // Send logs to centralized backend
 await client.sendLog('INFO', 'Extension activated', {
@@ -149,7 +149,7 @@ await client.sendLogs([
 Ingest single or batch logs.
 
 ```bash
-curl -X POST http://localhost:8000/v1/logs/ingest \
+curl -X POST http://localhost:8080/v1/logs/ingest \
   -H "Content-Type: application/json" \
   -d '{
     "logs": [
@@ -168,7 +168,7 @@ curl -X POST http://localhost:8000/v1/logs/ingest \
 Query logs with filters.
 
 ```bash
-curl "http://localhost:8000/v1/logs/query?\
+curl "http://localhost:8080/v1/logs/query?\
 start_time=2024-01-01T00:00:00Z&\
 end_time=2024-01-02T00:00:00Z&\
 level=ERROR&\
@@ -181,7 +181,7 @@ limit=100"
 Get log statistics.
 
 ```bash
-curl "http://localhost:8000/v1/logs/aggregate?\
+curl "http://localhost:8080/v1/logs/aggregate?\
 start_time=2024-01-01T00:00:00Z&\
 end_time=2024-01-02T00:00:00Z&\
 group_by=level,service"

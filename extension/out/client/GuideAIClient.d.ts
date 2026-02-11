@@ -74,15 +74,20 @@ export interface BCIBehaviorMatch {
     citation_label?: string;
     metadata?: Record<string, unknown> | null;
 }
-export type AgentStatus = 'draft' | 'active' | 'deprecated' | 'archived';
+export type AgentStatus = 'DRAFT' | 'PUBLISHED' | 'DEPRECATED' | 'ARCHIVED' | 'draft' | 'active' | 'deprecated' | 'archived';
 export type AgentVisibility = 'private' | 'public' | 'org';
-export type RoleAlignment = 'strict' | 'flexible';
+export type RoleAlignment = 'STRATEGIST' | 'TEACHER' | 'STUDENT' | 'MULTI' | 'strict' | 'flexible';
 export interface AgentVersion {
     version: string;
     status: AgentStatus;
-    created_at: string;
+    created_at?: string;
     performance_score?: number;
     change_log?: string;
+    instruction?: string;
+    tags?: string[];
+    capabilities?: string[];
+    behaviors?: string[];
+    role_alignment?: RoleAlignment;
 }
 export interface Agent {
     agent_id: string;
@@ -98,8 +103,13 @@ export interface Agent {
     role_alignment: RoleAlignment;
     versions: AgentVersion[];
     owner?: string;
+    owner_id?: string;
     created_at?: string;
     updated_at?: string;
+    model?: string;
+    temperature?: number;
+    max_tokens?: number;
+    system_prompt?: string;
 }
 export interface AgentSearchResult {
     agent: Agent;
@@ -113,17 +123,26 @@ export interface TopPerformer {
     metricName: string;
     changePercent: number;
     rank?: number;
+    totalTasks?: number;
+    periodDays?: number;
 }
 export interface PerformanceAlert {
     id: string;
+    alertId?: string;
     agentId: string;
     agentName: string;
     metric: string;
     threshold: number;
+    thresholdValue?: number;
     value: number;
+    actualValue?: number;
     timestamp: string;
+    createdAt?: string;
     status: 'active' | 'acknowledged' | 'resolved';
     severity: 'low' | 'medium' | 'high' | 'critical';
+    message?: string;
+    acknowledgedAt?: string;
+    resolvedAt?: string;
 }
 export interface AgentPerformanceSummary {
     totalSavings: number;
@@ -170,6 +189,61 @@ export interface CredentialAuditEntry {
     actor_id: string;
     details?: Record<string, unknown>;
     created_at: string;
+}
+export interface GitHubLink {
+    id: string;
+    link_type: 'pat' | 'app';
+    github_credential_id?: string;
+    installation_link_id?: string;
+    priority: number;
+    credential_name?: string;
+    github_identity?: string;
+    created_at?: string;
+    last_used_at?: string;
+}
+export interface GitHubResolution {
+    has_credential: boolean;
+    source?: string;
+    credential_id?: string;
+    installation_id?: number;
+    github_username?: string;
+    token_type?: string;
+    has_required_scopes?: boolean;
+    scope_warning?: string;
+    resolved_for_user_id?: string;
+    link_id?: string;
+    message?: string;
+    resolution_order?: string[];
+}
+export interface GitHubPreferences {
+    default_pat_credential_id?: string;
+    default_app_installation_id?: number;
+    auto_link_new_projects: boolean;
+    prefer_app_over_pat: boolean;
+    created_at?: string;
+    updated_at?: string;
+}
+export interface GitHubCredential {
+    id: string;
+    scope_type: string;
+    scope_id: string;
+    token_type: string;
+    name: string;
+    token_prefix: string;
+    is_valid: boolean;
+    failure_count: number;
+    scopes?: string[];
+    github_username?: string;
+    created_at?: string;
+    last_used_at?: string;
+}
+export interface GitHubAppInstallation {
+    installation_id: number;
+    account_type: string;
+    account_login: string;
+    account_id: number;
+    permissions?: Record<string, string>;
+    is_active: boolean;
 }
 export interface BCIRetrieveOptions {
     query: string;
@@ -499,11 +573,19 @@ export declare class GuideAIClient {
     listAgents(filters?: {
         tag?: string;
         status?: AgentStatus;
+        visibility?: string;
         limit?: number;
+    }, _telemetry?: {
+        source?: string;
     }): Promise<Agent[]>;
     searchAgents(query: string, options?: {
         limit?: number;
         minScore?: number;
+        status?: AgentStatus;
+        visibility?: string;
+    }, _telemetry?: {
+        source?: string;
+        query?: string;
     }): Promise<AgentSearchResult[]>;
     publishAgent(agentId: string): Promise<void>;
     deprecateAgent(agentId: string, reason: string): Promise<void>;
@@ -554,6 +636,52 @@ export declare class GuideAIClient {
      * Get audit log for an org credential
      */
     getOrgCredentialAudit(orgId: string, credentialId: string, limit?: number): Promise<CredentialAuditEntry[]>;
+    /**
+     * Get the current user's GitHub link for a project
+     */
+    getMyGitHubLink(projectId: string): Promise<GitHubLink | null>;
+    /**
+     * Link the current user's PAT credential to a project
+     */
+    linkMyPATToProject(projectId: string, options: {
+        github_credential_id?: string;
+        token?: string;
+        name?: string;
+    }): Promise<GitHubLink>;
+    /**
+     * Link the current user's GitHub App installation to a project
+     */
+    linkMyAppToProject(projectId: string, options: {
+        installation_link_id?: string;
+        installation_id?: number;
+    }): Promise<GitHubLink>;
+    /**
+     * Remove the current user's GitHub link from a project
+     */
+    unlinkMyGitHubFromProject(projectId: string, linkType?: 'pat' | 'app'): Promise<{
+        unlinked: boolean;
+        deleted_count: number;
+    }>;
+    /**
+     * Show which GitHub credential would be used for the current user + project
+     */
+    getGitHubResolution(projectId: string): Promise<GitHubResolution>;
+    /**
+     * Get the current user's GitHub preferences
+     */
+    getMyGitHubPreferences(): Promise<GitHubPreferences>;
+    /**
+     * Update the current user's GitHub preferences
+     */
+    updateMyGitHubPreferences(prefs: Partial<GitHubPreferences>): Promise<GitHubPreferences>;
+    /**
+     * List GitHub credentials owned by the current user
+     */
+    listMyGitHubCredentials(): Promise<GitHubCredential[]>;
+    /**
+     * List GitHub App installations accessible to the current user
+     */
+    listMyGitHubAppInstallations(): Promise<GitHubAppInstallation[]>;
     /**
      * Convert days to start/end date strings for CLI
      */

@@ -9,12 +9,12 @@ Tests real OAuth device authorization flow with staging infrastructure:
 
 Prerequisites:
 - Staging environment running (podman ps | grep staging)
-- GUIDEAI_API_URL set to staging endpoint (default: http://localhost:8000)
+- GUIDEAI_GATEWAY_URL set to staging endpoint (default: http://localhost:8080)
 - Valid GitHub OAuth app credentials in deployment/staging.env
 
 Usage:
     # Set staging endpoint
-    export GUIDEAI_API_URL=http://localhost:8000
+    export GUIDEAI_GATEWAY_URL=http://localhost:8080
 
     # Run integration tests
     pytest tests/integration/test_staging_device_flow.py -v -s
@@ -41,7 +41,7 @@ class StagingAPIClient:
     """Client for interacting with GuideAI staging API."""
 
     def __init__(self, base_url: Optional[str] = None):
-        self.base_url = base_url or os.getenv("GUIDEAI_API_URL", "http://localhost:8000")
+        self.base_url = base_url or os.getenv("GUIDEAI_GATEWAY_URL", "http://localhost:8080")
         self.session = self._create_session()
 
     def _create_session(self) -> requests.Session:

@@ -305,7 +305,7 @@ class CostAlertService:
         recipients: Optional[List[str]] = None,
         cooldown_minutes: int = 60,
         enabled: bool = True,
-        preferences_url: str = "http://localhost:8000/settings/alerts",
+        preferences_url: str = "http://localhost:8080/settings/alerts",
     ):
         """Initialize CostAlertService.
 

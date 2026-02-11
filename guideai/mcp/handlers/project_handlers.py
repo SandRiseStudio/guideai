@@ -52,17 +52,30 @@ def _project_to_dict(project: Project) -> Dict[str, Any]:
 # ==============================================================================
 
 
+def _is_admin_from_session(arguments: Dict[str, Any]) -> bool:
+    """Check if the session indicates admin status."""
+    session = arguments.get("_session", {})
+    return session.get("is_admin", False)
+
+
 def _check_org_access(
     org_service: OrganizationService,
     org_id: str,
     user_id: str,
     require_admin: bool = False,
+    arguments: Optional[Dict[str, Any]] = None,
 ) -> tuple[bool, Optional[str], Optional[MemberRole]]:
     """
     Check if user has access to the organization.
 
+    Admin users (from session) bypass all access checks.
+
     Returns: (has_access, error_message, role)
     """
+    # Admin users have full access
+    if arguments and _is_admin_from_session(arguments):
+        return True, None, MemberRole.OWNER
+
     membership = org_service.get_membership(org_id=org_id, user_id=user_id)
     if not membership:
         return False, "Access denied or organization not found", None
@@ -79,21 +92,41 @@ def _check_project_access(
     project_id: str,
     user_id: str,
     require_write: bool = False,
+    arguments: Optional[Dict[str, Any]] = None,
 ) -> tuple[bool, Optional[str], Optional[Project]]:
     """
     Check if user has access to the project.
 
+    Admin users (from session) bypass all access checks.
+    Personal projects (no org_id) are accessible if owned by user.
+
     Returns: (has_access, error_message, project)
     """
+    # Admin users have full access
+    if arguments and _is_admin_from_session(arguments):
+        project = project_service.get_project(project_id)
+        if not project:
+            return False, f"Project {project_id} not found", None
+        return True, None, project
+
     project = project_service.get_project(project_id)
     if not project:
         return False, f"Project {project_id} not found", None
 
+    # Personal project - check ownership
+    if project.org_id is None:
+        owner_id = getattr(project, 'owner_id', None) or getattr(project, 'created_by', None)
+        if owner_id == user_id:
+            return True, None, project
+        return False, "Access denied. You are not the owner of this personal project.", None
+
+    # Org project - check org membership
     has_access, error, role = _check_org_access(
         org_service,
         project.org_id,
         user_id,
         require_admin=require_write,
+        arguments=arguments,
     )
 
     if not has_access:
@@ -113,24 +146,25 @@ def handle_create_project(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Create a new project within an organization.
+    Create a new project. If org_id is provided, creates an organization project.
+    If org_id is omitted, creates a personal project owned by the user.
 
     MCP Tool: projects.create
     """
-    user_id = arguments["user_id"]
-    org_id = arguments["org_id"]
+    user_id = arguments.get("user_id")
+    if not user_id:
+        return {
+            "success": False,
+            "error": "Authentication required. Call auth.deviceLogin first to authenticate.",
+            "hint": "Use the auth.deviceLogin tool to authenticate before creating projects.",
+        }
+
+    org_id = arguments.get("org_id")  # Optional - None for personal projects
     name = arguments["name"]
     description = arguments.get("description")
     visibility = arguments.get("visibility", "private")
     settings = arguments.get("settings", {})
     metadata = arguments.get("metadata", {})
-
-    # Check user has admin access to org
-    has_access, error, _ = _check_org_access(
-        org_service, org_id, user_id, require_admin=True
-    )
-    if not has_access:
-        return {"success": False, "error": error}
 
     # Parse visibility
     try:
@@ -138,14 +172,31 @@ def handle_create_project(
     except ValueError:
         visibility_enum = ProjectVisibility.PRIVATE
 
-    project = project_service.create_project(
-        org_id=org_id,
-        name=name,
-        owner_id=user_id,
-        description=description,
-        visibility=visibility_enum,
-        settings=settings,
-    )
+    if org_id:
+        # Org project: check user has admin access to org
+        has_access, error, _ = _check_org_access(
+            org_service, org_id, user_id, require_admin=True
+        )
+        if not has_access:
+            return {"success": False, "error": error}
+
+        project = project_service.create_project(
+            org_id=org_id,
+            name=name,
+            owner_id=user_id,
+            description=description,
+            visibility=visibility_enum,
+            settings=settings,
+        )
+    else:
+        # Personal project: create without org
+        project = project_service.create_personal_project(
+            owner_id=user_id,
+            name=name,
+            description=description,
+            visibility=visibility_enum,
+            settings=settings,
+        )
 
     return {
         "success": True,
@@ -185,31 +236,76 @@ def handle_list_projects(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    List projects within an organization.
+    List projects. If org_id is provided, lists projects in that org.
+    If org_id is not provided, lists all projects the user has access to
+    (personal projects + projects from orgs they belong to).
 
     MCP Tool: projects.list
+
+    The user_id is automatically injected from the authenticated session context.
+    If not authenticated, an error is returned.
     """
-    user_id = arguments["user_id"]
-    org_id = arguments["org_id"]
+    user_id = arguments.get("user_id")
+    if not user_id:
+        return {
+            "success": False,
+            "error": "Authentication required. Call auth.deviceLogin first to authenticate.",
+            "hint": "Use the auth.deviceLogin tool to authenticate before accessing projects.",
+        }
+
+    org_id = arguments.get("org_id")  # Optional - if not provided, list all user's projects
     limit = arguments.get("limit", 50)
     offset = arguments.get("offset", 0)
+    is_admin = _is_admin_from_session(arguments)
 
-    # Check user has access to org
-    has_access, error, _ = _check_org_access(org_service, org_id, user_id)
-    if not has_access:
-        return {"success": False, "error": error}
+    all_projects = []
 
-    projects = project_service.list_projects(org_id=org_id)
+    if org_id:
+        # List projects in specific org
+        has_access, error, _ = _check_org_access(org_service, org_id, user_id, arguments=arguments)
+        if not has_access:
+            return {"success": False, "error": error}
+
+        all_projects = project_service.list_projects(org_id=org_id)
+    elif is_admin:
+        # Admin: list ALL projects across all orgs
+        try:
+            # Get all orgs
+            all_orgs = org_service.list_organizations()
+            for org in all_orgs:
+                org_projects = project_service.list_projects(org_id=org.id)
+                all_projects.extend(org_projects)
+            # Also get personal projects - for admin, list all
+            all_personal = project_service.list_all_personal_projects()
+            all_projects.extend(all_personal)
+        except Exception:
+            # Fallback to normal user flow if list_all methods don't exist
+            pass
+    else:
+        # List all projects user has access to:
+        # 1. Personal projects (no org, owned by user)
+        try:
+            personal_projects = project_service.list_personal_projects(owner_id=user_id)
+            all_projects.extend(personal_projects)
+        except Exception:
+            # Schema may not support personal projects yet
+            pass
+
+        # 2. Projects from orgs user belongs to
+        user_orgs = org_service.list_user_organizations(user_id=user_id)
+        for org in user_orgs:
+            org_projects = project_service.list_projects(org_id=org.id)
+            all_projects.extend(org_projects)
 
     # Apply pagination
-    total = len(projects)
-    projects = projects[offset:offset + limit]
+    total = len(all_projects)
+    paginated_projects = all_projects[offset:offset + limit]
 
     return {
         "success": True,
-        "projects": [_project_to_dict(p) for p in projects],
+        "projects": [_project_to_dict(p) for p in paginated_projects],
         "total": total,
-        "org_id": org_id,
+        "org_id": org_id,  # None if listing all
         "limit": limit,
         "offset": offset,
     }

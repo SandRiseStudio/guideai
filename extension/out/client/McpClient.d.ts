@@ -244,13 +244,14 @@ export declare class McpClient extends EventEmitter {
     private pendingRequests;
     private requestId;
     private buffer;
-    private isConnected;
+    private _isConnected;
     private connectionPromise;
     private connectionState;
     private heartbeatInterval;
     private reconnectAttempts;
     private lastHeartbeat?;
     private lastError?;
+    private heartbeatFailures;
     private requestQueue;
     private requestTimeoutMs;
     private heartbeatIntervalMs;
@@ -263,6 +264,10 @@ export declare class McpClient extends EventEmitter {
      * Get current connection status for UI display
      */
     getConnectionStatus(): ConnectionStatus;
+    /**
+     * Check if the MCP client is connected
+     */
+    isConnected(): boolean;
     /**
      * Connect to the MCP server (spawns guideai.mcp_server as subprocess)
      */

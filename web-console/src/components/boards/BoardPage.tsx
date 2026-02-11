@@ -104,6 +104,7 @@ interface WorkItemCardProps {
   columns: BoardColumn[];
   targetPositions: Record<string, number>;
   assigneeIndex: Map<string, AssigneeProfile>;
+  childTaskCount: number;
   execution?: ExecutionListItem | null;
   orgId?: string | null;
   onMove: (itemId: string, toColumnId: string | null, position: number) => void;
@@ -122,6 +123,7 @@ const WorkItemCard = memo(function WorkItemCard({
   columns,
   targetPositions,
   assigneeIndex,
+  childTaskCount,
   execution,
   orgId,
   onMove,
@@ -177,6 +179,8 @@ const WorkItemCard = memo(function WorkItemCard({
       : isActiveExecution
         ? 'Execution already running'
         : 'Start execution';
+  const showChildCount = item.item_type === 'story' && childTaskCount > 0;
+  const childCountLabel = `${childTaskCount} task${childTaskCount === 1 ? '' : 's'}`;
 
   const handleMoveChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -250,7 +254,14 @@ const WorkItemCard = memo(function WorkItemCard({
       aria-current={selected ? 'true' : undefined}
     >
       <div className="work-item-top">
-        <span className={`work-item-type work-item-type-${item.item_type}`}>{label}</span>
+        <div className="work-item-top-left">
+          <span className={`work-item-type work-item-type-${item.item_type}`}>{label}</span>
+          {showChildCount && (
+            <span className="work-item-rollup-count" aria-label={`${childCountLabel} roll up to this story`}>
+              {childCountLabel}
+            </span>
+          )}
+        </div>
         <label className="work-item-move" htmlFor={moveSelectId}>
           <span className="sr-only">Move</span>
           <select
@@ -274,7 +285,7 @@ const WorkItemCard = memo(function WorkItemCard({
         <ExecutionStatusBadge
           state={executionState ?? 'unknown'}
           phase={execution?.phase ?? null}
-          statusLabel={execution ? undefined : isOrphanedAssignment ? 'Invalid' : hasAgentAssignment ? 'Ready' : 'Unassigned'}
+          statusLabel={execution ? undefined : isOrphanedAssignment ? 'Invalid' : hasAgentAssignment ? 'Ready' : undefined}
           showPhase={Boolean(execution?.phase)}
           showProgress={false}
           progressPct={execution?.progressPct ?? null}
@@ -320,9 +331,12 @@ const WorkItemCard = memo(function WorkItemCard({
         >
           <span className="assignee-pill-avatar">{assigneeAvatar}</span>
           <span className="assignee-pill-name">{assigneeLabel}</span>
-          <span className="assignee-pill-type">
-            {isOrphanedAssignment ? '⚠ Missing' : item.assignee_type === 'agent' ? 'Agent' : item.assignee_type === 'user' ? 'Human' : 'Unassigned'}
-          </span>
+          {/* Only show type label when assigned (avoid duplicate "Unassigned" text) */}
+          {item.assignee_type && (
+            <span className="assignee-pill-type">
+              {isOrphanedAssignment ? '⚠ Missing' : item.assignee_type === 'agent' ? 'Agent' : 'Human'}
+            </span>
+          )}
         </div>
       </div>
     </div>
@@ -337,6 +351,7 @@ interface ColumnLaneProps {
   targetPositions: Record<string, number>;
   assigneeIndex: Map<string, AssigneeProfile>;
   executionByItemId: Map<string, ExecutionListItem>;
+  childTaskCountByParent: Map<string, number>;
   orgId?: string | null;
   onCreate: (columnId: string, title: string, itemType: WorkItemType) => void;
   onMove: (itemId: string, toColumnId: string | null, position: number) => void;
@@ -359,6 +374,7 @@ const ColumnLane = memo(function ColumnLane({
   targetPositions,
   assigneeIndex,
   executionByItemId,
+  childTaskCountByParent,
   orgId,
   onCreate,
   onMove,
@@ -470,6 +486,7 @@ const ColumnLane = memo(function ColumnLane({
             columns={columns}
             targetPositions={targetPositions}
             assigneeIndex={assigneeIndex}
+            childTaskCount={childTaskCountByParent.get(item.item_id) ?? 0}
             execution={executionByItemId.get(item.item_id) ?? null}
             orgId={orgId}
             onMove={onMove}
@@ -611,6 +628,15 @@ export function BoardPage(): React.JSX.Element {
       next[k] = sortByPosition(next[k]);
     }
     return next;
+  }, [items]);
+
+  const childTaskCountByParent = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of items) {
+      if (!item.parent_id || item.item_type !== 'task') continue;
+      counts.set(item.parent_id, (counts.get(item.parent_id) ?? 0) + 1);
+    }
+    return counts;
   }, [items]);
 
   const targetPositions = useMemo(() => {
@@ -823,6 +849,7 @@ export function BoardPage(): React.JSX.Element {
                 targetPositions={targetPositions}
                 assigneeIndex={assigneeIndex}
                 executionByItemId={executionByItemId}
+                childTaskCountByParent={childTaskCountByParent}
                 orgId={project?.org_id ?? null}
                 onCreate={onCreate}
                 onMove={onMove}

@@ -675,13 +675,20 @@ class BCIService:
                 - behaviors_extracted: List of behavior names extracted
                 - latency_ms: Analysis latency
         """
+        import os
         from .trace_analysis_service import TraceAnalysisService
-        from .run_service import RunService
+        from .utils.dsn import apply_host_overrides
 
         start = perf_counter()
 
-        # Get run details
-        run_service = RunService()
+        # Get run details - prefer PostgreSQL when DSN is available
+        dsn = apply_host_overrides(os.environ.get("GUIDEAI_RUN_PG_DSN"), "RUN")
+        if dsn:
+            from .run_service_postgres import PostgresRunService
+            run_service = PostgresRunService(dsn=dsn)
+        else:
+            from .run_service import RunService
+            run_service = RunService()
         run = run_service.get_run(run_id)
         if run is None:
             raise ValueError(f"Run not found: {run_id}")

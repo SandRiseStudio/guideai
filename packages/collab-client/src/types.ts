@@ -332,6 +332,9 @@ export interface ExecutionStep {
   outputTokens?: number | null;
   toolCalls?: number | null;
   contentPreview?: string | null;
+  contentFull?: string | null;
+  toolNames?: string[] | null;
+  modelId?: string | null;
 }
 
 export interface ExecutionStepsResponse {

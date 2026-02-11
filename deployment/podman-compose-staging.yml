@@ -147,3 +147,43 @@ services:
         reservations:
           cpus: '0.25'
           memory: 128M
+
+  # ==========================================================================
+  # Execution Worker - Queue-based Agent Execution
+  # ==========================================================================
+  execution-worker:
+    image: localhost:5001/guideai-core:staging
+    container_name: guideai-execution-worker-staging
+    env_file:
+      - staging.env
+    environment:
+      - POSTGRES_HOST=host.containers.internal
+      - REDIS_HOST=redis-staging
+      - REDIS_URL=redis://redis-staging:6379/0
+      - EXECUTION_MODE=queue
+      - WORKER_CONCURRENCY=5
+      - WORKER_ID=worker-staging-1
+      - ENVIRONMENT=staging
+    networks:
+      - guideai-postgres-net
+    depends_on:
+      - redis-staging
+      - guideai-api
+    # Worker needs access to Podman socket for workspace provisioning
+    volumes:
+      - ${PODMAN_SOCKET_PATH:-/run/podman/podman.sock}:/run/podman/podman.sock:rw
+    command: ["python", "-m", "guideai.execution_worker"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import redis; r=redis.from_url(\"redis://redis-staging:6379/0\"); r.ping()'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G

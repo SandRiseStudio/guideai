@@ -53,7 +53,10 @@ class ActionTreeDataProvider {
         this.lastError = null;
         this.filterBehaviorId = null;
         this.filterArtifactPath = null;
-        this.loadActions();
+        this.lastLoad = 0;
+        this.minLoadInterval = 5000; // Minimum 5s between loads
+        // NOTE: Do NOT auto-load - wait for user to manually refresh
+        // This prevents resource exhaustion on startup
     }
     refresh() {
         this.filterBehaviorId = null;
@@ -85,10 +88,19 @@ class ActionTreeDataProvider {
         this.loadActions();
     }
     async loadActions() {
-        if (this.isLoading) {
+        // Rate limiting - prevent rapid loads
+        const now = Date.now();
+        if (this.isLoading || (now - this.lastLoad < this.minLoadInterval)) {
+            return;
+        }
+        // Check if MCP client is connected before attempting load
+        if (!this.mcpClient.isConnected()) {
+            this.lastError = 'MCP server not connected. Use "GuideAI: Connect to MCP Server" command.';
+            this._onDidChangeTreeData.fire();
             return;
         }
         this.isLoading = true;
+        this.lastLoad = now;
         this.lastError = null;
         try {
             const result = await this.mcpClient.actionList({
@@ -101,7 +113,8 @@ class ActionTreeDataProvider {
         }
         catch (error) {
             this.lastError = error instanceof Error ? error.message : String(error);
-            vscode.window.showErrorMessage(`Failed to load actions: ${this.lastError}`);
+            // Don't spam error messages - just update tree to show error state
+            console.error('Failed to load actions:', this.lastError);
             this._onDidChangeTreeData.fire();
         }
         finally {

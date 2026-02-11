@@ -159,8 +159,18 @@ def handle_list_orgs(
     List organizations the user belongs to.
 
     MCP Tool: orgs.list
+
+    The user_id is automatically injected from the authenticated session context.
+    If not authenticated, an error is returned.
     """
-    user_id = arguments["user_id"]
+    user_id = arguments.get("user_id")
+    if not user_id:
+        return {
+            "success": False,
+            "error": "Authentication required. Call auth.deviceLogin first to authenticate.",
+            "hint": "Use the auth.deviceLogin tool to authenticate before accessing organizations.",
+        }
+
     role = arguments.get("role")
     limit = arguments.get("limit", 50)
     offset = arguments.get("offset", 0)

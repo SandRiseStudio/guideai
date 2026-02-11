@@ -18,6 +18,8 @@ export declare class ActionTreeDataProvider implements vscode.TreeDataProvider<A
     private lastError;
     private filterBehaviorId;
     private filterArtifactPath;
+    private lastLoad;
+    private readonly minLoadInterval;
     constructor(mcpClient: McpClient);
     refresh(): void;
     /**

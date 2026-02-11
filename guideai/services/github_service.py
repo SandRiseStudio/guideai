@@ -3,6 +3,13 @@
 Provides high-level operations for creating PRs and committing to branches.
 Uses project-level GitHub tokens from CredentialStore following `behavior_externalize_configuration`.
 
+Token resolution order (first match wins):
+1. Project GitHub App installation token (if configured)
+2. Org GitHub App installation token (if configured)
+3. Project PAT (BYOK)
+4. Org PAT (BYOK)
+5. Platform token (GITHUB_TOKEN env var)
+
 Following `behavior_prefer_mcp_tools` - this service is used by github.* MCP handlers.
 """
 
@@ -21,7 +28,12 @@ import httpx
 from ..storage.postgres_pool import PostgresPool
 
 if TYPE_CHECKING:
-    from ..auth.github_credential_repository import GitHubCredentialRepository
+    from ..auth.github_credential_repository import (
+        GitHubCredentialRepository,
+        CredentialScopeType,
+    )
+    from ..auth.github_app_installation_repository import GitHubAppInstallationRepository
+    from ..auth.github_app_service import GitHubAppService
 
 
 logger = logging.getLogger(__name__)
@@ -84,12 +96,21 @@ class PRResult:
 
 @dataclass
 class ResolvedGitHubToken:
-    """Result of resolving a GitHub token for a project/org.
+    """Result of resolving a GitHub token for a project/org/user.
 
     Contains the token and metadata about its source and capabilities.
+
+    Source values (in resolution order):
+    - "user_app": User's linked GitHub App for this project
+    - "user_pat": User's linked PAT for this project
+    - "project_app": Shared project GitHub App installation
+    - "project_pat": Shared project PAT (legacy)
+    - "org_app": Organization GitHub App installation
+    - "org_pat": Organization PAT (legacy)
+    - "platform": Platform-managed token (GITHUB_TOKEN env var)
     """
     token: str
-    source: str  # "project", "org", "platform"
+    source: str  # "user_app", "user_pat", "project_app", "org_app", "project_pat", "org_pat", "platform"
     credential_id: Optional[str] = None
     token_type: Optional[str] = None
     github_username: Optional[str] = None
@@ -97,19 +118,38 @@ class ResolvedGitHubToken:
     has_required_scopes: bool = True
     scope_warning: Optional[str] = None
     rate_limit_remaining: Optional[int] = None
+    # GitHub App specific fields
+    installation_id: Optional[int] = None
+    app_permissions: Optional[Dict[str, str]] = None
+    expires_at: Optional[datetime] = None
+    # User-aware resolution fields
+    resolved_for_user_id: Optional[str] = None
+    link_id: Optional[str] = None  # auth.user_project_github_links.id if user-linked
 
 
 class GitHubCredentialStore:
-    """Manages GitHub tokens at project/org level.
+    """Manages GitHub tokens at project/org/user level.
 
     Resolution order (first match wins, if valid):
-    1. Project token (BYOK) - highest priority
-    2. Org token (BYOK)
-    3. Platform token (admin-managed from environment)
+    1. User's linked GitHub App for this project (if user_id provided)
+    2. User's linked PAT for this project (if user_id provided)
+    3. Project GitHub App installation token (shared, highest non-user priority)
+    4. Org GitHub App installation token
+    5. Project PAT (BYOK, shared) - legacy, still supported
+    6. Org PAT (BYOK)
+    7. Platform token (admin-managed from environment)
 
-    Important: If a BYOK token is configured but invalid, we do NOT
-    fall back to platform token. This honors user intent - if they
-    configured a project token, they want that token used.
+    Design decisions:
+    - GitHub App installations are SHAREABLE - team members can share one install
+    - PATs are PERSONAL - user's token shouldn't be shared with teammates
+    - User-project links let each user choose which credential to use
+    - If user has linked credential but it's invalid, we fall back to project/org
+    - If project has BYOK but it's invalid, we do NOT fall back to platform
+
+    Behavior: behavior_externalize_configuration
+
+    However, GitHub App installations take priority over PATs when both
+    are configured, as they are more secure (auto-rotating tokens).
 
     Behavior: behavior_externalize_configuration
     """
@@ -118,6 +158,8 @@ class GitHubCredentialStore:
         self._pool = pool
         self._platform_token: Optional[str] = None
         self._repo: Optional["GitHubCredentialRepository"] = None
+        self._app_repo: Optional["GitHubAppInstallationRepository"] = None
+        self._app_service: Optional["GitHubAppService"] = None
         self._load_platform_token()
 
     def _load_platform_token(self) -> None:
@@ -131,21 +173,42 @@ class GitHubCredentialStore:
             self._repo = GitHubCredentialRepository(pool=self._pool)
         return self._repo
 
+    def _get_app_repo(self) -> "GitHubAppInstallationRepository":
+        """Lazy-load the GitHub App installation repository."""
+        if self._app_repo is None:
+            from ..auth.github_app_installation_repository import GitHubAppInstallationRepository
+            self._app_repo = GitHubAppInstallationRepository(pool=self._pool)
+        return self._app_repo
+
+    def _get_app_service(self) -> Optional["GitHubAppService"]:
+        """Lazy-load the GitHub App service if configured."""
+        if self._app_service is None:
+            try:
+                from ..auth.github_app_service import get_github_app_service
+                self._app_service = get_github_app_service()
+            except ValueError:
+                # GitHub App not configured - this is fine, fall back to PATs
+                logger.debug("GitHub App not configured, skipping App token resolution")
+                return None
+        return self._app_service
+
     def get_token(
         self,
         project_id: Optional[str] = None,
         org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Optional[Tuple[str, str]]:
-        """Get GitHub token for a project.
+        """Get GitHub token for a project/user.
 
         Returns:
             Tuple of (token, source) or None if not available.
-            Source is one of: "project", "org", "platform"
+            Source is one of: "user_app", "user_pat", "project_app", "org_app",
+                             "project_pat", "org_pat", "platform"
 
         Note: Use get_resolved_token() for full metadata including
         scopes, rate limits, and credential ID for tracking.
         """
-        resolved = self.get_resolved_token(project_id, org_id)
+        resolved = self.get_resolved_token(project_id, org_id, user_id)
         if resolved:
             return (resolved.token, resolved.source)
         return None
@@ -154,20 +217,33 @@ class GitHubCredentialStore:
         self,
         project_id: Optional[str] = None,
         org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Optional[ResolvedGitHubToken]:
         """Get GitHub token with full resolution metadata.
 
-        Resolution order:
-        1. Project BYOK token (if project_id provided and valid)
-        2. Org BYOK token (if org_id provided and valid)
-        3. Platform token (from GITHUB_TOKEN/GH_TOKEN env var)
+        Resolution order (user-aware):
+        1. User's linked GitHub App for this project (if user_id provided)
+        2. User's linked PAT for this project (if user_id provided)
+        3. Project GitHub App installation token (shared)
+        4. Org GitHub App installation token
+        5. Project PAT/BYOK token (shared, legacy)
+        6. Org PAT/BYOK token
+        7. Platform token (from GITHUB_TOKEN/GH_TOKEN env var)
 
-        If BYOK is configured but invalid (is_valid=false), we return None
-        for that scope level and do NOT fall back - this honors user intent.
+        User-level credentials (1-2) are checked first when user_id is provided,
+        allowing per-user GitHub connections while falling back to shared credentials.
+
+        GitHub App tokens take priority over PATs because they are more secure
+        (auto-rotating, fine-grained permissions, auditable).
+
+        If user-linked credential is invalid, we fall back to project/org level.
+        If project-level BYOK PAT is configured but invalid, we do NOT fall back
+        to platform token - this honors user/project intent.
 
         Args:
-            project_id: Project ID to check for BYOK token
-            org_id: Organization ID to check for BYOK token
+            project_id: Project ID to check for tokens
+            org_id: Organization ID to check for tokens
+            user_id: User ID for user-specific credential resolution (optional)
 
         Returns:
             ResolvedGitHubToken with token and metadata, or None if not available
@@ -177,9 +253,51 @@ class GitHubCredentialStore:
             CredentialScopeType,
         )
 
+        # -------------------------------------------------------------------------
+        # 1. Check for User's linked GitHub App for this project
+        # -------------------------------------------------------------------------
+        if user_id and project_id:
+            user_app_token = self._try_get_user_linked_app_token(user_id, project_id)
+            if user_app_token:
+                return user_app_token
+
+        # -------------------------------------------------------------------------
+        # 2. Check for User's linked PAT for this project
+        # -------------------------------------------------------------------------
+        if user_id and project_id:
+            user_pat_token = self._try_get_user_linked_pat_token(user_id, project_id)
+            if user_pat_token:
+                return user_pat_token
+
+        # -------------------------------------------------------------------------
+        # 3. Check for Project GitHub App installation token (shared)
+        # -------------------------------------------------------------------------
+        if project_id:
+            app_token = self._try_get_app_token(
+                scope_type=CredentialScopeType.PROJECT,
+                scope_id=project_id,
+                source="project_app",
+            )
+            if app_token:
+                return app_token
+
+        # -------------------------------------------------------------------------
+        # 4. Check for Org GitHub App installation token
+        # -------------------------------------------------------------------------
+        if org_id:
+            app_token = self._try_get_app_token(
+                scope_type=CredentialScopeType.ORG,
+                scope_id=org_id,
+                source="org_app",
+            )
+            if app_token:
+                return app_token
+
+        # -------------------------------------------------------------------------
+        # 5. Check project-level PAT (BYOK, shared)
+        # -------------------------------------------------------------------------
         repo = self._get_repo()
 
-        # 1. Check project-level BYOK token
         if project_id:
             credential = repo.get_for_scope(
                 scope_type=CredentialScopeType.PROJECT,
@@ -190,7 +308,7 @@ class GitHubCredentialStore:
                 if credential.is_valid and credential.decrypted_token:
                     return ResolvedGitHubToken(
                         token=credential.decrypted_token,
-                        source="project",
+                        source="project_pat",
                         credential_id=credential.id,
                         token_type=credential.token_type.value if credential.token_type else None,
                         github_username=credential.github_username,
@@ -201,14 +319,16 @@ class GitHubCredentialStore:
                     )
                 else:
                     # BYOK configured but invalid - do NOT fall back
-                    # This honors user intent
+                    # This honors project intent
                     logger.warning(
                         f"Project {project_id} has invalid GitHub credential {credential.id}, "
                         "not falling back to org/platform token"
                     )
                     return None
 
-        # 2. Check org-level BYOK token
+        # -------------------------------------------------------------------------
+        # 6. Check org-level PAT (BYOK)
+        # -------------------------------------------------------------------------
         if org_id:
             credential = repo.get_for_scope(
                 scope_type=CredentialScopeType.ORG,
@@ -219,7 +339,7 @@ class GitHubCredentialStore:
                 if credential.is_valid and credential.decrypted_token:
                     return ResolvedGitHubToken(
                         token=credential.decrypted_token,
-                        source="org",
+                        source="org_pat",
                         credential_id=credential.id,
                         token_type=credential.token_type.value if credential.token_type else None,
                         github_username=credential.github_username,
@@ -236,7 +356,9 @@ class GitHubCredentialStore:
                     )
                     return None
 
-        # 3. Fall back to platform token
+        # -------------------------------------------------------------------------
+        # 7. Fall back to platform token
+        # -------------------------------------------------------------------------
         if self._platform_token:
             return ResolvedGitHubToken(
                 token=self._platform_token,
@@ -244,6 +366,216 @@ class GitHubCredentialStore:
             )
 
         return None
+
+    def _try_get_user_linked_app_token(
+        self,
+        user_id: str,
+        project_id: str,
+    ) -> Optional[ResolvedGitHubToken]:
+        """Try to get user's linked GitHub App installation token for a project.
+
+        Args:
+            user_id: The user ID
+            project_id: The project ID
+
+        Returns:
+            ResolvedGitHubToken if successful, None otherwise
+        """
+        app_service = self._get_app_service()
+        if not app_service:
+            return None
+
+        # Query user's linked app installation for this project
+        try:
+            with self._pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT
+                            upl.id AS link_id,
+                            upl.installation_link_id,
+                            gail.installation_id,
+                            gai.permissions
+                        FROM auth.user_project_github_links upl
+                        JOIN auth.github_app_installation_links gail
+                            ON upl.installation_link_id = gail.id
+                        JOIN auth.github_app_installations gai
+                            ON gail.installation_id = gai.installation_id
+                        WHERE upl.user_id = %s
+                          AND upl.project_id = %s
+                          AND upl.link_type = 'app'
+                          AND gai.is_active = true
+                        ORDER BY upl.priority ASC
+                        LIMIT 1
+                    """, (user_id, project_id))
+                    row = cur.fetchone()
+
+            if not row:
+                return None
+
+            link_id, installation_link_id, installation_id, permissions = row
+
+            # Get the installation access token
+            token = app_service.get_installation_token_sync(installation_id=installation_id)
+
+            if not token:
+                logger.warning(
+                    f"Failed to get user-linked GitHub App token for user {user_id}, "
+                    f"project {project_id}, installation {installation_id}"
+                )
+                return None
+
+            return ResolvedGitHubToken(
+                token=token,
+                source="user_app",
+                installation_id=installation_id,
+                app_permissions=permissions,
+                has_required_scopes=True,  # App permissions are always valid
+                resolved_for_user_id=user_id,
+                link_id=link_id,
+            )
+
+        except Exception as e:
+            logger.warning(
+                f"Error getting user-linked GitHub App token for user {user_id}, "
+                f"project {project_id}: {e}"
+            )
+            return None
+
+    def _try_get_user_linked_pat_token(
+        self,
+        user_id: str,
+        project_id: str,
+    ) -> Optional[ResolvedGitHubToken]:
+        """Try to get user's linked PAT credential for a project.
+
+        Args:
+            user_id: The user ID
+            project_id: The project ID
+
+        Returns:
+            ResolvedGitHubToken if successful, None otherwise
+        """
+        repo = self._get_repo()
+
+        try:
+            with self._pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT
+                            upl.id AS link_id,
+                            upl.github_credential_id
+                        FROM auth.user_project_github_links upl
+                        WHERE upl.user_id = %s
+                          AND upl.project_id = %s
+                          AND upl.link_type = 'pat'
+                        ORDER BY upl.priority ASC
+                        LIMIT 1
+                    """, (user_id, project_id))
+                    row = cur.fetchone()
+
+            if not row:
+                return None
+
+            link_id, credential_id = row
+
+            # Get the credential with decrypted token
+            credential = repo.get_by_id(credential_id, decrypt=True)
+
+            if not credential:
+                logger.warning(
+                    f"User-linked PAT credential {credential_id} not found for "
+                    f"user {user_id}, project {project_id}"
+                )
+                return None
+
+            if not credential.is_valid or not credential.decrypted_token:
+                logger.info(
+                    f"User-linked PAT credential {credential_id} is invalid for "
+                    f"user {user_id}, project {project_id} - falling back to project/org"
+                )
+                return None
+
+            return ResolvedGitHubToken(
+                token=credential.decrypted_token,
+                source="user_pat",
+                credential_id=credential.id,
+                token_type=credential.token_type.value if credential.token_type else None,
+                github_username=credential.github_username,
+                scopes=credential.scopes,
+                has_required_scopes=credential.has_required_scopes,
+                scope_warning=credential.scope_warning,
+                rate_limit_remaining=credential.rate_limit_remaining,
+                resolved_for_user_id=user_id,
+                link_id=link_id,
+            )
+
+        except Exception as e:
+            logger.warning(
+                f"Error getting user-linked PAT token for user {user_id}, "
+                f"project {project_id}: {e}"
+            )
+            return None
+
+    def _try_get_app_token(
+        self,
+        scope_type: "CredentialScopeType",
+        scope_id: str,
+        source: str,
+    ) -> Optional[ResolvedGitHubToken]:
+        """Try to get a GitHub App installation token for a scope.
+
+        Args:
+            scope_type: PROJECT or ORG
+            scope_id: The project or org ID
+            source: Token source label for logging
+
+        Returns:
+            ResolvedGitHubToken if successful, None otherwise
+        """
+        app_service = self._get_app_service()
+        if not app_service:
+            return None
+
+        app_repo = self._get_app_repo()
+
+        try:
+            installation = app_repo.get_installation_for_scope(
+                scope_type=scope_type,
+                scope_id=scope_id,
+            )
+
+            if not installation:
+                return None
+
+            # Get or refresh the installation token
+            # Note: get_installation_token_sync handles caching internally
+            # and returns just the token string
+            token = app_service.get_installation_token_sync(
+                installation_id=installation.installation_id
+            )
+
+            if not token:
+                logger.warning(
+                    f"Failed to get GitHub App token for {source} {scope_id}, "
+                    f"installation {installation.installation_id}"
+                )
+                return None
+
+            return ResolvedGitHubToken(
+                token=token,
+                source=source,
+                installation_id=installation.installation_id,
+                app_permissions=installation.permissions,
+                # Note: exact expiry is managed by the GitHubAppService's cache
+                # Tokens are valid for ~1 hour with auto-refresh
+                has_required_scopes=True,  # App permissions are always valid
+            )
+
+        except Exception as e:
+            logger.warning(
+                f"Error getting GitHub App token for {source} {scope_id}: {e}"
+            )
+            return None
 
     def record_token_usage(
         self,

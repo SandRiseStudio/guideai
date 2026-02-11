@@ -14,6 +14,7 @@ for _env_file in [".env", ".env.github-oauth", ".env.google-oauth"]:
 
 import asyncio
 import base64
+from datetime import datetime, timezone
 import html
 import json
 import logging
@@ -142,6 +143,17 @@ from .services.board_service import BoardService
 from .services.assignment_service import AssignmentService
 from .services.board_api_v2 import create_board_routes
 from .services.work_item_execution_api import create_work_item_execution_routes
+from .services.run_events_api import create_run_events_routes
+
+# Notification system
+try:
+    from .notifications.gate_notifier import GateNotifier
+    from .notifications.webhook_dispatcher import WebhookDispatcher
+    NOTIFICATIONS_AVAILABLE = True
+except ImportError:
+    NOTIFICATIONS_AVAILABLE = False
+    GateNotifier = None  # type: ignore[assignment, misc]
+    WebhookDispatcher = None  # type: ignore[assignment, misc]
 
 # Work Item Execution Service (optional - requires dependencies)
 try:
@@ -368,6 +380,26 @@ class _ServiceContainer:
         # Store for use by identity linking and other services
         self.user_auth_service = user_auth_service
 
+        # Initialize device flow manager with PostgreSQL backing for shared state
+        # This allows MCP server and API to share device flow sessions
+        self.postgres_device_store = None
+        auth_dsn = resolve_optional_postgres_dsn(
+            service="AUTH",
+            explicit_dsn=os.getenv("GUIDEAI_AUTH_PG_DSN"),
+            env_var="GUIDEAI_AUTH_PG_DSN",
+        )
+        if auth_dsn:
+            try:
+                from guideai.storage.postgres_pool import PostgresPool
+                from guideai.auth.postgres_device_flow import PostgresDeviceFlowStore
+
+                auth_pool = PostgresPool(auth_dsn, schema="auth")
+                self.postgres_device_store = PostgresDeviceFlowStore(pool=auth_pool)
+                logger.info("PostgreSQL device flow store initialized for shared auth state")
+            except Exception as exc:
+                logger.warning(f"PostgreSQL device flow store unavailable: {exc}")
+
+        # Fallback to in-memory manager (legacy)
         self.device_flow_manager = DeviceFlowManager(
             telemetry=telemetry,
             provider=None,  # InternalAuthProvider removed - device flow uses OAuth only
@@ -2356,10 +2388,11 @@ def create_app(
             ) from exc
 
     @app.get("/api/v1/projects/{project_id}/github-credential")
-    def get_project_github_credential(project_id: str) -> Dict[str, Any]:
+    def get_project_github_credential(project_id: str) -> Optional[Dict[str, Any]]:
         """Get the GitHub credential for a project.
 
-        Returns credential without the actual token (only prefix shown).
+        Returns credential without the actual token (only prefix shown),
+        or null if no credential is configured.
         """
         from .auth.github_credential_repository import (
             GitHubCredentialRepository,
@@ -2376,10 +2409,7 @@ def create_app(
             decrypt=False,
         )
         if not credential:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No GitHub credential configured for this project",
-            )
+            return None
         return credential.to_dict()
 
     @app.delete("/api/v1/projects/{project_id}/github-credential")
@@ -2748,6 +2778,937 @@ def create_app(
         ]
 
     # ------------------------------------------------------------------
+    # GitHub App (Recommended over PAT)
+    # ------------------------------------------------------------------
+
+    @app.get("/api/v1/github-app/status")
+    def get_github_app_status() -> Dict[str, Any]:
+        """Check if GitHub App is configured.
+
+        Returns whether the GitHub App integration is available.
+        """
+        from .auth.github_app_service import get_github_app_service
+
+        service = get_github_app_service()
+        return {
+            "configured": service.is_configured,
+            "message": "GitHub App is configured" if service.is_configured
+                else "GitHub App not configured. Set GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, etc.",
+        }
+
+    @app.get("/api/v1/github-app/installations")
+    async def list_github_app_installations() -> List[Dict[str, Any]]:
+        """List GitHub App installations available to the app."""
+        from .auth.github_app_service import get_github_app_service
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub App not configured",
+            )
+
+        installations = await service.list_installations()
+        app_slug = service._config.slug if service._config else None
+
+        summaries: List[Dict[str, Any]] = []
+        for inst in installations:
+            account = inst.get("account", {}) if isinstance(inst, dict) else {}
+            summaries.append({
+                "installation_id": inst.get("id"),
+                "account_login": account.get("login"),
+                "account_type": account.get("type"),
+                "account_avatar_url": account.get("avatar_url"),
+                "repository_selection": inst.get("repository_selection"),
+                "html_url": inst.get("html_url"),
+                "app_slug": app_slug,
+            })
+
+        return summaries
+
+    @app.get("/api/v1/github-app/install-url")
+    def get_github_app_install_url(
+        scope_type: str = Query(..., description="Scope type: 'project' or 'org'"),
+        scope_id: str = Query(..., description="Project or organization ID"),
+        redirect_uri: Optional[str] = Query(None, description="Where to redirect after installation"),
+    ) -> Dict[str, str]:
+        """Get URL to install/configure the GitHub App.
+
+        Initiates OAuth-like flow for GitHub App installation.
+        User will be redirected to GitHub to authorize the app.
+        """
+        from .auth.github_app_service import get_github_app_service
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub App not configured. Contact administrator.",
+            )
+
+        try:
+            url, state = service.get_install_url(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                redirect_uri=redirect_uri,
+            )
+            return {"url": url, "state": state}
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/github-app/callback")
+    async def github_app_callback(
+        installation_id: int = Query(..., description="GitHub App installation ID"),
+        setup_action: str = Query("install", description="Action: install, update, delete"),
+        state: str = Query(..., description="Signed state for CSRF verification"),
+        actor_id: Optional[str] = Query(None, description="User who initiated the flow"),
+    ) -> RedirectResponse:
+        """Handle GitHub App installation callback.
+
+        Called when GitHub redirects back after app installation.
+        Verifies state, fetches installation details, and stores them.
+        """
+        from .auth.github_app_service import get_github_app_service, InstallationState
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub App not configured",
+            )
+
+        try:
+            installation = await service.handle_installation_callback(
+                installation_id=installation_id,
+                setup_action=setup_action,
+                state=state,
+                installed_by=actor_id,
+            )
+
+            # Decode state to get redirect URI
+            decoded_state = InstallationState.decode(state, service._state_secret)
+            redirect_uri = decoded_state.redirect_uri if decoded_state else None
+
+            # Build redirect URL
+            if redirect_uri:
+                redirect_url = redirect_uri
+            elif decoded_state:
+                if decoded_state.scope_type == "project":
+                    redirect_url = f"/projects/{decoded_state.scope_id}/settings?github=connected"
+                else:
+                    redirect_url = f"/orgs/{decoded_state.scope_id}/settings?github=connected"
+            else:
+                redirect_url = "/"
+
+            # Add status to redirect
+            if setup_action == "delete":
+                redirect_url += "&status=disconnected" if "?" in redirect_url else "?status=disconnected"
+
+            return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+
+        except ValueError as exc:
+            logger.warning(f"GitHub App callback failed: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    @app.get("/api/v1/projects/{project_id}/github-app-installation")
+    def get_project_github_app_installation(project_id: str) -> Optional[Dict[str, Any]]:
+        """Get the GitHub App installation for a project.
+
+        Returns installation details or null if not connected.
+        """
+        from .auth.github_app_service import get_github_app_service
+        from .auth.github_credential_repository import CredentialScopeType
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            return None
+
+        installation = service.get_installation_for_scope(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+        )
+        if not installation:
+            return None
+        return installation.to_dict()
+
+    @app.post("/api/v1/projects/{project_id}/github-app-installation/link")
+    async def link_project_to_github_app_installation(
+        project_id: str,
+        payload: Dict[str, Any],
+        actor_id: str = Query(..., description="User linking the installation"),
+    ) -> Dict[str, Any]:
+        """Link a project to an existing GitHub App installation.
+
+        Useful when multiple projects should share the same installation.
+        If the installation isn't in our database yet, fetches from GitHub API.
+
+        Args:
+            project_id: Project ID
+            payload: {"installation_id": 12345}
+            actor_id: User performing the link
+        """
+        from .auth.github_app_service import get_github_app_service
+        from .auth.github_credential_repository import CredentialScopeType
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub App not configured",
+            )
+
+        installation_id = payload.get("installation_id")
+        if not installation_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="installation_id is required",
+            )
+
+        success = await service.link_existing_installation(
+            installation_id=installation_id,
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+            linked_by=actor_id,
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Installation not found or inactive",
+            )
+
+        installation = service.get_installation_for_scope(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+        )
+        return installation.to_dict() if installation else {"linked": True}
+
+    @app.delete("/api/v1/projects/{project_id}/github-app-installation")
+    def unlink_project_github_app_installation(
+        project_id: str,
+        actor_id: str = Query(..., description="User unlinking the installation"),
+    ) -> Dict[str, Any]:
+        """Unlink GitHub App installation from a project.
+
+        Note: This does NOT uninstall the app from GitHub, just removes
+        the link between this project and the installation.
+        """
+        from .auth.github_app_service import get_github_app_service
+        from .auth.github_credential_repository import CredentialScopeType
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub App not configured",
+            )
+
+        success = service.unlink_installation(
+            scope_type=CredentialScopeType.PROJECT,
+            scope_id=project_id,
+        )
+
+        return {"unlinked": success}
+
+    @app.get("/api/v1/github-app/installation/{installation_id}/configure-url")
+    def get_github_app_configure_url(installation_id: int) -> Dict[str, str]:
+        """Get URL to configure an existing GitHub App installation.
+
+        Use this to let users modify which repos the app can access.
+        """
+        from .auth.github_app_service import get_github_app_service
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub App not configured",
+            )
+
+        url = service.get_configure_url(installation_id)
+        return {"url": url}
+
+    # --- Organization GitHub App ---
+
+    @app.get("/api/v1/orgs/{org_id}/github-app-installation")
+    def get_org_github_app_installation(org_id: str) -> Optional[Dict[str, Any]]:
+        """Get the GitHub App installation for an organization.
+
+        Returns installation details or null if not connected.
+        """
+        from .auth.github_app_service import get_github_app_service
+        from .auth.github_credential_repository import CredentialScopeType
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            return None
+
+        installation = service.get_installation_for_scope(
+            scope_type=CredentialScopeType.ORG,
+            scope_id=org_id,
+        )
+        if not installation:
+            return None
+        return installation.to_dict()
+
+    @app.delete("/api/v1/orgs/{org_id}/github-app-installation")
+    def unlink_org_github_app_installation(
+        org_id: str,
+        actor_id: str = Query(..., description="User unlinking the installation"),
+    ) -> Dict[str, Any]:
+        """Unlink GitHub App installation from an organization.
+
+        Note: This does NOT uninstall the app from GitHub.
+        """
+        from .auth.github_app_service import get_github_app_service
+        from .auth.github_credential_repository import CredentialScopeType
+
+        service = get_github_app_service()
+        if not service.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="GitHub App not configured",
+            )
+
+        success = service.unlink_installation(
+            scope_type=CredentialScopeType.ORG,
+            scope_id=org_id,
+        )
+
+        return {"unlinked": success}
+
+    # ------------------------------------------------------------------
+    # Per-User GitHub Credential Links
+    # ------------------------------------------------------------------
+    # These endpoints manage user-specific GitHub credential links.
+    # Users link their personal GitHub credentials (PAT or App installation)
+    # to projects so that agents executing work items use the correct
+    # user's GitHub access.
+
+    @app.get("/api/v1/projects/{project_id}/github/my-link")
+    def get_my_project_github_link(
+        project_id: str,
+        request: Request,
+    ) -> Optional[Dict[str, Any]]:
+        """Get the current user's GitHub credential link for a project.
+
+        Returns the user's linked credential (PAT or App) or null if not linked.
+        """
+        user_id = _require_user_id(request)
+
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT
+                            upl.id,
+                            upl.link_type,
+                            upl.github_credential_id,
+                            upl.installation_link_id,
+                            upl.priority,
+                            upl.created_at,
+                            upl.last_used_at,
+                            CASE
+                                WHEN upl.link_type = 'pat' THEN gc.name
+                                WHEN upl.link_type = 'app' THEN gai.account_login
+                            END AS credential_name,
+                            CASE
+                                WHEN upl.link_type = 'pat' THEN gc.github_username
+                                WHEN upl.link_type = 'app' THEN gai.account_login
+                            END AS github_identity
+                        FROM auth.user_project_github_links upl
+                        LEFT JOIN credentials.github_credentials gc
+                            ON upl.github_credential_id = gc.id
+                        LEFT JOIN auth.github_app_installation_links gail
+                            ON upl.installation_link_id = gail.id
+                        LEFT JOIN auth.github_app_installations gai
+                            ON gail.installation_id = gai.installation_id
+                        WHERE upl.user_id = %s
+                          AND upl.project_id = %s
+                        ORDER BY upl.priority ASC
+                        LIMIT 1
+                    """, (user_id, project_id))
+                    row = cur.fetchone()
+
+            if not row:
+                return None
+
+            (
+                link_id, link_type, credential_id, installation_link_id,
+                priority, created_at, last_used_at, credential_name, github_identity
+            ) = row
+
+            return {
+                "id": link_id,
+                "link_type": link_type,
+                "github_credential_id": credential_id,
+                "installation_link_id": installation_link_id,
+                "priority": priority,
+                "credential_name": credential_name,
+                "github_identity": github_identity,
+                "created_at": created_at.isoformat() if created_at else None,
+                "last_used_at": last_used_at.isoformat() if last_used_at else None,
+            }
+
+        except Exception as exc:
+            logger.exception(f"Error getting user GitHub link: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get GitHub link",
+            ) from exc
+
+    @app.post("/api/v1/projects/{project_id}/github/link-pat")
+    def link_my_pat_to_project(
+        project_id: str,
+        payload: Dict[str, Any],
+        request: Request,
+    ) -> Dict[str, Any]:
+        """Link the current user's PAT credential to a project.
+
+        Args:
+            project_id: Project ID
+            payload: {
+                "github_credential_id": "uuid-of-existing-pat"
+                OR
+                "token": "ghp_xxx..." (to create a new PAT)
+                "name": Optional name for new PAT
+            }
+
+        The PAT must belong to the current user (created_by matches user_id).
+        """
+        user_id = _require_user_id(request)
+
+        from .auth.github_credential_repository import (
+            GitHubCredentialRepository,
+            CreateGitHubCredentialRequest,
+            CredentialScopeType,
+        )
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credential_id = payload.get("github_credential_id")
+        token = payload.get("token")
+
+        if not credential_id and not token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Either github_credential_id or token is required",
+            )
+
+        # If token provided, create a new credential first
+        if token:
+            try:
+                request_obj = CreateGitHubCredentialRequest(
+                    scope_type=CredentialScopeType.USER,
+                    scope_id=user_id,
+                    token=token,
+                    name=payload.get("name"),
+                    created_by=user_id,
+                )
+                credential, warning = repo.create(request_obj)
+                credential_id = credential.id
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(exc),
+                ) from exc
+        else:
+            # Verify the credential belongs to this user
+            credential = repo.get_by_id(credential_id, decrypt=False)
+            if not credential:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Credential not found",
+                )
+            if credential.created_by != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot link another user's credential",
+                )
+
+        # Create or update the link
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO auth.user_project_github_links
+                            (user_id, project_id, link_type, github_credential_id, priority)
+                        VALUES (%s, %s, 'pat', %s, 0)
+                        ON CONFLICT (user_id, project_id, link_type)
+                        DO UPDATE SET
+                            github_credential_id = EXCLUDED.github_credential_id,
+                            installation_link_id = NULL,
+                            updated_at = NOW()
+                        RETURNING id
+                    """, (user_id, project_id, credential_id))
+                    link_id = cur.fetchone()[0]
+                conn.commit()
+
+            return {
+                "id": link_id,
+                "link_type": "pat",
+                "github_credential_id": credential_id,
+                "linked": True,
+            }
+
+        except Exception as exc:
+            logger.exception(f"Error linking PAT to project: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to link PAT",
+            ) from exc
+
+    @app.post("/api/v1/projects/{project_id}/github/link-app")
+    async def link_my_app_to_project(
+        project_id: str,
+        payload: Dict[str, Any],
+        request: Request,
+    ) -> Dict[str, Any]:
+        """Link the current user's GitHub App installation to a project.
+
+        Args:
+            project_id: Project ID
+            payload: {
+                "installation_link_id": "uuid-of-existing-installation-link"
+                OR
+                "installation_id": 12345 (GitHub's installation ID)
+            }
+
+        GitHub App installations are shareable, so any user with access to
+        the installation can link it to their projects.
+        If the installation isn't in our database yet, fetches from GitHub API.
+        """
+        user_id = _require_user_id(request)
+
+        from .auth.github_app_service import get_github_app_service
+        from .auth.github_credential_repository import CredentialScopeType
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+
+        installation_link_id = payload.get("installation_link_id")
+        installation_id = payload.get("installation_id")
+
+        if not installation_link_id and not installation_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Either installation_link_id or installation_id is required",
+            )
+
+        # If installation_id provided, find or create the link
+        if installation_id:
+            service = get_github_app_service()
+            if not service.is_configured:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="GitHub App not configured",
+                )
+
+            # Link the installation (fetches from GitHub if not in DB)
+            success = await service.link_existing_installation(
+                installation_id=installation_id,
+                scope_type=CredentialScopeType.PROJECT,
+                scope_id=project_id,
+                linked_by=user_id,
+            )
+
+            if not success:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to link installation",
+                )
+
+            # Get the installation link ID
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id FROM auth.github_app_installation_links
+                        WHERE installation_id = %s AND scope_type = 'PROJECT' AND scope_id = %s
+                    """, (installation_id, project_id))
+                    row = cur.fetchone()
+
+            if row:
+                installation_link_id = row[0]
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to find installation link",
+                )
+        else:
+            # Verify the installation link exists
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id FROM auth.github_app_installation_links
+                        WHERE id = %s
+                    """, (installation_link_id,))
+                    if not cur.fetchone():
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Installation link not found",
+                        )
+
+        # Create or update the user link
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO auth.user_project_github_links
+                            (user_id, project_id, link_type, installation_link_id, priority)
+                        VALUES (%s, %s, 'app', %s, 0)
+                        ON CONFLICT (user_id, project_id, link_type)
+                        DO UPDATE SET
+                            installation_link_id = EXCLUDED.installation_link_id,
+                            github_credential_id = NULL,
+                            updated_at = NOW()
+                        RETURNING id
+                    """, (user_id, project_id, installation_link_id))
+                    link_id = cur.fetchone()[0]
+                conn.commit()
+
+            return {
+                "id": link_id,
+                "link_type": "app",
+                "installation_link_id": installation_link_id,
+                "linked": True,
+            }
+
+        except Exception as exc:
+            logger.exception(f"Error linking App to project: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to link App installation",
+            ) from exc
+
+    @app.delete("/api/v1/projects/{project_id}/github/my-link")
+    def unlink_my_github_from_project(
+        project_id: str,
+        link_type: Optional[str] = Query(default=None, description="'pat' or 'app', or omit for all"),
+        request: Request = None,
+    ) -> Dict[str, Any]:
+        """Remove the current user's GitHub credential link from a project.
+
+        Args:
+            project_id: Project ID
+            link_type: Optional - 'pat', 'app', or omit to remove all links
+        """
+        user_id = _require_user_id(request)
+
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    if link_type:
+                        cur.execute("""
+                            DELETE FROM auth.user_project_github_links
+                            WHERE user_id = %s AND project_id = %s AND link_type = %s
+                            RETURNING id
+                        """, (user_id, project_id, link_type))
+                    else:
+                        cur.execute("""
+                            DELETE FROM auth.user_project_github_links
+                            WHERE user_id = %s AND project_id = %s
+                            RETURNING id
+                        """, (user_id, project_id))
+                    deleted = cur.fetchall()
+                conn.commit()
+
+            return {
+                "unlinked": len(deleted) > 0,
+                "deleted_count": len(deleted),
+            }
+
+        except Exception as exc:
+            logger.exception(f"Error unlinking GitHub from project: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to unlink GitHub",
+            ) from exc
+
+    @app.get("/api/v1/projects/{project_id}/github/resolution")
+    def get_github_resolution_for_project(
+        project_id: str,
+        request: Request,
+    ) -> Dict[str, Any]:
+        """Show which GitHub credential would be used for the current user + project.
+
+        This helps users understand the credential resolution hierarchy and
+        verify their configuration before running work items.
+        """
+        user_id = _require_user_id(request)
+
+        from .services.github_service import GitHubCredentialStore
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+
+        # Get the project's org_id for resolution
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT org_id FROM projects WHERE id = %s", (project_id,))
+                row = cur.fetchone()
+                org_id = row[0] if row else None
+
+        store = GitHubCredentialStore(pool=pool)
+        resolved = store.get_resolved_token(
+            project_id=project_id,
+            org_id=org_id,
+            user_id=user_id,
+        )
+
+        if not resolved:
+            return {
+                "has_credential": False,
+                "source": None,
+                "message": "No GitHub credential available for this project",
+                "resolution_order": [
+                    "1. User's linked GitHub App installation",
+                    "2. User's linked PAT",
+                    "3. Project's shared GitHub App installation",
+                    "4. Project's shared PAT",
+                    "5. Organization's GitHub App installation",
+                    "6. Organization's PAT",
+                    "7. Platform-level fallback token",
+                ],
+            }
+
+        return {
+            "has_credential": True,
+            "source": resolved.source,
+            "credential_id": resolved.credential_id,
+            "installation_id": resolved.installation_id,
+            "github_username": resolved.github_username,
+            "token_type": resolved.token_type,
+            "has_required_scopes": resolved.has_required_scopes,
+            "scope_warning": resolved.scope_warning,
+            "resolved_for_user_id": resolved.resolved_for_user_id,
+            "link_id": resolved.link_id,
+        }
+
+    # ------------------------------------------------------------------
+    # User GitHub Preferences
+    # ------------------------------------------------------------------
+
+    @app.get("/api/v1/users/me/github-preferences")
+    def get_my_github_preferences(request: Request) -> Dict[str, Any]:
+        """Get the current user's GitHub preferences.
+
+        Returns default credential settings and auto-link preferences.
+        """
+        user_id = _require_user_id(request)
+
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT
+                            default_pat_credential_id,
+                            default_app_installation_id,
+                            auto_link_new_projects,
+                            prefer_app_over_pat,
+                            created_at,
+                            updated_at
+                        FROM auth.user_github_preferences
+                        WHERE user_id = %s
+                    """, (user_id,))
+                    row = cur.fetchone()
+
+            if not row:
+                # Return defaults
+                return {
+                    "default_pat_credential_id": None,
+                    "default_app_installation_id": None,
+                    "auto_link_new_projects": False,
+                    "prefer_app_over_pat": True,  # Default: prefer App if both available
+                }
+
+            (
+                default_pat_credential_id, default_app_installation_id,
+                auto_link_new_projects, prefer_app_over_pat,
+                created_at, updated_at
+            ) = row
+
+            return {
+                "default_pat_credential_id": default_pat_credential_id,
+                "default_app_installation_id": default_app_installation_id,
+                "auto_link_new_projects": auto_link_new_projects,
+                "prefer_app_over_pat": prefer_app_over_pat,
+                "created_at": created_at.isoformat() if created_at else None,
+                "updated_at": updated_at.isoformat() if updated_at else None,
+            }
+
+        except Exception as exc:
+            logger.exception(f"Error getting user GitHub preferences: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to get preferences",
+            ) from exc
+
+    @app.put("/api/v1/users/me/github-preferences")
+    def update_my_github_preferences(
+        payload: Dict[str, Any],
+        request: Request,
+    ) -> Dict[str, Any]:
+        """Update the current user's GitHub preferences.
+
+        Args:
+            payload: {
+                "default_pat_credential_id": "uuid" or null,
+                "default_app_installation_id": 12345 or null,
+                "auto_link_new_projects": true/false,
+                "prefer_app_over_pat": true/false
+            }
+        """
+        user_id = _require_user_id(request)
+
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+
+        try:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO auth.user_github_preferences
+                            (user_id, default_pat_credential_id, default_app_installation_id,
+                             auto_link_new_projects, prefer_app_over_pat)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id)
+                        DO UPDATE SET
+                            default_pat_credential_id = EXCLUDED.default_pat_credential_id,
+                            default_app_installation_id = EXCLUDED.default_app_installation_id,
+                            auto_link_new_projects = EXCLUDED.auto_link_new_projects,
+                            prefer_app_over_pat = EXCLUDED.prefer_app_over_pat,
+                            updated_at = NOW()
+                        RETURNING
+                            default_pat_credential_id, default_app_installation_id,
+                            auto_link_new_projects, prefer_app_over_pat, updated_at
+                    """, (
+                        user_id,
+                        payload.get("default_pat_credential_id"),
+                        payload.get("default_app_installation_id"),
+                        payload.get("auto_link_new_projects", False),
+                        payload.get("prefer_app_over_pat", True),
+                    ))
+                    row = cur.fetchone()
+                conn.commit()
+
+            (
+                default_pat_credential_id, default_app_installation_id,
+                auto_link_new_projects, prefer_app_over_pat, updated_at
+            ) = row
+
+            return {
+                "default_pat_credential_id": default_pat_credential_id,
+                "default_app_installation_id": default_app_installation_id,
+                "auto_link_new_projects": auto_link_new_projects,
+                "prefer_app_over_pat": prefer_app_over_pat,
+                "updated_at": updated_at.isoformat() if updated_at else None,
+            }
+
+        except Exception as exc:
+            logger.exception(f"Error updating user GitHub preferences: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update preferences",
+            ) from exc
+
+    @app.get("/api/v1/users/me/github-credentials")
+    def list_my_github_credentials(request: Request) -> List[Dict[str, Any]]:
+        """List all GitHub credentials owned by the current user.
+
+        Returns PATs created by the user (without actual token values).
+        """
+        user_id = _require_user_id(request)
+
+        from .auth.github_credential_repository import GitHubCredentialRepository
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        repo = GitHubCredentialRepository(pool)
+
+        credentials = repo.list_by_creator(user_id)
+        return [c.to_dict() for c in credentials]
+
+    @app.get("/api/v1/users/me/github-app-installations")
+    def list_my_github_app_installations(request: Request) -> List[Dict[str, Any]]:
+        """List GitHub App installations accessible to the current user.
+
+        Returns installations the user has linked to their projects, plus
+        installations linked to projects/orgs the user has access to.
+        """
+        user_id = _require_user_id(request)
+
+        from .auth.github_app_service import get_github_app_service
+        from .storage.postgres_pool import PostgresPool
+
+        pool = PostgresPool()
+        service = get_github_app_service()
+
+        if not service.is_configured:
+            return []
+
+        try:
+            # Get installations user has personally linked
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT DISTINCT
+                            gai.installation_id,
+                            gai.account_type,
+                            gai.account_login,
+                            gai.account_id,
+                            gai.permissions,
+                            gai.is_active
+                        FROM auth.github_app_installations gai
+                        JOIN auth.github_app_installation_links gail
+                            ON gai.installation_id = gail.installation_id
+                        WHERE gail.linked_by = %s
+                           OR EXISTS (
+                               SELECT 1 FROM auth.user_project_github_links upl
+                               WHERE upl.installation_link_id = gail.id
+                                 AND upl.user_id = %s
+                           )
+                        ORDER BY gai.account_login
+                    """, (user_id, user_id))
+                    rows = cur.fetchall()
+
+            return [
+                {
+                    "installation_id": row[0],
+                    "account_type": row[1],
+                    "account_login": row[2],
+                    "account_id": row[3],
+                    "permissions": row[4],
+                    "is_active": row[5],
+                }
+                for row in rows
+            ]
+
+        except Exception as exc:
+            logger.exception(f"Error listing user GitHub App installations: {exc}")
+            return []
+
+    # ------------------------------------------------------------------
     # Workflows
     # ------------------------------------------------------------------
     @app.post("/api/v1/workflows/templates", status_code=status.HTTP_201_CREATED)
@@ -3035,6 +3996,109 @@ def create_app(
     # ------------------------------------------------------------------
     # Work Item Execution Streaming
     # ------------------------------------------------------------------
+
+    @app.get("/api/v1/executions/{run_id}/steps")
+    def get_execution_steps(
+        run_id: str,
+        org_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get execution steps for a run.
+
+        Returns steps with token counts, phases, and other execution metadata.
+        This endpoint supports the ExecutionTimeline component in the frontend.
+
+        Response format expected by frontend:
+        {
+            "steps": [
+                {
+                    "step_id": "...",
+                    "phase": "EXECUTING",
+                    "step_type": "llm_response",
+                    "started_at": "2025-01-15T...",
+                    "completed_at": "2025-01-15T...",
+                    "input_tokens": 493,
+                    "output_tokens": 90,
+                    "tool_calls": 0,
+                    "content_preview": "...",
+                    "content_full": null,
+                    "tool_names": null,
+                    "model_id": null
+                }
+            ],
+            "total": 9
+        }
+        """
+        run_id = _validated_uuid(run_id, "Run")
+
+        # Try to get steps from run_service (preferred path with PostgreSQL)
+        try:
+            run = container.run_service.get_run(run_id)
+            steps = []
+            for step in run.steps:
+                step_dict = step.to_dict()
+                metadata = step_dict.get("metadata", {})
+                input_data = metadata.get("input_data", {})
+                if isinstance(input_data, dict):
+                    # Extract from nested input_data if present
+                    input_tokens = input_data.get("input_tokens", 0)
+                    output_tokens = input_data.get("output_tokens", 0)
+                    step_type = input_data.get("step_type", step_dict.get("name", "step"))
+                    phase = input_data.get("phase", "unknown")
+                    content_preview = input_data.get("content_preview")
+                else:
+                    # Already flattened
+                    input_tokens = metadata.get("input_tokens", 0)
+                    output_tokens = metadata.get("output_tokens", 0)
+                    step_type = metadata.get("step_type", step_dict.get("name", "step"))
+                    phase = metadata.get("phase", "unknown")
+                    content_preview = metadata.get("content_preview")
+
+                # Extract tool_calls array and convert to count + names
+                tool_calls_data = input_data.get("tool_calls") if isinstance(input_data, dict) else metadata.get("tool_calls")
+                if isinstance(tool_calls_data, list):
+                    # tool_calls is an array like [{"tool_name": "list_dir"}]
+                    tool_call_count = len(tool_calls_data)
+                    tool_names = [tc.get("tool_name") for tc in tool_calls_data if isinstance(tc, dict) and tc.get("tool_name")]
+                elif isinstance(tool_calls_data, int):
+                    # Already a count
+                    tool_call_count = tool_calls_data
+                    tool_names = metadata.get("tool_names") or []
+                else:
+                    tool_call_count = 0
+                    tool_names = metadata.get("tool_names") or []
+
+                # Format step in the shape expected by frontend
+                formatted_step = {
+                    "step_id": step_dict.get("id") or step_dict.get("step_id", ""),
+                    "phase": phase,
+                    "step_type": step_type,
+                    "started_at": step_dict.get("started_at") or step_dict.get("created_at", ""),
+                    "completed_at": step_dict.get("completed_at"),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "tool_calls": tool_call_count,
+                    "content_preview": content_preview,
+                    "content_full": metadata.get("content_full"),
+                    "tool_names": tool_names if tool_names else None,
+                    "model_id": metadata.get("model_id"),
+                }
+                steps.append(formatted_step)
+
+            # Sort steps by started_at ascending (chronological order for timeline)
+            logger.info(f"Before sort: {len(steps)} steps, first={steps[0].get('started_at') if steps else None}")
+            steps.sort(key=lambda s: s.get("started_at") or "")
+            logger.info(f"After sort: first={steps[0].get('started_at') if steps else None}")
+
+            return {
+                "steps": steps,
+                "total": len(steps),
+            }
+        except RunNotFoundError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run {run_id} not found")
+        except Exception as exc:
+            logger.exception(f"Error fetching execution steps for run {run_id}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
     @app.websocket("/api/v1/executions/ws")
     async def executions_ws(websocket: WebSocket) -> None:
@@ -3747,6 +4811,26 @@ def create_app(
         """Initiate device authorization for CLI or partner surfaces."""
 
         try:
+            # Use PostgreSQL store for shared state if available
+            if container.postgres_device_store:
+                session = container.postgres_device_store.create_session(
+                    client_id=payload["client_id"],
+                    scopes=payload["scopes"],
+                    surface=payload.get("surface", "CLI"),
+                    metadata=payload.get("metadata"),
+                )
+                verification_uri = os.getenv("GUIDEAI_DEVICE_VERIFICATION_URI", "https://device.guideai.dev/activate")
+                return {
+                    "device_code": session.device_code,
+                    "user_code": session.user_code,
+                    "verification_uri": verification_uri,
+                    "verification_uri_complete": f"{verification_uri}?user_code={session.user_code}",
+                    "expires_in": int((session.expires_at - session.created_at).total_seconds()),
+                    "interval": session.poll_interval,
+                    "status": session.status,
+                }
+
+            # Fallback to in-memory manager
             session = container.device_flow_manager.start_authorization(
                 client_id=payload["client_id"],
                 scopes=payload["scopes"],
@@ -3786,6 +4870,28 @@ def create_app(
             )
         try:
             normalized = _normalize_user_code(raw_code)
+
+            # Use PostgreSQL store for shared state if available
+            if container.postgres_device_store:
+                session = container.postgres_device_store.get_by_user_code(normalized)
+                if session is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"No authorization request found for user code: {normalized}",
+                    )
+                expires_in = int((session.expires_at - datetime.now(timezone.utc)).total_seconds())
+                return {
+                    "status": session.status,
+                    "client_id": session.client_id,
+                    "scopes": session.scopes,
+                    "surface": session.surface or "CLI",
+                    "user_code": session.user_code,
+                    "verification_uri": os.getenv("GUIDEAI_DEVICE_VERIFICATION_URI", "https://device.guideai.dev/activate"),
+                    "expires_in": max(0, expires_in),
+                    "created_at": session.created_at.isoformat(),
+                }
+
+            # Fallback to in-memory manager
             session = container.device_flow_manager.describe_user_code(normalized)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -3819,6 +4925,27 @@ def create_app(
         surface = payload.get("surface", "WEB")
         try:
             normalized = _normalize_user_code(raw_code)
+
+            # Use PostgreSQL store for shared state if available
+            if container.postgres_device_store:
+                session = container.postgres_device_store.approve_by_user_code(
+                    user_code=normalized,
+                    approver=approver,
+                    approver_surface=surface,
+                )
+                if session is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"No pending authorization request found for user code: {normalized}",
+                    )
+                return {
+                    "status": session.status,
+                    "client_id": session.client_id,
+                    "scopes": session.scopes,
+                    "approved_at": session.approved_at.isoformat() if session.approved_at else None,
+                }
+
+            # Fallback to in-memory manager
             session = container.device_flow_manager.approve_user_code(
                 normalized,
                 approver,
@@ -3855,6 +4982,28 @@ def create_app(
         surface = payload.get("surface", "WEB")
         try:
             normalized = _normalize_user_code(raw_code)
+
+            # Use PostgreSQL store for shared state if available
+            if container.postgres_device_store:
+                session = container.postgres_device_store.deny_by_user_code(
+                    user_code=normalized,
+                    approver=approver,
+                    approver_surface=surface,
+                    reason=reason,
+                )
+                if session is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"No pending authorization request found for user code: {normalized}",
+                    )
+                return {
+                    "status": session.status,
+                    "client_id": session.client_id,
+                    "scopes": session.scopes,
+                    "denied_reason": session.denied_reason,
+                }
+
+            # Fallback to in-memory manager
             session = container.device_flow_manager.deny_user_code(
                 normalized,
                 approver,
@@ -3886,6 +5035,69 @@ def create_app(
                 detail="device_code is required",
             )
         try:
+            # Use PostgreSQL store for shared state if available
+            if container.postgres_device_store:
+                session = container.postgres_device_store.get_by_device_code(device_code)
+                if session is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"No authorization request found for device code",
+                    )
+
+                # Per RFC 8628, pending authorization should return 400 with authorization_pending error
+                if session.status == "pending":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            "error": "authorization_pending",
+                            "error_description": "The authorization request is still pending.",
+                            "interval": session.poll_interval,
+                        },
+                    )
+
+                if session.status == "denied":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            "error": "access_denied",
+                            "error_description": session.denied_reason or "The user denied the authorization request.",
+                        },
+                    )
+
+                if session.status == "expired" or (session.expires_at and session.expires_at < datetime.now(timezone.utc)):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            "error": "expired_token",
+                            "error_description": "The device code has expired.",
+                        },
+                    )
+
+                # Only APPROVED status gets here
+                if session.access_token is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Session approved but tokens not generated",
+                    )
+
+                # Calculate expires_in from token expiry
+                access_expires_in = 3600  # default 1 hour
+                refresh_expires_in = 86400 * 7  # default 7 days
+                if session.access_token_expires_at:
+                    access_expires_in = int((session.access_token_expires_at - datetime.now(timezone.utc)).total_seconds())
+                if session.refresh_token_expires_at:
+                    refresh_expires_in = int((session.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds())
+
+                return {
+                    "access_token": session.access_token,
+                    "refresh_token": session.refresh_token,
+                    "token_type": "Bearer",
+                    "expires_in": max(0, access_expires_in),
+                    "refresh_expires_in": max(0, refresh_expires_in),
+                    "scope": " ".join(session.scopes) if session.scopes else "",
+                }
+
+            # Fallback to in-memory manager
             result = container.device_flow_manager.poll_device_code(device_code)
         except DeviceCodeNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -4013,8 +5225,15 @@ def create_app(
 
         access_token = auth_header[7:]  # Remove "Bearer " prefix
 
-        # Look up user info from the access token
-        user_info = container.device_flow_manager.get_user_info_from_access_token(access_token)
+        # Try PostgreSQL store first for shared state
+        user_info = None
+        if container.postgres_device_store:
+            user_info = container.postgres_device_store.get_user_info_from_access_token(access_token)
+
+        # Fallback to in-memory manager
+        if user_info is None:
+            user_info = container.device_flow_manager.get_user_info_from_access_token(access_token)
+
         if user_info is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -4040,7 +5259,16 @@ def create_app(
             )
 
         access_token = auth_header[7:]
-        user_info = container.device_flow_manager.get_user_info_from_access_token(access_token)
+
+        # Try PostgreSQL store first for shared state
+        user_info = None
+        if container.postgres_device_store:
+            user_info = container.postgres_device_store.get_user_info_from_access_token(access_token)
+
+        # Fallback to in-memory manager
+        if user_info is None:
+            user_info = container.device_flow_manager.get_user_info_from_access_token(access_token)
+
         if user_info is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -4543,6 +5771,260 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to get verification status: {exc}",
+            ) from exc
+
+    # =========================================================================
+    # JIT CONSENT ENDPOINTS (Phase 6: Consent UX Dashboard)
+    # =========================================================================
+
+    @app.get("/api/v1/consent/{user_code}")
+    async def get_consent_request(user_code: str) -> Dict[str, Any]:
+        """
+        Look up a consent request by user code.
+
+        Used by the consent approval dashboard to display request details.
+
+        Args:
+            user_code: User-friendly code (e.g., 'ABCD-1234')
+
+        Returns:
+            Consent request details or 404 if not found
+        """
+        try:
+            from .auth.consent_service import get_consent_service
+            from .storage.postgres_pool import PostgresPool
+
+            dsn = os.environ.get("GUIDEAI_CONSENT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            if not dsn:
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+
+            pool = PostgresPool(dsn)
+            consent_service = get_consent_service(pool)
+
+            request = await consent_service.get_by_user_code(user_code)
+            if not request:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Consent request not found for code: {user_code}",
+                )
+
+            return request.to_dict()
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"Failed to get consent request: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to get consent request: {exc}",
+            ) from exc
+
+    @app.post("/api/v1/consent/{user_code}/approve")
+    async def approve_consent_request(
+        user_code: str,
+        request: Request,
+        payload: Dict[str, Any] = Body(default={}),
+    ) -> Dict[str, Any]:
+        """
+        Approve a consent request.
+
+        Requires authentication - the approver must be the user the consent is for.
+
+        Args:
+            user_code: User-friendly code (e.g., 'ABCD-1234')
+            reason: Optional approval reason
+
+        Returns:
+            Success status
+        """
+        try:
+            approver_id = _require_user_id(request)
+            reason = payload.get("reason")
+
+            from .auth.consent_service import get_consent_service
+            from .storage.postgres_pool import PostgresPool
+
+            dsn = os.environ.get("GUIDEAI_CONSENT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            if not dsn:
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+
+            pool = PostgresPool(dsn)
+            consent_service = get_consent_service(pool)
+
+            # Verify the request exists and user is authorized
+            consent_req = await consent_service.get_by_user_code(user_code)
+            if not consent_req:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Consent request not found for code: {user_code}",
+                )
+
+            if consent_req.user_id != approver_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot approve consent for another user",
+                )
+
+            success = await consent_service.approve(
+                user_code=user_code,
+                approver_id=approver_id,
+                reason=reason,
+            )
+
+            return {
+                "success": success,
+                "user_code": user_code,
+                "status": "approved" if success else "failed",
+            }
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"Failed to approve consent: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to approve consent: {exc}",
+            ) from exc
+
+    @app.post("/api/v1/consent/{user_code}/deny")
+    async def deny_consent_request(
+        user_code: str,
+        request: Request,
+        payload: Dict[str, Any] = Body(default={}),
+    ) -> Dict[str, Any]:
+        """
+        Deny a consent request.
+
+        Requires authentication - the denier must be the user the consent is for.
+
+        Args:
+            user_code: User-friendly code (e.g., 'ABCD-1234')
+            reason: Optional denial reason
+
+        Returns:
+            Success status
+        """
+        try:
+            approver_id = _require_user_id(request)
+            reason = payload.get("reason")
+
+            from .auth.consent_service import get_consent_service
+            from .storage.postgres_pool import PostgresPool
+
+            dsn = os.environ.get("GUIDEAI_CONSENT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            if not dsn:
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+
+            pool = PostgresPool(dsn)
+            consent_service = get_consent_service(pool)
+
+            # Verify the request exists and user is authorized
+            consent_req = await consent_service.get_by_user_code(user_code)
+            if not consent_req:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Consent request not found for code: {user_code}",
+                )
+
+            if consent_req.user_id != approver_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot deny consent for another user",
+                )
+
+            success = await consent_service.deny(
+                user_code=user_code,
+                approver_id=approver_id,
+                reason=reason,
+            )
+
+            return {
+                "success": success,
+                "user_code": user_code,
+                "status": "denied" if success else "failed",
+            }
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"Failed to deny consent: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to deny consent: {exc}",
+            ) from exc
+
+    @app.get("/api/v1/consent/{user_code}/status")
+    async def poll_consent_status(user_code: str) -> Dict[str, Any]:
+        """
+        Poll the status of a consent request.
+
+        Used by CLI/MCP clients waiting for user approval.
+        Does not require authentication - only the user code is needed.
+
+        Args:
+            user_code: User-friendly code (e.g., 'ABCD-1234')
+
+        Returns:
+            Current status (pending, approved, denied, expired, not_found)
+        """
+        try:
+            from .auth.consent_service import get_consent_service
+            from .storage.postgres_pool import PostgresPool
+
+            dsn = os.environ.get("GUIDEAI_CONSENT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            if not dsn:
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+
+            pool = PostgresPool(dsn)
+            consent_service = get_consent_service(pool)
+
+            poll_result = await consent_service.poll_status(user_code)
+            return poll_result.to_dict()
+
+        except Exception as exc:
+            logger.error(f"Failed to poll consent status: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to poll consent status: {exc}",
+            ) from exc
+
+    @app.get("/api/v1/consent/pending")
+    async def list_pending_consents(request: Request) -> Dict[str, Any]:
+        """
+        List pending consent requests for the authenticated user.
+
+        Requires authentication.
+
+        Returns:
+            List of pending consent requests
+        """
+        try:
+            user_id = _require_user_id(request)
+
+            from .auth.consent_service import get_consent_service
+            from .storage.postgres_pool import PostgresPool
+
+            dsn = os.environ.get("GUIDEAI_CONSENT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            if not dsn:
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+
+            pool = PostgresPool(dsn)
+            consent_service = get_consent_service(pool)
+
+            requests = await consent_service.list_pending_for_user(user_id)
+
+            return {
+                "requests": [r.to_dict() for r in requests],
+                "total": len(requests),
+            }
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"Failed to list pending consents: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to list pending consents: {exc}",
             ) from exc
 
     # =========================================================================

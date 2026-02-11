@@ -152,13 +152,23 @@ def create_amprealize_routes(
 
     if include_environment_routes:
         @router.get("/environments", response_model=List[Dict[str, Any]])
-        async def list_environments() -> List[Dict[str, Any]]:
+        async def list_environments(
+            reconcile: bool = True,
+            auto_cleanup: bool = True,
+        ) -> List[Dict[str, Any]]:
             """List active environments.
 
             Returns all environments currently deployed or in progress.
+
+            Args:
+                reconcile: If True, verify containers actually exist
+                auto_cleanup: If True, remove state files for stale environments
             """
             try:
-                return service.list_environments()
+                return service.list_environments(
+                    reconcile=reconcile,
+                    auto_cleanup=auto_cleanup,
+                )
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"List environments failed: {e}")
 

@@ -90,7 +90,7 @@ export interface IngestResponse {
 }
 
 export interface RazeClientOptions {
-	/** Base URL for Raze API (default: from settings or http://localhost:8000) */
+	/** Base URL for Raze API (default: from settings or http://localhost:8080) */
 	baseUrl?: string;
 	/** Service name to tag all logs with */
 	serviceName?: string;
@@ -199,7 +199,7 @@ export class RazeClient {
 	) {
 		const config = vscode.workspace.getConfiguration('guideai');
 
-		this.baseUrl = options.baseUrl ?? config.get('apiBaseUrl', 'http://localhost:8000');
+		this.baseUrl = options.baseUrl ?? config.get('apiBaseUrl', 'http://localhost:8080');
 		this.serviceName = options.serviceName ?? 'guideai-vscode-extension';
 		this.maxBufferSize = options.maxBufferSize ?? 100;
 		this.lingerMs = options.lingerMs ?? 5000;

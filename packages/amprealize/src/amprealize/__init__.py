@@ -58,11 +58,57 @@ from amprealize.models import (
 from amprealize.hooks import AmprealizeHooks
 from amprealize.service import AmprealizeService
 
+# Orchestrator for workspace management
+from amprealize.orchestrator import (
+    AmpOrchestrator,
+    WorkspaceConfig,
+    WorkspaceInfo,
+    OrchestratorHooks,
+    OrchestratorError,
+    WorkspaceNotFoundError,
+    QuotaExceededError,
+    ProvisionError,
+    get_orchestrator,
+)
+
+# Quota service for plan-based limits
+from amprealize.quota import (
+    QuotaService,
+    QuotaLimits,
+    PLAN_LIMITS,
+    get_isolation_scope,
+    parse_scope,
+    get_quota_service,
+    reset_quota_service,
+    EnvironmentPlanResolver,
+    DatabasePlanResolver,
+)
+
 __version__ = "0.1.0"
 __all__ = [
     # Core service
     "AmprealizeService",
     "AmprealizeHooks",
+    # Orchestrator
+    "AmpOrchestrator",
+    "WorkspaceConfig",
+    "WorkspaceInfo",
+    "OrchestratorHooks",
+    "OrchestratorError",
+    "WorkspaceNotFoundError",
+    "QuotaExceededError",
+    "ProvisionError",
+    "get_orchestrator",
+    # Quota service
+    "QuotaService",
+    "QuotaLimits",
+    "PLAN_LIMITS",
+    "get_isolation_scope",
+    "parse_scope",
+    "get_quota_service",
+    "reset_quota_service",
+    "EnvironmentPlanResolver",
+    "DatabasePlanResolver",
     # Request/Response models
     "PlanRequest",
     "PlanResponse",

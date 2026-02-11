@@ -37,15 +37,15 @@ export class CostTreeDataProvider implements vscode.TreeDataProvider<CostTreeIte
 	private periodDays = 30;
 
 	constructor(private client: GuideAIClient) {
-		this.initializeDataProvider();
+		// NOTE: Do NOT auto-initialize - wait for user to manually refresh
+		// This prevents resource exhaustion on startup
 	}
 
-	private async initializeDataProvider(): Promise<void> {
-		await this.refresh();
-		this.startAutoRefresh();
-	}
-
+	/**
+	 * Start auto-refresh (call only after user initiates first refresh)
+	 */
 	private startAutoRefresh(): void {
+		if (this.refreshTimer) return;
 		this.refreshTimer = setInterval(async () => {
 			await this.refresh();
 		}, this.refreshInterval);

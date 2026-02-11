@@ -1472,6 +1472,7 @@ class CLIRunServiceAdapter(BaseRunServiceAdapter):
         metadata: Dict[str, Any] | None = None,
         initial_message: str | None = None,
         total_steps: int | None = None,
+        triggering_user_id: str | None = None,
     ) -> Dict[str, Any]:
         actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
         request = RunCreateRequest(
@@ -1484,6 +1485,7 @@ class CLIRunServiceAdapter(BaseRunServiceAdapter):
             metadata=metadata or {},
             initial_message=initial_message,
             total_steps=total_steps,
+            triggering_user_id=triggering_user_id,
         )
         run = self._service.create_run(request)
         return self._format_run(run)
@@ -1581,6 +1583,7 @@ class RestRunServiceAdapter(BaseRunServiceAdapter):
             metadata=payload.get("metadata", {}),
             initial_message=payload.get("initial_message"),
             total_steps=payload.get("total_steps"),
+            triggering_user_id=payload.get("triggering_user_id"),
         )
         run = self._service.create_run(request)
         return self._format_run(run)
@@ -1694,6 +1697,7 @@ class MCPRunServiceAdapter(BaseRunServiceAdapter):
             metadata=payload.get("metadata", {}),
             initial_message=payload.get("initial_message"),
             total_steps=payload.get("total_steps"),
+            triggering_user_id=payload.get("triggering_user_id"),
         )
         run = self._service.create_run(request)
         return self._format_run(run)
@@ -1892,6 +1896,7 @@ class CLIWorkflowServiceAdapter(BaseWorkflowAdapter):
         metadata: Dict[str, Any] | None,
         actor_id: str,
         actor_role: str,
+        enable_early_retrieval: bool = True,
     ) -> Dict[str, Any]:
         actor = Actor(id=actor_id, role=actor_role, surface=self.surface)
         run = self._service.run_workflow(
@@ -1899,6 +1904,7 @@ class CLIWorkflowServiceAdapter(BaseWorkflowAdapter):
             actor=actor,
             behavior_ids=behavior_ids,
             metadata=metadata,
+            enable_early_retrieval=enable_early_retrieval,
         )
         return self._format_run(run)
 
@@ -2284,6 +2290,7 @@ class RestWorkflowServiceAdapter(BaseWorkflowAdapter):
             actor=actor,
             behavior_ids=payload.get("behavior_ids"),
             metadata=payload.get("metadata"),
+            enable_early_retrieval=payload.get("enable_early_retrieval", True),
         )
         return self._format_run(run)
 
@@ -2361,6 +2368,7 @@ class MCPWorkflowServiceAdapter(BaseWorkflowAdapter):
             actor=actor,
             behavior_ids=payload.get("behavior_ids"),
             metadata=payload.get("metadata"),
+            enable_early_retrieval=payload.get("enable_early_retrieval", True),
         )
         return self._format_run(run)
 

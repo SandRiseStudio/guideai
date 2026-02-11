@@ -7,6 +7,8 @@
       "env": {
         "PYTHONUNBUFFERED": "1",
 
+        "GUIDEAI_DEV_ADMIN_USERS": "dev-user,admin,dev-admin",
+
         "GUIDEAI_AUTH_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
         "GUIDEAI_BOARD_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
         "GUIDEAI_ACTION_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
@@ -21,6 +23,7 @@
         "GUIDEAI_METRICS_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
         "GUIDEAI_AUDIT_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
         "GUIDEAI_AGENTAUTH_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
+        "GUIDEAI_ORG_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dauth",
 
         "GUIDEAI_TELEMETRY_PG_DSN": "postgresql://telemetry:telemetry_dev@localhost:5433/telemetry",
         "GUIDEAI_TASK_PG_DSN": "postgresql://telemetry:telemetry_dev@localhost:5433/telemetry"

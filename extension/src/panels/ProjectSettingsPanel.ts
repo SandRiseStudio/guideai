@@ -6,10 +6,19 @@
  * - GitHub repository URL
  * - GitHub branch selection
  * - Execution mode (local, github_pr, local_and_pr)
+ * - GitHub Credential linking (per-user)
  */
 
 import * as vscode from 'vscode';
-import { GuideAIClient, ProjectSettings as ClientProjectSettings, LLMCredential as ClientLLMCredential } from '../client/GuideAIClient';
+import {
+	GuideAIClient,
+	ProjectSettings as ClientProjectSettings,
+	LLMCredential as ClientLLMCredential,
+	GitHubLink,
+	GitHubResolution,
+	GitHubCredential,
+	GitHubAppInstallation
+} from '../client/GuideAIClient';
 
 // Execution mode determines where file changes are written
 export type ExecutionMode = 'local' | 'github_pr' | 'local_and_pr';
@@ -45,6 +54,11 @@ export class ProjectSettingsPanel {
 	private _settings: ProjectSettings | null = null;
 	private _validatedGithub: GitHubValidationResult | null = null;
 	private _credentials: LLMCredential[] = [];
+	// GitHub credential linking
+	private _githubLink: GitHubLink | null = null;
+	private _githubResolution: GitHubResolution | null = null;
+	private _myGitHubCredentials: GitHubCredential[] = [];
+	private _myGitHubAppInstallations: GitHubAppInstallation[] = [];
 
 	private constructor(
 		panel: vscode.WebviewPanel,
@@ -84,6 +98,16 @@ export class ProjectSettingsPanel {
 						return;
 					case 'reEnableCredential':
 						await this._reEnableCredential(message.credentialId, message.apiKey);
+						return;
+					// GitHub credential linking
+					case 'linkGitHubPAT':
+						await this._linkGitHubPAT(message.token, message.name);
+						return;
+					case 'linkGitHubApp':
+						await this._linkGitHubApp(message.installationId);
+						return;
+					case 'unlinkGitHub':
+						await this._unlinkGitHub(message.linkType);
 						return;
 				}
 			},
@@ -148,12 +172,25 @@ export class ProjectSettingsPanel {
 	private async _loadSettings() {
 		try {
 			this._settings = await this._client.getProjectSettings(this._projectId);
-			// Load credentials
+			// Load LLM credentials
 			try {
 				this._credentials = await this._client.getProjectCredentials(this._projectId);
 			} catch (credError) {
 				console.warn('Failed to load credentials:', credError);
 				this._credentials = [];
+			}
+			// Load GitHub link data
+			try {
+				this._githubLink = await this._client.getMyGitHubLink(this._projectId);
+				this._githubResolution = await this._client.getGitHubResolution(this._projectId);
+				this._myGitHubCredentials = await this._client.listMyGitHubCredentials();
+				this._myGitHubAppInstallations = await this._client.listMyGitHubAppInstallations();
+			} catch (ghError) {
+				console.warn('Failed to load GitHub link data:', ghError);
+				this._githubLink = null;
+				this._githubResolution = null;
+				this._myGitHubCredentials = [];
+				this._myGitHubAppInstallations = [];
 			}
 			this._update();
 		} catch (error) {
@@ -285,8 +322,169 @@ export class ProjectSettingsPanel {
 		}
 	}
 
+	private async _linkGitHubPAT(token: string, name?: string) {
+		try {
+			await this._client.linkMyPATToProject(this._projectId, { token, name });
+			vscode.window.showInformationMessage('GitHub PAT linked successfully');
+			await this._loadSettings();
+		} catch (error) {
+			console.error('Failed to link GitHub PAT:', error);
+			vscode.window.showErrorMessage(`Failed to link GitHub PAT: ${error}`);
+		}
+	}
+
+	private async _linkGitHubApp(installationId: number) {
+		try {
+			await this._client.linkMyAppToProject(this._projectId, { installation_id: installationId });
+			vscode.window.showInformationMessage('GitHub App linked successfully');
+			await this._loadSettings();
+		} catch (error) {
+			console.error('Failed to link GitHub App:', error);
+			vscode.window.showErrorMessage(`Failed to link GitHub App: ${error}`);
+		}
+	}
+
+	private async _unlinkGitHub(linkType?: 'pat' | 'app') {
+		const confirm = await vscode.window.showWarningMessage(
+			'Are you sure you want to unlink this GitHub credential?',
+			{ modal: true },
+			'Unlink'
+		);
+		if (confirm !== 'Unlink') {
+			return;
+		}
+
+		try {
+			await this._client.unlinkMyGitHubFromProject(this._projectId, linkType);
+			vscode.window.showInformationMessage('GitHub credential unlinked successfully');
+			await this._loadSettings();
+		} catch (error) {
+			console.error('Failed to unlink GitHub credential:', error);
+			vscode.window.showErrorMessage(`Failed to unlink GitHub credential: ${error}`);
+		}
+	}
+
 	private _update() {
 		this._panel.webview.html = this._getHtmlForWebview();
+	}
+
+	private _renderGitHubResolutionStatus(): string {
+		const resolution = this._githubResolution;
+
+		if (!resolution) {
+			return '';
+		}
+
+		if (!resolution.has_credential) {
+			return `
+				<div class="info-card warning">
+					<span class="info-icon">⚠️</span>
+					<span>No GitHub credential configured. Agents won't be able to create PRs or access private repositories.</span>
+				</div>
+			`;
+		}
+
+		const sourceLabels: Record<string, string> = {
+			'user_app': 'Your linked GitHub App',
+			'user_pat': 'Your linked Personal Access Token',
+			'project_app': 'Shared project GitHub App',
+			'project_pat': 'Shared project PAT',
+			'org_app': 'Organization GitHub App',
+			'org_pat': 'Organization PAT',
+			'platform': 'Platform default',
+		};
+
+		const sourceLabel = sourceLabels[resolution.source || ''] || resolution.source || 'Unknown';
+		const scopeStatus = resolution.has_required_scopes
+			? '<span class="status-badge success">✓ Required scopes</span>'
+			: `<span class="status-badge warning">⚠️ ${escapeHtml(resolution.scope_warning || 'Missing scopes')}</span>`;
+
+		return `
+			<div class="info-card success">
+				<span class="info-icon">✓</span>
+				<div class="resolution-info">
+					<span><strong>Active credential:</strong> ${escapeHtml(sourceLabel)}</span>
+					${resolution.github_username ? `<span>GitHub user: @${escapeHtml(resolution.github_username)}</span>` : ''}
+					${scopeStatus}
+				</div>
+			</div>
+		`;
+	}
+
+	private _renderGitHubLinkSection(): string {
+		const link = this._githubLink;
+
+		// If user has a link, show it
+		if (link) {
+			const linkTypeLabel = link.link_type === 'app' ? 'GitHub App' : 'Personal Access Token';
+			return `
+				<div class="github-link-active">
+					<div class="link-info">
+						<span class="link-type">${escapeHtml(linkTypeLabel)}</span>
+						${link.credential_name ? `<span class="link-name">${escapeHtml(link.credential_name)}</span>` : ''}
+						${link.github_identity ? `<span class="link-identity">@${escapeHtml(link.github_identity)}</span>` : ''}
+						${link.last_used_at ? `<span class="link-usage">Last used: ${new Date(link.last_used_at).toLocaleDateString()}</span>` : ''}
+					</div>
+					<button class="danger-btn small" id="unlinkGitHubBtn" data-type="${link.link_type}">
+						Unlink
+					</button>
+				</div>
+			`;
+		}
+
+		// Show options to link
+		const appOptions = this._myGitHubAppInstallations
+			.filter(i => i.is_active)
+			.map(i => `<option value="${i.installation_id}">${escapeHtml(i.account_login)} (${escapeHtml(i.account_type)})</option>`)
+			.join('');
+
+		return `
+			<div class="github-link-form">
+				<div class="link-option">
+					<h4>Option 1: Link a GitHub App Installation</h4>
+					<p class="option-description">Recommended. GitHub Apps have fine-grained permissions and don't expire.</p>
+					${appOptions
+						? `
+							<div class="form-row">
+								<label for="ghAppSelect" class="field-label">Select Installation</label>
+								<select id="ghAppSelect" class="select-input">
+									<option value="">Choose an installation...</option>
+									${appOptions}
+								</select>
+							</div>
+							<button class="primary-btn" id="linkGitHubAppBtn">Link App</button>
+						`
+						: `<p class="empty-state">No GitHub App installations available. <a href="https://github.com/apps/guideai" target="_blank">Install the GitHub App</a></p>`
+					}
+				</div>
+
+				<div class="divider">or</div>
+
+				<div class="link-option">
+					<h4>Option 2: Link a Personal Access Token</h4>
+					<p class="option-description">Use a classic or fine-grained PAT. Requires 'repo' scope for private repos.</p>
+					<div class="form-row">
+						<label for="ghPATInput" class="field-label">Personal Access Token</label>
+						<input
+							type="password"
+							id="ghPATInput"
+							class="text-input"
+							placeholder="ghp_... or github_pat_..."
+						/>
+					</div>
+					<div class="form-row">
+						<label for="ghPATName" class="field-label">Name (optional)</label>
+						<input
+							type="text"
+							id="ghPATName"
+							class="text-input"
+							placeholder="e.g., My GitHub PAT"
+						/>
+					</div>
+					<button class="primary-btn" id="linkGitHubPATBtn">Link PAT</button>
+				</div>
+			</div>
+		`;
 	}
 
 	private _getHtmlForWebview(): string {
@@ -476,6 +674,18 @@ export class ProjectSettingsPanel {
 			</div>
 		</section>
 
+		<section class="settings-section">
+			<h2>GitHub Credentials</h2>
+			<p class="section-description">
+				Link your personal GitHub credentials for agent access to repositories. When agents run work items,
+				they'll use your linked credentials to interact with GitHub on your behalf.
+			</p>
+
+			${this._renderGitHubResolutionStatus()}
+
+			${this._renderGitHubLinkSection()}
+		</section>
+
 		<div class="actions">
 			<button class="primary-btn" id="saveBtn">Save Settings</button>
 		</div>
@@ -616,6 +826,51 @@ export class ProjectSettingsPanel {
 				reEnableModal.classList.add('hidden');
 				reEnableCredentialId = null;
 			});
+
+			// GitHub credential link handlers
+			const linkGitHubAppBtn = document.getElementById('linkGitHubAppBtn');
+			const linkGitHubPATBtn = document.getElementById('linkGitHubPATBtn');
+			const unlinkGitHubBtn = document.getElementById('unlinkGitHubBtn');
+			const ghAppSelect = document.getElementById('ghAppSelect');
+			const ghPATInput = document.getElementById('ghPATInput');
+			const ghPATName = document.getElementById('ghPATName');
+
+			if (linkGitHubAppBtn && ghAppSelect) {
+				linkGitHubAppBtn.addEventListener('click', () => {
+					const installationId = parseInt(ghAppSelect.value, 10);
+					if (installationId) {
+						vscode.postMessage({
+							type: 'linkGitHubApp',
+							installationId: installationId
+						});
+					}
+				});
+			}
+
+			if (linkGitHubPATBtn && ghPATInput) {
+				linkGitHubPATBtn.addEventListener('click', () => {
+					const token = ghPATInput.value.trim();
+					if (token) {
+						vscode.postMessage({
+							type: 'linkGitHubPAT',
+							token: token,
+							name: ghPATName ? ghPATName.value.trim() : undefined
+						});
+						ghPATInput.value = '';
+						if (ghPATName) ghPATName.value = '';
+					}
+				});
+			}
+
+			if (unlinkGitHubBtn) {
+				unlinkGitHubBtn.addEventListener('click', () => {
+					const linkType = unlinkGitHubBtn.dataset.type;
+					vscode.postMessage({
+						type: 'unlinkGitHub',
+						linkType: linkType
+					});
+				});
+			}
 
 			window.addEventListener('message', event => {
 				const message = event.data;

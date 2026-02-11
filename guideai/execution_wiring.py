@@ -91,6 +91,9 @@ def wire_execution_service(
     telemetry: Optional[TelemetryClient] = None,
     credential_resolver: Optional[CredentialResolver] = None,
     tool_registry: Optional[Dict[str, Any]] = None,
+    bci_service: Optional[Any] = None,  # BCIService for EKA
+    enable_early_retrieval: Optional[bool] = None,  # Override EKA config
+    gate_notifier: Optional[Any] = None,  # GateNotifier for gate event notifications
 ) -> Any:
     """Create and wire a fully-configured WorkItemExecutionService.
 
@@ -129,9 +132,15 @@ def wire_execution_service(
         pool = PostgresPool(dsn) if dsn else None
         task_cycle_service = TaskCycleService(pool=pool)
 
-    # Create the run service if not provided
+    # Create the run service if not provided - prefer PostgreSQL when DSN is available
     if run_service is None:
-        run_service = RunService()
+        if dsn:
+            from .run_service_postgres import PostgresRunService
+            run_service = PostgresRunService(dsn=dsn, telemetry=telemetry)
+            logger.info("Created PostgresRunService with PostgreSQL backend")
+        else:
+            run_service = RunService()
+            logger.warning("No DSN provided - using SQLite RunService (not recommended for production)")
 
     # Create the main service
     service = WorkItemExecutionService(
@@ -156,14 +165,32 @@ def wire_execution_service(
     )
     logger.info("Created AgentLLMClient")
 
-    # Create the execution loop
+    # Create BCIService for Early Knowledge Alignment if not provided
+    if bci_service is None:
+        try:
+            from .bci_service import BCIService
+            from .behavior_service import BehaviorService
+            behavior_service = BehaviorService()
+            bci_service = BCIService(
+                behavior_service=behavior_service,
+                telemetry=telemetry,
+            )
+            logger.info("Created BCIService for EKA")
+        except Exception as e:
+            logger.warning(f"Could not create BCIService for EKA: {e}")
+            bci_service = None
+
+    # Create the execution loop with EKA support
     execution_loop = AgentExecutionLoop(
         run_service=run_service,
         task_cycle_service=task_cycle_service,
         llm_client=llm_client,
         telemetry=telemetry,
+        bci_service=bci_service,
+        enable_early_retrieval=enable_early_retrieval,
+        gate_notifier=gate_notifier,
     )
-    logger.info("Created AgentExecutionLoop")
+    logger.info(f"Created AgentExecutionLoop (EKA enabled: {execution_loop._enable_early_retrieval})")
 
     # Wire them together
     service.set_execution_loop(execution_loop)
@@ -175,11 +202,14 @@ def wire_execution_service(
 
 def wire_execution_loop(
     *,
+    dsn: Optional[str] = None,
     run_service: Optional[RunService] = None,
     task_cycle_service: Optional[TaskCycleService] = None,
     telemetry: Optional[TelemetryClient] = None,
     credential_resolver: Optional[CredentialResolver] = None,
     tool_registry: Optional[Dict[str, Any]] = None,
+    bci_service: Optional[Any] = None,  # BCIService for EKA
+    enable_early_retrieval: Optional[bool] = None,  # Override EKA config
 ) -> Any:
     """Create and wire a standalone AgentExecutionLoop with LLM client.
 
@@ -187,14 +217,17 @@ def wire_execution_loop(
     for example when the WorkItemExecutionService is already created.
 
     Args:
+        dsn: PostgreSQL connection string for PostgresRunService
         run_service: Service for run tracking
         task_cycle_service: Service for GEP phase management
         telemetry: Telemetry client
         credential_resolver: Function to resolve LLM API keys
         tool_registry: Registry of tool schemas
+        bci_service: BCIService for Early Knowledge Alignment (EKA)
+        enable_early_retrieval: Override GUIDEAI_ENABLE_EARLY_RETRIEVAL env var
 
     Returns:
-        AgentExecutionLoop with LLM client wired
+        AgentExecutionLoop with LLM client and EKA wired
     """
     from .agent_execution_loop import AgentExecutionLoop
     from .agent_llm_client import AgentLLMClient
@@ -206,12 +239,39 @@ def wire_execution_loop(
         telemetry=telemetry,
     )
 
-    # Create execution loop with LLM client
+    # Create run service if not provided - prefer PostgreSQL when DSN is available
+    if run_service is None:
+        if dsn:
+            from .run_service_postgres import PostgresRunService
+            run_service = PostgresRunService(dsn=dsn, telemetry=telemetry)
+            logger.info("Created PostgresRunService for wire_execution_loop")
+        else:
+            run_service = RunService()
+            logger.warning("No DSN provided - using SQLite RunService")
+
+    # Create BCIService for EKA if not provided
+    if bci_service is None:
+        try:
+            from .bci_service import BCIService
+            from .behavior_service import BehaviorService
+            behavior_service = BehaviorService()
+            bci_service = BCIService(
+                behavior_service=behavior_service,
+                telemetry=telemetry,
+            )
+            logger.info("Created BCIService for EKA in wire_execution_loop")
+        except Exception as e:
+            logger.warning(f"Could not create BCIService for EKA: {e}")
+            bci_service = None
+
+    # Create execution loop with LLM client and EKA support
     execution_loop = AgentExecutionLoop(
-        run_service=run_service or RunService(),
+        run_service=run_service,
         task_cycle_service=task_cycle_service or TaskCycleService(),
         llm_client=llm_client,
         telemetry=telemetry,
+        bci_service=bci_service,
+        enable_early_retrieval=enable_early_retrieval,
     )
 
     return execution_loop
@@ -223,17 +283,31 @@ def create_tool_executor_for_run(
     mcp_client: Optional[Any] = None,
     project_root: Optional[str] = None,
     telemetry: Optional[TelemetryClient] = None,
+    pr_context: Optional[Any] = None,
+    github_service: Optional[Any] = None,
+    github_context: Optional[Dict[str, Any]] = None,
+    workspace_info: Optional[Any] = None,
+    workspace_manager: Optional[Any] = None,
 ) -> Any:
     """Create a ToolExecutor for a specific execution run.
 
     ToolExecutor is created per-run because it needs the ExecutionPolicy
     which varies by work item, agent, and project settings.
 
+    This factory is the shared entrypoint for both direct mode
+    (WorkItemExecutionService) and queue mode (ExecutionWorker),
+    ensuring cross-surface parity per COLLAB_SAAS_REQUIREMENTS.md.
+
     Args:
         policy: Execution policy for this run (permissions, write scope, etc.)
         mcp_client: MCP client for remote tool execution
         project_root: Project root directory for path resolution
         telemetry: Telemetry client
+        pr_context: PRExecutionContext for file change accumulation
+        github_service: GitHubService for GitHub API fallback tools
+        github_context: Context for GitHub API (repo, project_id, org_id, user_id)
+        workspace_info: WorkspaceInfo for container-based execution
+        workspace_manager: GuideAIWorkspaceClient for workspace operations
 
     Returns:
         ToolExecutor configured for the run
@@ -245,4 +319,9 @@ def create_tool_executor_for_run(
         mcp_client=mcp_client,
         project_root=project_root,
         telemetry=telemetry,
+        pr_context=pr_context,
+        github_service=github_service,
+        github_context=github_context,
+        workspace_info=workspace_info,
+        workspace_manager=workspace_manager,
     )

@@ -25,7 +25,9 @@ export declare class CostTreeDataProvider implements vscode.TreeDataProvider<Cos
     private refreshTimer?;
     private periodDays;
     constructor(client: GuideAIClient);
-    private initializeDataProvider;
+    /**
+     * Start auto-refresh (call only after user initiates first refresh)
+     */
     private startAutoRefresh;
     private stopAutoRefresh;
     refresh(): Promise<void>;

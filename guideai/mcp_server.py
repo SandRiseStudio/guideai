@@ -42,9 +42,10 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 # MCP protocol types
 
@@ -55,6 +56,153 @@ from .behavior_service import BehaviorService
 from .workflow_service import WorkflowService
 from .storage.postgres_pool import PostgresPool
 from .utils.dsn import apply_host_overrides
+
+
+# ============================================================================
+# MCP Session Context (Phase 1: MCP_AUTH_IMPLEMENTATION_PLAN.md)
+# ============================================================================
+
+# Tools that don't require authentication (public tools)
+PUBLIC_TOOLS: Set[str] = {
+    "auth.deviceLogin",
+    "auth.deviceInit",
+    "auth.devicePoll",
+    "auth.authStatus",
+    "auth.clientCredentials",
+    "auth.refreshToken",
+    "auth.consentStatus",
+    # Tool group management (meta-tools)
+    "tools.listGroups",
+    "tools.activateGroup",
+    "tools.deactivateGroup",
+    "tools.activeGroups",
+}
+
+
+@dataclass
+class MCPSessionContext:
+    """
+    Authenticated session context for MCP connections.
+
+    Tracks identity and authorization state for the duration of an MCP session.
+    Populated after successful auth.deviceLogin or auth.clientCredentials.
+
+    After authentication, the session knows:
+    - Who the user is (user_id)
+    - Whether they're an admin (is_admin) - can access all resources
+    - What orgs they belong to (accessible_org_ids)
+    - What projects they can access (accessible_project_ids)
+
+    Tools use this context to:
+    - Auto-inject user_id into handlers
+    - Authorize access without requiring explicit org_id/project_id params
+    - Allow admins to bypass access checks
+
+    See MCP_AUTH_IMPLEMENTATION_PLAN.md Phase 1 for details.
+    """
+    user_id: Optional[str] = None
+    org_id: Optional[str] = None  # Current/default org (if any)
+    project_id: Optional[str] = None  # Current/default project (if any)
+    service_principal_id: Optional[str] = None
+    email: Optional[str] = None
+    roles: List[str] = field(default_factory=list)
+    granted_scopes: Set[str] = field(default_factory=set)
+    auth_method: Literal["device_flow", "client_credentials", "none"] = "none"
+    authenticated_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+    # Authorization context - populated after auth
+    is_admin: bool = False  # If True, can access all resources
+    accessible_org_ids: Set[str] = field(default_factory=set)  # Orgs user belongs to
+    accessible_project_ids: Set[str] = field(default_factory=set)  # Projects user can access
+
+    @property
+    def is_authenticated(self) -> bool:
+        """Check if session has valid authentication."""
+        if self.auth_method == "none":
+            return False
+        if self.expires_at and datetime.utcnow() > self.expires_at:
+            return False
+        return bool(self.user_id or self.service_principal_id)
+
+    @property
+    def identity(self) -> Optional[str]:
+        """Get the primary identity (user_id or service_principal_id)."""
+        return self.user_id or self.service_principal_id
+
+    def has_scope(self, scope: str) -> bool:
+        """Check if session has a specific scope granted.
+
+        Args:
+            scope: The scope to check (e.g., 'behaviors.read', 'runs.create')
+
+        Returns:
+            True if scope is in granted_scopes
+        """
+        return scope in self.granted_scopes
+
+    def has_all_scopes(self, scopes: List[str]) -> bool:
+        """Check if session has ALL specified scopes.
+
+        Args:
+            scopes: List of required scopes
+
+        Returns:
+            True if all scopes are granted
+        """
+        if not scopes:
+            return True
+        return set(scopes).issubset(self.granted_scopes)
+
+    def has_any_scope(self, scopes: List[str]) -> bool:
+        """Check if session has ANY of the specified scopes.
+
+        Args:
+            scopes: List of scopes (need at least one)
+
+        Returns:
+            True if at least one scope is granted
+        """
+        if not scopes:
+            return True
+        return bool(set(scopes) & self.granted_scopes)
+
+    def missing_scopes(self, required: List[str]) -> Set[str]:
+        """Get scopes that are required but not granted.
+
+        Args:
+            required: List of required scopes
+
+        Returns:
+            Set of missing scopes
+        """
+        return set(required) - self.granted_scopes
+
+    def can_access_org(self, org_id: str) -> bool:
+        """Check if user can access the specified organization.
+
+        Args:
+            org_id: Organization ID to check
+
+        Returns:
+            True if admin or org is in accessible_org_ids
+        """
+        if self.is_admin:
+            return True
+        return org_id in self.accessible_org_ids
+
+    def can_access_project(self, project_id: str) -> bool:
+        """Check if user can access the specified project.
+
+        Args:
+            project_id: Project ID to check
+
+        Returns:
+            True if admin or project is in accessible_project_ids
+        """
+        if self.is_admin:
+            return True
+        return project_id in self.accessible_project_ids
 
 
 @dataclass
@@ -100,6 +248,7 @@ class MCPServiceRegistry:
         self._compliance_service: Optional[Any] = None
         self._audit_log_service: Optional[Any] = None
         self._agent_auth_service: Optional[Any] = None
+        self._consent_service: Optional[Any] = None  # Phase 6: JIT consent
         self._task_assignment_service: Optional[Any] = None
         self._raze_service: Optional[Any] = None
         self._amprealize_service: Optional[Any] = None
@@ -434,6 +583,31 @@ class MCPServiceRegistry:
             self._agent_auth_service = service
         return self._agent_auth_service
 
+    def consent_service(self) -> Any:
+        """Get or create ConsentService singleton for MCP.
+
+        Phase 6: JIT (Just-In-Time) authorization consent flows.
+        Uses PostgreSQL backend; resolves DSN from GUIDEAI_CONSENT_PG_DSN or GUIDEAI_PG_DSN.
+        """
+        if self._consent_service is None:
+            from .auth.consent_service import ConsentService
+            from .storage.postgres_pool import PostgresPool
+
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_CONSENT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "CONSENT"
+            )
+            if not dsn:
+                # Fallback DSN for local development
+                dsn = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+                self._logger.warning("Using default ConsentService DSN (GUIDEAI_CONSENT_PG_DSN not set)")
+
+            pool = PostgresPool(dsn)
+            service = ConsentService(pool=pool)
+            self._logger.info("Initialized ConsentService for MCP (PostgreSQL backend)")
+            self._consent_service = service
+        return self._consent_service
+
     def task_assignment_service(self) -> Any:
         """Get or create TaskService singleton for MCP (replaces stub)."""
         if self._task_assignment_service is None:
@@ -757,6 +931,8 @@ class MCPServer:
     INVALID_PARAMS = -32602
     INTERNAL_ERROR = -32603
     RATE_LIMITED = -32000  # Custom code for rate limiting
+    AUTH_REQUIRED = -32001  # Custom code for authentication required
+    ACCESS_DENIED = -32003  # Custom code for authorization denied
 
     def __init__(self) -> None:
         """Initialize MCP server with tool handlers."""
@@ -764,14 +940,18 @@ class MCPServer:
         self._logger = logging.getLogger("guideai.mcp_server")
         self._services = MCPServiceRegistry(logger=self._logger)
 
+        # Session context for authentication (Phase 1: MCP_AUTH_IMPLEMENTATION_PLAN.md)
+        self._session_context = MCPSessionContext()
+
         # Stdio framing mode detection.
         # Some MCP clients (including VS Code/Copilot) use LSP-style Content-Length framing.
         # Keep backward compatibility with line-delimited JSON used by older/manual clients.
         self._stdio_framing: Literal["unknown", "newline", "content-length"] = "unknown"
 
         # Initialize rate limiter for abuse prevention (MCP_SERVER_DESIGN.md §9)
-        from .mcp_rate_limiter import MCPRateLimiter
+        from .mcp_rate_limiter import MCPRateLimiter, DistributedRateLimiter
         self._rate_limiter = MCPRateLimiter()
+        self._distributed_rate_limiter = DistributedRateLimiter()  # Phase 5: Redis-backed
         self._client_id: Optional[str] = None  # Set during initialize
 
         # Connection stability (Epic 6 - MCP Server Stability)
@@ -786,15 +966,40 @@ class MCPServer:
         self._logger.info("Pre-warming PostgreSQL connection pools...")
         self._services.prewarm_pools()
 
+        # Initialize PostgreSQL device flow store for shared auth state
+        self._postgres_device_store = None
+        try:
+            auth_dsn = os.environ.get("GUIDEAI_ORG_PG_DSN") or os.environ.get("GUIDEAI_MULTI_TENANT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            if auth_dsn:
+                from .auth.postgres_device_flow import PostgresDeviceFlowStore
+                # Ensure auth schema is used
+                if "search_path" not in auth_dsn:
+                    if "?" in auth_dsn:
+                        auth_dsn = f"{auth_dsn}&options=-c%20search_path%3Dauth"
+                    else:
+                        auth_dsn = f"{auth_dsn}?options=-c%20search_path%3Dauth"
+                auth_pool = PostgresPool(dsn=auth_dsn, service_name="device_auth")
+                self._postgres_device_store = PostgresDeviceFlowStore(pool=auth_pool)
+                self._logger.info("PostgreSQL device flow store initialized for shared auth state")
+            else:
+                self._logger.warning("No PostgreSQL DSN available - using in-memory device flow (not shared with API)")
+        except Exception as e:
+            self._logger.error(f"Failed to initialize PostgreSQL device flow store: {e}")
+            self._postgres_device_store = None
+
         # Import device flow handler
         try:
             from .mcp_device_flow import MCPDeviceFlowHandler, MCPDeviceFlowService
 
-            # Initialize service with AgentAuthService integration
+            # Initialize service with AgentAuthService integration and PostgreSQL store
             device_flow_service = MCPDeviceFlowService(
                 agent_auth_service=self._services.agent_auth_service(),
+                postgres_store=self._postgres_device_store,
             )
             self._device_flow_handler = MCPDeviceFlowHandler(service=device_flow_service)
+
+            # Try to restore session from stored tokens (keychain/file)
+            self._try_restore_session_from_tokens()
         except ImportError as e:
             self._logger.error(f"Failed to import device flow handler: {e}")
             self._device_flow_handler = None
@@ -820,9 +1025,32 @@ class MCPServer:
             self._logger.error(f"Failed to initialize Amprealize adapter: {e}")
             self._amprealize_adapter = None
 
-        # Tool registry
+        # Tool registry - now using lazy loader for <128 tool limit compliance
         self._tools: Dict[str, Dict[str, Any]] = {}
-        self._load_tool_manifests()
+        self._tool_scopes: Dict[str, List[str]] = {}  # Phase 3: tool_name -> required_scopes
+
+        # Initialize lazy tool loader (MCP best practices: stay under 128 tools)
+        from .mcp_lazy_loader import MCPLazyToolLoader
+        self._lazy_loader = MCPLazyToolLoader(logger=self._logger)
+
+        # Check if lazy loading is enabled (can be disabled for backwards compatibility)
+        self._lazy_loading_enabled = os.environ.get("MCP_LAZY_LOADING", "true").lower() == "true"
+
+        if self._lazy_loading_enabled:
+            # Use lazy loader - only loads core tools + outcome tools initially
+            self._lazy_loader.initialize()
+            self._tools = self._lazy_loader.get_active_tools()
+            self._tool_scopes = self._lazy_loader.get_tool_scopes()
+        else:
+            # Legacy mode - load all tools (may exceed 128 limit)
+            self._load_tool_manifests()
+
+        # Initialize long-running operation handler with keepalive support
+        from .mcp_long_running import MCPLongRunningHandler
+        self._long_running_handler = MCPLongRunningHandler(
+            progress_callback=self._send_notification,
+            logger=self._logger,
+        )
 
         # Performance metrics
         self._metrics = {
@@ -833,9 +1061,14 @@ class MCPServer:
             "tool_latency_seconds": {},
             "errors_total": 0,
             "batch_requests_total": 0,
+            "tool_groups_activated": 0,
+            "tool_groups_deactivated": 0,
         }
 
-        self._logger.info(f"GuideAI MCP Server initialized with {len(self._tools)} tools")
+        self._logger.info(
+            f"GuideAI MCP Server initialized with {len(self._tools)} active tools "
+            f"(lazy_loading={'enabled' if self._lazy_loading_enabled else 'disabled'})"
+        )
 
     def _setup_logging(self) -> None:
         """Configure structured logging to stderr."""
@@ -945,6 +1178,97 @@ class MCPServer:
         normalized = re.sub(r"[^a-z0-9_-]", "_", normalized)
         return normalized
 
+    def _resolve_json_refs(
+        self, obj: Any, base_path: Path, root_doc: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        """Recursively resolve $ref references in JSON schema objects.
+
+        This inlines external and internal $ref references so VS Code/Copilot can
+        understand the tool schemas without needing to resolve file paths.
+
+        Args:
+            obj: The JSON object to process
+            base_path: The base path for resolving relative $ref paths
+            root_doc: The root document for resolving internal #/ refs
+
+        Returns:
+            The object with all $ref references resolved/inlined
+        """
+        if isinstance(obj, dict):
+            # Check if this is a $ref that needs resolution
+            if "$ref" in obj and isinstance(obj["$ref"], str):
+                ref = obj["$ref"]
+
+                # Handle internal refs like #/definitions/BehaviorSnippet
+                if ref.startswith("#/") and root_doc is not None:
+                    try:
+                        parts = ref[2:].split("/")  # Remove leading #/
+                        target = root_doc
+                        for part in parts:
+                            if isinstance(target, dict) and part in target:
+                                target = target[part]
+                            else:
+                                # Can't resolve internal pointer
+                                return {"type": "object", "additionalProperties": True}
+                        # Recursively resolve, but don't infinitely loop on same ref
+                        return self._resolve_json_refs(target, base_path, root_doc)
+                    except Exception:
+                        return {"type": "object", "additionalProperties": True}
+
+                # Handle file-based external refs (includes bare filenames like "trace.json#...")
+                elif (
+                    ref.startswith("../../")
+                    or ref.startswith("../")
+                    or ref.startswith("./")
+                    or (ref.split("#")[0].endswith(".json") and not ref.startswith("#"))
+                ):
+                    try:
+                        # Parse the ref: "../../schema/bci/v1/prompt.json#/definitions/ComposePromptRequest"
+                        # or "trace.json#/definitions/TraceFormat"
+                        if "#" in ref:
+                            file_path, json_pointer = ref.split("#", 1)
+                        else:
+                            file_path, json_pointer = ref, ""
+
+                        # Resolve the file path
+                        resolved_path = (base_path / file_path).resolve()
+                        if resolved_path.exists():
+                            with open(resolved_path) as f:
+                                schema_doc = json.load(f)
+
+                            # Navigate to the referenced definition using JSON pointer
+                            if json_pointer:
+                                parts = json_pointer.strip("/").split("/")
+                                target = schema_doc
+                                for part in parts:
+                                    if isinstance(target, dict) and part in target:
+                                        target = target[part]
+                                    else:
+                                        # Can't resolve pointer, return simplified schema
+                                        self._logger.warning(
+                                            f"Could not resolve JSON pointer {json_pointer} in {resolved_path}"
+                                        )
+                                        return {"type": "object", "additionalProperties": True}
+
+                                # Recursively resolve any nested $refs, using schema_doc as root
+                                return self._resolve_json_refs(target, resolved_path.parent, schema_doc)
+                            else:
+                                return self._resolve_json_refs(schema_doc, resolved_path.parent, schema_doc)
+                        else:
+                            self._logger.warning(f"Referenced schema file not found: {resolved_path}")
+                            return {"type": "object", "additionalProperties": True}
+                    except Exception as e:
+                        self._logger.warning(f"Failed to resolve $ref {ref}: {e}")
+                        return {"type": "object", "additionalProperties": True}
+
+            # Process all keys in the dict, resolving any nested $refs
+            return {k: self._resolve_json_refs(v, base_path, root_doc) for k, v in obj.items()}
+
+        elif isinstance(obj, list):
+            return [self._resolve_json_refs(item, base_path, root_doc) for item in obj]
+
+        return obj
+
     def _load_tool_manifests(self) -> None:
         """Load MCP tool manifests from mcp/tools/ directory."""
         # Find mcp/tools directory relative to this file
@@ -970,6 +1294,12 @@ class MCPServer:
                 manifest["name"] = tool_name  # Update manifest with normalized name
                 manifest["_original_name"] = original_name  # Keep original for handler lookup
 
+                # Resolve $ref references in inputSchema so VS Code/Copilot can parse them
+                if "inputSchema" in manifest:
+                    manifest["inputSchema"] = self._resolve_json_refs(
+                        manifest["inputSchema"], manifest_path.parent
+                    )
+
                 if tool_name in self._tools:
                     existing_original = self._tools[tool_name].get("_original_name")
                     if existing_original != original_name:
@@ -980,6 +1310,12 @@ class MCPServer:
                         continue
 
                 self._tools[tool_name] = manifest
+
+                # Extract required_scopes for authorization (Phase 3)
+                required_scopes = manifest.get("required_scopes", [])
+                if required_scopes:
+                    self._tool_scopes[tool_name] = required_scopes
+
                 self._logger.info(f"Loaded tool: {tool_name}")
 
             except Exception as e:
@@ -1110,14 +1446,36 @@ class MCPServer:
                 "experimental": {
                     "batchRequests": True,  # Support batch requests
                     "rateLimiting": True,  # Rate limiting enabled
+                    "lazyToolLoading": self._lazy_loading_enabled,  # Dynamic tool groups
                 },
             },
         }
 
         return self._success_response(request_id, result)
 
+    async def _send_notification(self, method: str, params: Dict[str, Any]) -> None:
+        """Send an MCP notification (no response expected).
+
+        Used for progress updates, keepalive heartbeats, etc.
+        """
+        notification = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }
+        self._write_stdout_message(json.dumps(notification))
+
     def _handle_tools_list(self, request_id: Optional[str]) -> str:
-        """Handle MCP tools/list request."""
+        """Handle MCP tools/list request.
+
+        Returns currently active tools. With lazy loading enabled,
+        this returns core tools + any activated groups.
+        """
+        # Refresh tools from lazy loader if enabled
+        if self._lazy_loading_enabled:
+            self._tools = self._lazy_loader.get_active_tools()
+            self._tool_scopes = self._lazy_loader.get_tool_scopes()
+
         tools_list = []
 
         for tool_name, manifest in self._tools.items():
@@ -1127,17 +1485,39 @@ class MCPServer:
                 "inputSchema": manifest.get("inputSchema", {}),
             })
 
-        result = {"tools": tools_list}
+        # Add metadata about lazy loading
+        result = {
+            "tools": tools_list,
+        }
+
+        # Include lazy loading stats if enabled
+        if self._lazy_loading_enabled:
+            stats = self._lazy_loader.get_stats()
+            result["_meta"] = {
+                "active_tools": stats["active_tools"],
+                "total_available": stats["total_available_tools"],
+                "active_groups": stats["active_groups"],
+                "headroom": stats["headroom"],
+                "lazy_loading": True,
+            }
+
         return self._success_response(request_id, result)
 
     async def _handle_tools_call(self, request_id: Optional[str], params: Dict[str, Any]) -> str:
-        """Handle MCP tools/call request with rate limiting and latency tracking."""
+        """Handle MCP tools/call request with rate limiting, timeout, and latency tracking."""
         from .mcp_rate_limiter import RateLimitDecision
+        import uuid as uuid_module
+
+        # Generate unique trace ID for this tool call (for debugging hangs)
+        trace_id = str(uuid_module.uuid4())[:8]
 
         tool_name = params.get("name")
         tool_params = params.get("arguments", {})
 
+        self._logger.debug(f"[{trace_id}] TOOL_CALL_START: {tool_name}, request_id={request_id}")
+
         if not tool_name:
+            self._logger.warning(f"[{trace_id}] TOOL_CALL_ERROR: Missing tool name")
             return self._error_response(
                 request_id,
                 self.INVALID_PARAMS,
@@ -1146,6 +1526,7 @@ class MCPServer:
 
         # Apply rate limiting (MCP_SERVER_DESIGN.md §9)
         client_id = self._client_id or f"anonymous:{id(self)}"
+        self._logger.debug(f"[{trace_id}] RATE_LIMIT_CHECK: client={client_id}, tool={tool_name}")
         rate_result = self._rate_limiter.check(client_id, tool_name)
 
         if rate_result.decision == RateLimitDecision.DENY:
@@ -1172,14 +1553,23 @@ class MCPServer:
         # Start timing
         start_time = time.time()
 
-        self._logger.info(f"Calling tool: {tool_name} with params: {tool_params}")
+        self._logger.info(f"[{trace_id}] TOOL_DISPATCH_START: {tool_name}")
+        self._logger.debug(f"[{trace_id}] TOOL_PARAMS: {tool_params}")
 
         # Increment counters
         self._metrics["tool_calls_total"] += 1
         self._metrics["tool_calls_by_name"][tool_name] = self._metrics["tool_calls_by_name"].get(tool_name, 0) + 1
 
+        # Configurable timeout for tool execution (default 60s to catch hanging tools)
+        tool_timeout = float(os.environ.get("MCP_TOOL_TIMEOUT_SECONDS", "60"))
+
         try:
-            result_str = await self._dispatch_tool_call(request_id, tool_name, tool_params)
+            # Wrap dispatch in timeout to catch hanging tools
+            self._logger.debug(f"[{trace_id}] AWAITING_DISPATCH: timeout={tool_timeout}s")
+            result_str = await asyncio.wait_for(
+                self._dispatch_tool_call(request_id, tool_name, tool_params, trace_id),
+                timeout=tool_timeout
+            )
 
             # Record latency
             duration = time.time() - start_time
@@ -1187,13 +1577,25 @@ class MCPServer:
                 self._metrics["tool_latency_seconds"][tool_name] = []
             self._metrics["tool_latency_seconds"][tool_name].append(duration)
 
-            self._logger.info(f"Tool {tool_name} completed in {duration:.3f}s")
+            self._logger.info(f"[{trace_id}] TOOL_COMPLETE: {tool_name} in {duration:.3f}s")
             return result_str
 
+        except asyncio.TimeoutError:
+            duration = time.time() - start_time
+            self._metrics["errors_total"] += 1
+            self._logger.error(
+                f"[{trace_id}] TOOL_TIMEOUT: {tool_name} exceeded {tool_timeout}s timeout after {duration:.3f}s"
+            )
+            return self._error_response(
+                request_id,
+                self.INTERNAL_ERROR,
+                f"Tool '{tool_name}' timed out after {tool_timeout}s. Check MCP server logs for trace_id={trace_id}",
+                data={"trace_id": trace_id, "timeout_seconds": tool_timeout, "duration": duration},
+            )
         except Exception as e:
             self._metrics["errors_total"] += 1
             duration = time.time() - start_time
-            self._logger.error(f"Tool {tool_name} failed after {duration:.3f}s: {e}", exc_info=True)
+            self._logger.error(f"[{trace_id}] TOOL_ERROR: {tool_name} failed after {duration:.3f}s: {e}", exc_info=True)
             raise
 
     def _denormalize_tool_name(self, normalized_name: str) -> str:
@@ -1216,11 +1618,138 @@ class MCPServer:
             return f"{parts[0]}.{parts[1]}"
         return normalized_name
 
-    async def _dispatch_tool_call(self, request_id: Optional[str], tool_name: str, tool_params: Dict[str, Any]) -> str:
-        """Dispatch tool call to appropriate handler."""
+    async def _dispatch_tool_call(self, request_id: Optional[str], tool_name: str, tool_params: Dict[str, Any], trace_id: str = "unknown") -> str:
+        """Dispatch tool call to appropriate handler with authentication checks.
+
+        Args:
+            request_id: JSON-RPC request ID
+            tool_name: Normalized tool name (with underscores)
+            tool_params: Tool parameters
+            trace_id: Unique trace ID for debugging hangs
+        """
+        from datetime import timedelta
+
         # Convert from normalized name (underscores) back to internal format (dots)
         internal_tool_name = self._denormalize_tool_name(tool_name)
-        self._logger.debug(f"Tool dispatch: normalized={tool_name} -> internal={internal_tool_name}")
+        self._logger.debug(f"[{trace_id}] DISPATCH: normalized={tool_name} -> internal={internal_tool_name}")
+
+        # ====================================================================
+        # Authentication Check (Phase 1: MCP_AUTH_IMPLEMENTATION_PLAN.md)
+        # ====================================================================
+        # Check if tool requires authentication
+        if internal_tool_name not in PUBLIC_TOOLS:
+            self._logger.debug(f"[{trace_id}] AUTH_CHECK: tool requires authentication")
+            if not self._session_context.is_authenticated:
+                self._logger.warning(f"[{trace_id}] AUTH_FAIL: Unauthenticated call to {internal_tool_name}")
+                return self._error_response(
+                    request_id,
+                    self.AUTH_REQUIRED,
+                    "Authentication required. Call auth.deviceLogin or auth.clientCredentials first.",
+                    data={"tool": internal_tool_name, "public_tools": list(PUBLIC_TOOLS)}
+                )
+
+            # ====================================================================
+            # Scope Authorization (Phase 3: MCP_AUTH_IMPLEMENTATION_PLAN.md)
+            # ====================================================================
+            # Check if user/SP has required scopes for this tool
+            required_scopes = self._tool_scopes.get(internal_tool_name, [])
+            if required_scopes:
+                missing = self._session_context.missing_scopes(required_scopes)
+                if missing:
+                    self._logger.warning(
+                        f"Access denied to {internal_tool_name}: "
+                        f"identity={self._session_context.identity}, "
+                        f"missing_scopes={missing}"
+                    )
+                    return self._error_response(
+                        request_id,
+                        self.ACCESS_DENIED,
+                        f"Access denied: missing required scopes: {', '.join(sorted(missing))}",
+                        data={
+                            "tool": internal_tool_name,
+                            "required_scopes": required_scopes,
+                            "granted_scopes": list(self._session_context.granted_scopes),
+                            "missing_scopes": list(missing),
+                        }
+                    )
+
+            # ====================================================================
+            # Tenant-Aware Rate Limiting (Phase 5: MCP_AUTH_IMPLEMENTATION_PLAN.md)
+            # ====================================================================
+            # Check distributed rate limits based on org/user/tier
+            from .mcp_rate_limiter import SubscriptionTier
+
+            # Determine subscription tier (default to FREE, could be looked up from org)
+            tier = SubscriptionTier.FREE
+            if self._session_context.org_id:
+                # TODO: Look up org subscription tier from database
+                # For now, use PRO if authenticated with an org
+                tier = SubscriptionTier.PRO
+
+            tenant_rate_result = await self._distributed_rate_limiter.check_tenant_limit(
+                org_id=self._session_context.org_id,
+                user_id=self._session_context.user_id,
+                service_principal_id=self._session_context.service_principal_id,
+                tier=tier,
+                tool_name=internal_tool_name,
+            )
+
+            if not tenant_rate_result.allowed:
+                self._logger.warning(
+                    f"Tenant rate limit exceeded: org={self._session_context.org_id}, "
+                    f"user={self._session_context.user_id}, tier={tier.value}, "
+                    f"limit_type={tenant_rate_result.limit_type}, "
+                    f"retry_after={tenant_rate_result.retry_after}"
+                )
+                return self._error_response(
+                    request_id,
+                    self.RATE_LIMITED,
+                    f"Rate limit exceeded ({tenant_rate_result.limit_type}). "
+                    f"Retry after {tenant_rate_result.retry_after} seconds.",
+                    data=tenant_rate_result.to_dict(),
+                )
+
+        # ====================================================================
+        # Route tool group management tools (Lazy Loading)
+        # ====================================================================
+        if internal_tool_name.startswith("tools."):
+            result = await self._handle_tools_management(internal_tool_name, tool_params)
+
+            mcp_result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, indent=2),
+                    }
+                ]
+            }
+
+            return self._success_response(request_id, mcp_result)
+
+        # ====================================================================
+        # Route high-level outcome tools (consolidated operations)
+        # Following MCP best practice: "Focus on Outcomes, Not Operations"
+        # ====================================================================
+        outcome_tools = {
+            "project.setupComplete",
+            "behavior.analyzeAndRetrieve",
+            "workItem.executeWithTracking",
+            "analytics.fullReport",
+            "compliance.fullValidation",
+        }
+        if internal_tool_name in outcome_tools:
+            result = await self._handle_outcome_tool(internal_tool_name, tool_params, trace_id)
+
+            mcp_result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, indent=2),
+                    }
+                ]
+            }
+
+            return self._success_response(request_id, mcp_result)
 
         # Route device flow tools
         if internal_tool_name.startswith("auth."):
@@ -1231,9 +1760,70 @@ class MCPServer:
                     "Device flow handler not available",
                 )
 
-            result = await self._device_flow_handler.handle_tool_call(internal_tool_name, tool_params)
+            # Handle client credentials flow (Phase 2: Service Principal Auth)
+            if internal_tool_name == "auth.clientCredentials":
+                result = await self._handle_client_credentials(tool_params)
+            else:
+                result = await self._device_flow_handler.handle_tool_call(internal_tool_name, tool_params)
+
+            # Populate session context on successful device flow auth
+            # Works for both auth.deviceLogin (blocking) and auth.devicePoll (non-blocking)
+            if internal_tool_name in ("auth.deviceLogin", "auth.devicePoll") and result.get("status") == "authorized":
+                self._populate_session_from_device_flow(result)
+                self._logger.info(f"Session populated from device flow: user_id={self._session_context.user_id}")
 
             # Wrap result in MCP content format
+            mcp_result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, indent=2),
+                    }
+                ]
+            }
+
+            return self._success_response(request_id, mcp_result)
+
+        # ====================================================================
+        # Route JIT consent tools (Phase 6: Consent UX Dashboard)
+        # ====================================================================
+        if internal_tool_name.startswith("consent."):
+            result = await self._handle_consent_tool(internal_tool_name, tool_params)
+
+            mcp_result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, indent=2),
+                    }
+                ]
+            }
+
+            return self._success_response(request_id, mcp_result)
+
+        # ====================================================================
+        # Route context switching tools (Phase 4: Tenant Context & Isolation)
+        # ====================================================================
+        if internal_tool_name.startswith("context."):
+            result = await self._handle_context_tool(internal_tool_name, tool_params)
+
+            mcp_result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(result, indent=2),
+                    }
+                ]
+            }
+
+            return self._success_response(request_id, mcp_result)
+
+        # ====================================================================
+        # Route rate limit tools (Phase 5: Distributed Rate Limiting)
+        # ====================================================================
+        if internal_tool_name.startswith("ratelimit."):
+            result = await self._handle_ratelimit_tool(internal_tool_name, tool_params)
+
             mcp_result = {
                 "content": [
                     {
@@ -1880,7 +2470,7 @@ class MCPServer:
                         )
                     # Get RazeService for log queries
                     raze_service = self._get_raze_service()
-                    import asyncio
+                    # Note: asyncio is already imported at module level (line 36)
                     # Run async method
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
@@ -3052,8 +3642,12 @@ class MCPServer:
                 # Get the organization service
                 org_service = self._services.organization_service()
 
+                # Inject session context into tool params if authenticated
+                # This allows handlers to use user_id from session without requiring it as parameter
+                enriched_params = self._inject_session_context(tool_params)
+
                 # Call the sync handler in a thread to avoid blocking
-                result = await asyncio.to_thread(handler, org_service, tool_params)
+                result = await asyncio.to_thread(handler, org_service, enriched_params)
 
                 # Wrap result in MCP content format
                 mcp_result = {
@@ -3077,11 +3671,13 @@ class MCPServer:
 
         # Handle projects.* tools (project management)
         if internal_tool_name.startswith("projects."):
+            self._logger.debug(f"[{trace_id}] ROUTE_PROJECTS: {internal_tool_name}")
             try:
                 from .mcp.handlers.project_handlers import PROJECT_HANDLERS
 
                 handler = PROJECT_HANDLERS.get(internal_tool_name)
                 if not handler:
+                    self._logger.warning(f"[{trace_id}] PROJECTS_HANDLER_MISSING: {internal_tool_name}")
                     return self._error_response(
                         request_id,
                         self.METHOD_NOT_FOUND,
@@ -3089,10 +3685,16 @@ class MCPServer:
                     )
 
                 # Get services - OrganizationService handles both orgs and projects
+                self._logger.debug(f"[{trace_id}] PROJECTS_GET_SERVICE")
                 org_service = self._services.organization_service()
 
+                # Inject session context into tool params if authenticated
+                enriched_params = self._inject_session_context(tool_params)
+
                 # Call the sync handler in a thread to avoid blocking
-                result = await asyncio.to_thread(handler, org_service, org_service, tool_params)
+                self._logger.debug(f"[{trace_id}] PROJECTS_EXEC_HANDLER: {handler.__name__ if hasattr(handler, '__name__') else 'anon'}")
+                result = await asyncio.to_thread(handler, org_service, org_service, enriched_params)
+                self._logger.debug(f"[{trace_id}] PROJECTS_HANDLER_COMPLETE")
 
                 # Wrap result in MCP content format
                 mcp_result = {
@@ -3373,6 +3975,7 @@ class MCPServer:
                 )
 
         # Unknown tool prefix
+        self._logger.warning(f"[{trace_id}] UNKNOWN_TOOL: No handler for {internal_tool_name}")
         return self._error_response(
             request_id,
             self.METHOD_NOT_FOUND,
@@ -3528,6 +4131,1384 @@ class MCPServer:
             "degraded_services": degraded_services,
             "failed_services": failed_services,
         }
+
+    # ========================================================================
+    # Session Management (Phase 1 & 2: MCP_AUTH_IMPLEMENTATION_PLAN.md)
+    # ========================================================================
+
+    def _populate_session_from_device_flow(self, result: Dict[str, Any]) -> None:
+        """Populate session context from successful device flow authorization.
+
+        Called after auth.deviceLogin returns status='authorized'.
+        """
+        from datetime import datetime, timedelta
+
+        self._session_context.user_id = result.get("user_id")
+        self._session_context.org_id = result.get("org_id")
+        self._session_context.granted_scopes = set(result.get("scopes", []))
+        self._session_context.auth_method = "device_flow"
+        self._session_context.roles = set(result.get("roles", []))
+
+        # Set expiration from token if available, otherwise default 1 hour
+        expires_in = result.get("expires_in", 3600)
+        self._session_context.expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+
+        self._logger.info(
+            f"Session populated: user={self._session_context.user_id}, "
+            f"org={self._session_context.org_id}, "
+            f"scopes={self._session_context.granted_scopes}, "
+            f"expires_at={self._session_context.expires_at}"
+        )
+
+        # Populate authorization context (orgs, projects, admin status)
+        self._populate_authorization_context()
+
+    def _try_restore_session_from_tokens(self) -> None:
+        """Try to restore session from stored tokens on startup.
+
+        This enables session persistence across MCP server restarts when using
+        stdio transport (where each tool call starts a fresh process).
+
+        Checks:
+        1. PostgreSQL device_sessions table for valid access tokens
+        2. Local keychain/file token store
+        """
+        from datetime import datetime, timedelta, timezone
+
+        self._logger.debug("Attempting to restore session from stored tokens...")
+
+        # First, try PostgreSQL device sessions (most reliable for shared state)
+        # Always try SQL query if DSN is available, regardless of _postgres_device_store
+        try:
+            from .storage.postgres_pool import PostgresPool
+            import os
+
+            auth_dsn = os.environ.get("GUIDEAI_ORG_PG_DSN") or os.environ.get("GUIDEAI_MULTI_TENANT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            if auth_dsn:
+                self._logger.debug(f"Found auth DSN, attempting PostgreSQL session restore...")
+                # Ensure auth schema
+                if "search_path" not in auth_dsn:
+                    if "?" in auth_dsn:
+                        auth_dsn = f"{auth_dsn}&options=-c%20search_path%3Dauth"
+                    else:
+                        auth_dsn = f"{auth_dsn}?options=-c%20search_path%3Dauth"
+
+                pool = PostgresPool(dsn=auth_dsn, service_name="session_restore")
+                with pool.connection() as conn:
+                    cur = conn.cursor()
+                    try:
+                        # Find most recent approved session with valid access token
+                        cur.execute("""
+                            SELECT
+                                access_token,
+                                scopes,
+                                approver,
+                                access_token_expires_at
+                            FROM auth.device_sessions
+                            WHERE status = 'APPROVED'
+                                AND access_token IS NOT NULL
+                                AND access_token_expires_at > NOW()
+                            ORDER BY approved_at DESC
+                            LIMIT 1
+                        """)
+                        row = cur.fetchone()
+                        if row:
+                            access_token, scopes, approver, expires_at = row
+
+                            # Populate session context
+                            self._session_context.user_id = approver
+                            self._session_context.granted_scopes = set(scopes) if scopes else set()
+                            self._session_context.auth_method = "device_flow"
+                            self._session_context.expires_at = expires_at.replace(tzinfo=None) if expires_at else datetime.utcnow() + timedelta(hours=1)
+
+                            self._logger.info(
+                                f"Session restored from PostgreSQL: user_id={approver}, "
+                                f"scopes={self._session_context.granted_scopes}, "
+                                f"expires_at={self._session_context.expires_at}"
+                            )
+                            # Populate authorization context (orgs, projects, admin status)
+                            self._populate_authorization_context()
+                            return  # Success - no need to check token store
+                    finally:
+                        cur.close()
+        except Exception as e:
+            self._logger.warning(f"Failed to restore session from PostgreSQL: {e}")
+
+        # Fallback: try local token store (keychain or file)
+        try:
+            from .mcp_device_flow import MCPDeviceFlowService
+            from .device_flow.token_store import KeychainTokenStore, FileTokenStore, TokenStoreError
+
+            store = None
+            try:
+                store = KeychainTokenStore()
+            except Exception:
+                store = FileTokenStore()
+
+            bundle = store.load()
+            if bundle and bundle.access_token:
+                now = datetime.now(timezone.utc)
+                if bundle.expires_at > now:
+                    # Token is still valid - restore session
+                    self._session_context.granted_scopes = set(bundle.scopes) if bundle.scopes else set()
+                    self._session_context.auth_method = "device_flow"
+                    self._session_context.expires_at = bundle.expires_at.replace(tzinfo=None)
+
+                    # We don't have user_id in the token bundle, but we can try to look it up
+                    # For now, just mark as authenticated without user_id (tools can still work)
+                    # The user_id will be populated on the next explicit auth call
+                    self._logger.info(
+                        f"Session restored from token store: "
+                        f"scopes={self._session_context.granted_scopes}, "
+                        f"expires_at={self._session_context.expires_at}"
+                    )
+                else:
+                    self._logger.debug(f"Stored token expired at {bundle.expires_at}")
+        except Exception as e:
+            self._logger.debug(f"No valid session restored from token store: {e}")
+
+    def _populate_authorization_context(self) -> None:
+        """Populate authorization context after session is authenticated.
+
+        This enriches the session with:
+        - is_admin: True if user is in DEV_ADMIN_USERS env var
+        - accessible_org_ids: Orgs the user belongs to
+        - accessible_project_ids: Projects the user can access (personal + org)
+        """
+        import os
+
+        if not self._session_context.user_id:
+            return
+
+        # Check if user is an admin (from env var)
+        admin_users = os.environ.get("GUIDEAI_DEV_ADMIN_USERS", "admin,dev-admin").split(",")
+        admin_users = [u.strip() for u in admin_users if u.strip()]
+        self._session_context.is_admin = self._session_context.user_id in admin_users
+
+        if self._session_context.is_admin:
+            self._logger.info(f"User {self._session_context.user_id} is an admin - full access granted")
+
+        # Populate accessible orgs and projects from database
+        try:
+            org_service = self._services.organization_service()
+
+            # Get orgs user belongs to
+            user_orgs = org_service.list_user_organizations(user_id=self._session_context.user_id)
+            self._session_context.accessible_org_ids = {org.id for org in user_orgs}
+
+            # Get projects user can access (calls list_projects without org_id)
+            # This returns personal projects + org projects
+            from .mcp.handlers.project_handlers import handle_list_projects
+            result = handle_list_projects(
+                project_service=org_service,
+                org_service=org_service,
+                arguments={"user_id": self._session_context.user_id}
+            )
+            if result.get("success"):
+                self._session_context.accessible_project_ids = {
+                    p["id"] for p in result.get("projects", [])
+                }
+
+            self._logger.debug(
+                f"Authorization context populated: "
+                f"is_admin={self._session_context.is_admin}, "
+                f"orgs={len(self._session_context.accessible_org_ids)}, "
+                f"projects={len(self._session_context.accessible_project_ids)}"
+            )
+        except Exception as e:
+            self._logger.warning(f"Failed to populate authorization context: {e}")
+
+    async def _handle_client_credentials(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle auth.clientCredentials tool - Service Principal authentication.
+
+        Phase 2: MCP_AUTH_IMPLEMENTATION_PLAN.md
+
+        Args:
+            params: {client_id: str, client_secret: str, scopes?: List[str]}
+
+        Returns:
+            On success: {status: 'authorized', service_principal_id, org_id, scopes, expires_in}
+            On failure: {status: 'error', error: str, error_code: str}
+        """
+        from datetime import datetime, timedelta
+        from guideai.auth.service_principal_service import ServicePrincipalService
+
+        client_id = params.get("client_id")
+        client_secret = params.get("client_secret")
+        requested_scopes = params.get("scopes", [])
+
+        if not client_id or not client_secret:
+            return {
+                "status": "error",
+                "error": "Missing required parameters: client_id and client_secret",
+                "error_code": "INVALID_REQUEST",
+            }
+
+        try:
+            # Use ServicePrincipalService to authenticate
+            sp_service = ServicePrincipalService()
+            service_principal = await asyncio.get_event_loop().run_in_executor(
+                None, sp_service.authenticate, client_id, client_secret
+            )
+
+            if not service_principal:
+                self._logger.warning(f"Client credentials auth failed for client_id={client_id}")
+                return {
+                    "status": "error",
+                    "error": "Invalid client credentials",
+                    "error_code": "INVALID_CLIENT",
+                }
+
+            # Check if service principal is active
+            if not service_principal.is_active:
+                self._logger.warning(f"Inactive service principal: {service_principal.id}")
+                return {
+                    "status": "error",
+                    "error": "Service principal is inactive",
+                    "error_code": "INACTIVE_CLIENT",
+                }
+
+            # Validate requested scopes against allowed scopes
+            allowed_scopes = set(service_principal.allowed_scopes or [])
+            if requested_scopes:
+                requested_set = set(requested_scopes)
+                if not requested_set.issubset(allowed_scopes):
+                    invalid_scopes = requested_set - allowed_scopes
+                    return {
+                        "status": "error",
+                        "error": f"Requested scopes not allowed: {invalid_scopes}",
+                        "error_code": "INVALID_SCOPE",
+                    }
+                granted_scopes = requested_set
+            else:
+                granted_scopes = allowed_scopes
+
+            # Populate session context (org_id is optional - may be None)
+            self._session_context.service_principal_id = str(service_principal.id)
+            self._session_context.org_id = str(service_principal.org_id) if service_principal.org_id else None
+            self._session_context.granted_scopes = granted_scopes
+            self._session_context.auth_method = "client_credentials"
+            self._session_context.roles = {service_principal.role} if service_principal.role else {"service"}
+
+            # Service principals get 24 hour sessions by default
+            expires_in = 86400
+            self._session_context.expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+
+            self._logger.info(
+                f"Service principal authenticated: sp_id={service_principal.id}, "
+                f"org={service_principal.org_id}, scopes={granted_scopes}"
+            )
+
+            # Build response - org_id only included if present
+            response = {
+                "status": "authorized",
+                "service_principal_id": str(service_principal.id),
+                "name": service_principal.name,
+                "scopes": list(granted_scopes),
+                "role": service_principal.role,
+                "expires_in": expires_in,
+            }
+            if service_principal.org_id:
+                response["org_id"] = str(service_principal.org_id)
+
+            return response
+
+        except Exception as e:
+            self._logger.error(f"Client credentials auth error: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "error": f"Authentication failed: {str(e)}",
+                "error_code": "SERVER_ERROR",
+            }
+
+    # ========================================================================
+    # High-Level Outcome Tools (Consolidated Operations)
+    # ========================================================================
+
+    async def _handle_outcome_tool(
+        self, tool_name: str, params: Dict[str, Any], trace_id: str
+    ) -> Dict[str, Any]:
+        """
+        Handle high-level outcome tools that consolidate multiple operations.
+
+        Following MCP best practice: "Focus on Outcomes, Not Operations"
+        - One tool call achieves what previously required multiple round-trips
+        - Reduces context window usage and latency
+
+        Supports:
+        - project.setupComplete: Create project + board + invite members
+        - behavior.analyzeAndRetrieve: Get behaviors + compose BCI prompt
+        - workItem.executeWithTracking: Full execution with progress updates
+        - analytics.fullReport: Comprehensive cost/performance report
+        - compliance.fullValidation: Full compliance check with audit trail
+        """
+        from .mcp_long_running import is_long_running_tool
+
+        try:
+            if tool_name == "project.setupComplete":
+                return await self._outcome_project_setup(params, trace_id)
+
+            elif tool_name == "behavior.analyzeAndRetrieve":
+                return await self._outcome_behavior_analyze(params, trace_id)
+
+            elif tool_name == "workItem.executeWithTracking":
+                # Use long-running handler with keepalive for execution
+                if is_long_running_tool(tool_name):
+                    return await self._outcome_workitem_execute_with_keepalive(params, trace_id)
+                return await self._outcome_workitem_execute(params, trace_id)
+
+            elif tool_name == "analytics.fullReport":
+                return await self._outcome_analytics_report(params, trace_id)
+
+            elif tool_name == "compliance.fullValidation":
+                return await self._outcome_compliance_validate(params, trace_id)
+
+            else:
+                return {
+                    "success": False,
+                    "error": f"Unknown outcome tool: {tool_name}",
+                    "error_code": "UNKNOWN_TOOL",
+                }
+
+        except Exception as e:
+            self._logger.error(f"[{trace_id}] Outcome tool error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Outcome operation failed: {str(e)}",
+                "error_code": "SERVER_ERROR",
+                "trace_id": trace_id,
+            }
+
+    async def _outcome_project_setup(self, params: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
+        """Create a complete project with board and team members in one operation."""
+        org_service = self._services.organization_service()
+
+        # Extract params
+        name = params.get("name")
+        description = params.get("description", "")
+        org_id = params.get("org_id")
+        board_name = params.get("board_name", "Main Board")
+        member_emails = params.get("member_emails", [])
+
+        if not name:
+            return {"success": False, "error": "name is required", "error_code": "MISSING_PARAM"}
+        if not org_id:
+            return {"success": False, "error": "org_id is required", "error_code": "MISSING_PARAM"}
+
+        results = {"steps": []}
+
+        # Step 1: Create project
+        try:
+            project = await asyncio.to_thread(
+                org_service.create_project,
+                org_id=org_id,
+                name=name,
+                description=description,
+                created_by=self._session_context.user_id or "system",
+            )
+            results["project"] = {"id": project.id, "name": project.name}
+            results["steps"].append({"step": "create_project", "success": True})
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to create project: {e}",
+                "error_code": "PROJECT_CREATE_FAILED",
+                "completed_steps": results["steps"],
+            }
+
+        # Step 2: Create default board
+        try:
+            board_service = self._services.board_service()
+            board = await asyncio.to_thread(
+                board_service.create_board,
+                project_id=project.id,
+                name=board_name,
+                created_by=self._session_context.user_id or "system",
+            )
+            results["board"] = {"id": board.id, "name": board.name}
+            results["steps"].append({"step": "create_board", "success": True})
+        except Exception as e:
+            self._logger.warning(f"[{trace_id}] Board creation failed (non-fatal): {e}")
+            results["steps"].append({"step": "create_board", "success": False, "error": str(e)})
+
+        # Step 3: Invite members
+        invited_count = 0
+        for email in member_emails:
+            try:
+                await asyncio.to_thread(
+                    org_service.add_project_member,
+                    project_id=project.id,
+                    email=email,
+                    role="member",
+                    added_by=self._session_context.user_id or "system",
+                )
+                invited_count += 1
+            except Exception as e:
+                self._logger.warning(f"[{trace_id}] Failed to invite {email}: {e}")
+
+        if member_emails:
+            results["steps"].append({
+                "step": "invite_members",
+                "success": invited_count > 0,
+                "invited": invited_count,
+                "total": len(member_emails),
+            })
+
+        results["success"] = True
+        results["message"] = f"Project '{name}' set up successfully with {len(results['steps'])} steps completed"
+        return results
+
+    async def _outcome_behavior_analyze(self, params: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
+        """Analyze a task, retrieve relevant behaviors, and get recommendations."""
+        task_description = params.get("task_description")
+        role = params.get("role", "Student")
+        include_prompt = params.get("include_prompt", True)
+
+        if not task_description:
+            return {"success": False, "error": "task_description is required", "error_code": "MISSING_PARAM"}
+
+        behavior_service = self._services.behavior_service()
+        bci_service = self._services.bci_service()
+
+        results = {"task_description": task_description, "role": role}
+
+        # Step 1: Get relevant behaviors
+        try:
+            behaviors = await asyncio.to_thread(
+                behavior_service.get_for_task,
+                task_description=task_description,
+                role=role,
+                limit=5,
+            )
+            results["behaviors"] = [
+                {"id": b.id, "name": b.name, "description": b.description[:200] if b.description else ""}
+                for b in behaviors
+            ]
+        except Exception as e:
+            self._logger.warning(f"[{trace_id}] Behavior retrieval failed: {e}")
+            results["behaviors"] = []
+            results["behavior_error"] = str(e)
+
+        # Step 2: Compose BCI prompt if requested
+        if include_prompt and results.get("behaviors"):
+            try:
+                prompt_result = await asyncio.to_thread(
+                    bci_service.compose_prompt,
+                    query=task_description,
+                    behaviors=results["behaviors"],
+                    role=role,
+                )
+                results["composed_prompt"] = prompt_result.get("prompt", "")[:2000]  # Truncate for response
+                results["token_estimate"] = prompt_result.get("token_count", 0)
+            except Exception as e:
+                self._logger.warning(f"[{trace_id}] BCI prompt composition failed: {e}")
+                results["prompt_error"] = str(e)
+
+        results["success"] = True
+        results["advisory"] = self._get_role_advisory(role, results.get("behaviors", []))
+        return results
+
+    def _get_role_advisory(self, role: str, behaviors: list) -> str:
+        """Generate role-specific advisory text."""
+        if not behaviors:
+            return f"No behaviors found for this task. Consider proposing new behaviors as a {role}."
+
+        if role == "Student":
+            return f"Found {len(behaviors)} applicable behavior(s). Follow them during execution and cite in your work."
+        elif role == "Teacher":
+            return f"Found {len(behaviors)} behavior(s). Validate they are appropriate and create examples if needed."
+        else:  # Strategist
+            return f"Found {len(behaviors)} behavior(s). Analyze for gaps and consider proposing improvements."
+
+    async def _outcome_workitem_execute(self, params: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
+        """Execute a work item with tracking (without keepalive, for shorter operations)."""
+        work_item_id = params.get("work_item_id")
+        agent_id = params.get("agent_id")
+
+        if not work_item_id:
+            return {"success": False, "error": "work_item_id is required", "error_code": "MISSING_PARAM"}
+
+        execution_service = self._services.work_item_execution_service()
+
+        try:
+            result = await asyncio.to_thread(
+                execution_service.execute,
+                work_item_id=work_item_id,
+                agent_id=agent_id,
+                user_id=self._session_context.user_id,
+            )
+            return {
+                "success": True,
+                "run_id": result.get("run_id"),
+                "status": result.get("status"),
+                "message": "Work item execution started",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Execution failed: {e}",
+                "error_code": "EXECUTION_FAILED",
+            }
+
+    async def _outcome_workitem_execute_with_keepalive(self, params: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
+        """Execute a work item with keepalive support for long-running operations."""
+        from .mcp_long_running import ProgressReporter
+
+        work_item_id = params.get("work_item_id")
+        agent_id = params.get("agent_id")
+
+        if not work_item_id:
+            return {"success": False, "error": "work_item_id is required", "error_code": "MISSING_PARAM"}
+
+        async def execute_with_progress(reporter: ProgressReporter):
+            execution_service = self._services.work_item_execution_service()
+
+            await reporter.update(10, "Initializing execution...")
+
+            result = await asyncio.to_thread(
+                execution_service.execute,
+                work_item_id=work_item_id,
+                agent_id=agent_id,
+                user_id=self._session_context.user_id,
+            )
+
+            await reporter.update(100, "Execution complete")
+            return result
+
+        try:
+            result = await self._long_running_handler.run_with_keepalive(
+                "workItem.executeWithTracking",
+                execute_with_progress,
+                timeout=1800,  # 30 minutes
+                heartbeat_interval=30,
+            )
+            return {
+                "success": True,
+                "run_id": result.get("run_id"),
+                "status": result.get("status"),
+                "message": "Work item execution completed",
+            }
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "error": "Execution timed out after 30 minutes",
+                "error_code": "EXECUTION_TIMEOUT",
+            }
+
+    async def _outcome_analytics_report(self, params: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
+        """Generate a comprehensive analytics report."""
+        org_id = params.get("org_id") or self._session_context.org_id
+        period_days = params.get("period_days", 30)
+        include_trends = params.get("include_trends", True)
+
+        analytics_service = self._services.analytics_service()
+
+        report = {
+            "org_id": org_id,
+            "period_days": period_days,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+
+        # Aggregate multiple analytics calls
+        try:
+            # Cost summary
+            cost_data = await asyncio.to_thread(
+                analytics_service.get_cost_summary,
+                org_id=org_id,
+                days=period_days,
+            )
+            report["costs"] = cost_data
+        except Exception as e:
+            self._logger.warning(f"[{trace_id}] Cost analysis failed: {e}")
+            report["cost_error"] = str(e)
+
+        try:
+            # KPI summary
+            kpi_data = await asyncio.to_thread(
+                analytics_service.get_kpi_summary,
+                org_id=org_id,
+                days=period_days,
+            )
+            report["kpis"] = kpi_data
+        except Exception as e:
+            self._logger.warning(f"[{trace_id}] KPI analysis failed: {e}")
+            report["kpi_error"] = str(e)
+
+        if include_trends:
+            try:
+                # Daily trends
+                trend_data = await asyncio.to_thread(
+                    analytics_service.get_daily_trends,
+                    org_id=org_id,
+                    days=period_days,
+                )
+                report["trends"] = trend_data
+            except Exception as e:
+                self._logger.warning(f"[{trace_id}] Trend analysis failed: {e}")
+                report["trend_error"] = str(e)
+
+        report["success"] = True
+        return report
+
+    async def _outcome_compliance_validate(self, params: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
+        """Perform comprehensive compliance validation."""
+        action_id = params.get("action_id")
+        policy_ids = params.get("policy_ids", [])
+        generate_audit_trail = params.get("generate_audit_trail", True)
+
+        if not action_id:
+            return {"success": False, "error": "action_id is required", "error_code": "MISSING_PARAM"}
+
+        compliance_service = self._services.compliance_service()
+
+        validation = {
+            "action_id": action_id,
+            "validated_at": datetime.utcnow().isoformat(),
+            "policy_results": [],
+        }
+
+        # Validate against policies
+        try:
+            result = await asyncio.to_thread(
+                compliance_service.validate_by_action,
+                action_id=action_id,
+                policy_ids=policy_ids if policy_ids else None,
+            )
+            validation["policy_results"] = result.get("results", [])
+            validation["compliant"] = result.get("compliant", False)
+        except Exception as e:
+            self._logger.warning(f"[{trace_id}] Policy validation failed: {e}")
+            validation["policy_error"] = str(e)
+            validation["compliant"] = False
+
+        # Generate audit trail if requested
+        if generate_audit_trail:
+            try:
+                audit_result = await asyncio.to_thread(
+                    compliance_service.record_audit_entry,
+                    action_id=action_id,
+                    event_type="compliance_validation",
+                    details=validation,
+                    user_id=self._session_context.user_id,
+                )
+                validation["audit_entry_id"] = audit_result.get("id")
+            except Exception as e:
+                self._logger.warning(f"[{trace_id}] Audit trail generation failed: {e}")
+                validation["audit_error"] = str(e)
+
+        validation["success"] = True
+        return validation
+
+    # ========================================================================
+    # Tool Group Management (Lazy Loading)
+    # ========================================================================
+
+    async def _handle_tools_management(
+        self, tool_name: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle tools.* meta-tools for managing tool groups.
+
+        MCP Best Practices Implementation:
+        - Keep active tools < 128 to avoid model limits
+        - Curate tools per group (5-15 per active group)
+        - Dynamic activation based on context
+
+        Supports:
+        - tools.listGroups: List available tool groups with activation status
+        - tools.activateGroup: Activate a tool group to load its tools
+        - tools.deactivateGroup: Deactivate a group to free up context
+        - tools.activeGroups: Get currently active groups and stats
+        """
+        try:
+            if not self._lazy_loading_enabled:
+                return {
+                    "success": False,
+                    "error": "Lazy loading is disabled. Set MCP_LAZY_LOADING=true to enable tool groups.",
+                    "error_code": "LAZY_LOADING_DISABLED",
+                }
+
+            if tool_name == "tools.listGroups":
+                include_keywords = params.get("include_keywords", False)
+                groups = self._lazy_loader.list_available_groups()
+
+                if not include_keywords:
+                    # Remove keywords from response for cleaner output
+                    for g in groups:
+                        g.pop("keywords", None)
+
+                return {
+                    "success": True,
+                    "groups": groups,
+                    "total_groups": len(groups),
+                    "active_count": sum(1 for g in groups if g.get("is_active")),
+                }
+
+            elif tool_name == "tools.activateGroup":
+                group_name = params.get("group_name")
+                if not group_name:
+                    return {
+                        "success": False,
+                        "error": "group_name is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                success, message, tools_loaded = self._lazy_loader.activate_group(group_name)
+
+                if success:
+                    self._metrics["tool_groups_activated"] += 1
+                    # Refresh tools dict
+                    self._tools = self._lazy_loader.get_active_tools()
+                    self._tool_scopes = self._lazy_loader.get_tool_scopes()
+
+                return {
+                    "success": success,
+                    "message": message,
+                    "tools_loaded": tools_loaded,
+                    "total_active_tools": len(self._tools),
+                }
+
+            elif tool_name == "tools.deactivateGroup":
+                group_name = params.get("group_name")
+                if not group_name:
+                    return {
+                        "success": False,
+                        "error": "group_name is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                success, message, tools_removed = self._lazy_loader.deactivate_group(group_name)
+
+                if success and tools_removed > 0:
+                    self._metrics["tool_groups_deactivated"] += 1
+                    # Refresh tools dict
+                    self._tools = self._lazy_loader.get_active_tools()
+                    self._tool_scopes = self._lazy_loader.get_tool_scopes()
+
+                return {
+                    "success": success,
+                    "message": message,
+                    "tools_removed": tools_removed,
+                    "total_active_tools": len(self._tools),
+                }
+
+            elif tool_name == "tools.activeGroups":
+                active = self._lazy_loader.get_active_groups()
+                stats = self._lazy_loader.get_stats()
+
+                return {
+                    "success": True,
+                    "active_groups": active,
+                    "stats": stats,
+                }
+
+            else:
+                return {
+                    "success": False,
+                    "error": f"Unknown tools management tool: {tool_name}",
+                    "error_code": "UNKNOWN_TOOL",
+                }
+
+        except Exception as e:
+            self._logger.error(f"Tools management error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Tool group operation failed: {str(e)}",
+                "error_code": "SERVER_ERROR",
+            }
+
+    # ========================================================================
+    # Context Switching (Phase 4: Tenant Context & Isolation)
+    # ========================================================================
+
+    async def _handle_context_tool(
+        self, tool_name: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle context.* tools for tenant context switching.
+
+        Phase 4: MCP_AUTH_IMPLEMENTATION_PLAN.md
+
+        Supports:
+        - context.setOrg: Switch to a different organization
+        - context.setProject: Switch to a different project
+        - context.getContext: Get current context state
+        - context.clearContext: Clear org/project context
+
+        Important: org_id is OPTIONAL - users can operate without an org.
+        """
+        try:
+            if tool_name == "context.getContext":
+                # Return current context (no auth check needed beyond session)
+                return self._get_current_context()
+
+            elif tool_name == "context.setOrg":
+                org_id = params.get("org_id")
+                if not org_id:
+                    return {
+                        "success": False,
+                        "error": "org_id is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+                return await self._set_org_context(org_id)
+
+            elif tool_name == "context.setProject":
+                project_id = params.get("project_id")
+                if not project_id:
+                    return {
+                        "success": False,
+                        "error": "project_id is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+                return await self._set_project_context(project_id)
+
+            elif tool_name == "context.clearContext":
+                return self._clear_context()
+
+            else:
+                return {
+                    "success": False,
+                    "error": f"Unknown context tool: {tool_name}",
+                    "error_code": "UNKNOWN_TOOL",
+                }
+
+        except Exception as e:
+            self._logger.error(f"Context tool error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Context operation failed: {str(e)}",
+                "error_code": "SERVER_ERROR",
+            }
+
+    def _get_current_context(self) -> Dict[str, Any]:
+        """Get the current session context state."""
+        return {
+            "user_id": self._session_context.user_id,
+            "service_principal_id": self._session_context.service_principal_id,
+            "org_id": self._session_context.org_id,
+            "project_id": self._session_context.project_id,
+            "auth_method": self._session_context.auth_method,
+            "roles": list(self._session_context.roles) if self._session_context.roles else [],
+            "scopes": list(self._session_context.granted_scopes) if self._session_context.granted_scopes else [],
+            "is_authenticated": self._session_context.is_authenticated,
+        }
+
+    async def _set_org_context(self, org_id: str) -> Dict[str, Any]:
+        """
+        Switch to a different organization context.
+
+        Verifies the user/SP has access to the target org before switching.
+        """
+        identity = self._session_context.user_id or self._session_context.service_principal_id
+
+        if not identity:
+            return {
+                "success": False,
+                "error": "Not authenticated",
+                "error_code": "NOT_AUTHENTICATED",
+            }
+
+        # Get permission service to verify org access
+        permission_service = self._get_permission_service()
+
+        if permission_service:
+            try:
+                # Check if user has any role in the org
+                role = await permission_service.get_user_org_role(identity, org_id)
+
+                if role is None:
+                    self._logger.warning(
+                        f"Context switch denied: identity={identity} has no access to org={org_id}"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"Access denied to organization {org_id}",
+                        "error_code": "ACCESS_DENIED",
+                    }
+
+                # Get permissions for this role
+                permissions = []
+                try:
+                    perms = await permission_service.get_user_org_permissions(identity, org_id)
+                    permissions = [p.value for p in perms]
+                except Exception as perm_err:
+                    self._logger.debug(f"Could not fetch permissions: {perm_err}")
+
+                # Get org name if org service available
+                org_name = None
+                try:
+                    org_service = self._services.organization_service()
+                    if org_service:
+                        org = org_service.get(org_id)
+                        org_name = org.name if org else None
+                except Exception as org_err:
+                    self._logger.debug(f"Could not fetch org details: {org_err}")
+
+                # Update session context
+                self._session_context.org_id = org_id
+                self._session_context.project_id = None  # Reset project when switching org
+
+                self._logger.info(
+                    f"Context switched: identity={identity}, org={org_id}, role={role.value}"
+                )
+
+                return {
+                    "success": True,
+                    "org_id": org_id,
+                    "org_name": org_name,
+                    "role": role.value if role else None,
+                    "permissions": permissions,
+                }
+
+            except Exception as e:
+                self._logger.error(f"Permission check failed: {e}")
+                return {
+                    "success": False,
+                    "error": f"Failed to verify org access: {e}",
+                    "error_code": "PERMISSION_CHECK_FAILED",
+                }
+
+        # If no permission service (dev mode), allow switching
+        self._logger.warning(f"No permission service - allowing org switch without verification")
+        self._session_context.org_id = org_id
+        self._session_context.project_id = None
+
+        return {
+            "success": True,
+            "org_id": org_id,
+            "warning": "Permission verification skipped (no permission service)",
+        }
+
+    async def _set_project_context(self, project_id: str) -> Dict[str, Any]:
+        """
+        Switch to a different project context.
+
+        For org-owned projects, verifies the project belongs to the current org
+        (if one is set) and user has access. For personal projects, verifies ownership.
+        """
+        identity = self._session_context.user_id or self._session_context.service_principal_id
+
+        if not identity:
+            return {
+                "success": False,
+                "error": "Not authenticated",
+                "error_code": "NOT_AUTHENTICATED",
+            }
+
+        # Get project service
+        try:
+            project_service = self._services.organization_service()
+        except Exception:
+            project_service = None
+
+        project = None
+        project_name = None
+        project_org_id = None
+
+        if project_service:
+            try:
+                project = project_service.get_project(project_id)
+                if not project:
+                    return {
+                        "success": False,
+                        "error": f"Project {project_id} not found",
+                        "error_code": "PROJECT_NOT_FOUND",
+                    }
+
+                project_name = project.name
+                project_org_id = project.org_id
+
+                # If project belongs to an org, verify access
+                if project.org_id:
+                    # If we have a current org context, verify it matches
+                    if self._session_context.org_id and project.org_id != self._session_context.org_id:
+                        return {
+                            "success": False,
+                            "error": f"Project {project_id} belongs to a different organization. "
+                                   f"Switch org context first with context.setOrg.",
+                            "error_code": "ORG_MISMATCH",
+                        }
+
+                    # Verify user has access to the project's org
+                    permission_service = self._get_permission_service()
+                    if permission_service:
+                        role = await permission_service.get_user_org_role(identity, project.org_id)
+                        if role is None:
+                            return {
+                                "success": False,
+                                "error": f"Access denied to project's organization",
+                                "error_code": "ACCESS_DENIED",
+                            }
+                else:
+                    # Personal project - verify ownership or collaboration
+                    if hasattr(project, 'owner_id') and project.owner_id != identity:
+                        # TODO: Check collaborators when that feature is implemented
+                        self._logger.debug(
+                            f"Project owner mismatch: project.owner_id={project.owner_id}, identity={identity}"
+                        )
+                        # For now, allow access (collaborator check not implemented)
+
+            except Exception as e:
+                self._logger.error(f"Project lookup failed: {e}")
+                return {
+                    "success": False,
+                    "error": f"Failed to verify project access: {e}",
+                    "error_code": "PROJECT_LOOKUP_FAILED",
+                }
+
+        # Update session context
+        self._session_context.project_id = project_id
+
+        # Also set org context if project has one and we don't have one set
+        if project_org_id and not self._session_context.org_id:
+            self._session_context.org_id = project_org_id
+
+        self._logger.info(
+            f"Project context set: identity={identity}, project={project_id}, org={self._session_context.org_id}"
+        )
+
+        return {
+            "success": True,
+            "project_id": project_id,
+            "project_name": project_name,
+            "org_id": self._session_context.org_id,
+        }
+
+    def _clear_context(self) -> Dict[str, Any]:
+        """Clear the org and project context."""
+        self._session_context.org_id = None
+        self._session_context.project_id = None
+
+        self._logger.info(f"Context cleared for identity={self._session_context.identity}")
+
+        return {
+            "success": True,
+            "message": "Organization and project context cleared",
+        }
+
+    # ========================================================================
+    # Rate Limiting Tools (Phase 5: Distributed Rate Limiting)
+    # ========================================================================
+
+    async def _handle_ratelimit_tool(
+        self, tool_name: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle ratelimit.* tools for rate limit management.
+
+        Phase 5: MCP_AUTH_IMPLEMENTATION_PLAN.md
+
+        Supports:
+        - ratelimit.getUsage: Get current usage for org/user
+        - ratelimit.getLimits: Get tier limit configuration
+        - ratelimit.getMetrics: Get rate limiter metrics
+        - ratelimit.reset: Reset rate limits (admin)
+        """
+        from .mcp_rate_limiter import SubscriptionTier, get_tier_limits
+
+        try:
+            if tool_name == "ratelimit.getUsage":
+                org_id = params.get("org_id")
+                user_id = params.get("user_id")
+
+                # Default to current context if no params provided
+                if not org_id and not user_id:
+                    org_id = self._session_context.org_id
+                    user_id = self._session_context.user_id
+
+                return await self._distributed_rate_limiter.get_usage(
+                    org_id=org_id,
+                    user_id=user_id,
+                )
+
+            elif tool_name == "ratelimit.getLimits":
+                tier_str = params.get("tier", "free")
+                try:
+                    tier = SubscriptionTier(tier_str)
+                except ValueError:
+                    tier = SubscriptionTier.FREE
+
+                limits = get_tier_limits(tier)
+                return {
+                    "tier": tier.value,
+                    "limits": limits.to_dict(),
+                }
+
+            elif tool_name == "ratelimit.getMetrics":
+                return self._distributed_rate_limiter.get_metrics()
+
+            elif tool_name == "ratelimit.reset":
+                org_id = params.get("org_id")
+                user_id = params.get("user_id")
+
+                if not org_id and not user_id:
+                    return {
+                        "success": False,
+                        "error": "org_id or user_id is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                return await self._distributed_rate_limiter.reset_limits(
+                    org_id=org_id,
+                    user_id=user_id,
+                )
+
+            else:
+                return {
+                    "success": False,
+                    "error": f"Unknown ratelimit tool: {tool_name}",
+                    "error_code": "UNKNOWN_TOOL",
+                }
+
+        except Exception as e:
+            self._logger.error(f"Ratelimit tool error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Rate limit operation failed: {str(e)}",
+                "error_code": "SERVER_ERROR",
+            }
+
+    async def _handle_consent_tool(
+        self, tool_name: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle consent.* tools for JIT (Just-In-Time) authorization.
+
+        Phase 6: MCP_AUTH_IMPLEMENTATION_PLAN.md - Consent UX Dashboard
+
+        Supports:
+        - consent.create: Create a new consent request
+        - consent.lookup: Look up consent request by user code
+        - consent.approve: Approve a consent request
+        - consent.deny: Deny a consent request
+        - consent.poll: Poll consent status (for waiting clients)
+        - consent.list: List pending consent requests for a user
+        """
+        try:
+            consent_service = self._services.consent_service()
+
+            if tool_name == "consent.create":
+                user_id = params.get("user_id")
+                agent_id = params.get("agent_id")
+                tool_req = params.get("tool_name")
+                scopes = params.get("scopes", [])
+                context = params.get("context", {})
+                expires_in = params.get("expires_in", 600)
+
+                if not user_id or not agent_id or not tool_req:
+                    return {
+                        "success": False,
+                        "error": "user_id, agent_id, and tool_name are required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                request = await consent_service.create_request(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    tool_name=tool_req,
+                    scopes=scopes,
+                    context=context,
+                    expires_in=expires_in,
+                )
+
+                return {
+                    "success": True,
+                    "id": request.id,
+                    "user_code": request.user_code,
+                    "verification_uri": request.verification_uri,
+                    "expires_at": request.expires_at.isoformat() if request.expires_at else None,
+                }
+
+            elif tool_name == "consent.lookup":
+                user_code = params.get("user_code")
+                if not user_code:
+                    return {
+                        "success": False,
+                        "error": "user_code is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                request = await consent_service.get_by_user_code(user_code)
+                if not request:
+                    return {
+                        "status": "not_found",
+                        "error": f"No pending consent request found for code: {user_code}",
+                    }
+
+                return request.to_dict()
+
+            elif tool_name == "consent.approve":
+                user_code = params.get("user_code")
+                approver = params.get("approver") or self._session_context.user_id
+                reason = params.get("reason")
+
+                if not user_code:
+                    return {
+                        "success": False,
+                        "error": "user_code is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                if not approver:
+                    return {
+                        "success": False,
+                        "error": "approver is required (or authenticate first)",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                success = await consent_service.approve(
+                    user_code=user_code,
+                    approver_id=approver,
+                    reason=reason,
+                )
+
+                return {
+                    "success": success,
+                    "user_code": user_code,
+                    "status": "approved" if success else "not_found",
+                }
+
+            elif tool_name == "consent.deny":
+                user_code = params.get("user_code")
+                approver = params.get("approver") or self._session_context.user_id
+                reason = params.get("reason")
+
+                if not user_code:
+                    return {
+                        "success": False,
+                        "error": "user_code is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                if not approver:
+                    return {
+                        "success": False,
+                        "error": "approver is required (or authenticate first)",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                success = await consent_service.deny(
+                    user_code=user_code,
+                    approver_id=approver,
+                    reason=reason,
+                )
+
+                return {
+                    "success": success,
+                    "user_code": user_code,
+                    "status": "denied" if success else "not_found",
+                }
+
+            elif tool_name == "consent.poll":
+                user_code = params.get("user_code")
+                if not user_code:
+                    return {
+                        "success": False,
+                        "error": "user_code is required",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                poll_result = await consent_service.poll_status(user_code)
+                return poll_result.to_dict()
+
+            elif tool_name == "consent.list":
+                user_id = params.get("user_id") or self._session_context.user_id
+                if not user_id:
+                    return {
+                        "success": False,
+                        "error": "user_id is required (or authenticate first)",
+                        "error_code": "MISSING_PARAM",
+                    }
+
+                requests = await consent_service.list_pending_for_user(user_id)
+                return {
+                    "requests": [r.to_dict() for r in requests],
+                    "total": len(requests),
+                }
+
+            else:
+                return {
+                    "success": False,
+                    "error": f"Unknown consent tool: {tool_name}",
+                    "error_code": "UNKNOWN_TOOL",
+                }
+
+        except Exception as e:
+            self._logger.error(f"Consent tool error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Consent operation failed: {str(e)}",
+                "error_code": "SERVER_ERROR",
+            }
+
+    def _get_permission_service(self):
+        """Get the AsyncPermissionService if available."""
+        try:
+            # Try to get from services registry
+            from .multi_tenant.permissions import AsyncPermissionService
+
+            dsn = os.environ.get("GUIDEAI_AUTH_PG_DSN")
+            if dsn:
+                return AsyncPermissionService(dsn=dsn)
+
+            # Fallback to pool-based DSN
+            dsn = os.environ.get("GUIDEAI_PG_DSN")
+            if dsn:
+                return AsyncPermissionService(dsn=dsn)
+
+            return None
+        except Exception as e:
+            self._logger.debug(f"Could not initialize permission service: {e}")
+            return None
+
+    def _inject_session_context(self, tool_params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inject authenticated session context into tool parameters.
+
+        This method enriches tool parameters with session identity information,
+        allowing handlers to access user_id, org_id, etc. from the authenticated
+        session without requiring callers to pass them explicitly.
+
+        Priority order for each field:
+        1. Explicit parameter from caller (preserved if provided)
+        2. Session context value (injected if authenticated)
+        3. None (if neither available)
+
+        Args:
+            tool_params: Original tool parameters from the MCP call.
+
+        Returns:
+            Enriched parameters dict with session context injected.
+        """
+        enriched = dict(tool_params)  # Copy to avoid mutating original
+
+        if self._session_context.is_authenticated:
+            # Inject user_id if not explicitly provided
+            if "user_id" not in enriched and self._session_context.user_id:
+                enriched["user_id"] = self._session_context.user_id
+
+            # Inject org_id if not explicitly provided (for org-scoped operations)
+            if "org_id" not in enriched and self._session_context.org_id:
+                enriched["org_id"] = self._session_context.org_id
+
+            # Inject project_id if not explicitly provided
+            if "project_id" not in enriched and self._session_context.project_id:
+                enriched["project_id"] = self._session_context.project_id
+
+            # Add session metadata for audit/logging and authorization
+            enriched["_session"] = {
+                "user_id": self._session_context.user_id,
+                "org_id": self._session_context.org_id,
+                "project_id": self._session_context.project_id,
+                "auth_method": self._session_context.auth_method,
+                "roles": list(self._session_context.roles) if self._session_context.roles else [],
+                "scopes": list(self._session_context.granted_scopes),
+                "is_admin": self._session_context.is_admin,
+                "accessible_org_ids": list(self._session_context.accessible_org_ids),
+                "accessible_project_ids": list(self._session_context.accessible_project_ids),
+            }
+
+        return enriched
 
     def _success_response(self, request_id: Optional[str], result: Any) -> str:
         """Build JSON-RPC success response."""

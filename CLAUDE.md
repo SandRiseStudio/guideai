@@ -1,8 +1,37 @@
 # Agent Handbook
 
-> **TL;DR**: **Use the role that makes the most sense to begin with. Declare your role at task start.** Use MCP tools first.
+> **TL;DR**: **ALWAYS retrieve behaviors before starting any task.** Use the role that makes the most sense. Declare your role at task start. **Use GuideAI MCP tools directly** (they work natively in VS Code Copilot Chat and Claude Desktop!).
 > Log with Raze. Manage environments with Amprealize. Extract reusable code to `packages/`.
 > Never hardcode secrets. Run `pre-commit` before pushing. **Cite both behavior AND role in your work.**
+
+---
+
+## 🚨 MANDATORY: Retrieve Behaviors Before Every Task
+
+**Before starting ANY task**, you MUST retrieve relevant behaviors. In VS Code Copilot Chat or Claude Desktop, **use GuideAI MCP tools directly**:
+
+```bash
+# MCP (preferred - works natively in VS Code Copilot Chat and Claude Desktop)
+mcp_guideai_behaviors_getfortask(task_description="<describe your task>", role="Student")
+
+# CLI (fallback when MCP unavailable)
+guideai behaviors get-for-task "<describe your task>" --role Student
+
+# REST API (for programmatic access)
+POST /v1/behaviors:getForTask
+{"task_description": "...", "role": "Student"}
+```
+
+**Why this is mandatory:**
+- Behaviors contain proven procedural knowledge that prevents re-derivation
+- Achieves up to 46% token reduction while maintaining quality
+- Ensures consistent, auditable execution patterns
+- Tracks behavior usage for continuous improvement
+
+**After retrieval**, cite the behaviors in your work:
+```
+Following `behavior_use_raze_for_logging` (Student): Adding structured logging...
+```
 
 ---
 
@@ -10,12 +39,14 @@
 
 | Rule | Behavior | Why |
 |------|----------|-----|
+| **Retrieve behaviors before EVERY task** | `behaviors.getForTask` | Ensures behavior-conditioned execution, tracks usage |
 | Use MCP tools over CLI/API when available | `behavior_prefer_mcp_tools` | Consistent schemas, automatic telemetry |
 | Use Raze for all logging | `behavior_use_raze_for_logging` | Centralized, queryable, context-enriched |
 | Use Amprealize for environments | `behavior_use_amprealize_for_environments` | Blueprint-driven, compliance hooks |
 | Never hardcode secrets | `behavior_prevent_secret_leaks` | Security, auditability |
 | Run pre-commit before pushing | `behavior_prevent_secret_leaks` | Catches leaks before they reach git |
 | Update docs after API/workflow changes | `behavior_update_docs_after_changes` | Keeps team aligned |
+| Propose new behaviors when patterns repeat 3+ times | `behaviors.propose` | Grows the handbook, reduces future re-derivation |
 
 ---
 
@@ -387,12 +418,13 @@ Scan this table before starting any task. If keywords match, follow the linked b
 ### `behavior_prefer_mcp_tools`
 - **When**: Working in an IDE with MCP server extensions, or when guideai MCP tools could replace CLI/API interactions.
 - **Steps**:
-  1. **Check available tools**: Review `MCP_SERVER_DESIGN.md` for the catalog (`behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`).
-  2. **Prefer MCP over CLI/API**: MCP provides consistent schemas, automatic telemetry, and cross-surface parity.
-  3. **Leverage IDE extensions**: VS Code and other IDEs with MCP support can invoke tools directly for real-time behavior retrieval, run status, and compliance validation.
-  4. **Record usage**: Cite MCP tools in action logs for reproducibility.
-  5. **Fallback gracefully**: If MCP unavailable, use CLI commands with same parameters.
-  6. **Report gaps**: Document missing MCP equivalents in `docs/capability_matrix.md`.
+  1. **Check available tools**: GuideAI MCP server exposes **220 tools** including `behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`, `projects.*`, `orgs.*`, `boards.*`. See `MCP_SERVER_DESIGN.md` for full catalog.
+  2. **Use MCP directly in VS Code Copilot Chat**: GuideAI MCP tools work natively—just invoke them by name (e.g., `mcp_guideai_projects_list`, `mcp_guideai_behaviors_getfortask`). No CLI fallback needed.
+  3. **Prefer MCP over CLI/API**: MCP provides consistent schemas, automatic telemetry, and cross-surface parity.
+  4. **Leverage IDE extensions**: VS Code Copilot Chat can invoke GuideAI tools directly for real-time behavior retrieval, project management, run status, and compliance validation.
+  5. **Record usage**: Cite MCP tools in action logs for reproducibility.
+  6. **Fallback gracefully**: If MCP unavailable (e.g., outside VS Code), use CLI commands with same parameters.
+  7. **Report gaps**: Document missing MCP equivalents in `docs/capability_matrix.md`.
 
 ### `behavior_use_raze_for_logging`
 - **When**: Adding logging to any service, debugging production issues, implementing telemetry, or replacing ad-hoc print statements.

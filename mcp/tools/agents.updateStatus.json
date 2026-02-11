@@ -38,7 +38,7 @@
         "description": "Additional metadata to include with the status change"
       }
     },
-    "required": ["agent_id", "org_id", "status"]
+    "required": ["agent_id", "status"]
   },
   "outputSchema": {
     "type": "object",

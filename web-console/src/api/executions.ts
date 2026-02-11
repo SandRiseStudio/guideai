@@ -14,6 +14,7 @@ import {
   type ExecutionListItem,
   type ExecutionListResponse,
   type ExecutionSnapshotEventPayload,
+  type ExecutionState,
   type ExecutionStatus,
   type ExecutionStatusEventPayload,
   type ExecutionStatusSnapshotPayload,
@@ -85,6 +86,9 @@ interface ExecutionStepsApiResponse {
     output_tokens: number;
     tool_calls: number;
     content_preview?: string | null;
+    content_full?: string | null;
+    tool_names?: string[] | null;
+    model_id?: string | null;
   }>;
   total: number;
 }
@@ -99,11 +103,15 @@ export const executionKeys = {
 };
 
 function mapExecutionStatus(response: ExecutionStatusResponse): ExecutionStatus {
+  // Validate state is a valid ExecutionState
+  const validStates = ['pending', 'running', 'completed', 'failed', 'cancelled'];
+  const state = response.state && validStates.includes(response.state) ? response.state as ExecutionState : null;
+
   return {
     hasExecution: response.has_execution,
     runId: response.run_id ?? null,
     taskCycleId: response.task_cycle_id ?? null,
-    state: response.state ?? null,
+    state,
     phase: response.phase ?? null,
     startedAt: response.started_at ?? null,
     progressPct: response.progress_pct ?? null,
@@ -145,6 +153,9 @@ function mapExecutionSteps(response: ExecutionStepsApiResponse): ExecutionStepsR
       outputTokens: step.output_tokens,
       toolCalls: step.tool_calls,
       contentPreview: step.content_preview ?? null,
+      contentFull: step.content_full ?? null,
+      toolNames: step.tool_names ?? null,
+      modelId: step.model_id ?? null,
     })),
     total: response.total,
   };
@@ -226,9 +237,18 @@ function mapStepFromSnapshot(step: ExecutionStepEventPayload['step'] | Execution
     };
   }
 
+  // Convert to event payload with required name field
   const payload: ExecutionStepEventPayload = {
     run_id: '',
-    step,
+    step: {
+      step_id: step.step_id,
+      name: step.name ?? 'step',
+      status: step.status ?? 'unknown',
+      started_at: step.started_at ?? undefined,
+      completed_at: step.completed_at ?? undefined,
+      progress_pct: step.progress_pct ?? undefined,
+      metadata: step.metadata ?? undefined,
+    },
   };
   return mapStepFromEvent(payload);
 }
@@ -499,13 +519,16 @@ export function useExecutionSteps(
   return useQuery({
     queryKey: executionKeys.steps(runId),
     queryFn: async () => {
-      if (!runId || !orgId || !projectId) return null;
+      if (!runId || !projectId) return null;
+      const params = new URLSearchParams();
+      if (orgId) params.set('org_id', orgId);
+      params.set('project_id', projectId);
       const response = await apiClient.get<ExecutionStepsApiResponse>(
-        `/v1/executions/${encodeURIComponent(runId)}/steps?org_id=${encodeURIComponent(orgId)}&project_id=${encodeURIComponent(projectId)}`
+        `/v1/executions/${encodeURIComponent(runId)}/steps?${params.toString()}`
       );
       return mapExecutionSteps(response);
     },
-    enabled: Boolean(runId && orgId && projectId) && (options?.enabled ?? true),
+    enabled: Boolean(runId && projectId) && (options?.enabled ?? true),
     refetchInterval: options?.refetchInterval,
     staleTime: 2_000,
   });

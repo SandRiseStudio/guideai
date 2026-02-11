@@ -10,9 +10,21 @@ Key Features:
 - Per-tool limits for sensitive operations
 - Configurable via environment variables
 - Metrics and telemetry integration
+
+Phase 5 Enhancements (MCP_AUTH_IMPLEMENTATION_PLAN.md):
+- Redis backend for distributed rate limiting across instances
+- Per-tenant (org) rate limiting based on subscription tier
+- Daily quota tracking for free tier
+- Async Redis operations for non-blocking performance
+
+Behaviors referenced:
+- behavior_lock_down_security_surface: Rate limiting for DoS prevention
+- behavior_use_raze_for_logging: Structured logging of limit events
+- behavior_externalize_configuration: Tier limits from config
 """
 
 from __future__ import annotations
+import asyncio
 import logging
 import os
 import time
@@ -21,9 +33,130 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Subscription Tier Configuration (Phase 5)
+# ============================================================================
+
+class SubscriptionTier(str, Enum):
+    """Subscription tiers with different rate limits."""
+    FREE = "free"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"
+    UNLIMITED = "unlimited"  # For internal/system use
+
+
+@dataclass
+class TierLimits:
+    """Rate limit configuration per subscription tier."""
+    requests_per_minute: int
+    burst_size: int
+    daily_quota: Optional[int] = None  # None = unlimited
+    user_requests_per_minute: Optional[int] = None  # Per-user within org
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "requests_per_minute": self.requests_per_minute,
+            "burst_size": self.burst_size,
+            "daily_quota": self.daily_quota,
+            "user_requests_per_minute": self.user_requests_per_minute,
+        }
+
+
+# Default tier configurations - can be overridden via environment
+TIER_LIMITS: Dict[SubscriptionTier, TierLimits] = {
+    SubscriptionTier.FREE: TierLimits(
+        requests_per_minute=60,
+        burst_size=15,
+        daily_quota=1000,
+        user_requests_per_minute=30,
+    ),
+    SubscriptionTier.PRO: TierLimits(
+        requests_per_minute=300,
+        burst_size=75,
+        daily_quota=10000,
+        user_requests_per_minute=100,
+    ),
+    SubscriptionTier.ENTERPRISE: TierLimits(
+        requests_per_minute=1000,
+        burst_size=250,
+        daily_quota=None,  # Unlimited
+        user_requests_per_minute=300,
+    ),
+    SubscriptionTier.UNLIMITED: TierLimits(
+        requests_per_minute=10000,
+        burst_size=2500,
+        daily_quota=None,
+        user_requests_per_minute=None,
+    ),
+}
+
+
+def get_tier_limits(tier: SubscriptionTier) -> TierLimits:
+    """Get limits for a tier with environment variable overrides."""
+    base = TIER_LIMITS.get(tier, TIER_LIMITS[SubscriptionTier.FREE])
+
+    tier_name = tier.value.upper()
+    rpm = os.getenv(f"GUIDEAI_RATELIMIT_{tier_name}_RPM")
+    burst = os.getenv(f"GUIDEAI_RATELIMIT_{tier_name}_BURST")
+    daily = os.getenv(f"GUIDEAI_RATELIMIT_{tier_name}_DAILY")
+
+    return TierLimits(
+        requests_per_minute=int(rpm) if rpm else base.requests_per_minute,
+        burst_size=int(burst) if burst else base.burst_size,
+        daily_quota=int(daily) if daily else base.daily_quota,
+        user_requests_per_minute=base.user_requests_per_minute,
+    )
+
+
+# ============================================================================
+# Distributed Rate Limit Result (Phase 5)
+# ============================================================================
+
+@dataclass
+class DistributedRateLimitResult:
+    """Result from distributed (Redis-backed) rate limit check."""
+    allowed: bool
+    remaining: int
+    reset_at: int  # Unix timestamp
+    retry_after: Optional[int] = None
+    limit_type: str = "minute"  # "minute", "daily", "burst"
+    tier: str = "free"
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "allowed": self.allowed,
+            "remaining": self.remaining,
+            "reset_at": self.reset_at,
+            "limit_type": self.limit_type,
+            "tier": self.tier,
+        }
+        if self.retry_after is not None:
+            result["retry_after"] = self.retry_after
+        return result
+
+    def get_headers(self) -> Dict[str, str]:
+        """Generate rate limit response headers."""
+        headers = {
+            "X-RateLimit-Remaining": str(max(0, self.remaining)),
+            "X-RateLimit-Reset": str(self.reset_at),
+            "X-RateLimit-Tier": self.tier,
+        }
+        if self.retry_after is not None:
+            headers["Retry-After"] = str(self.retry_after)
+        return headers
+
+
+# ============================================================================
+# Original Classes (Enhanced)
+# ============================================================================
 
 
 class RateLimitDecision(str, Enum):
@@ -549,3 +682,556 @@ class MCPRateLimiter:
             logger.info(f"Cleaned up {removed} stale rate limit clients")
 
         return removed
+
+# ============================================================================
+# Distributed Rate Limiter (Phase 5: Redis-backed)
+# ============================================================================
+
+class DistributedRateLimiter:
+    """Redis-backed distributed rate limiter for MCP with tenant awareness.
+
+    Provides per-org and per-user rate limiting with subscription tier support.
+    Falls back to in-memory limiting when Redis is unavailable.
+
+    Key patterns:
+    - mcp:ratelimit:org:{org_id}:minute - Per-org minute window
+    - mcp:ratelimit:org:{org_id}:daily:{date} - Per-org daily quota
+    - mcp:ratelimit:user:{user_id}:minute - Per-user minute window
+    """
+
+    def __init__(
+        self,
+        redis_url: Optional[str] = None,
+        tier_limits: Optional[Dict[SubscriptionTier, TierLimits]] = None,
+    ):
+        """Initialize distributed rate limiter.
+
+        Args:
+            redis_url: Redis connection URL. If None, tries env vars.
+            tier_limits: Override default tier limits.
+        """
+        self._tier_limits = tier_limits or TIER_LIMITS
+        self._redis_client: Optional["aioredis.Redis"] = None
+        self._use_redis = False
+        self._redis_url = redis_url
+
+        # In-memory fallback state
+        self._memory_counters: Dict[str, Dict[str, Any]] = {}
+        self._memory_lock = Lock()
+
+        # Metrics
+        self._metrics = {
+            "checks_total": 0,
+            "redis_checks": 0,
+            "memory_checks": 0,
+            "denies_total": 0,
+            "redis_errors": 0,
+        }
+
+    async def _ensure_redis(self) -> bool:
+        """Lazily initialize Redis connection."""
+        if self._redis_client is not None:
+            return self._use_redis
+
+        try:
+            import redis.asyncio as aioredis
+
+            url = self._redis_url or os.getenv("GUIDEAI_REDIS_URL") or os.getenv("REDIS_URL")
+            if not url:
+                host = os.getenv("REDIS_HOST", "localhost")
+                port = os.getenv("REDIS_PORT", "6379")
+                db = os.getenv("REDIS_RATE_LIMIT_DB", "1")
+                password = os.getenv("REDIS_PASSWORD", "")
+
+                if password:
+                    url = f"redis://:{password}@{host}:{port}/{db}"
+                else:
+                    url = f"redis://{host}:{port}/{db}"
+
+            self._redis_client = aioredis.from_url(
+                url,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+
+            # Test connection
+            await self._redis_client.ping()
+            self._use_redis = True
+            logger.info(f"Distributed rate limiter connected to Redis")
+            return True
+
+        except ImportError:
+            logger.warning("redis package not installed, using in-memory fallback")
+            return False
+        except Exception as e:
+            logger.warning(f"Redis connection failed, using in-memory fallback: {e}")
+            self._metrics["redis_errors"] += 1
+            return False
+
+    def _get_tier_limits(self, tier: SubscriptionTier) -> TierLimits:
+        """Get limits for a tier, checking instance overrides first."""
+        # Use instance-level tier_limits if provided, otherwise global with env overrides
+        if self._tier_limits is not TIER_LIMITS and tier in self._tier_limits:
+            return self._tier_limits[tier]
+        return get_tier_limits(tier)
+
+    async def check_tenant_limit(
+        self,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        service_principal_id: Optional[str] = None,
+        tier: SubscriptionTier = SubscriptionTier.FREE,
+        tool_name: Optional[str] = None,
+    ) -> DistributedRateLimitResult:
+        """Check and consume rate limit for a tenant.
+
+        Args:
+            org_id: Organization ID for tenant-level limiting
+            user_id: User ID for per-user limiting
+            service_principal_id: SP ID for service-to-service calls
+            tier: Subscription tier for limit configuration
+            tool_name: Optional tool name for tool-specific limits
+
+        Returns:
+            DistributedRateLimitResult with allowed status and metadata
+        """
+        self._metrics["checks_total"] += 1
+        limits = self._get_tier_limits(tier)
+        now = int(time.time())
+
+        # Determine identifier
+        if org_id:
+            identifier = f"org:{org_id}"
+        elif user_id:
+            identifier = f"user:{user_id}"
+        elif service_principal_id:
+            identifier = f"sp:{service_principal_id}"
+        else:
+            identifier = "anon:default"
+            limits = TierLimits(requests_per_minute=10, burst_size=3, daily_quota=50)
+
+        # Try Redis first
+        redis_available = await self._ensure_redis()
+
+        # Check daily quota first (if applicable)
+        if limits.daily_quota is not None:
+            daily_result = await self._check_daily_quota(
+                identifier, limits, now, tier.value, redis_available
+            )
+            if not daily_result.allowed:
+                self._metrics["denies_total"] += 1
+                return daily_result
+
+        # Check per-minute limit
+        minute_result = await self._check_minute_limit(
+            identifier, limits, now, tier.value, redis_available
+        )
+        if not minute_result.allowed:
+            self._metrics["denies_total"] += 1
+            return minute_result
+
+        # Check per-user limit within org (fair sharing)
+        if org_id and user_id and limits.user_requests_per_minute:
+            user_limits = TierLimits(
+                requests_per_minute=limits.user_requests_per_minute,
+                burst_size=limits.burst_size // 4,
+                daily_quota=None,
+            )
+            user_result = await self._check_minute_limit(
+                f"user:{user_id}:in:{org_id}",
+                user_limits,
+                now,
+                tier.value,
+                redis_available,
+            )
+            if not user_result.allowed:
+                user_result.limit_type = "user_minute"
+                self._metrics["denies_total"] += 1
+                return user_result
+
+        return minute_result
+
+    async def _check_minute_limit(
+        self,
+        identifier: str,
+        limits: TierLimits,
+        now: int,
+        tier: str,
+        use_redis: bool,
+    ) -> DistributedRateLimitResult:
+        """Check per-minute sliding window limit."""
+        if use_redis and self._redis_client:
+            self._metrics["redis_checks"] += 1
+            return await self._check_minute_redis(identifier, limits, now, tier)
+        else:
+            self._metrics["memory_checks"] += 1
+            return self._check_minute_memory(identifier, limits, now, tier)
+
+    async def _check_minute_redis(
+        self,
+        identifier: str,
+        limits: TierLimits,
+        now: int,
+        tier: str,
+    ) -> DistributedRateLimitResult:
+        """Check minute limit using Redis sliding window."""
+        key = f"mcp:ratelimit:{identifier}:minute"
+        window_start = now - 60
+
+        lua_script = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local window_start = tonumber(ARGV[2])
+        local max_requests = tonumber(ARGV[3])
+
+        redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
+        local count = redis.call('ZCARD', key)
+
+        if count < max_requests then
+            local member = now .. ':' .. redis.call('INCR', key .. ':seq')
+            redis.call('ZADD', key, now, member)
+            redis.call('EXPIRE', key, 120)
+            redis.call('EXPIRE', key .. ':seq', 120)
+            return {1, max_requests - count - 1, 0}
+        else
+            local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+            local retry_after = 60
+            if oldest and oldest[2] then
+                retry_after = math.ceil(tonumber(oldest[2]) + 60 - now)
+                if retry_after < 1 then retry_after = 1 end
+            end
+            return {0, 0, retry_after}
+        end
+        """
+
+        try:
+            result = await self._redis_client.eval(
+                lua_script, 1, key,
+                now, window_start, limits.requests_per_minute
+            )
+
+            return DistributedRateLimitResult(
+                allowed=bool(result[0]),
+                remaining=int(result[1]),
+                reset_at=now + 60,
+                retry_after=int(result[2]) if not result[0] else None,
+                limit_type="minute",
+                tier=tier,
+            )
+
+        except Exception as e:
+            logger.error(f"Redis rate limit error: {e}")
+            self._metrics["redis_errors"] += 1
+            # Fail open
+            return DistributedRateLimitResult(
+                allowed=True,
+                remaining=limits.requests_per_minute,
+                reset_at=now + 60,
+                tier=tier,
+            )
+
+    def _check_minute_memory(
+        self,
+        identifier: str,
+        limits: TierLimits,
+        now: int,
+        tier: str,
+    ) -> DistributedRateLimitResult:
+        """Check minute limit using in-memory sliding window."""
+        key = f"minute:{identifier}"
+        window_start = now - 60
+
+        with self._memory_lock:
+            if key not in self._memory_counters:
+                self._memory_counters[key] = {"requests": [], "last_cleanup": now}
+
+            counter = self._memory_counters[key]
+            counter["requests"] = [ts for ts in counter["requests"] if ts > window_start]
+            count = len(counter["requests"])
+
+            if count < limits.requests_per_minute:
+                counter["requests"].append(now)
+                return DistributedRateLimitResult(
+                    allowed=True,
+                    remaining=limits.requests_per_minute - count - 1,
+                    reset_at=now + 60,
+                    tier=tier,
+                )
+            else:
+                oldest = min(counter["requests"]) if counter["requests"] else now
+                retry_after = max(1, oldest + 60 - now)
+
+                return DistributedRateLimitResult(
+                    allowed=False,
+                    remaining=0,
+                    reset_at=now + retry_after,
+                    retry_after=retry_after,
+                    limit_type="minute",
+                    tier=tier,
+                )
+
+    async def _check_daily_quota(
+        self,
+        identifier: str,
+        limits: TierLimits,
+        now: int,
+        tier: str,
+        use_redis: bool,
+    ) -> DistributedRateLimitResult:
+        """Check daily quota limit."""
+        if limits.daily_quota is None:
+            return DistributedRateLimitResult(
+                allowed=True,
+                remaining=999999,
+                reset_at=self._get_day_end(now),
+                tier=tier,
+            )
+
+        if use_redis and self._redis_client:
+            return await self._check_daily_redis(identifier, limits, now, tier)
+        else:
+            return self._check_daily_memory(identifier, limits, now, tier)
+
+    async def _check_daily_redis(
+        self,
+        identifier: str,
+        limits: TierLimits,
+        now: int,
+        tier: str,
+    ) -> DistributedRateLimitResult:
+        """Check daily quota using Redis."""
+        day_key = now // 86400
+        key = f"mcp:ratelimit:{identifier}:daily:{day_key}"
+
+        try:
+            pipe = self._redis_client.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, 90000)  # 25 hours
+            results = await pipe.execute()
+
+            count = results[0]
+            remaining = max(0, limits.daily_quota - count)
+            day_end = self._get_day_end(now)
+
+            if count > limits.daily_quota:
+                return DistributedRateLimitResult(
+                    allowed=False,
+                    remaining=0,
+                    reset_at=day_end,
+                    retry_after=day_end - now,
+                    limit_type="daily",
+                    tier=tier,
+                )
+
+            return DistributedRateLimitResult(
+                allowed=True,
+                remaining=remaining,
+                reset_at=day_end,
+                tier=tier,
+            )
+
+        except Exception as e:
+            logger.error(f"Redis daily quota error: {e}")
+            self._metrics["redis_errors"] += 1
+            return DistributedRateLimitResult(
+                allowed=True,
+                remaining=limits.daily_quota,
+                reset_at=self._get_day_end(now),
+                tier=tier,
+            )
+
+    def _check_daily_memory(
+        self,
+        identifier: str,
+        limits: TierLimits,
+        now: int,
+        tier: str,
+    ) -> DistributedRateLimitResult:
+        """Check daily quota using in-memory counter."""
+        day_key = now // 86400
+        key = f"daily:{identifier}:{day_key}"
+
+        with self._memory_lock:
+            if key not in self._memory_counters:
+                self._memory_counters[key] = {"count": 0, "day": day_key}
+
+            counter = self._memory_counters[key]
+            if counter["day"] != day_key:
+                counter["count"] = 0
+                counter["day"] = day_key
+
+            counter["count"] += 1
+            remaining = max(0, limits.daily_quota - counter["count"])
+            day_end = self._get_day_end(now)
+
+            if counter["count"] > limits.daily_quota:
+                return DistributedRateLimitResult(
+                    allowed=False,
+                    remaining=0,
+                    reset_at=day_end,
+                    retry_after=day_end - now,
+                    limit_type="daily",
+                    tier=tier,
+                )
+
+            return DistributedRateLimitResult(
+                allowed=True,
+                remaining=remaining,
+                reset_at=day_end,
+                tier=tier,
+            )
+
+    def _get_day_end(self, now: int) -> int:
+        """Get timestamp for end of current day (UTC)."""
+        return ((now // 86400) + 1) * 86400
+
+    async def get_usage(
+        self,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get current usage statistics."""
+        now = int(time.time())
+
+        if org_id:
+            identifier = f"org:{org_id}"
+        elif user_id:
+            identifier = f"user:{user_id}"
+        else:
+            return {"error": "org_id or user_id required"}
+
+        redis_available = await self._ensure_redis()
+
+        if redis_available and self._redis_client:
+            return await self._get_usage_redis(identifier, now)
+        else:
+            return self._get_usage_memory(identifier, now)
+
+    async def _get_usage_redis(self, identifier: str, now: int) -> Dict[str, Any]:
+        """Get usage from Redis."""
+        minute_key = f"mcp:ratelimit:{identifier}:minute"
+        day_key = now // 86400
+        daily_key = f"mcp:ratelimit:{identifier}:daily:{day_key}"
+
+        try:
+            pipe = self._redis_client.pipeline()
+            pipe.zcard(minute_key)
+            pipe.get(daily_key)
+            results = await pipe.execute()
+
+            return {
+                "identifier": identifier,
+                "requests_last_minute": results[0] or 0,
+                "requests_today": int(results[1]) if results[1] else 0,
+                "timestamp": now,
+                "backend": "redis",
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _get_usage_memory(self, identifier: str, now: int) -> Dict[str, Any]:
+        """Get usage from memory."""
+        minute_key = f"minute:{identifier}"
+        day_key = now // 86400
+        daily_key = f"daily:{identifier}:{day_key}"
+
+        minute_count = 0
+        daily_count = 0
+
+        with self._memory_lock:
+            if minute_key in self._memory_counters:
+                window_start = now - 60
+                minute_count = len([
+                    ts for ts in self._memory_counters[minute_key].get("requests", [])
+                    if ts > window_start
+                ])
+
+            if daily_key in self._memory_counters:
+                daily_count = self._memory_counters[daily_key].get("count", 0)
+
+        return {
+            "identifier": identifier,
+            "requests_last_minute": minute_count,
+            "requests_today": daily_count,
+            "timestamp": now,
+            "backend": "memory",
+        }
+
+    async def reset_limits(
+        self,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Reset rate limits for an org or user (admin operation)."""
+        if org_id:
+            identifier = f"org:{org_id}"
+        elif user_id:
+            identifier = f"user:{user_id}"
+        else:
+            return {"error": "org_id or user_id required"}
+
+        redis_available = await self._ensure_redis()
+
+        if redis_available and self._redis_client:
+            return await self._reset_redis(identifier)
+        else:
+            return self._reset_memory(identifier)
+
+    async def _reset_redis(self, identifier: str) -> Dict[str, Any]:
+        """Reset limits in Redis."""
+        pattern = f"mcp:ratelimit:{identifier}:*"
+
+        try:
+            keys = []
+            async for key in self._redis_client.scan_iter(pattern, count=100):
+                keys.append(key)
+
+            if keys:
+                await self._redis_client.delete(*keys)
+
+            return {"reset": True, "keys_deleted": len(keys), "backend": "redis"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _reset_memory(self, identifier: str) -> Dict[str, Any]:
+        """Reset limits in memory."""
+        deleted = 0
+
+        with self._memory_lock:
+            keys_to_delete = [k for k in self._memory_counters if identifier in k]
+            for k in keys_to_delete:
+                del self._memory_counters[k]
+                deleted += 1
+
+        return {"reset": True, "keys_deleted": deleted, "backend": "memory"}
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get rate limiter metrics."""
+        return {
+            **self._metrics,
+            "redis_available": self._use_redis,
+            "tier_limits": {
+                tier.value: limits.to_dict()
+                for tier, limits in self._tier_limits.items()
+            },
+        }
+
+    async def close(self) -> None:
+        """Close Redis connection."""
+        if self._redis_client:
+            await self._redis_client.close()
+            self._redis_client = None
+            self._use_redis = False
+
+
+# Singleton instance for distributed rate limiter
+_distributed_limiter: Optional[DistributedRateLimiter] = None
+
+
+def get_distributed_rate_limiter() -> DistributedRateLimiter:
+    """Get or create global distributed rate limiter instance."""
+    global _distributed_limiter
+    if _distributed_limiter is None:
+        _distributed_limiter = DistributedRateLimiter()
+    return _distributed_limiter

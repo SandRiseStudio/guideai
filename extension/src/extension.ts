@@ -24,30 +24,76 @@ import { ComplianceReviewPanel } from './panels/ComplianceReviewPanel';
 import { AmprealizePanel } from './panels/AmprealizePanel';
 import { ActionTimelinePanel } from './panels/ActionTimelinePanel';
 import { BehaviorAccuracyPanel } from './panels/BehaviorAccuracyPanel';
+import { GuideAIChatPanel } from './panels/GuideAIChatPanel';
 import { McpStatusBarProvider } from './providers/McpStatusBarProvider';
 
 export function activate(context: vscode.ExtensionContext) {
 	console.log('GuideAI extension is now active');
 
-	// Initialize GuideAIClient
-	const client = new GuideAIClient(context);
+	// Create output channel for extension logging
+	const outputChannel = vscode.window.createOutputChannel('GuideAI Extension');
+	outputChannel.appendLine('GuideAI extension activating...');
 
-	// Initialize McpClient for MCP-based operations (behavior_prefer_mcp_tools)
-	const mcpClient = new McpClient(context);
-	context.subscriptions.push({ dispose: () => mcpClient.dispose() });
+	try {
+		// Initialize GuideAIClient
+		const client = new GuideAIClient(context);
 
-	// Initialize MCP Status Bar Provider (Epic 6 - Connection Stability)
-	const mcpStatusBarProvider = new McpStatusBarProvider(mcpClient);
-	context.subscriptions.push(mcpStatusBarProvider);
+		// Initialize McpClient for MCP-based operations (behavior_prefer_mcp_tools)
+		const mcpClient = new McpClient(context);
+		context.subscriptions.push({ dispose: () => mcpClient.dispose() });
 
-	// Register tree data providers
-	const executionTrackerProvider = new ExecutionTrackerDataProvider(client);
-	const complianceTrackerProvider = new ComplianceTreeDataProvider(client);
-	const actionTrackerProvider = new ActionTreeDataProvider(mcpClient);
-	const costTrackerProvider = new CostTreeDataProvider(client);
+		// Initialize MCP Status Bar Provider (Epic 6 - Connection Stability)
+		const mcpStatusBarProvider = new McpStatusBarProvider(mcpClient);
+		context.subscriptions.push(mcpStatusBarProvider);
 
-	// Register authentication provider (Epic 5.6)
-	const authProvider = new AuthProvider(client);
+		// Register core commands early to avoid "command not found" if later init fails
+		context.subscriptions.push(
+			vscode.commands.registerCommand('guideai.openChat', () => {
+				GuideAIChatPanel.createOrShow(context.extensionUri, mcpClient);
+			}),
+			vscode.commands.registerCommand('guideai.mcp.showStatus', () => {
+				mcpStatusBarProvider.showStatusQuickPick();
+			})
+		);
+
+		// NOTE: Auto-connect disabled to prevent resource exhaustion
+		// User must manually connect via command palette: "GuideAI: Connect to MCP Server"
+		outputChannel.appendLine('GuideAI extension ready. Use "GuideAI: Connect to MCP Server" to connect.');
+
+		// Register manual connect command
+		context.subscriptions.push(
+			vscode.commands.registerCommand('guideai.mcp.connect', async () => {
+				try {
+					outputChannel.appendLine('Connecting to MCP server...');
+					await mcpClient.connect();
+					outputChannel.appendLine('MCP client connected successfully');
+					vscode.window.showInformationMessage('GuideAI MCP server connected');
+				} catch (err) {
+					const errorMsg = err instanceof Error ? err.message : String(err);
+					outputChannel.appendLine(`Failed to connect MCP client: ${errorMsg}`);
+					vscode.window.showErrorMessage(`GuideAI MCP connection failed: ${errorMsg}`);
+				}
+			}),
+			vscode.commands.registerCommand('guideai.mcp.disconnect', () => {
+				try {
+					mcpClient.disconnect();
+					outputChannel.appendLine('MCP client disconnected');
+					vscode.window.showInformationMessage('GuideAI MCP server disconnected');
+				} catch (err) {
+					const errorMsg = err instanceof Error ? err.message : String(err);
+					outputChannel.appendLine(`Failed to disconnect MCP client: ${errorMsg}`);
+				}
+			})
+		);
+
+		// Register tree data providers
+		const executionTrackerProvider = new ExecutionTrackerDataProvider(client);
+		const complianceTrackerProvider = new ComplianceTreeDataProvider(client);
+		const actionTrackerProvider = new ActionTreeDataProvider(mcpClient);
+		const costTrackerProvider = new CostTreeDataProvider(client);
+
+		// Register authentication provider (Epic 5.6)
+		const authProvider = new AuthProvider(client, context, mcpClient);
 	context.subscriptions.push(vscode.authentication.registerAuthenticationProvider('guideai', 'GuideAI', authProvider));
 
 	// Register settings sync provider (Epic 5.7)
@@ -169,11 +215,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 		vscode.commands.registerCommand('guideai.complianceTracker.refreshChecklist', async (item: ComplianceChecklistItem) => {
 			await complianceTrackerProvider.refresh();
-		}),
-
-		// MCP Connection Status Command (Epic 6 - Connection Stability)
-		vscode.commands.registerCommand('guideai.mcp.showStatus', () => {
-			mcpStatusBarProvider.showStatusQuickPick();
 		}),
 
 		// Action Registry Commands (behavior_sanitize_action_registry)
@@ -435,6 +476,12 @@ export function activate(context: vscode.ExtensionContext) {
 		mcpStatusBarProvider,
 		...commands
 	);
+	} catch (error) {
+		const errorMsg = error instanceof Error ? error.message : String(error);
+		outputChannel.appendLine(`Activation error: ${errorMsg}`);
+		console.error('GuideAI extension activation failed:', error);
+		vscode.window.showErrorMessage(`GuideAI extension activation failed: ${errorMsg}`);
+	}
 
 	// Show welcome message
 	vscode.window.showInformationMessage('GuideAI IDE Integration complete! All features available: Execution Tracker, Compliance Review, Auth, Settings Sync.');

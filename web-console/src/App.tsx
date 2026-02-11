@@ -36,6 +36,7 @@ import { ProjectSettingsPage } from './components/projects/ProjectSettingsPage';
 import { BoardPage } from './components/boards/BoardPage';
 import { OrganizationsPage } from './components/orgs/OrganizationsPage';
 import { AgentsPage } from './components/agents/AgentsPage';
+import { GitHubAppCallbackPage } from './pages/GitHubAppCallbackPage';
 import type { ReflectionCandidate } from './api/reflection';
 import './styles/design-system.css';
 import './App.css';
@@ -108,6 +109,7 @@ function App() {
             {/* Public routes */}
             <Route path="/login" element={<LoginPage />} />
             <Route path="/auth/callback" element={<OAuthCallback />} />
+            <Route path="/auth/github-app/callback" element={<GitHubAppCallbackPage />} />
 
             {/* Protected routes */}
             <Route

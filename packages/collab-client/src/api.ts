@@ -21,7 +21,7 @@ import type {
 } from './types.js';
 
 export interface CollabApiConfig {
-  /** REST API base URL (e.g., http://localhost:8000) */
+  /** REST API base URL (e.g., http://localhost:8080) */
   baseUrl: string;
   /** Optional auth token */
   authToken?: string;

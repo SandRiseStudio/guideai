@@ -12,6 +12,7 @@
  */
 import * as vscode from 'vscode';
 import { GuideAIClient } from '../client/GuideAIClient';
+import { McpClient } from '../client/McpClient';
 export interface AuthToken {
     access_token: string;
     refresh_token?: string;
@@ -38,7 +39,8 @@ export declare class AuthProvider implements vscode.AuthenticationProvider {
     private _client;
     private _mcpClient;
     private _useMcp;
-    constructor(client: GuideAIClient, context?: vscode.ExtensionContext);
+    private _context?;
+    constructor(client: GuideAIClient, context?: vscode.ExtensionContext, mcpClient?: McpClient);
     /**
      * Get authentication sessions
      */

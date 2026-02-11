@@ -34,25 +34,31 @@ export class ExecutionTrackerDataProvider implements vscode.TreeDataProvider<Run
 	readonly onDidChangeTreeData: vscode.Event<RunTreeItem | RunStepTreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
 
 	private runs: Run[] = [];
-	private readonly refreshInterval: number = 5000; // 5 seconds
+	private readonly refreshInterval: number = 30000; // 30 seconds (was 5s - too aggressive)
 	private refreshTimer?: NodeJS.Timeout;
+	private isLoading = false;
+	private lastRefresh = 0;
+	private readonly minRefreshInterval = 5000; // Minimum 5s between refreshes
 
 	constructor(private client: GuideAIClient) {
-		this.initializeDataProvider();
+		// NOTE: Do NOT auto-initialize - wait for user to manually refresh
+		// This prevents resource exhaustion on startup
 	}
 
-	private async initializeDataProvider(): Promise<void> {
-		await this.refresh();
-		this.startAutoRefresh();
-	}
-
-	private startAutoRefresh(): void {
+	/**
+	 * Start auto-refresh (call this when view becomes visible)
+	 */
+	startAutoRefresh(): void {
+		if (this.refreshTimer) return; // Already running
 		this.refreshTimer = setInterval(async () => {
 			await this.refresh();
 		}, this.refreshInterval);
 	}
 
-	private stopAutoRefresh(): void {
+	/**
+	 * Stop auto-refresh (call this when view is hidden)
+	 */
+	stopAutoRefresh(): void {
 		if (this.refreshTimer) {
 			clearInterval(this.refreshTimer);
 			this.refreshTimer = undefined;
@@ -60,6 +66,15 @@ export class ExecutionTrackerDataProvider implements vscode.TreeDataProvider<Run
 	}
 
 	async refresh(): Promise<void> {
+		// Rate limiting - prevent rapid refreshes
+		const now = Date.now();
+		if (this.isLoading || (now - this.lastRefresh < this.minRefreshInterval)) {
+			return;
+		}
+
+		this.isLoading = true;
+		this.lastRefresh = now;
+
 		try {
 			// Get recent runs (last 20 runs)
 			const runs = await this.client.listRuns({ limit: 20 });
@@ -67,6 +82,9 @@ export class ExecutionTrackerDataProvider implements vscode.TreeDataProvider<Run
 			this._onDidChangeTreeData.fire();
 		} catch (error) {
 			console.error('Failed to refresh execution tracker:', error);
+			// Don't spam errors - just log once
+		} finally {
+			this.isLoading = false;
 		}
 	}
 

@@ -22,7 +22,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from .action_contracts import Actor
 from .agent_registry_contracts import Agent, AgentVersion
@@ -40,6 +40,12 @@ from .task_cycle_contracts import (
 )
 from .task_cycle_service import TaskCycleService
 from .telemetry import TelemetryClient
+
+# EKA (Early Knowledge Alignment) configuration
+import os
+ENABLE_EARLY_RETRIEVAL = os.getenv("GUIDEAI_ENABLE_EARLY_RETRIEVAL", "true").lower() == "true"
+EARLY_RETRIEVAL_TOP_K = int(os.getenv("GUIDEAI_EARLY_RETRIEVAL_TOP_K", "5"))
+
 from .work_item_execution_contracts import (
     AgentResponse,
     ClarificationQuestion,
@@ -128,6 +134,9 @@ class AgentExecutionLoop:
         tool_executor: Optional[Any] = None,  # ToolExecutor
         telemetry: Optional[TelemetryClient] = None,
         github_service: Optional[Any] = None,  # GitHubService
+        bci_service: Optional[Any] = None,  # BCIService for early retrieval
+        enable_early_retrieval: Optional[bool] = None,  # Override env var config
+        gate_notifier: Optional[Any] = None,  # GateNotifier for gate event notifications
     ) -> None:
         """Initialize AgentExecutionLoop.
 
@@ -138,13 +147,37 @@ class AgentExecutionLoop:
             tool_executor: Executor for tool calls
             telemetry: Telemetry client
             github_service: Service for GitHub operations (PR creation, commits)
+            bci_service: BCIService for Early Knowledge Alignment (EKA) retrieval
+            enable_early_retrieval: Override GUIDEAI_ENABLE_EARLY_RETRIEVAL env var
+            gate_notifier: Notifier for gate events (SSE, webhook, Slack)
         """
-        self._run_service = run_service or RunService()
+        # Initialize run service - prefer PostgreSQL when DSN is available
+        if run_service is not None:
+            self._run_service = run_service
+        else:
+            import os
+            from .utils.dsn import apply_host_overrides
+            dsn = apply_host_overrides(os.environ.get("GUIDEAI_RUN_PG_DSN"), "RUN")
+            if dsn:
+                from .run_service_postgres import PostgresRunService
+                self._run_service = PostgresRunService(dsn=dsn)
+                logging.getLogger(__name__).info("Created PostgresRunService for AgentExecutionLoop")
+            else:
+                self._run_service = RunService()
+                logging.getLogger(__name__).warning("No DSN provided - using SQLite RunService")
+
         self._task_cycle_service = task_cycle_service or TaskCycleService()
         self._llm_client = llm_client
         self._tool_executor = tool_executor
         self._telemetry = telemetry or TelemetryClient.noop()
         self._github_service = github_service
+        self._gate_notifier = gate_notifier
+
+        # EKA (Early Knowledge Alignment) - retrieve behaviors before planning
+        self._bci_service = bci_service
+        self._enable_early_retrieval = (
+            enable_early_retrieval if enable_early_retrieval is not None else ENABLE_EARLY_RETRIEVAL
+        )
 
         # PR execution context (set during run() if in PR mode)
         self._pr_context: Optional[PRExecutionContext] = None
@@ -173,6 +206,10 @@ class AgentExecutionLoop:
         """Set the GitHub service (avoids circular import)."""
         self._github_service = service
 
+    def set_bci_service(self, service: Any) -> None:
+        """Set the BCI service for Early Knowledge Alignment."""
+        self._bci_service = service
+
     def set_pr_context(self, context: PRExecutionContext) -> None:
         """Set the PR execution context for PR mode."""
         self._pr_context = context
@@ -181,6 +218,111 @@ class AgentExecutionLoop:
     def pr_context(self) -> Optional[PRExecutionContext]:
         """Get the current PR execution context."""
         return self._pr_context
+
+    # =========================================================================
+    # EKA (Early Knowledge Alignment)
+    # =========================================================================
+
+    def _retrieve_early_behaviors(
+        self,
+        work_item: WorkItem,
+        run_id: str,
+    ) -> List[Dict[str, str]]:
+        """Retrieve behavior summaries BEFORE planning phase (EKA).
+
+        This implements Early Knowledge Alignment from the research paper
+        "Multi-hop Reasoning via Early Knowledge Alignment". By retrieving
+        relevant behaviors before the first planning step, we ground the
+        agent's reasoning in available knowledge, reducing cascading errors.
+
+        Args:
+            work_item: Work item with title/description for query construction
+            run_id: Run ID for telemetry
+
+        Returns:
+            List of behavior summaries (name + one-line description only,
+            to avoid biasing toward existing full behaviors)
+        """
+        from time import perf_counter
+
+        if not self._enable_early_retrieval:
+            logger.debug(f"EKA disabled for run {run_id}")
+            return []
+
+        if not self._bci_service:
+            logger.debug(f"No BCI service configured for EKA in run {run_id}")
+            return []
+
+        # Construct query from work item
+        query = f"{work_item.title}"
+        if work_item.description:
+            # Limit description to first 500 chars for query
+            query = f"{query} {work_item.description[:500]}"
+
+        start = perf_counter()
+
+        try:
+            # Import here to avoid circular imports
+            from .bci_contracts import RetrieveRequest, RetrievalStrategy
+
+            request = RetrieveRequest(
+                query=query,
+                top_k=EARLY_RETRIEVAL_TOP_K,
+                strategy=RetrievalStrategy.HYBRID,
+                include_metadata=False,  # Keep lightweight
+            )
+
+            response = self._bci_service.retrieve(request)
+            elapsed_ms = (perf_counter() - start) * 1000.0
+
+            # Extract summaries only (name + one-line instruction)
+            # This prevents biasing toward full behavior content
+            behavior_summaries = []
+            for match in response.results:
+                summary = {
+                    "name": match.name,
+                    "summary": (match.description or match.instruction)[:100],
+                }
+                behavior_summaries.append(summary)
+
+            # Emit telemetry for EKA
+            self._telemetry.emit_event(
+                event_type="eka.early_retrieval",
+                payload={
+                    "run_id": run_id,
+                    "query_length": len(query),
+                    "behaviors_retrieved": len(behavior_summaries),
+                    "latency_ms": round(elapsed_ms, 2),
+                    "top_k": EARLY_RETRIEVAL_TOP_K,
+                    "enabled": True,
+                },
+            )
+
+            logger.info(
+                f"EKA retrieved {len(behavior_summaries)} behaviors for run {run_id} "
+                f"in {elapsed_ms:.1f}ms"
+            )
+
+            return behavior_summaries
+
+        except Exception as e:
+            elapsed_ms = (perf_counter() - start) * 1000.0
+            logger.warning(f"EKA retrieval failed for run {run_id}: {e}")
+
+            # Emit telemetry for failure
+            self._telemetry.emit_event(
+                event_type="eka.early_retrieval",
+                payload={
+                    "run_id": run_id,
+                    "query_length": len(query),
+                    "behaviors_retrieved": 0,
+                    "latency_ms": round(elapsed_ms, 2),
+                    "error": str(e),
+                    "enabled": True,
+                },
+            )
+
+            return []  # Graceful degradation - proceed without behaviors
 
     async def run(
         self,
@@ -228,9 +370,35 @@ class AgentExecutionLoop:
         # Load playbook from agent version
         playbook = self._load_playbook(agent_version)
 
+        # =====================================================================
+        # EKA: Early Knowledge Alignment - retrieve behaviors BEFORE planning
+        # =====================================================================
+        early_behaviors = self._retrieve_early_behaviors(work_item, run_id)
+
+        # Store early behaviors in run metadata for observability
+        if early_behaviors:
+            self._run_service.update_progress(
+                run_id,
+                metadata={
+                    "phase": CyclePhase.PLANNING.value,
+                    "eka_behaviors": [b["name"] for b in early_behaviors],
+                    "eka_enabled": True,
+                },
+            )
+        else:
+            self._run_service.update_progress(
+                run_id,
+                metadata={
+                    "phase": CyclePhase.PLANNING.value,
+                    "eka_enabled": self._enable_early_retrieval,
+                },
+            )
+
         # Track execution state
         total_iterations = 0
         phase_outputs: Dict[CyclePhase, Dict[str, Any]] = {}
+        # Store early behaviors as instance attribute for access by phase handlers
+        self._current_early_behaviors: List[Dict[str, Any]] = early_behaviors
         all_tool_calls: List[ToolCall] = []
 
         try:
@@ -302,14 +470,51 @@ class AgentExecutionLoop:
 
                     # Check if this is a clarification request
                     if result.clarification_questions:
-                        # Transition to CLARIFYING phase
+                        # Transition to CLARIFYING phase and PAUSE execution
                         self._task_cycle_service.transition_phase(
-                            cycle_id=cycle_id,
-                            to_phase=CyclePhase.CLARIFYING,
-                            user_id=user_id,
-                            gate_satisfied=True,  # Automatic gate for clarification
+                            TransitionPhaseRequest(
+                                cycle_id=cycle_id,
+                                target_phase=CyclePhase.CLARIFYING,
+                                triggered_by=user_id,
+                                trigger_type=TriggerType.AUTO,
+                                notes="Agent requires clarification",
+                                approval_granted=True,  # Automatic gate for clarification
+                            )
                         )
-                        continue
+                        # Convert ClarificationQuestion objects to dicts for JSON serialization
+                        clarification_dicts = [cq.to_dict() for cq in result.clarification_questions]
+                        # Pause execution - waiting for user clarification
+                        self._run_service.update_progress(
+                            run_id,
+                            status=RunStatus.PENDING,
+                            current_step="Waiting for clarification",
+                            metadata={
+                                "phase": CyclePhase.CLARIFYING.value,
+                                "step_type": ExecutionStepType.GATE_WAITING.value,
+                                "clarification_questions": clarification_dicts,
+                            },
+                        )
+
+                        # Notify: clarification needed
+                        await self._emit_gate_notification(
+                            event_type="CLARIFICATION_NEEDED",
+                            run_id=run_id,
+                            work_item=work_item,
+                            phase=CyclePhase.CLARIFYING.value,
+                            gate_type="SOFT",
+                            agent_id=agent.agent_id if agent else None,
+                            org_id=org_id,
+                            project_id=project_id,
+                            clarification_questions=clarification_dicts,
+                        )
+
+                        return {
+                            "status": "paused",
+                            "phase": CyclePhase.CLARIFYING.value,
+                            "waiting_for": "clarification",
+                            "clarification_questions": clarification_dicts,
+                            "phase_outputs": phase_outputs,
+                        }
 
                     # Actual failure - update run status
                     self._run_service.update_progress(
@@ -333,12 +538,21 @@ class AgentExecutionLoop:
                     total_iterations += 1
                     continue
 
-                # Determine next phase
-                next_phase = result.next_phase or self._get_next_phase(current_phase, result)
+                # Determine next phase (respecting skip_phases from exec_policy)
+                next_phase = result.next_phase or self._get_next_phase(
+                    current_phase, result, skip_phases=exec_policy.skip_phases
+                )
 
                 if not next_phase:
                     logger.error(f"No valid next phase from {current_phase.value}")
                     break
+
+                # Log if phases were skipped
+                if exec_policy.skip_phases:
+                    logger.info(
+                        f"Phase skipping enabled: {exec_policy.skip_phases}, "
+                        f"transitioning from {current_phase.value} to {next_phase.value}"
+                    )
 
                 # Check gate policy for transition
                 gate_satisfied = self._check_gate_satisfaction(
@@ -365,6 +579,18 @@ class AgentExecutionLoop:
                         },
                     )
 
+                    # Notify: strict gate waiting for approval
+                    await self._emit_gate_notification(
+                        event_type="GATE_WAITING",
+                        run_id=run_id,
+                        work_item=work_item,
+                        phase=current_phase.value,
+                        gate_type="STRICT",
+                        agent_id=agent.agent_id if agent else None,
+                        org_id=org_id,
+                        project_id=project_id,
+                    )
+
                     return {
                         "status": "paused",
                         "phase": current_phase.value,
@@ -373,6 +599,20 @@ class AgentExecutionLoop:
                     }
 
                 # Transition to next phase
+                # If gate was SOFT, notify observers (proceed but notify)
+                gate_policy = self._get_gate_policy(current_phase, exec_policy)
+                if gate_policy == "SOFT":
+                    await self._emit_gate_notification(
+                        event_type="GATE_SOFT_PASSED",
+                        run_id=run_id,
+                        work_item=work_item,
+                        phase=current_phase.value,
+                        gate_type="SOFT",
+                        agent_id=agent.agent_id if agent else None,
+                        org_id=org_id,
+                        project_id=project_id,
+                    )
+
                 self._task_cycle_service.transition_phase(
                     TransitionPhaseRequest(
                         cycle_id=cycle_id,
@@ -563,8 +803,11 @@ class AgentExecutionLoop:
 
         logger.info(f"PLANNING phase: LLM client configured, building prompt for run {run_id}")
 
-        # Build planning prompt
-        prompt = self._build_planning_prompt(context)
+        # Get early behaviors from instance attribute (set by run() before phase execution)
+        early_behaviors = getattr(self, "_current_early_behaviors", [])
+
+        # Build planning prompt with early behaviors (EKA)
+        prompt = self._build_planning_prompt(context, early_behaviors=early_behaviors)
         logger.info(f"PLANNING phase: Built prompt with {len(prompt)} messages, calling LLM model {model_id}")
 
         # Call LLM with project/org context for BYOK credential resolution
@@ -577,6 +820,8 @@ class AgentExecutionLoop:
                 org_id=org_id,
             )
             logger.info(f"PLANNING phase: LLM call completed for run {run_id}")
+            # Record LLM response for visibility
+            self._record_llm_response(run_id, CyclePhase.PLANNING.value, model_id, response)
         except Exception as e:
             logger.error(f"PLANNING phase: LLM call failed for run {run_id}: {e}")
             raise
@@ -696,6 +941,8 @@ class AgentExecutionLoop:
             project_id=project_id,
             org_id=org_id,
         )
+        # Record LLM response for visibility
+        self._record_llm_response(run_id, CyclePhase.ARCHITECTING.value, model_id, response)
 
         # Handle clarifications
         if response.needs_clarification:
@@ -777,6 +1024,8 @@ class AgentExecutionLoop:
                 project_id=project_id,
                 org_id=org_id,
             )
+            # Record LLM response for visibility
+            self._record_llm_response(run_id, f"{CyclePhase.EXECUTING.value}_iter_{iteration}", model_id, response)
 
             # Handle clarifications
             if response.needs_clarification:
@@ -866,6 +1115,8 @@ class AgentExecutionLoop:
             project_id=project_id,
             org_id=org_id,
         )
+        # Record LLM response for visibility
+        self._record_llm_response(run_id, CyclePhase.TESTING.value, model_id, response)
 
         # Execute tool calls (run tests)
         tool_results = await self._execute_tool_calls(
@@ -942,6 +1193,8 @@ class AgentExecutionLoop:
             project_id=project_id,
             org_id=org_id,
         )
+        # Record LLM response for visibility
+        self._record_llm_response(run_id, CyclePhase.FIXING.value, model_id, response)
 
         # Execute tool calls (apply fixes)
         tool_results = await self._execute_tool_calls(
@@ -1002,6 +1255,8 @@ class AgentExecutionLoop:
             project_id=project_id,
             org_id=org_id,
         )
+        # Record LLM response for visibility
+        self._record_llm_response(run_id, CyclePhase.VERIFYING.value, model_id, response)
 
         # Execute tool calls (lint, type check, etc.)
         tool_results = await self._execute_tool_calls(
@@ -1488,15 +1743,7 @@ class AgentExecutionLoop:
 
         results = []
         for call in tool_calls:
-            # Record tool call step
-            step = ExecutionStep(
-                step_id=_short_id("step"),
-                step_type=ExecutionStepType.TOOL_CALL,
-                phase="tool_execution",
-                timestamp=_now_iso(),
-                content={"inputs": call.tool_args},
-                tool_name=call.tool_name,
-            )
+            start_time = _now_iso()
 
             try:
                 # Check permissions
@@ -1521,9 +1768,21 @@ class AgentExecutionLoop:
                     output={},
                 )
 
-            # Record completion - ExecutionStep doesn't have these fields, skip
-            # step.completed_at = _now_iso()
-            # step.outputs = result.output
+            # Record tool call step with both inputs AND outputs
+            step = ExecutionStep(
+                step_id=_short_id("step"),
+                step_type=ExecutionStepType.TOOL_CALL,
+                phase="tool_execution",
+                timestamp=start_time,
+                content={
+                    "tool_name": call.tool_name,
+                    "inputs": call.tool_args,
+                    "success": result.success,
+                    "output": result.output if result.success else None,
+                    "error": result.error if not result.success else None,
+                },
+                tool_name=call.tool_name,
+            )
             self._add_run_step(run_id, step)
 
             results.append(result)
@@ -1544,6 +1803,38 @@ class AgentExecutionLoop:
 
         return True
 
+    def _record_llm_response(
+        self,
+        run_id: str,
+        phase: str,
+        model_id: str,
+        response: AgentResponse,
+    ) -> None:
+        """Record an LLM response as a run step with full content.
+
+        This captures the agent's reasoning/output text so users can see
+        what the agent actually said/thought during execution.
+        """
+        input_tokens = response.input_tokens if hasattr(response, "input_tokens") else 0
+        output_tokens = response.output_tokens if hasattr(response, "output_tokens") else 0
+
+        step = ExecutionStep(
+            step_id=_short_id("step"),
+            step_type=ExecutionStepType.LLM_RESPONSE,
+            phase=phase,
+            timestamp=_now_iso(),
+            content={
+                "text": response.text_output or "",
+                "tool_calls_requested": len(response.tool_calls) if response.tool_calls else 0,
+                "phase_complete": response.phase_complete,
+                "needs_clarification": response.needs_clarification,
+            },
+            model_id=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        self._add_run_step(run_id, step)
+
     def _add_run_step(self, run_id: str, step: ExecutionStep) -> None:
         """Add a step to the run."""
         try:
@@ -1556,7 +1847,10 @@ class AgentExecutionLoop:
             duration_ms = int(getattr(step, "duration_ms", 0) or 0)
             model_id = getattr(step, "model_id", None)
             content = getattr(step, "content", None) or getattr(step, "outputs", None) or {}
-            preview = json.dumps(content, ensure_ascii=True)[:240] if content else None
+
+            # Store full content as JSON for retrieval, and a short preview for display
+            content_json = json.dumps(content, ensure_ascii=True) if content else None
+            preview = content_json[:240] if content_json else None
 
             metadata: Dict[str, Any] = {
                 "phase": phase,
@@ -1567,6 +1861,9 @@ class AgentExecutionLoop:
             }
             if preview:
                 metadata["content_preview"] = preview
+            # Store the full content (up to reasonable limit to avoid DB bloat)
+            if content_json:
+                metadata["content_full"] = content_json[:50000]  # Cap at 50KB per step
             if model_id:
                 metadata["model_id"] = model_id
             if tool_name:
@@ -1616,20 +1913,124 @@ class AgentExecutionLoop:
         """Get the gate type for a phase."""
         return PHASE_GATES.get(phase, GateType.CLARIFICATION_PROVIDED)
 
-    def _get_next_phase(self, current_phase: CyclePhase, result: PhaseResult) -> Optional[CyclePhase]:
-        """Determine the next phase based on current phase and result."""
+    def _get_gate_policy(
+        self, phase: CyclePhase, exec_policy: ExecutionPolicy
+    ) -> Optional[str]:
+        """Get the gate policy type string for a phase (NONE, SOFT, STRICT)."""
+        gate_type = PHASE_GATES.get(phase)
+        if not gate_type:
+            return None
+        gate_policies = exec_policy.phase_gates or {}
+        policy = gate_policies.get(gate_type.value, GatePolicyType.NONE)
+        return policy.value if hasattr(policy, "value") else str(policy)
+
+    async def _emit_gate_notification(
+        self,
+        *,
+        event_type: str,
+        run_id: str,
+        work_item: Any,
+        phase: str,
+        gate_type: str,
+        agent_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        clarification_questions: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Emit a gate notification via GateNotifier (SSE, webhook, Slack).
+
+        Fire-and-forget — errors are logged but never block execution.
+        """
+        if not self._gate_notifier:
+            return
+        try:
+            from .notifications.gate_notifier import GateEvent, GateEventType
+
+            event_type_enum = GateEventType(f"gate.{event_type.lower()}")
+            event = GateEvent(
+                event_type=event_type_enum,
+                run_id=run_id,
+                work_item_id=getattr(work_item, "item_id", str(work_item)),
+                phase=phase,
+                gate_type=gate_type,
+                agent_id=agent_id,
+                org_id=org_id,
+                project_id=project_id,
+                work_item_title=getattr(work_item, "title", None),
+                clarification_questions=clarification_questions,
+            )
+
+            # Retrieve callback_url from run metadata if available
+            callback_urls = None
+            try:
+                run = self._run_service.get_run(run_id)
+                if run and run.metadata:
+                    cb = run.metadata.get("callback_url")
+                    if cb:
+                        callback_urls = [cb]
+            except Exception:
+                pass
+
+            await self._gate_notifier.notify(event, callback_urls=callback_urls)
+        except Exception as exc:
+            logger.warning(f"Gate notification failed (non-fatal): {exc}")
+
+    def _get_next_phase(
+        self,
+        current_phase: CyclePhase,
+        result: PhaseResult,
+        skip_phases: Optional[Set[str]] = None,
+    ) -> Optional[CyclePhase]:
+        """Determine the next phase based on current phase and result.
+
+        Args:
+            current_phase: The current execution phase
+            result: The result from executing the current phase
+            skip_phases: Set of phase names to skip (e.g., {"TESTING", "FIXING"})
+
+        Returns:
+            The next phase to execute, or None if no valid transition exists
+        """
+        skip_phases = skip_phases or set()
+
         # Check valid transitions
         valid_next = VALID_TRANSITIONS.get(current_phase, [])
 
         if not valid_next:
             return None
 
+        # Helper to find non-skipped phase
+        def find_next_non_skipped(phase: CyclePhase) -> Optional[CyclePhase]:
+            """Recursively find the next phase that isn't in skip_phases."""
+            if phase.value not in skip_phases:
+                return phase
+            # Phase should be skipped - find its successor
+            successor_transitions = VALID_TRANSITIONS.get(phase, [])
+            for successor in successor_transitions:
+                # Skip terminal states when searching for next phase
+                if successor in (CyclePhase.CANCELLED, CyclePhase.FAILED):
+                    continue
+                result_phase = find_next_non_skipped(successor)
+                if result_phase:
+                    return result_phase
+            return None
+
         # Use suggested next phase if valid
         if result.next_phase and result.next_phase in valid_next:
-            return result.next_phase
+            candidate = result.next_phase
+        else:
+            # Default to first valid transition (excluding terminal states)
+            candidate = None
+            for phase in valid_next:
+                if phase not in (CyclePhase.CANCELLED, CyclePhase.FAILED):
+                    candidate = phase
+                    break
 
-        # Default to first valid transition
-        return valid_next[0] if valid_next else None
+        if not candidate:
+            return None
+
+        # If candidate is in skip_phases, find the next non-skipped phase
+        return find_next_non_skipped(candidate)
 
     def _calculate_progress(self, phase: CyclePhase) -> int:
         """Calculate progress percentage based on current phase."""
@@ -1668,8 +2069,33 @@ class AgentExecutionLoop:
     # Prompt Builders
     # =========================================================================
 
-    def _build_planning_prompt(self, context: PhaseContext) -> List[Dict[str, Any]]:
-        """Build the prompt for the PLANNING phase."""
+    def _build_planning_prompt(
+        self,
+        context: PhaseContext,
+        early_behaviors: Optional[List[Dict[str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build the prompt for the PLANNING phase.
+
+        Args:
+            context: Phase context with work item, agent, playbook
+            early_behaviors: EKA behavior summaries retrieved before planning
+        """
+        # Build EKA section if behaviors were retrieved
+        eka_section = ""
+        if early_behaviors:
+            behavior_list = "\n".join(
+                f"- **{b['name']}**: {b['summary']}"
+                for b in early_behaviors
+            )
+            eka_section = f"""
+Relevant Behaviors (from knowledge base):
+{behavior_list}
+
+Consider these existing behaviors when planning. They may provide proven patterns
+for similar tasks. However, also identify if new approaches are needed that aren't
+covered by existing behaviors.
+"""
+
         system = f"""You are {context.agent.name}, an AI agent executing a work item.
 
 Current Phase: PLANNING
@@ -1679,7 +2105,7 @@ Work Item:
 - Title: {context.work_item.title}
 - Description: {context.work_item.description or 'No description'}
 - Labels: {', '.join(context.work_item.labels) if context.work_item.labels else 'None'}
-
+{eka_section}
 Playbook Instructions:
 {json.dumps(context.playbook.get('planning_instructions', {}), indent=2)}
 

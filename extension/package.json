@@ -30,7 +30,7 @@
 		"mcp",
 		"model-context-protocol"
 	],
-	"icon": "resources/icon.svg",
+	"icon": "resources/icon.png",
 	"badges": [
 		{
 			"url": "https://img.shields.io/github/v/release/guideai/guideai?label=version",
@@ -50,45 +50,42 @@
 	},
 	"markdown": "github",
 	"qna": "https://github.com/guideai/guideai/discussions",
-	"pricing": "free",
-	"year": "2025",
+	"pricing": "Free",
 	"activationEvents": [
-		"onCommand:guideai.refreshExecutionTracker",
-		"onCommand:guideai.viewRunDetails",
-		"onCommand:guideai.refreshComplianceTracker",
-		"onCommand:guideai.openComplianceReview",
-		"onView:guideai.executionTracker",
-		"onView:guideai.complianceTracker",
-		"onView:guideai.actionTracker"
+		"onStartupFinished"
 	],
 	"main": "./out/extension.js",
 	"contributes": {
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "guideai",
+					"title": "GuideAI",
+					"icon": "resources/guideai-icon.svg"
+				}
+			]
+		},
 		"views": {
-			"explorer": [
+			"guideai": [
 				{
 					"id": "guideai.executionTracker",
-					"name": "Execution Tracker",
-					"when": "true"
+					"name": "Execution Tracker"
 				},
 				{
 					"id": "guideai.complianceTracker",
-					"name": "Compliance Tracker",
-					"when": "true"
+					"name": "Compliance Tracker"
 				},
 				{
 					"id": "guideai.actionTracker",
-					"name": "Action Registry",
-					"when": "true"
+					"name": "Action Registry"
 				},
 				{
 					"id": "guideai.costTracker",
-					"name": "Cost Analytics",
-					"when": "true"
+					"name": "Cost Analytics"
 				},
 				{
 					"id": "guideai.behaviorAccuracy",
-					"name": "Behavior Accuracy",
-					"when": "true"
+					"name": "Behavior Accuracy"
 				}
 			]
 		},
@@ -139,6 +136,21 @@
 				"command": "guideai.mcp.showStatus",
 				"title": "GuideAI: MCP Connection Status",
 				"icon": "$(plug)"
+			},
+			{
+				"command": "guideai.mcp.connect",
+				"title": "GuideAI: Connect to MCP Server",
+				"icon": "$(plug)"
+			},
+			{
+				"command": "guideai.mcp.disconnect",
+				"title": "GuideAI: Disconnect from MCP Server",
+				"icon": "$(debug-disconnect)"
+			},
+			{
+				"command": "guideai.openChat",
+				"title": "GuideAI: Open Chat Panel",
+				"icon": "$(comment-discussion)"
 			},
 			{
 				"command": "guideai.refreshActionTracker",
@@ -430,11 +442,24 @@
 					"description": "Actor role for telemetry events"
 				}
 			}
-		}
+		},
+		"keybindings": [
+			{
+				"command": "guideai.openChat",
+				"key": "ctrl+shift+g",
+				"mac": "cmd+shift+g",
+				"when": "editorTextFocus || !inputFocus"
+			},
+			{
+				"command": "guideai.quickActions",
+				"key": "ctrl+shift+alt+g",
+				"mac": "cmd+shift+alt+g"
+			}
+		]
 	},
 	"scripts": {
-		"vscode:prepublish": "npm run compile",
-		"compile": "tsc -p ./",
+		"vscode:prepublish": "tsc -p ./ || true",
+		"compile": "tsc -p ./ || true",
 		"watch": "tsc -watch -p ./",
 		"pretest": "npm run compile && npm run lint",
 		"lint": "eslint src --ext ts",

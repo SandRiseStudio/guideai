@@ -19,7 +19,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -634,6 +634,86 @@ class AnthropicProvider(LLMProvider):
                 latency_ms=latency_ms,
                 finish_reason=response.stop_reason,
                 raw_response=response.model_dump() if hasattr(response, "model_dump") else None,
+            )
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            if "rate_limit" in exc_str or "429" in exc_str:
+                raise LLMRateLimitError(str(exc), provider=ProviderType.ANTHROPIC, raw_error=exc)
+            if "authentication" in exc_str or "401" in exc_str:
+                raise LLMAuthenticationError(str(exc), provider=ProviderType.ANTHROPIC, raw_error=exc)
+            raise LLMProviderError(str(exc), provider=ProviderType.ANTHROPIC, raw_error=exc)
+
+    def generate_stream(self, request: LLMRequest, callback: Optional[Callable[[str], None]] = None) -> LLMResponse:
+        """Generate response using Anthropic API with streaming.
+
+        Args:
+            request: The LLM request
+            callback: Optional callback called with each text chunk as it arrives
+
+        Returns:
+            LLMResponse with the complete content
+        """
+        start_time = time.perf_counter()
+        client = self._get_client()
+
+        model = request.model or self.config.model
+        max_tokens = request.max_tokens or self.config.max_tokens
+
+        # Extract system message if present
+        system_content = ""
+        messages = []
+        for msg in request.messages:
+            if msg.role == "system":
+                system_content = msg.content
+            else:
+                messages.append({"role": msg.role, "content": msg.content})
+
+        try:
+            kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+            }
+            if system_content:
+                kwargs["system"] = system_content
+            if request.temperature is not None:
+                kwargs["temperature"] = request.temperature
+            elif self.config.temperature:
+                kwargs["temperature"] = self.config.temperature
+            if request.stop:
+                kwargs["stop_sequences"] = request.stop
+
+            # Use streaming API
+            content_parts = []
+            input_tokens = 0
+            output_tokens = 0
+
+            with client.messages.stream(**kwargs) as stream:
+                for text in stream.text_stream:
+                    content_parts.append(text)
+                    if callback:
+                        callback(text)
+
+                # Get final message for token counts
+                final_message = stream.get_final_message()
+                input_tokens = final_message.usage.input_tokens
+                output_tokens = final_message.usage.output_tokens
+                finish_reason = final_message.stop_reason
+                model_used = final_message.model
+
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            content = "".join(content_parts)
+
+            return LLMResponse(
+                content=content,
+                model=model_used,
+                provider=ProviderType.ANTHROPIC,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                latency_ms=latency_ms,
+                finish_reason=finish_reason,
+                raw_response=None,
             )
         except Exception as exc:
             exc_str = str(exc).lower()

@@ -40,7 +40,7 @@ httpx = pytest.importorskip("httpx")
 
 
 # Configuration
-DEFAULT_BASE_URL = os.environ.get("GUIDEAI_API_URL", "http://localhost:8000")
+DEFAULT_BASE_URL = os.environ.get("GUIDEAI_GATEWAY_URL", "http://localhost:8080")
 
 
 def measure_latency(

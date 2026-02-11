@@ -671,8 +671,8 @@ refresh_api_server_cmd() {
 
 set_api_env_vars() {
     local computed_url="http://${API_SERVER_HOST}:${API_SERVER_PORT}"
-    if [ -z "${GUIDEAI_API_URL:-}" ] || [ "${GUIDEAI_API_URL}" = "${ORIGINAL_API_BASE_URL}" ]; then
-        export GUIDEAI_API_URL="$computed_url"
+    if [ -z "${GUIDEAI_GATEWAY_URL:-}" ] || [ "${GUIDEAI_GATEWAY_URL}" = "${ORIGINAL_API_BASE_URL}" ]; then
+        export GUIDEAI_GATEWAY_URL="$computed_url"
     fi
     export GUIDEAI_API_SERVER_PORT="$API_SERVER_PORT"
 }
@@ -1029,8 +1029,9 @@ ensure_staging_stack() {
     fi
 
     STAGING_STACK_ACTIVE=true
-    export STAGING_API_URL="${STAGING_API_URL:-http://localhost:8000}"
-    export STAGING_NGINX_URL="${STAGING_NGINX_URL:-http://localhost:8080}"
+    # Gateway is the primary entry point (port 8080), API is internal (port 8000)
+    export STAGING_GATEWAY_URL="${STAGING_GATEWAY_URL:-http://localhost:8080}"
+    export STAGING_API_URL="${STAGING_API_URL:-http://localhost:8000}"  # Internal API
 
     if [ "$STAGING_PORT_REASSIGNED" = false ]; then
         local fallback_port

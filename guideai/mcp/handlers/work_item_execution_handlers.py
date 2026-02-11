@@ -236,6 +236,44 @@ WORK_ITEM_EXECUTION_TOOLS = [
             "required": ["project_id"],
         },
     },
+    {
+        "name": "workItems.approveGate",
+        "description": (
+            "Approve a strict gate on a paused execution and resume the agent. "
+            "Required for ARCHITECTING, VERIFYING, and COMPLETING phase gates. "
+            "After approval, the execution is re-enqueued and the agent resumes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "work_item_id": {
+                    "type": "string",
+                    "description": "ID of the work item with a paused execution",
+                },
+                "org_id": {
+                    "type": "string",
+                    "description": "Organization ID (optional)",
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Project ID",
+                },
+                "phase": {
+                    "type": "string",
+                    "description": "Phase gate to approve (e.g. 'architecting', 'verifying'). If omitted, approves current gate.",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Approval notes or feedback for the agent",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User ID approving the gate",
+                },
+            },
+            "required": ["work_item_id", "project_id"],
+        },
+    },
 ]
 
 
@@ -445,12 +483,36 @@ def create_work_item_execution_handlers(
                 "message": str(e),
             }
 
+    async def handle_approve_gate(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle workItems.approveGate tool call."""
+        actor = _get_actor(arguments)
+
+        try:
+            result = await service.approve_gate(
+                work_item_id=arguments["work_item_id"],
+                user_id=actor.id,
+                org_id=arguments.get("org_id"),
+                project_id=arguments["project_id"],
+                phase=arguments.get("phase"),
+                notes=arguments.get("notes"),
+            )
+
+            return result
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": "unexpected_error",
+                "message": str(e),
+            }
+
     return {
         "workItems.execute": handle_execute,
         "workItems.executionStatus": handle_execution_status,
         "workItems.cancelExecution": handle_cancel_execution,
         "workItems.provideClarification": handle_provide_clarification,
         "workItems.listExecutions": handle_list_executions,
+        "workItems.approveGate": handle_approve_gate,
     }
 
 

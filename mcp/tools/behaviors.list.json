@@ -71,5 +71,7 @@
       },
       "required": ["behavior_id", "name", "status", "role_focus", "version"]
     }
-  }
+  },
+  "required_scopes": ["behaviors.read"],
+  "category": "behaviors"
 }

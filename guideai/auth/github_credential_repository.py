@@ -37,6 +37,7 @@ class CredentialScopeType(str, Enum):
     """Scope type for credentials."""
     ORG = "org"
     PROJECT = "project"
+    USER = "user"  # Personal credentials owned by a specific user
 
 
 class GitHubTokenType(str, Enum):
@@ -655,6 +656,41 @@ class GitHubCredentialRepository:
                 return None
 
             return self._row_to_credential(row, decrypt=decrypt)
+
+    def list_by_creator(
+        self,
+        created_by: str,
+        include_invalid: bool = False,
+    ) -> List[GitHubCredential]:
+        """List all credentials created by a specific user.
+
+        Args:
+            created_by: The user ID who created the credentials
+            include_invalid: Whether to include disabled/invalid credentials
+
+        Returns:
+            List of GitHubCredential objects (without decrypted tokens)
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                query = """
+                    SELECT
+                        id, scope_type, scope_id, token_type, name,
+                        token_prefix, token_encrypted, is_valid, failure_count,
+                        scopes, rate_limit, rate_limit_remaining, rate_limit_reset,
+                        last_used_at, last_validated_at, github_username, github_user_id,
+                        created_by, created_at, updated_at, metadata
+                    FROM credentials.github_credentials
+                    WHERE created_by = %(created_by)s
+                """
+                if not include_invalid:
+                    query += " AND is_valid = true"
+                query += " ORDER BY created_at DESC"
+
+                cur.execute(query, {"created_by": created_by})
+                rows = cur.fetchall()
+
+        return [self._row_to_credential(row, decrypt=False) for row in rows]
 
     def delete(
         self,

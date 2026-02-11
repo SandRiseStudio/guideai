@@ -19,7 +19,7 @@
         "maxLength": 500
       }
     },
-    "required": ["agent_id", "org_id"]
+    "required": ["agent_id"]
   },
   "outputSchema": {
     "type": "object",

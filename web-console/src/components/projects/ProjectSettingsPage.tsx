@@ -28,6 +28,7 @@ import {
   type LLMCredential,
   type LLMProvider,
 } from '../../api/credentials';
+import { GitHubAppConnection } from './GitHubAppConnection';
 import './ProjectSettingsPage.css';
 
 // ---------------------------------------------------------------------------
@@ -45,24 +46,23 @@ interface ProjectSettings {
 
 interface GitHubBranchInfo {
   name: string;
-  is_default: boolean;
-  is_protected: boolean;
+  sha?: string;
+  protected?: boolean;
 }
 
 interface GitHubRepoValidationResponse {
   valid: boolean;
   owner?: string;
   repo?: string;
-  full_name?: string;
   default_branch?: string;
-  is_private?: boolean;
+  visibility?: 'private' | 'public';
   description?: string;
   error?: string;
 }
 
 interface GitHubBranchListResponse {
   branches: GitHubBranchInfo[];
-  total_count: number;
+  total_count?: number;
   page: number;
   per_page: number;
 }
@@ -141,8 +141,8 @@ export function ProjectSettingsPage(): React.JSX.Element {
       await razeLog('INFO', 'Validating GitHub repository', { project_id: projectId, url });
 
       const response = await apiClient.post<GitHubRepoValidationResponse>(
-        `/v1/projects/${projectId}/settings/github/validate`,
-        { repo_url: url }
+        `/v1/projects/${projectId}/settings/repository/validate`,
+        { repository_url: url }
       );
 
       setGithubValidation(response);
@@ -150,7 +150,8 @@ export function ProjectSettingsPage(): React.JSX.Element {
       if (response.valid) {
         await razeLog('INFO', 'GitHub repository validated', {
           project_id: projectId,
-          full_name: response.full_name,
+          owner: response.owner,
+          repo: response.repo,
         });
 
         // If valid, auto-select default branch and load branch list
@@ -178,7 +179,7 @@ export function ProjectSettingsPage(): React.JSX.Element {
 
     try {
       const response = await apiClient.get<GitHubBranchListResponse>(
-        `/v1/projects/${projectId}/settings/github/branches`
+        `/v1/projects/${projectId}/settings/repository/branches`
       );
       setBranches(response.branches);
     } catch (err) {
@@ -278,6 +279,12 @@ export function ProjectSettingsPage(): React.JSX.Element {
 
   // Validation status
   const isGithubValid = useMemo(() => githubValidation?.valid === true, [githubValidation]);
+  const githubRepoLabel = useMemo(() => {
+    if (githubValidation?.owner && githubValidation?.repo) {
+      return `${githubValidation.owner}/${githubValidation.repo}`;
+    }
+    return githubUrl.trim();
+  }, [githubValidation?.owner, githubValidation?.repo, githubUrl]);
 
   if (projectLoading) {
     return (
@@ -361,7 +368,7 @@ export function ProjectSettingsPage(): React.JSX.Element {
             <h2 className="settings-section-title">GitHub Repository</h2>
             <p className="settings-section-description">
               Optional: Connect a GitHub repository for branch selection and integration features.
-              Requires GitHub authentication.
+              For private repos, sign in with GitHub or add a project token below.
             </p>
 
             <label className="field">
@@ -394,8 +401,8 @@ export function ProjectSettingsPage(): React.JSX.Element {
                 <div className="github-validation-success">
                   <span className="validation-icon">✓</span>
                   <span className="validation-text">
-                    <strong>{githubValidation.full_name}</strong>
-                    {githubValidation.is_private && <span className="badge private">Private</span>}
+                    <strong>{githubRepoLabel}</strong>
+                    {githubValidation.visibility === 'private' && <span className="badge private">Private</span>}
                     {githubValidation.description && (
                       <span className="validation-description">{githubValidation.description}</span>
                     )}
@@ -418,18 +425,26 @@ export function ProjectSettingsPage(): React.JSX.Element {
                     <option value="">Select a branch</option>
                   )}
                   {isLoadingBranches && <option value="">Loading branches…</option>}
-                  {branches.map((branch) => (
-                    <option key={branch.name} value={branch.name}>
-                      {branch.name}
-                      {branch.is_default && ' (default)'}
-                      {branch.is_protected && ' 🔒'}
-                    </option>
-                  ))}
+                  {branches.map((branch) => {
+                    const isDefaultBranch = branch.name === githubValidation?.default_branch;
+                    return (
+                      <option key={branch.name} value={branch.name}>
+                        {branch.name}
+                        {isDefaultBranch && ' (default)'}
+                        {branch.protected && ' 🔒'}
+                      </option>
+                    );
+                  })}
                 </select>
                 <span className="field-hint">
                   Select the branch to use for this project. Default branch is auto-selected.
                 </span>
               </label>
+            )}
+
+            {/* GitHub Connection (App or PAT) */}
+            {projectId && (
+              <GitHubAppConnection projectId={projectId} />
             )}
           </div>
 

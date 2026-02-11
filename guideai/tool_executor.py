@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -224,6 +226,52 @@ class ToolRegistry:
             is_write_operation=False,
         ))
 
+        # Enhanced filesystem tools for workspace exploration
+        self.register(ToolDefinition(
+            name="get_repo_structure",
+            description="Get a tree view of the repository structure, useful for understanding codebase layout",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Root path to start from (default: workspace root)"},
+                    "max_depth": {"type": "integer", "description": "Maximum depth to traverse (default: 3)"},
+                    "include_hidden": {"type": "boolean", "description": "Include hidden files/directories (default: false)"},
+                },
+            },
+            category=ToolCategory.READ,
+            is_write_operation=False,
+        ))
+
+        self.register(ToolDefinition(
+            name="find_files",
+            description="Find files matching a pattern, similar to 'find' command",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern to match (e.g., '*.py', '**/test_*.py')"},
+                    "path": {"type": "string", "description": "Directory to search in (default: workspace root)"},
+                    "max_results": {"type": "integer", "description": "Maximum number of results (default: 100)"},
+                },
+                "required": ["pattern"],
+            },
+            category=ToolCategory.SEARCH,
+            is_write_operation=False,
+        ))
+
+        self.register(ToolDefinition(
+            name="get_file_info",
+            description="Get metadata about a file (size, type, modification time)",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                },
+                "required": ["path"],
+            },
+            category=ToolCategory.READ,
+            is_write_operation=False,
+        ))
+
         # Terminal tools
         self.register(ToolDefinition(
             name="run_in_terminal",
@@ -293,6 +341,58 @@ class ToolRegistry:
                     "url": {"type": "string", "description": "URL to fetch"},
                 },
                 "required": ["url"],
+            },
+            category=ToolCategory.NETWORK,
+            requires_internet=True,
+            is_write_operation=False,
+        ))
+
+        # GitHub API tools - fallback when local workspace isn't available
+        self.register(ToolDefinition(
+            name="github_read_file",
+            description="Read a file from GitHub repository via API (use when local workspace unavailable)",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository in owner/repo format"},
+                    "path": {"type": "string", "description": "Path to file in repository"},
+                    "ref": {"type": "string", "description": "Branch, tag, or commit SHA (default: default branch)"},
+                },
+                "required": ["repo", "path"],
+            },
+            category=ToolCategory.NETWORK,
+            requires_internet=True,
+            is_write_operation=False,
+        ))
+
+        self.register(ToolDefinition(
+            name="github_list_directory",
+            description="List contents of a directory in GitHub repository via API",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository in owner/repo format"},
+                    "path": {"type": "string", "description": "Path to directory (empty for root)"},
+                    "ref": {"type": "string", "description": "Branch, tag, or commit SHA (default: default branch)"},
+                },
+                "required": ["repo"],
+            },
+            category=ToolCategory.NETWORK,
+            requires_internet=True,
+            is_write_operation=False,
+        ))
+
+        self.register(ToolDefinition(
+            name="github_search_code",
+            description="Search for code in a GitHub repository",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository in owner/repo format"},
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Maximum results (default: 20)"},
+                },
+                "required": ["repo", "query"],
             },
             category=ToolCategory.NETWORK,
             requires_internet=True,
@@ -442,6 +542,7 @@ class ToolExecutor:
     - PR mode file change interception
     - Result formatting and error handling
     - Execution logging and metrics
+    - Container-based execution for isolated agent workspaces
     """
 
     def __init__(
@@ -454,6 +555,10 @@ class ToolExecutor:
         project_root: Optional[str] = None,
         pr_context: Optional[PRExecutionContext] = None,
         current_phase: Optional[str] = None,
+        github_service: Optional[Any] = None,
+        github_context: Optional[Dict[str, Any]] = None,
+        workspace_info: Optional[Any] = None,  # WorkspaceInfo for container exec
+        workspace_manager: Optional[Any] = None,  # GuideAIWorkspaceClient (workspace-agent)
     ) -> None:
         """Initialize ToolExecutor.
 
@@ -465,6 +570,10 @@ class ToolExecutor:
             project_root: Project root directory for path resolution
             pr_context: PR execution context for file change accumulation
             current_phase: Current GEP phase (for PR change tracking)
+            github_service: GitHubService for GitHub API fallback tools
+            github_context: Context for GitHub API (repo, project_id, org_id, user_id)
+            workspace_info: WorkspaceInfo for container-based execution
+            workspace_manager: GuideAIWorkspaceClient for workspace operations (via gRPC)
         """
         self._policy = policy
         self._registry = registry or ToolRegistry()
@@ -473,6 +582,10 @@ class ToolExecutor:
         self._project_root = project_root
         self._pr_context = pr_context
         self._current_phase = current_phase or "unknown"
+        self._github_service = github_service
+        self._workspace_info = workspace_info
+        self._workspace_manager = workspace_manager
+        self._github_context = github_context or {}
 
         self._permission_checker = PermissionChecker(policy, self._registry)
 
@@ -672,34 +785,51 @@ class ToolExecutor:
         # Implement basic tools locally
         if tool_name == "read_file":
             path = inputs.get("path", "")
-            if self._project_root:
-                path = os.path.join(self._project_root, path)
+            start_line = inputs.get("start_line")
+            end_line = inputs.get("end_line")
 
-            try:
-                with open(path, "r") as f:
-                    content = f.read()
+            # Use container execution if workspace is container-based
+            if self._workspace_info and self._workspace_info.use_container_exec and self._workspace_manager:
+                try:
+                    import asyncio
+                    loop = asyncio.get_event_loop()
+                    content = loop.run_until_complete(
+                        self._workspace_manager.read_file_in_workspace(
+                            self._workspace_info.run_id,
+                            path,
+                            start_line=start_line,
+                            end_line=end_line,
+                        )
+                    )
+                    return content
+                except Exception as e:
+                    raise ToolExecutionError(tool_name, str(e))
+            else:
+                # Local execution fallback
+                if self._project_root:
+                    path = os.path.join(self._project_root, path)
 
-                # Handle line ranges
-                start_line = inputs.get("start_line")
-                end_line = inputs.get("end_line")
-                if start_line or end_line:
-                    lines = content.split("\n")
-                    start = (start_line or 1) - 1
-                    end = end_line or len(lines)
-                    content = "\n".join(lines[start:end])
+                try:
+                    with open(path, "r") as f:
+                        content = f.read()
 
-                return content
-            except FileNotFoundError:
-                raise ToolExecutionError(tool_name, f"File not found: {path}")
-            except Exception as e:
-                raise ToolExecutionError(tool_name, str(e))
+                    # Handle line ranges
+                    if start_line or end_line:
+                        lines = content.split("\n")
+                        start = (start_line or 1) - 1
+                        end = end_line or len(lines)
+                        content = "\n".join(lines[start:end])
+
+                    return content
+                except FileNotFoundError:
+                    raise ToolExecutionError(tool_name, f"File not found: {path}")
+                except Exception as e:
+                    raise ToolExecutionError(tool_name, str(e))
 
         elif tool_name == "write_file":
             path = inputs.get("path", "")
             content = inputs.get("content", "")
             relative_path = path  # Keep original for PR context
-            if self._project_root:
-                path = os.path.join(self._project_root, path)
 
             result_parts = []
 
@@ -721,14 +851,33 @@ class ToolExecutor:
 
             # Write locally if policy allows
             if self._should_write_locally():
-                try:
-                    # Create directory if needed
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "w") as f:
-                        f.write(content)
-                    result_parts.append(f"Wrote {len(content)} characters to {path}")
-                except Exception as e:
-                    raise ToolExecutionError(tool_name, str(e))
+                # Use container execution if workspace is container-based
+                if self._workspace_info and self._workspace_info.use_container_exec and self._workspace_manager:
+                    try:
+                        import asyncio
+                        loop = asyncio.get_event_loop()
+                        loop.run_until_complete(
+                            self._workspace_manager.write_file_in_workspace(
+                                self._workspace_info.run_id,
+                                path,
+                                content,
+                            )
+                        )
+                        result_parts.append(f"Wrote {len(content)} characters to {path} (container)")
+                    except Exception as e:
+                        raise ToolExecutionError(tool_name, str(e))
+                else:
+                    # Local execution fallback
+                    if self._project_root:
+                        path = os.path.join(self._project_root, path)
+                    try:
+                        # Create directory if needed
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        with open(path, "w") as f:
+                            f.write(content)
+                        result_parts.append(f"Wrote {len(content)} characters to {path}")
+                    except Exception as e:
+                        raise ToolExecutionError(tool_name, str(e))
 
             if not result_parts:
                 # This shouldn't happen - either PR mode or local write should be active
@@ -738,12 +887,167 @@ class ToolExecutor:
 
         elif tool_name == "list_dir":
             path = inputs.get("path", ".")
+
+            # Use container execution if workspace is container-based
+            if self._workspace_info and self._workspace_info.use_container_exec and self._workspace_manager:
+                try:
+                    import asyncio
+                    loop = asyncio.get_event_loop()
+                    entries = loop.run_until_complete(
+                        self._workspace_manager.list_dir_in_workspace(
+                            self._workspace_info.run_id,
+                            path,
+                        )
+                    )
+                    return json.dumps(entries)
+                except Exception as e:
+                    raise ToolExecutionError(tool_name, str(e))
+            else:
+                # Local execution fallback
+                if self._project_root:
+                    path = os.path.join(self._project_root, path)
+
+                try:
+                    entries = os.listdir(path)
+                    return json.dumps(entries)
+                except Exception as e:
+                    raise ToolExecutionError(tool_name, str(e))
+
+        elif tool_name == "get_repo_structure":
+            # Get tree view of repository structure
+            from pathlib import Path
+
+            root_path = inputs.get("path", ".")
+            max_depth = inputs.get("max_depth", 3)
+            include_hidden = inputs.get("include_hidden", False)
+
             if self._project_root:
-                path = os.path.join(self._project_root, path)
+                root_path = os.path.join(self._project_root, root_path)
 
             try:
-                entries = os.listdir(path)
-                return json.dumps(entries)
+                def build_tree(path: Path, depth: int = 0, prefix: str = "") -> List[str]:
+                    if depth > max_depth:
+                        return [f"{prefix}..."]
+
+                    lines = []
+                    try:
+                        entries = sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                    except PermissionError:
+                        return [f"{prefix}[Permission Denied]"]
+
+                    # Filter hidden files if needed
+                    if not include_hidden:
+                        entries = [e for e in entries if not e.name.startswith('.')]
+
+                    # Skip common large directories
+                    skip_dirs = {'node_modules', '__pycache__', '.git', 'venv', '.venv', 'dist', 'build'}
+
+                    for i, entry in enumerate(entries):
+                        is_last = i == len(entries) - 1
+                        connector = "└── " if is_last else "├── "
+
+                        if entry.is_dir():
+                            if entry.name in skip_dirs:
+                                lines.append(f"{prefix}{connector}{entry.name}/ [skipped]")
+                            else:
+                                lines.append(f"{prefix}{connector}{entry.name}/")
+                                extension = "    " if is_last else "│   "
+                                lines.extend(build_tree(entry, depth + 1, prefix + extension))
+                        else:
+                            lines.append(f"{prefix}{connector}{entry.name}")
+
+                    return lines
+
+                root = Path(root_path)
+                if not root.exists():
+                    raise ToolExecutionError(tool_name, f"Path not found: {root_path}")
+
+                tree_lines = [f"{root.name}/"] + build_tree(root)
+                return "\n".join(tree_lines)
+
+            except Exception as e:
+                raise ToolExecutionError(tool_name, str(e))
+
+        elif tool_name == "find_files":
+            # Find files matching a pattern
+            import fnmatch
+            from pathlib import Path
+
+            pattern = inputs.get("pattern", "*")
+            search_path = inputs.get("path", ".")
+            max_results = inputs.get("max_results", 100)
+
+            if self._project_root:
+                search_path = os.path.join(self._project_root, search_path)
+
+            try:
+                root = Path(search_path)
+                if not root.exists():
+                    raise ToolExecutionError(tool_name, f"Path not found: {search_path}")
+
+                results = []
+                # Use glob for pattern matching
+                if "**" in pattern:
+                    # Recursive glob
+                    matches = root.glob(pattern)
+                else:
+                    # Non-recursive, check if pattern has path separator
+                    if "/" in pattern or "\\" in pattern:
+                        matches = root.glob(pattern)
+                    else:
+                        matches = root.rglob(pattern)
+
+                for match in matches:
+                    if len(results) >= max_results:
+                        break
+                    # Return relative path from project root
+                    try:
+                        rel_path = match.relative_to(root)
+                    except ValueError:
+                        rel_path = match
+                    results.append(str(rel_path))
+
+                return json.dumps(results)
+
+            except Exception as e:
+                raise ToolExecutionError(tool_name, str(e))
+
+        elif tool_name == "get_file_info":
+            # Get file metadata
+            from pathlib import Path
+            from datetime import datetime
+
+            file_path = inputs.get("path", "")
+            if self._project_root:
+                file_path = os.path.join(self._project_root, file_path)
+
+            try:
+                path = Path(file_path)
+                if not path.exists():
+                    raise ToolExecutionError(tool_name, f"File not found: {file_path}")
+
+                stat = path.stat()
+                info = {
+                    "name": path.name,
+                    "path": str(path),
+                    "size": stat.st_size,
+                    "is_file": path.is_file(),
+                    "is_dir": path.is_dir(),
+                    "extension": path.suffix,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                }
+
+                # Add line count for text files
+                if path.is_file() and path.suffix in {'.py', '.js', '.ts', '.tsx', '.jsx', '.md', '.txt', '.yaml', '.yml', '.json', '.html', '.css'}:
+                    try:
+                        with open(path, 'r') as f:
+                            info["line_count"] = sum(1 for _ in f)
+                    except:
+                        pass
+
+                return json.dumps(info)
+
             except Exception as e:
                 raise ToolExecutionError(tool_name, str(e))
 
@@ -752,21 +1056,90 @@ class ToolExecutor:
             cwd = inputs.get("cwd", self._project_root)
 
             try:
-                import subprocess
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                output = result.stdout
-                if result.returncode != 0:
-                    output += f"\nError (exit {result.returncode}): {result.stderr}"
-                return output
+                # Use container execution if workspace is container-based
+                if self._workspace_info and self._workspace_info.use_container_exec and self._workspace_manager:
+                    import asyncio
+                    # Get the event loop and run the async method
+                    loop = asyncio.get_event_loop()
+                    output, exit_code = loop.run_until_complete(
+                        self._workspace_manager.exec_in_workspace(
+                            self._workspace_info.run_id,
+                            command,
+                            cwd=cwd,
+                            timeout=60,
+                        )
+                    )
+                    if exit_code != 0:
+                        output += f"\nError (exit {exit_code})"
+                    return output
+                else:
+                    # Local execution fallback
+                    result = subprocess.run(
+                        command,
+                        shell=True,
+                        cwd=cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    output = result.stdout
+                    if result.returncode != 0:
+                        output += f"\nError (exit {result.returncode}): {result.stderr}"
+                    return output
             except subprocess.TimeoutExpired:
                 raise ToolExecutionError(tool_name, "Command timed out after 60s")
+            except Exception as e:
+                raise ToolExecutionError(tool_name, str(e))
+
+        # =========================================================================
+        # GitHub API Tools - Fallback when local workspace isn't available
+        # =========================================================================
+        elif tool_name == "github_read_file":
+            # Read file from GitHub via API
+            repo = inputs.get("repo", self._github_context.get("repo", ""))
+            path = inputs.get("path", "")
+            ref = inputs.get("ref")
+
+            if not repo:
+                raise ToolExecutionError(tool_name, "Repository not specified")
+            if not path:
+                raise ToolExecutionError(tool_name, "Path not specified")
+
+            try:
+                content = self._github_read_file_api(repo, path, ref)
+                return content
+            except Exception as e:
+                raise ToolExecutionError(tool_name, str(e))
+
+        elif tool_name == "github_list_directory":
+            # List directory contents from GitHub via API
+            repo = inputs.get("repo", self._github_context.get("repo", ""))
+            path = inputs.get("path", "")
+            ref = inputs.get("ref")
+
+            if not repo:
+                raise ToolExecutionError(tool_name, "Repository not specified")
+
+            try:
+                contents = self._github_list_directory_api(repo, path, ref)
+                return json.dumps(contents)
+            except Exception as e:
+                raise ToolExecutionError(tool_name, str(e))
+
+        elif tool_name == "github_search_code":
+            # Search code in GitHub via API
+            repo = inputs.get("repo", self._github_context.get("repo", ""))
+            query = inputs.get("query", "")
+            max_results = inputs.get("max_results", 20)
+
+            if not repo:
+                raise ToolExecutionError(tool_name, "Repository not specified")
+            if not query:
+                raise ToolExecutionError(tool_name, "Query not specified")
+
+            try:
+                results = self._github_search_code_api(repo, query, max_results)
+                return json.dumps(results)
             except Exception as e:
                 raise ToolExecutionError(tool_name, str(e))
 
@@ -775,6 +1148,187 @@ class ToolExecutor:
                 tool_name=tool_name,
                 error="No local implementation available",
             )
+
+    def _github_read_file_api(
+        self,
+        repo: str,
+        path: str,
+        ref: Optional[str] = None,
+    ) -> str:
+        """Read a file from GitHub via the API.
+
+        Uses GitHubService if available, otherwise falls back to direct API call.
+        """
+        import base64
+        import urllib.request
+        import urllib.error
+
+        # Try GitHubService first
+        if self._github_service:
+            try:
+                token_info = self._github_service.get_resolved_token(
+                    project_id=self._github_context.get("project_id"),
+                    org_id=self._github_context.get("org_id"),
+                    user_id=self._github_context.get("user_id"),
+                )
+                token = token_info.token if token_info else None
+            except:
+                token = None
+        else:
+            token = self._github_context.get("token")
+
+        # Build API URL
+        url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        if ref:
+            url += f"?ref={ref}"
+
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "GuideAI-Agent",
+        }
+        if token:
+            headers["Authorization"] = f"token {token}"
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+
+                if data.get("type") != "file":
+                    raise ToolExecutionError(
+                        "github_read_file",
+                        f"Path is not a file: {path}"
+                    )
+
+                # Decode base64 content
+                content = base64.b64decode(data.get("content", "")).decode("utf-8")
+                return content
+
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ToolExecutionError("github_read_file", f"File not found: {path}")
+            raise ToolExecutionError("github_read_file", f"GitHub API error: {e}")
+
+    def _github_list_directory_api(
+        self,
+        repo: str,
+        path: str = "",
+        ref: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List directory contents from GitHub via the API."""
+        import urllib.request
+        import urllib.error
+
+        # Get token
+        if self._github_service:
+            try:
+                token_info = self._github_service.get_resolved_token(
+                    project_id=self._github_context.get("project_id"),
+                    org_id=self._github_context.get("org_id"),
+                    user_id=self._github_context.get("user_id"),
+                )
+                token = token_info.token if token_info else None
+            except:
+                token = None
+        else:
+            token = self._github_context.get("token")
+
+        # Build API URL
+        url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        if ref:
+            url += f"?ref={ref}"
+
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "GuideAI-Agent",
+        }
+        if token:
+            headers["Authorization"] = f"token {token}"
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+
+                # Format output
+                if isinstance(data, list):
+                    return [
+                        {
+                            "name": item.get("name"),
+                            "type": item.get("type"),
+                            "path": item.get("path"),
+                            "size": item.get("size"),
+                        }
+                        for item in data
+                    ]
+                else:
+                    # Single file, not a directory
+                    return [{
+                        "name": data.get("name"),
+                        "type": data.get("type"),
+                        "path": data.get("path"),
+                        "size": data.get("size"),
+                    }]
+
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ToolExecutionError("github_list_directory", f"Path not found: {path}")
+            raise ToolExecutionError("github_list_directory", f"GitHub API error: {e}")
+
+    def _github_search_code_api(
+        self,
+        repo: str,
+        query: str,
+        max_results: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Search code in GitHub via the API."""
+        import urllib.request
+        import urllib.error
+        import urllib.parse
+
+        # Get token
+        if self._github_service:
+            try:
+                token_info = self._github_service.get_resolved_token(
+                    project_id=self._github_context.get("project_id"),
+                    org_id=self._github_context.get("org_id"),
+                    user_id=self._github_context.get("user_id"),
+                )
+                token = token_info.token if token_info else None
+            except:
+                token = None
+        else:
+            token = self._github_context.get("token")
+
+        # Build search query
+        search_query = f"{query} repo:{repo}"
+        encoded_query = urllib.parse.quote(search_query)
+        url = f"https://api.github.com/search/code?q={encoded_query}&per_page={max_results}"
+
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "GuideAI-Agent",
+        }
+        if token:
+            headers["Authorization"] = f"token {token}"
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+
+                return [
+                    {
+                        "name": item.get("name"),
+                        "path": item.get("path"),
+                        "repository": item.get("repository", {}).get("full_name"),
+                        "url": item.get("html_url"),
+                    }
+                    for item in data.get("items", [])
+                ]
+
+        except urllib.error.HTTPError as e:
+            raise ToolExecutionError("github_search_code", f"GitHub API error: {e}")
 
     def get_available_tools(self) -> List[str]:
         """Get list of tools available given the current policy."""

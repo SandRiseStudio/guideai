@@ -72,5 +72,7 @@
       }
     },
     "required": ["checklist_id", "valid", "coverage_score", "missing_steps", "failed_steps", "warnings"]
-  }
+  },
+  "required_scopes": ["compliance.validate"],
+  "category": "compliance"
 }

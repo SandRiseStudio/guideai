@@ -1,6 +1,6 @@
 # Agent Handbook
 
-> **TL;DR**: **Use the role that makes the most sense to begin with. Declare your role at task start.** Use MCP tools first.
+> **TL;DR**: **Use the role that makes the most sense to begin with. Declare your role at task start.** Use GuideAI MCP tools directly (they work natively in VS Code Copilot Chat!).
 > Log with Raze. Manage environments with Amprealize. Extract reusable code to `packages/`.
 > Never hardcode secrets. Run `pre-commit` before pushing. **Cite both behavior AND role in your work.**
 
@@ -310,8 +310,11 @@ When adding significant functionality, create a standalone package under `packag
 
 Scan this table before starting any task. If keywords match, follow the linked behavior with the indicated role.
 
+> **⚠️ Before ANY task**: Run `behaviors.getForTask` or `guideai behaviors get-for-task` to retrieve relevant behaviors!
+
 | Trigger Keywords | Behavior(s) | Role |
 | --- | --- | --- |
+| **start task, begin work, any new task** | `behaviors.getForTask` | 📖 Student |
 | **MCP tool, MCP server, IDE extension** | `behavior_prefer_mcp_tools` | 📖 Student |
 | **logging, structured logs, telemetry sink** | `behavior_use_raze_for_logging` | 📖 Student |
 | **environment, blueprint, podman, container** | `behavior_use_amprealize_for_environments` | 📖 Student |
@@ -339,11 +342,12 @@ Scan this table before starting any task. If keywords match, follow the linked b
 | PostgreSQL migration, schema change, Alembic, SQL migration | `behavior_migrate_postgres_schema` | 📖 Student |
 | cross-surface parity, CLI/API/MCP consistency, parity test | `behavior_validate_cross_surface_parity` | 📖 Student |
 | VS Code extension, webview, TreeDataProvider, extension API | `behavior_integrate_vscode_extension` | 🎓 Teacher |
+| MCP tool schema, required fields, session context, Copilot Chat | `behavior_design_mcp_tool_schema` | 📖 Student |
 | code review, PR review, approval workflow, review checklist | `behavior_conduct_code_review` | 🎓 Teacher |
 | copywriting, messaging, tone, voice, brand copy | `behavior_craft_messaging` | 🎓 Teacher |
 | data pipeline, ETL, feature engineering, data quality | `behavior_create_data_pipeline` | 🎓 Teacher |
 | test strategy, test plan, coverage analysis, test pyramid | `behavior_design_test_strategy` | 🎓 Teacher |
-| **pattern observed 3+ times, need new behavior** | Propose new behavior entry | 🧠 Metacognitive Strategist |
+| **pattern observed 3+ times, need new behavior** | `behaviors.propose` → propose new behavior | 🧠 Metacognitive Strategist |
 | **creating examples, documentation, tutorials** | Relevant domain behavior | 🎓 Teacher |
 | **code review, quality validation** | Relevant domain behavior | 🎓 Teacher |
 
@@ -387,12 +391,13 @@ Scan this table before starting any task. If keywords match, follow the linked b
 ### `behavior_prefer_mcp_tools`
 - **When**: Working in an IDE with MCP server extensions, or when guideai MCP tools could replace CLI/API interactions.
 - **Steps**:
-  1. **Check available tools**: Review `MCP_SERVER_DESIGN.md` for the catalog (`behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`).
-  2. **Prefer MCP over CLI/API**: MCP provides consistent schemas, automatic telemetry, and cross-surface parity.
-  3. **Leverage IDE extensions**: VS Code and other IDEs with MCP support can invoke tools directly for real-time behavior retrieval, run status, and compliance validation.
-  4. **Record usage**: Cite MCP tools in action logs for reproducibility.
-  5. **Fallback gracefully**: If MCP unavailable, use CLI commands with same parameters.
-  6. **Report gaps**: Document missing MCP equivalents in `docs/capability_matrix.md`.
+  1. **Check available tools**: GuideAI MCP server exposes **220 tools** including `behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`, `projects.*`, `orgs.*`, `boards.*`. See `MCP_SERVER_DESIGN.md` for full catalog.
+  2. **Use MCP directly in VS Code Copilot Chat**: GuideAI MCP tools work natively—just invoke them by name (e.g., `mcp_guideai_projects_list`, `mcp_guideai_behaviors_getfortask`). No CLI fallback needed.
+  3. **Prefer MCP over CLI/API**: MCP provides consistent schemas, automatic telemetry, and cross-surface parity.
+  4. **Leverage IDE extensions**: VS Code Copilot Chat can invoke GuideAI tools directly for real-time behavior retrieval, project management, run status, and compliance validation.
+  5. **Record usage**: Cite MCP tools in action logs for reproducibility.
+  6. **Fallback gracefully**: If MCP unavailable (e.g., outside VS Code), use CLI commands with same parameters.
+  7. **Report gaps**: Document missing MCP equivalents in `docs/capability_matrix.md`.
 
 ### `behavior_use_raze_for_logging`
 - **When**: Adding logging to any service, debugging production issues, implementing telemetry, or replacing ad-hoc print statements.
@@ -669,15 +674,32 @@ Scan this table before starting any task. If keywords match, follow the linked b
 ### `behavior_migrate_postgres_schema`
 - **When**: Adding/modifying database tables, changing column types, adding indexes, or managing schema versioning.
 - **Role**: 📖 Student (routine migrations) or 🎓 Teacher (complex schema redesigns)
+- **Reference**: See `docs/MIGRATION_GUIDE.md` for detailed examples and troubleshooting.
 - **Steps**:
-  1. **Draft migration script**: Create numbered migration in `schema/migrations/` (e.g., `019_add_xyz_table.sql`).
-  2. **Include rollback**: Every migration must have corresponding DOWN migration or be documented as irreversible.
-  3. **Test locally first**: Run migration against local PostgresPool; verify with `\d+ table_name`.
-  4. **Handle data migrations**: For existing data, write idempotent transforms; never lose production data.
-  5. **Update schema docs**: Reflect changes in `AUDIT_LOG_STORAGE.md` and relevant service contracts.
-  6. **Add connection handling**: Ensure PostgresPool commits before returning; handle connection exhaustion gracefully.
-  7. **Verify indexes**: Add indexes for foreign keys and common query patterns; run `EXPLAIN ANALYZE`.
-  8. **Log in BUILD_TIMELINE.md**: Document migration number, purpose, and any breaking changes.
+  1. **Check for single head**: Run `alembic heads` - must show exactly ONE head before creating migration.
+  2. **Create migration**: Use `alembic revision -m "descriptive_name"` with clear action-oriented names.
+  3. **Verify revision references**: Ensure `down_revision` uses the actual revision ID (not filename).
+  4. **Include rollback**: Every migration must have corresponding `downgrade()` or be documented as irreversible.
+  5. **Avoid unsupported params**: `create_index()` does NOT support `comment=` - use Python comments instead.
+  6. **Test locally**: Run `alembic upgrade head`, verify, then test rollback with `alembic downgrade -1`.
+  7. **Validate before commit**: Run `python scripts/validate_migrations.py` or let pre-commit check.
+  8. **Handle data migrations**: For existing data, write idempotent transforms; never lose production data.
+  9. **Update schema docs**: Reflect changes in `AUDIT_LOG_STORAGE.md` and relevant service contracts.
+  10. **Log in BUILD_TIMELINE.md**: Document migration number, purpose, and any breaking changes.
+
+### `behavior_design_mcp_tool_schema`
+- **When**: Creating new MCP tools, updating tool schemas, or making tools work in VS Code Copilot Chat without required parameters.
+- **Role**: 📖 Student (follow pattern) or 🎓 Teacher (establish new patterns)
+- **Reference**: See `docs/MCP_TOOL_SCHEMA_PATTERN.md` for detailed implementation guide.
+- **Steps**:
+  1. **Set required to empty**: In `mcp/tools/<tool>.json`, use `"required": []` unless parameters are truly mandatory.
+  2. **Use session context**: Handler should check `arguments.get("_session", {})` for user_id, is_admin, accessible resources.
+  3. **Fallback to session**: When explicit parameters not provided, use session context values.
+  4. **Check admin status**: Call `_is_admin_from_session(arguments)` for elevated access patterns.
+  5. **Verify access control**: Ensure user can access requested resources via `_check_org_access()` or `_check_project_access()`.
+  6. **Update description**: Schema property descriptions should indicate "(optional, uses session)" when applicable.
+  7. **Test with Copilot**: After changes, fully restart VS Code (Cmd+Q) to clear schema cache, then test tool invocation.
+  8. **Document changes**: Update `docs/MCP_TOOL_SCHEMA_PATTERN.md` if establishing new patterns.
 
 ### `behavior_validate_cross_surface_parity`
 - **When**: Adding features that should work identically across CLI, API, MCP, and web surfaces.

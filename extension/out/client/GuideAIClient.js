@@ -55,7 +55,7 @@ class GuideAIClient {
         const config = vscode.workspace.getConfiguration('guideai');
         this.pythonPath = config.get('pythonPath', 'python');
         this.cliPath = config.get('cliPath', 'guideai');
-        this.apiBaseUrl = config.get('apiBaseUrl', 'http://localhost:8000');
+        this.apiBaseUrl = config.get('apiBaseUrl', 'http://localhost:8080');
         this.outputChannel = vscode.window.createOutputChannel('GuideAI');
         this.telemetryEnabled = config.get('telemetryEnabled', true);
         this.telemetryActorId = config.get('telemetryActorId', 'ide-user'); // IDE-agnostic default
@@ -454,7 +454,7 @@ class GuideAIClient {
             args.push('--version', version);
         return await this.runCLI(args);
     }
-    async listAgents(filters = {}) {
+    async listAgents(filters = {}, _telemetry) {
         const args = ['agent-registry', 'list'];
         if (filters.tag)
             args.push('--tag', filters.tag);
@@ -465,7 +465,7 @@ class GuideAIClient {
         const result = await this.runCLI(args);
         return result.agents || [];
     }
-    async searchAgents(query, options = {}) {
+    async searchAgents(query, options = {}, _telemetry) {
         const args = ['agent-registry', 'search', '--query', query];
         if (options.limit)
             args.push('--limit', String(options.limit));
@@ -608,6 +608,74 @@ class GuideAIClient {
     async getOrgCredentialAudit(orgId, credentialId, limit = 50) {
         const response = await this.callAPI(`/api/v1/orgs/${orgId}/credentials/${credentialId}/audit?limit=${limit}`, 'GET');
         return response.audit_log || [];
+    }
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Per-User GitHub Credential Links
+    // ─────────────────────────────────────────────────────────────────────────────
+    /**
+     * Get the current user's GitHub link for a project
+     */
+    async getMyGitHubLink(projectId) {
+        try {
+            const response = await this.callAPI(`/api/v1/projects/${projectId}/github/my-link`, 'GET');
+            return response;
+        }
+        catch (error) {
+            // 404 or null response means no link
+            return null;
+        }
+    }
+    /**
+     * Link the current user's PAT credential to a project
+     */
+    async linkMyPATToProject(projectId, options) {
+        return await this.callAPI(`/api/v1/projects/${projectId}/github/link-pat`, 'POST', options);
+    }
+    /**
+     * Link the current user's GitHub App installation to a project
+     */
+    async linkMyAppToProject(projectId, options) {
+        return await this.callAPI(`/api/v1/projects/${projectId}/github/link-app`, 'POST', options);
+    }
+    /**
+     * Remove the current user's GitHub link from a project
+     */
+    async unlinkMyGitHubFromProject(projectId, linkType) {
+        let url = `/api/v1/projects/${projectId}/github/my-link`;
+        if (linkType) {
+            url += `?link_type=${linkType}`;
+        }
+        return await this.callAPI(url, 'DELETE');
+    }
+    /**
+     * Show which GitHub credential would be used for the current user + project
+     */
+    async getGitHubResolution(projectId) {
+        return await this.callAPI(`/api/v1/projects/${projectId}/github/resolution`, 'GET');
+    }
+    /**
+     * Get the current user's GitHub preferences
+     */
+    async getMyGitHubPreferences() {
+        return await this.callAPI(`/api/v1/users/me/github-preferences`, 'GET');
+    }
+    /**
+     * Update the current user's GitHub preferences
+     */
+    async updateMyGitHubPreferences(prefs) {
+        return await this.callAPI(`/api/v1/users/me/github-preferences`, 'PUT', prefs);
+    }
+    /**
+     * List GitHub credentials owned by the current user
+     */
+    async listMyGitHubCredentials() {
+        return await this.callAPI(`/api/v1/users/me/github-credentials`, 'GET');
+    }
+    /**
+     * List GitHub App installations accessible to the current user
+     */
+    async listMyGitHubAppInstallations() {
+        return await this.callAPI(`/api/v1/users/me/github-app-installations`, 'GET');
     }
     // ─────────────────────────────────────────────────────────────────────────────
     // Cost Analytics (Customer-Facing)

@@ -44,15 +44,19 @@ export class AuthProvider implements vscode.AuthenticationProvider {
     private _client: GuideAIClient;
     private _mcpClient: McpClient | null = null;
     private _useMcp: boolean;
+    private _context?: vscode.ExtensionContext;
 
-    constructor(client: GuideAIClient, context?: vscode.ExtensionContext) {
+    constructor(client: GuideAIClient, context?: vscode.ExtensionContext, mcpClient?: McpClient) {
         this._client = client;
+        this._context = context;
 
         // Initialize MCP client if context is provided
         const config = vscode.workspace.getConfiguration('guideai');
         this._useMcp = config.get('useMcpForAuth', true);
 
-        if (context && this._useMcp) {
+        if (mcpClient && this._useMcp) {
+            this._mcpClient = mcpClient;
+        } else if (context && this._useMcp) {
             this._mcpClient = new McpClient(context);
         }
 
@@ -194,6 +198,9 @@ export class AuthProvider implements vscode.AuthenticationProvider {
      */
     private async showDeviceFlowUI(deviceCodeResponse: DeviceInitResult): Promise<AuthSession | null> {
         return new Promise((resolve, reject) => {
+            const extensionUri = this._context?.extensionUri
+                ?? vscode.extensions.getExtension('guideai.guideai-ide-extension')?.extensionUri;
+
             const panel = vscode.window.createWebviewPanel(
                 'guideai.deviceFlow',
                 'GuideAI Authentication',
@@ -201,7 +208,7 @@ export class AuthProvider implements vscode.AuthenticationProvider {
                 {
                     enableScripts: true,
                     retainContextWhenHidden: true,
-                    localResourceRoots: [vscode.Uri.joinPath(vscode.extensions.getExtension('guideai.guideai-ide-extension')!.extensionUri, 'src')]
+                    localResourceRoots: extensionUri ? [vscode.Uri.joinPath(extensionUri, 'src')] : []
                 }
             );
 
@@ -423,8 +430,15 @@ export class AuthProvider implements vscode.AuthenticationProvider {
      * Get device flow HTML
      */
     private getDeviceFlowHTML(webview: vscode.Webview, deviceCodeResponse: any): string {
-        const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(vscode.extensions.getExtension('guideai.guideai-ide-extension')!.extensionUri, 'src', 'webviews', 'deviceFlow.js'));
-        const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(vscode.extensions.getExtension('guideai.guideai-ide-extension')!.extensionUri, 'src', 'styles', 'AuthFlow.css'));
+        const extensionUri = this._context?.extensionUri
+            ?? vscode.extensions.getExtension('guideai.guideai-ide-extension')?.extensionUri;
+        const baseUri = extensionUri ?? webview.options.localResourceRoots?.[0];
+        const scriptUri = baseUri
+            ? webview.asWebviewUri(vscode.Uri.joinPath(baseUri, 'src', 'webviews', 'deviceFlow.js'))
+            : webview.asWebviewUri(vscode.Uri.joinPath(vscode.Uri.file('.'), 'src', 'webviews', 'deviceFlow.js'));
+        const styleUri = baseUri
+            ? webview.asWebviewUri(vscode.Uri.joinPath(baseUri, 'src', 'styles', 'AuthFlow.css'))
+            : webview.asWebviewUri(vscode.Uri.joinPath(vscode.Uri.file('.'), 'src', 'styles', 'AuthFlow.css'));
 
         return `<!DOCTYPE html>
         <html>
@@ -468,7 +482,7 @@ export class AuthProvider implements vscode.AuthenticationProvider {
      * Load stored sessions from VS Code storage
      */
     private loadStoredSessions(): void {
-        const globalState = vscode.extensions.getExtension('guideai.guideai-ide-extension')?.exports?.globalState;
+        const globalState = this._context?.globalState;
         if (globalState) {
             const stored = globalState.get('authSessions', '{}');
             try {
@@ -490,7 +504,7 @@ export class AuthProvider implements vscode.AuthenticationProvider {
      * Store sessions to VS Code storage
      */
     private storeSessions(): void {
-        const globalState = vscode.extensions.getExtension('guideai.guideai-ide-extension')?.exports?.globalState;
+        const globalState = this._context?.globalState;
         if (globalState) {
             const sessionsData: Record<string, AuthSession> = {};
             for (const [sessionId, session] of this._sessions) {

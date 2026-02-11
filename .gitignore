@@ -41,6 +41,11 @@ Thumbs.db
 client_secret*.json
 *apps.googleusercontent.com.json
 
+# Private keys and secrets directory
+secrets/
+*.pem
+*.private-key.pem
+
 # Amprealize runtime state (contains resolved secrets)
 .amprealize/
 

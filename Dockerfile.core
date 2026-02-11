@@ -24,11 +24,12 @@ COPY guideai/__init__.py guideai/__init__.py
 COPY packages/ ./packages/
 
 # Install Python dependencies (excluding ML deps to reduce image size)
-# Note: Local packages (raze, amprealize) are required for the API
+# Note: Local packages (raze, amprealize, execution-queue) are required for the API
 # Using non-editable installs so packages are copied to site-packages
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir ./packages/raze && \
     pip install --no-cache-dir ./packages/amprealize && \
+    pip install --no-cache-dir ./packages/execution-queue && \
     pip install --no-cache-dir -e .[telemetry,postgres,redis]
 
 # ============================================================================

@@ -9,6 +9,7 @@
 		"sourceMap": true,
 		"rootDir": "src",
 		"strict": true,
+		"noEmitOnError": false,
 		"esModuleInterop": true,
 		"skipLibCheck": true,
 		"forceConsistentCasingInFileNames": true,

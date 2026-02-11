@@ -2156,6 +2156,7 @@ class AmprealizeService:
                     detach=True,
                     network=network_name,
                     network_aliases=[name] if network_name else [],
+                    privileged=bool(spec.get("privileged", False)),
                 )
 
                 container_id = self.executor.run_container(config)
@@ -2589,23 +2590,88 @@ class AmprealizeService:
             details={"progress": status.progress_pct},
         )
 
-    def list_environments(self) -> List[Dict[str, Any]]:
-        """List all active environments.
+    def list_environments(
+        self,
+        reconcile: bool = True,
+        auto_cleanup: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """List all active environments, optionally reconciling with container reality.
+
+        Args:
+            reconcile: If True, verify containers actually exist and mark stale ones
+            auto_cleanup: If True, remove state files for environments with no containers
 
         Returns:
-            List of environment status dicts
+            List of environment status dicts with 'actual_status' field when reconciled
         """
         result = []
+        stale_paths = []
+
+        # Get actual running containers if we need to reconcile
+        actual_containers: set[str] = set()
+        if reconcile:
+            try:
+                containers = self.executor.list_containers(all_containers=True)
+                actual_containers = {c.name for c in containers}
+            except Exception:
+                # If we can't list containers (machine not running), skip reconciliation
+                reconcile = False
+
         for path in self.environments_dir.glob("*.json"):
-            with open(path, "r") as f:
-                data = json.load(f)
-            result.append({
-                "amp_run_id": data.get("amp_run_id"),
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                # Corrupted state file - mark for cleanup
+                stale_paths.append(path)
+                continue
+
+            amp_run_id = data.get("amp_run_id", "")
+            phase = data.get("phase", "UNKNOWN")
+
+            # Check if any containers for this run actually exist
+            actual_status = "UNKNOWN"
+            container_count = 0
+            if reconcile and amp_run_id:
+                # Containers are named: {amp_run_id}-{service_name}
+                run_containers = [c for c in actual_containers if c.startswith(f"{amp_run_id}-")]
+                container_count = len(run_containers)
+
+                if container_count == 0:
+                    actual_status = "STALE"
+                    if auto_cleanup:
+                        stale_paths.append(path)
+                else:
+                    actual_status = "RUNNING"
+
+            entry = {
+                "amp_run_id": amp_run_id,
                 "environment": data.get("environment"),
-                "phase": data.get("phase"),
+                "phase": phase,
                 "blueprint_id": data.get("blueprint_id"),
                 "created_at": data.get("created_at"),
-            })
+            }
+
+            if reconcile:
+                entry["actual_status"] = actual_status
+                entry["container_count"] = container_count
+
+            # Only include non-stale entries (or all if auto_cleanup is False)
+            if not auto_cleanup or actual_status != "STALE":
+                result.append(entry)
+
+        # Clean up stale state files
+        if auto_cleanup:
+            for stale_path in stale_paths:
+                try:
+                    # Also remove corresponding manifest
+                    manifest_path = self.manifests_dir / stale_path.name
+                    if manifest_path.exists():
+                        manifest_path.unlink()
+                    stale_path.unlink()
+                except OSError:
+                    pass  # Best effort cleanup
+
         return result
 
     # =========================================================================

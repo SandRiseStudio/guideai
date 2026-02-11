@@ -110,7 +110,7 @@ class RazeClient {
             startTime: Date.now(),
         };
         const config = vscode.workspace.getConfiguration('guideai');
-        this.baseUrl = options.baseUrl ?? config.get('apiBaseUrl', 'http://localhost:8000');
+        this.baseUrl = options.baseUrl ?? config.get('apiBaseUrl', 'http://localhost:8080');
         this.serviceName = options.serviceName ?? 'guideai-vscode-extension';
         this.maxBufferSize = options.maxBufferSize ?? 100;
         this.lingerMs = options.lingerMs ?? 5000;

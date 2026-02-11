@@ -116,7 +116,7 @@ class SettingsSyncProvider {
         return {
             pythonPath: config.get('pythonPath', 'python'),
             cliPath: config.get('cliPath', 'guideai'),
-            apiBaseUrl: config.get('apiBaseUrl', 'http://localhost:8000'),
+            apiBaseUrl: config.get('apiBaseUrl', 'http://localhost:8080'),
             timeout: config.get('timeout', 30000),
             logLevel: config.get('logLevel', 'INFO'),
             telemetryEnabled: config.get('telemetryEnabled', true),

@@ -3,11 +3,14 @@
 ## 1. Overview
 The Metacognitive Control Plane (MCP) server provides a contract-first integration point that keeps the platform UI, public API, CLI, and agent tooling in lockstep. It exposes behavior-handbook operations, run orchestration, compliance auditing, and reflection workflows through a consistent schema so every surface delivers the same capabilities and guardrails.
 
+**Status:** ✅ **220 MCP tools available** – Works natively in VS Code Copilot Chat and Claude Desktop.
+
 ## 2. Objectives
 - **Parity:** Ensure any capability offered in the platform UI or CLI is available through MCP tools and the public API by default.
 - **Observability:** Capture structured telemetry for every command (request metadata, behaviors used, checklist status).
 - **Extensibility:** Support partner agents and IDE extensions through well-typed schemas (JSON Schema + OpenAPI) and capability negotiation.
 - **Security & Compliance:** Enforce auth, RBAC, and audit logging aligned with compliance requirements.
+- **IDE Compatibility:** All tool schemas use fully-inlined JSON (no `$ref` dependencies) for VS Code Copilot Chat and Claude Desktop compatibility.
 
 ## 3. Core Capabilities
 | Domain | MCP Tool / Endpoint | Description |
@@ -25,12 +28,16 @@ The Metacognitive Control Plane (MCP) server provides a contract-first integrati
 | Agent Reviews | `reviews.run`, `reviews.list`, `reviews.get` | Trigger cross-functional agent reviewers (Engineering, DX, Compliance, Product) and retrieve synthesized feedback for artifacts. |
 | Agent Orchestration | `agents.assign`, `agents.switch`, `agents.status` | Select domain agents for runs, switch personas mid-execution, and expose assignment history with audit metadata. |
 | Agent Authentication | `auth.ensureGrant`, `auth.listGrants`, `auth.revoke`, `auth.status` | Broker OAuth/OIDC flows, enforce policy decisions, and expose grant state for agents and tools. |
+| **Project Management** | `projects.list`, `projects.create`, `projects.get`, `projects.update` | Manage projects within organizations for workstream organization. |
+| **Organization Management** | `orgs.list`, `orgs.create`, `orgs.get`, `orgs.update` | Manage organizations, members, and settings. |
+| **Board Management** | `boards.list`, `boards.create`, `boards.get`, `boards.update` | Kanban-style boards for work item tracking. |
 
 ## 4. Integration Surfaces
 - **Platform UI (Web):** Uses REST/GraphQL façade deployed alongside MCP; feature flags ensure UI only exposes capabilities registered in MCP.
 - **Public API:** Thin wrapper around MCP gRPC/HTTP endpoints with identical schemas; versioned routes (e.g., `/v1/behaviors`).
 - **CLI:** Consumes the MCP SDK; commands (`guideai plan`, `guideai run`, `guideai reflect`, `guideai agents review`) call the same tools.
-- **VS Code & MCP Tools:** IDE extension communicates via MCP protocol to retrieve behaviors, submit runs, and validate checklists without bespoke APIs.
+- **VS Code Copilot Chat:** ✅ **Works natively!** All 220 MCP tools can be invoked directly by name (e.g., `mcp_guideai_projects_list`, `mcp_guideai_behaviors_getfortask`).
+- **Claude Desktop:** MCP tools available via Claude Desktop MCP integration.
 
 ## 5. Architecture
 - **Transport:** Primary gRPC (for IDEs/CLI) with HTTP/JSON gateway; follows MCP capability negotiation (handshake with `listTools`).

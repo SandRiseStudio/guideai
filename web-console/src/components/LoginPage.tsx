@@ -181,7 +181,7 @@ export function LoginPage() {
   const handleSocialLogin = useCallback((provider: 'github' | 'google') => {
     // Build OAuth authorization URL
     const redirectUri = `${window.location.origin}/auth/callback`;
-    const rawBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000').replace(/\/+$/, '');
+    const rawBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080').replace(/\/+$/, '');
     const apiBaseUrl = rawBaseUrl.endsWith('/api') ? rawBaseUrl : `${rawBaseUrl}/api`;
     const state = createOAuthState(provider);
     const authUrl = `${apiBaseUrl}/v1/auth/oauth/${provider}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`;

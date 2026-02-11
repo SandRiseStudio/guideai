@@ -463,6 +463,7 @@ class WorkflowService:
         actor: Actor,
         behavior_ids: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        enable_early_retrieval: bool = True,
     ) -> WorkflowRun:
         """Execute a workflow template with behavior-conditioned inference.
 
@@ -471,6 +472,7 @@ class WorkflowService:
             actor: Actor running the workflow
             behavior_ids: Optional list of behavior IDs to inject (auto-retrieves if None)
             metadata: Optional run metadata
+            enable_early_retrieval: Whether to enable Early Knowledge Alignment (EKA)
 
         Returns:
             WorkflowRun with execution state
@@ -484,6 +486,10 @@ class WorkflowService:
 
         # Initialize run with pending steps
         metadata_copy: Dict[str, Any] = dict(metadata or {})
+
+        # Store EKA config in metadata for execution loop to read
+        metadata_copy["enable_early_retrieval"] = enable_early_retrieval
+
         baseline_tokens = metadata_copy.get("baseline_tokens")
         if baseline_tokens is not None:
             try:

@@ -1,3 +1,778 @@
+| 167 | PostgreSQL Device Flow Store | ### #167 - PostgreSQL Device Flow Store (2026-01-23)
+**Milestone:** Production-grade shared auth state between MCP server and REST API
+**Context:** Device flow tokens created via MCP couldn't be validated by REST API (separate in-memory stores).
+
+**Implementation (Completed):**
+
+1. **Database Migration** (`migrations/versions/20260122_add_device_sessions.py`):
+   - `auth.device_sessions` table with device_code as primary key
+   - Columns: user_code, client_id, scopes (JSONB), status, surface, poll_interval
+   - OAuth token fields: access_token, refresh_token, expiry timestamps
+   - Approver fields: approver, approver_surface, approved_at, denial_reason
+   - OAuth user info: oauth_user_id, oauth_username, oauth_email, etc.
+   - Indexes: user_code lookup, access_token lookup, expires_at cleanup, pending sessions
+
+2. **PostgresDeviceFlowStore** (`guideai/auth/postgres_device_flow.py` - NEW ~575 lines):
+   - `DeviceSession` dataclass with all session fields
+   - Full CRUD operations backed by PostgreSQL:
+     - `create_session()`: Generate device_code/user_code, store in DB
+     - `get_by_device_code()`, `get_by_user_code()`, `get_by_access_token()`
+     - `approve()`, `approve_by_user_code()`: Generate tokens, update status
+     - `deny()`, `deny_by_user_code()`: Deny pending sessions
+     - `get_user_info_from_access_token()`: Token validation for auth
+     - `cleanup_expired()`: Remove expired sessions
+
+3. **API Integration** (`guideai/api.py`):
+   - Initialize `postgres_device_store` on startup when DSN available
+   - Device flow endpoints use PostgreSQL store when available:
+     - `POST /api/v1/auth/device` - Create session in PostgreSQL
+     - `POST /api/v1/auth/device/lookup` - Lookup by user code
+     - `POST /api/v1/auth/device/approve` - Approve and generate tokens
+     - `POST /api/v1/auth/device/deny` - Deny with reason
+     - `POST /api/v1/auth/device/token` - Poll for tokens
+   - Token validation checks PostgreSQL store first, then in-memory
+
+4. **MCP Server Integration** (`guideai/mcp_server.py`):
+   - Initialize `PostgresDeviceFlowStore` when `GUIDEAI_ORG_PG_DSN` available
+   - Pass `postgres_store` to `MCPDeviceFlowService`
+   - MCP and API now share device flow state via PostgreSQL
+
+5. **MCPDeviceFlowService Updates** (`guideai/mcp_device_flow.py`):
+   - Added `postgres_store` parameter to constructor
+   - `device_init()` and `device_poll()` use PostgreSQL when available
+   - Fallback to in-memory manager for backward compatibility
+
+**E2E Flow Now Works:**
+1. MCP client calls `auth.deviceInit` → Session created in PostgreSQL
+2. User approves via web console `/api/v1/auth/device/approve`
+3. MCP client polls `auth.devicePoll` → Receives tokens from same PostgreSQL session
+4. Tokens validate across both MCP and REST API surfaces
+
+**Files Modified:**
+- `migrations/versions/20260122_add_device_sessions.py` (NEW)
+- `guideai/auth/postgres_device_flow.py` (NEW)
+- `guideai/api.py` (device flow endpoints + token validation)
+- `guideai/mcp_server.py` (PostgreSQL store initialization)
+- `guideai/mcp_device_flow.py` (PostgreSQL store support)
+
+| 166 | MCP Auth Phase 6: Consent UX Dashboard | ### #166 - MCP Auth Phase 6: Consent UX Dashboard (2026-01-22)
+**Milestone:** MCP Security - JIT Authorization Consent System
+**Context:** User-friendly consent approval flow for Just-In-Time (JIT) authorization across Web, CLI, and VS Code surfaces.
+
+**Phase 6 Implementation (Completed):**
+
+1. **Database Migration** (`migrations/versions/20260122_add_consent_requests.py`):
+   - `auth.consent_requests` table with PostgreSQL UUID primary key
+   - Columns: user_id, agent_id, tool_name, scopes (JSONB), context (JSONB)
+   - Status enum: pending, approved, denied, expired
+   - User code format: ABCD-1234 (avoiding confusing chars I, O, 0, 1)
+   - Indexes: user_code_normalized, (user_id, status), expires_at, agent_id
+   - Auto-updating updated_at trigger
+   - Default expiry: 600 seconds (10 minutes)
+
+2. **ConsentService** (`guideai/auth/consent_service.py` - NEW):
+   - `ConsentRequest` dataclass with to_dict(), is_expired(), is_pending()
+   - `ConsentPollResult` dataclass for polling responses
+   - `ConsentService` class with async PostgreSQL operations:
+     - `create_request()`: Generate user-friendly code, create DB record
+     - `get_by_user_code()`: Lookup by normalized code
+     - `get_by_id()`: Lookup by UUID
+     - `list_pending_for_user()`: List pending requests for a user
+     - `approve()`: Approve with audit trail (approver, reason, timestamp)
+     - `deny()`: Deny with reason
+     - `poll_status()`: For MCP clients waiting for user decisions
+     - `cleanup_expired()`: Background cleanup of expired requests
+   - Singleton pattern via `get_consent_service(pool)`
+
+3. **MCP Tool Manifests** (`mcp/tools/consent.*.json`):
+   - `consent.create` - Create JIT consent request (returns user_code, verification_uri)
+   - `consent.lookup` - Look up consent request by user code
+   - `consent.approve` - Approve consent request
+   - `consent.deny` - Deny consent request with reason
+   - `consent.poll` - Poll status for waiting clients
+   - `consent.list` - List pending requests for a user
+
+4. **MCP Server Integration** (`guideai/mcp_server.py`):
+   - Added `_consent_service` attribute to MCPServiceRegistry
+   - Added `consent_service()` method with PostgreSQL pool initialization
+   - Added consent.* routing in dispatch switch statement
+   - `_handle_consent_tool()`: Handlers for all 6 consent tools
+
+5. **REST API Endpoints** (`guideai/api.py`):
+   - `GET /api/v1/consent/{user_code}` - Get consent request details
+   - `POST /api/v1/consent/{user_code}/approve` - Approve (auth required)
+   - `POST /api/v1/consent/{user_code}/deny` - Deny (auth required)
+   - `GET /api/v1/consent/{user_code}/status` - Poll status (public)
+   - `GET /api/v1/consent/pending` - List pending for authenticated user
+
+**User Code Format:**
+- 4 uppercase letters (excluding I, O) + hyphen + 4 digits
+- Example: ABCD-1234, XYZK-5678
+- Easy to read and type on any device
+
+**Consent Flow:**
+1. Agent calls `consent.create` with user_id, agent_id, tool_name, scopes
+2. System returns user_code and verification_uri
+3. User opens verification_uri in browser/CLI/VS Code
+4. User reviews request and clicks Approve/Deny
+5. Agent polls `consent.poll` until status changes from pending
+6. On approval, agent proceeds with tool execution
+
+**Test:** `scripts/test_phase6_consent.py` (18 tests - all passing)
+
+**Files Changed:**
+- NEW: `migrations/versions/20260122_add_consent_requests.py`
+- NEW: `guideai/auth/consent_service.py` (~500 lines)
+- NEW: `mcp/tools/consent.create.json`
+- NEW: `mcp/tools/consent.poll.json`
+- NEW: `mcp/tools/consent.list.json`
+- MODIFIED: `guideai/mcp_server.py` (consent service, tool handlers)
+- MODIFIED: `guideai/api.py` (5 REST endpoints)
+- NEW: `scripts/test_phase6_consent.py`
+
+| 165 | MCP Auth Phase 5: Distributed Rate Limiting | ### #165 - MCP Auth Phase 5: Distributed Rate Limiting (2026-01-22)
+**Milestone:** MCP Security - Redis-Backed Rate Limiting with Tenant Awareness
+**Context:** Scale rate limiting for thousands of concurrent users with per-org quotas based on subscription tier.
+
+**Phase 5 Implementation (Completed):**
+
+1. **DistributedRateLimiter** (`guideai/mcp_rate_limiter.py` - ENHANCED):
+   - `SubscriptionTier` enum: FREE, PRO, ENTERPRISE, UNLIMITED
+   - `TierLimits` dataclass: requests_per_minute, burst_size, daily_quota, user_requests_per_minute
+   - `TIER_LIMITS` configuration dict with tier-specific limits
+   - `DistributedRateLimitResult` dataclass with to_dict(), get_headers() methods
+   - `DistributedRateLimiter` class: Redis-backed with async operations
+   - Sliding window algorithm using Redis sorted sets with Lua scripts
+   - In-memory fallback when Redis unavailable (fail open)
+   - Environment variable overrides: GUIDEAI_RATELIMIT_{TIER}_RPM, _BURST, _DAILY
+
+2. **Tier Configuration:**
+   - FREE: 60 rpm, burst 20, 1000 daily, 15 per-user
+   - PRO: 300 rpm, burst 100, 10000 daily, 60 per-user
+   - ENTERPRISE: 1000 rpm, burst 300, unlimited daily, 200 per-user
+   - UNLIMITED: 10000 rpm, burst 1000, unlimited daily, no per-user limit
+
+3. **Rate Limit Tool Manifests** (`mcp/tools/ratelimit.*.json`):
+   - `ratelimit.getUsage` - Get org/user usage stats (no scope required)
+   - `ratelimit.getLimits` - Get tier limit config (no scope required)
+   - `ratelimit.getMetrics` - Get rate limiter metrics (no scope required)
+   - `ratelimit.reset` - Reset limits (requires `admin.ratelimit` scope)
+
+4. **MCP Server Integration** (`guideai/mcp_server.py`):
+   - Initialize DistributedRateLimiter alongside MCPRateLimiter
+   - Tenant-aware rate limit check in dispatch (after scope check)
+   - Route ratelimit.* tools in dispatch switch statement
+   - `_handle_ratelimit_tool()`: Handlers for all 4 rate limit tools
+
+5. **Rate Limiting Flow:**
+   - Each tool call checks tenant rate limit before execution
+   - Uses org_id for tenant-level limits, user_id for per-user within org
+   - Returns HTTP 429 with Retry-After header when limit exceeded
+   - Tracks metrics: checks_total, redis_checks, memory_checks, denies_total
+
+**Key Design Decisions:**
+- Lazy Redis connection to avoid startup failures
+- Fail open on Redis errors (allow with logging)
+- PRO tier default when user has org context (TODO: actual tier lookup)
+- Per-user fair sharing limits within organization
+
+**Test:** `scripts/test_phase5_rate_limiting.py` (27 tests)
+
+**Files Changed:**
+- MODIFIED: `guideai/mcp_rate_limiter.py` (~500 lines added)
+- MODIFIED: `guideai/mcp_server.py` (distributed limiter, tool handlers)
+- NEW: `mcp/tools/ratelimit.getUsage.json`
+- NEW: `mcp/tools/ratelimit.getLimits.json`
+- NEW: `mcp/tools/ratelimit.getMetrics.json`
+- NEW: `mcp/tools/ratelimit.reset.json`
+- NEW: `scripts/test_phase5_rate_limiting.py`
+
+| 164 | MCP Auth Phase 4: Tenant Context & Isolation | ### #164 - MCP Auth Phase 4: Tenant Context & Isolation (2026-01-22)
+**Milestone:** MCP Security - Multi-Tenant Context Switching
+**Context:** All operations must be scoped to authenticated tenant. Note: org_id is OPTIONAL - users can operate without an organization, and projects can exist independently.
+
+**Phase 4 Implementation (Completed):**
+
+1. **MCPServiceAdapter** (`guideai/mcp_service_adapter.py` - NEW):
+   - `TenantContext` dataclass: user_id, service_principal_id, org_id (optional), project_id (optional)
+   - `to_headers()`: Generates X-Org-ID, X-Project-ID, X-User-ID, X-Request-ID headers for downstream services
+   - `to_audit_context()`: Generates context for audit logging
+   - `MCPServiceAdapter` class: Wraps session context for service calls
+   - `inject_tenant_params()`: Injects org_id/project_id into tool parameters if not already set
+
+2. **ContextSwitchHandler** (`guideai/mcp_service_adapter.py`):
+   - `set_org_context()`: Switch org with permission verification
+   - `set_project_context()`: Switch project with org/access verification
+   - `clear_context()`: Reset org and project context
+   - `get_current_context()`: Return current session state
+
+3. **Context Tool Manifests** (`mcp/tools/context.*.json`):
+   - `context.setOrg` - Switch org context (requires `context.switch` scope)
+   - `context.setProject` - Switch project context (requires `context.switch` scope)
+   - `context.getContext` - Get current context (public, no scope required)
+   - `context.clearContext` - Clear org/project context (requires `context.switch` scope)
+
+4. **MCP Server Handlers** (`guideai/mcp_server.py`):
+   - `_handle_context_tool()`: Routes context.* tools
+   - `_set_org_context()`: Permission-verified org switching with role/permissions
+   - `_set_project_context()`: Project switching with org access verification
+   - `_clear_context()`: Reset tenant scope
+   - `_get_current_context()`: Return session state
+   - `_get_permission_service()`: Lazy-load AsyncPermissionService
+
+5. **Permission Integration**:
+   - Uses `AsyncPermissionService.get_user_org_role()` for org access check
+   - Uses `AsyncPermissionService.get_user_org_permissions()` for role permissions
+   - Graceful fallback when permission service unavailable (dev mode)
+
+**Key Design Decisions:**
+- org_id is OPTIONAL - users can clear context and operate without org
+- Projects can belong to orgs OR be personal (owner_id based)
+- Setting project auto-sets org context if project has one
+- Switching org resets project context (must re-select project)
+- Permission checks are async for database-backed verification
+
+**Test:** `tests/test_mcp_tenant_context.py`, `scripts/test_phase4_tenant_context.py`
+
+**Files Changed:**
+- NEW: `guideai/mcp_service_adapter.py`
+- NEW: `mcp/tools/context.setOrg.json`
+- NEW: `mcp/tools/context.setProject.json`
+- NEW: `mcp/tools/context.getContext.json`
+- NEW: `mcp/tools/context.clearContext.json`
+- MODIFIED: `guideai/mcp_server.py` (context handlers)
+
+**Behavior:** `behavior_lock_down_security_surface`, `behavior_design_api_contract`
+|
+
+| 163 | MCP Auth Phase 3: Scope Enforcement | ### #163 - MCP Auth Phase 3: Scope Enforcement (2026-01-22)
+**Milestone:** MCP Security - Authorization & Scope Enforcement
+**Context:** Every tool call must be authorized against the user's granted scopes. Note: org_id is OPTIONAL - users can use GuideAI without an organization.
+
+**Phase 3 Implementation (Completed):**
+
+1. **Session Scope Methods** (`guideai/mcp_server.py` - MCPSessionContext):
+   - `has_scope(scope)` - Check if single scope is granted
+   - `has_all_scopes(scopes)` - Check if ALL scopes are granted
+   - `has_any_scope(scopes)` - Check if ANY scope is granted
+   - `missing_scopes(required)` - Get set of required but ungranted scopes
+
+2. **Tool Scopes Loading** (`guideai/mcp_server.py` - _load_tool_manifests):
+   - Added `self._tool_scopes: Dict[str, List[str]]` map
+   - Extracts `required_scopes` from each tool manifest at startup
+   - Currently 5 tools have scopes defined (behaviors, runs, projects, compliance)
+
+3. **Scope Enforcement in Dispatch** (`guideai/mcp_server.py` - _dispatch_tool_call):
+   - After auth check, verifies session has required scopes
+   - Returns ACCESS_DENIED (-32003) with missing scopes detail
+   - Response includes: tool, required_scopes, granted_scopes, missing_scopes
+
+4. **MCPAuthMiddleware** (`guideai/mcp_auth_middleware.py` - NEW):
+   - `AuthDecision` enum: ALLOW, DENY, CONSENT_REQUIRED
+   - `AuthResult` dataclass with decision, reason, scopes
+   - `authorize()` method for scope checking
+   - Supports future consent flow integration (Phase 6)
+   - Handles both service principals and human users
+
+5. **Tool Manifests Updated** with `required_scopes`:
+   - `behaviors.list` → `["behaviors.read"]`
+   - `runs.create` → `["runs.create"]`
+   - `runs.list` → `["runs.read"]`
+   - `projects.list` → `["projects.read"]`
+   - `compliance.validateChecklist` → `["compliance.validate"]`
+
+**Key Design Decisions:**
+- org_id is OPTIONAL throughout - users can work without organizations
+- Service principals cannot acquire new scopes at runtime (pre-configured)
+- Human users may trigger consent flow for missing scopes (Phase 6)
+- Empty required_scopes = tool is open to any authenticated user
+
+**Test:** `tests/test_mcp_scope_enforcement.py`
+
+**Behavior:** `behavior_lock_down_security_surface`, `behavior_design_api_contract`
+|
+
+| 162 | MCP Auth Phase 1 & 2: Session Identity + Service Principal Auth | ### #162 - MCP Auth Phase 1 & 2 Implementation (2026-01-22)
+**Milestone:** MCP Security - Session Identity & Service Principal Auth
+**Context:** Implementing first two phases of MCP_AUTH_IMPLEMENTATION_PLAN.md to enable authentication for MCP tools.
+
+**Phase 1: Session Identity (Completed):**
+
+1. **Added `MCPSessionContext` dataclass** (`guideai/mcp_server.py:61-97`):
+   - `user_id`, `org_id`, `service_principal_id` - identity fields
+   - `roles`, `granted_scopes` - authorization data
+   - `auth_method` - 'device_flow' or 'client_credentials'
+   - `expires_at` - session expiration timestamp
+   - `is_authenticated` property - checks identity and expiration
+   - `identity` property - returns user_id or service_principal_id
+
+2. **Added `PUBLIC_TOOLS` constant** (`guideai/mcp_server.py:52-58`):
+   - Tools that don't require authentication: `auth.deviceLogin`, `auth.deviceInit`, `auth.devicePoll`, `auth.authStatus`, `auth.clientCredentials`, `auth.refreshToken`, `auth.consentStatus`
+
+3. **Auth gate in `_dispatch_tool_call`** (`guideai/mcp_server.py`):
+   - Checks if tool is in PUBLIC_TOOLS before requiring auth
+   - Returns AUTH_REQUIRED (-32001) error for unauthenticated calls to protected tools
+   - Includes helpful error message directing to auth tools
+
+**Phase 2: Service Principal Auth (Completed):**
+
+1. **`_handle_client_credentials()` method** (`guideai/mcp_server.py`):
+   - OAuth 2.0 Client Credentials flow (RFC 6749 Section 4.4)
+   - Calls `ServicePrincipalService.authenticate(client_id, client_secret)`
+   - Validates requested scopes against allowed_scopes
+   - Populates session context on success
+   - Returns structured error codes: INVALID_REQUEST, INVALID_CLIENT, INACTIVE_CLIENT, INVALID_SCOPE, SERVER_ERROR
+
+2. **`_populate_session_from_device_flow()` method** (`guideai/mcp_server.py`):
+   - Populates session after successful `auth.deviceLogin`
+   - Extracts user_id, org_id, scopes, roles from auth result
+
+3. **Tool manifest: `auth.clientCredentials`** (`mcp/tools/auth.clientCredentials.json`):
+   - Input: client_id, client_secret, scopes (optional)
+   - Output: status, service_principal_id, org_id, scopes, role, expires_in
+   - Includes security notes on credential handling
+
+**Error Codes Added:**
+- `AUTH_REQUIRED = -32001` - Tool requires authentication
+- `ACCESS_DENIED = -32003` - Scope/permission denied (reserved for Phase 3)
+
+**Verification:**
+```python
+from guideai.mcp_server import MCPServer, MCPSessionContext, PUBLIC_TOOLS
+# PUBLIC_TOOLS: {'auth.clientCredentials', 'auth.deviceInit', ...}
+# MCPSessionContext().is_authenticated -> False (until auth)
+```
+
+**Next Steps (Phase 3):** Scope enforcement with `MCPAuthMiddleware`
+
+**Behavior:** `behavior_lock_down_security_surface`, `behavior_design_api_contract`
+|
+
+| 161 | MCP Auth Implementation Plan: Production-Grade Authentication | ### #161 - MCP Auth Implementation Plan (2026-01-22)
+**Milestone:** MCP Security - Production-Grade Authentication for Scale
+**Context:** GuideAI MCP server bypasses AgentAuthService—tools execute without verifying identity, checking scopes, or enforcing tenant isolation. This plan implements auth for thousands of concurrent users/agents.
+
+**Planning Document:** `docs/MCP_AUTH_IMPLEMENTATION_PLAN.md`
+
+**8 Phases (6-7 weeks):**
+1. **Phase 1: MCP Session Identity** - `MCPSessionContext` dataclass, auth gate for protected tools
+2. **Phase 2: Service Principal Auth** - `auth.clientCredentials` MCP tool for machine-to-machine auth
+3. **Phase 3: Scope Enforcement** - `MCPAuthMiddleware`, pre-dispatch authorization
+4. **Phase 4: Tenant Context & Isolation** - Context switching, org/project scoping
+5. **Phase 5: Distributed Rate Limiting** - Redis ElastiCache/Memorystore, per-tenant quotas
+6. **Phase 6: Consent UX Dashboard** - Web approval page, polling API, consent_requests table
+7. **Phase 7: Dynamic Policy Engine** - YAML bundle evaluation, hot-reload via SIGHUP
+8. **Phase 8: Token Vault & Security** - KMS envelope encryption, token blacklist
+
+**Key Decisions:**
+- Service Principal Auth: Implementing NOW with `auth.clientCredentials`
+- Consent UX: Building dashboard approval page NOW
+- Redis: Using managed ElastiCache/Memorystore for production HA
+
+**Target Completion:** 2026-03-05 (6 weeks)
+
+**Behavior:** `behavior_design_api_contract`, `behavior_lock_down_security_surface`, `behavior_update_docs_after_changes`
+|
+
+| 160 | MCP Server: VS Code Copilot Chat $ref Resolution Fix | ### #160 - MCP Server: VS Code Copilot Chat Compatibility (2026-01-22)
+**Milestone:** MCP Integration - Full VS Code Copilot Chat Support
+**Context:** VS Code Copilot Chat requires fully-inlined JSON schemas for MCP tools. The GuideAI MCP server was returning tool schemas with unresolved `$ref` references that VS Code couldn't process.
+
+**Problem Statement:**
+- MCP tools with BCI/reflection schemas (bci_composeprompt, bci_validatecitations, reflection_extract, etc.) used `$ref` to external JSON schema files
+- VS Code Copilot Chat cannot resolve external `$ref` references like `../../schema/bci/v1/prompt.json#/definitions/ComposePromptRequest`
+- This prevented Copilot Chat from discovering and invoking 11+ critical tools
+
+**Implementation:**
+
+1. **Added `_resolve_json_refs()` method** (`guideai/mcp_server.py`):
+   - Recursively resolves all `$ref` types in JSON schemas
+   - Handles internal refs: `#/definitions/BehaviorSnippet`
+   - Handles relative path refs: `../../schema/bci/v1/prompt.json#/definitions/...`
+   - Handles bare filename refs: `trace.json#/definitions/TraceFormat`
+   - Falls back to `{"type": "object", "additionalProperties": true}` on resolution failure
+
+2. **Updated `_load_tool_manifests()`** (`guideai/mcp_server.py`):
+   - Now calls `_resolve_json_refs()` on each tool's `inputSchema` before storing
+   - All 220 tools now have fully-inlined schemas
+
+**Verification:**
+- All 220 tools report no remaining `$ref` references
+- Successfully invoked `mcp_guideai_projects_list` from VS Code Copilot Chat
+- BCI tools (`bci_composeprompt`, etc.) now have complete inline schemas
+
+**Documentation Updated:**
+- AGENTS.md: Updated TL;DR and `behavior_prefer_mcp_tools` to emphasize native VS Code Copilot Chat support
+- CLAUDE.md: Updated behavior retrieval section with MCP tool names
+- .github/copilot-instructions.md: Added section on GuideAI MCP tools working natively
+
+**Behavior:** `behavior_prefer_mcp_tools`, `behavior_update_docs_after_changes`
+|
+
+| 159 | Behavior Lifecycle Enhancement: Confidence Scoring & Proposal Workflow | ### #159 - Behavior Lifecycle Enhancement (2026-01-16)
+**Milestone:** Metacognitive Reuse - Operationalizing Behavior Proposal & Auto-Approval
+**Context:** Per AGENTS.md behavior lifecycle, implementing confidence scoring and proposal workflow to enable automatic behavior creation from observed patterns.
+
+**Problem Statement:**
+- Since platform inception, NO new behaviors have been proposed/created (only the initial 34)
+- Agents are not actively using `behaviors.getForTask` or MCP tools before tasks
+- Role declarations (🎭 Role:) are documentation-only, not tracked in telemetry
+
+**Implementation:**
+
+1. **Confidence Scoring** (`guideai/behavior_service.py`):
+   - Added `confidence_score: Optional[float]` field to `BehaviorVersion` (0.0-1.0)
+   - Added `historical_validations: Optional[List[str]]` for run_id tracking
+   - Added `eligible_for_auto_approval` property (confidence >= 0.8)
+   - Updated `to_dict()`, row mappers, request dataclasses
+
+2. **ProposeBehaviorRequest & RoleContext** dataclasses:
+   - `ProposeBehaviorRequest`: Full proposal spec with confidence, validations, pattern_id, rationale
+   - `RoleContext`: Telemetry-tracked role declarations (emphasized but not mandatory)
+   - Added `propose_behavior()` method with auto-approval logic
+
+3. **PostgreSQL Migration** (`migrations/versions/20260116_add_confidence_scoring.py`):
+   - Added `confidence_score` DECIMAL(3,2) column
+   - Added `historical_validations` JSONB column
+   - Added `proposed_by_role` and `pattern_id` columns
+   - Created partial index on confidence_score >= 0.80
+
+4. **CLI Commands** (`guideai/cli.py`):
+   - `guideai behaviors propose`: Create behavior from pattern with confidence scoring
+   - `guideai behaviors get-for-task`: Retrieve relevant behaviors BEFORE task execution
+   - Role-specific advisory output based on Student/Teacher/Strategist
+
+5. **MCP Tools** (`mcp/tools/`):
+   - `behaviors.propose.json`: Propose with confidence, auto-approval if criteria met
+   - `behaviors.getForTask.json`: Primary tool agents call at task start
+
+6. **Instruction Files Updated**:
+   - AGENTS.md: Added `behaviors.getForTask` trigger, updated Quick Triggers
+   - CLAUDE.md: Added mandatory behavior retrieval section
+   - .github/copilot-instructions.md: Added behavior retrieval section
+
+**Auto-Approval Criteria** (per AGENTS.md):
+- confidence_score >= 0.8
+- 3+ historical_validations
+- Clear, unambiguous triggers
+- No overlap with existing behaviors
+- Follows behavior_<verb>_<noun> naming
+
+**Behavior:** `behavior_curate_behavior_handbook`, `behavior_update_docs_after_changes`
+
+| 158 | Horizontal Scaling & Hardening (Phase 4) | ### #158 - Horizontal Scaling & Hardening (Phase 4) ✅ (2026-01-16)
+**Milestone:** Agent Execution Architecture - Production-Ready Multi-Worker Deployment
+**Context:** Per AGENT_EXECUTION_ARCHITECTURE.md Phase 4, adding horizontal scaling infrastructure and monitoring.
+
+**Implementation:**
+1. **Consumer Groups** (already in `consumer.py`):
+   - XREADGROUP for at-least-once delivery
+   - Configurable consumer_group and consumer_name
+   - Priority-ordered consumption (high → normal → low)
+   - XAUTOCLAIM for pending message recovery
+
+2. **ZombieReaper** (`guideai/zombie_reaper.py`):
+   - Background task that cleans up zombie workspaces
+   - `ZombieReaperConfig` - check_interval, max_idle_seconds, enabled
+   - `ReaperStats` - runs_completed, zombies_reaped, errors
+   - Calls orchestrator.cleanup_zombies() periodically
+   - Context manager support for easy integration
+
+3. **Prometheus Metrics** (`guideai/execution_metrics.py`):
+   - `JOBS_PROCESSED` Counter - by status and scope
+   - `JOBS_IN_PROGRESS` Gauge - by worker_id
+   - `JOB_DURATION` Histogram - with 10s-1h buckets
+   - `QUEUE_DEPTH` and `QUEUE_PENDING` Gauges
+   - `WORKSPACES_ACTIVE`, `WORKSPACES_PROVISIONED`, `WORKSPACES_CLEANED`
+   - `ZOMBIES_REAPED`, `REAPER_RUNS`, `REAPER_ERRORS`
+   - `QUOTA_CHECKS`, `QUOTA_USAGE` Gauges
+   - `MetricsCollector` class for queue metrics from Redis
+   - Helper functions safe to call without prometheus_client
+
+4. **Worker Integration** (`guideai/execution_worker.py`):
+   - Metrics recorded for job processing
+   - Workspace provisioning and cleanup metrics
+   - Worker info set on startup
+
+**Files Created:**
+- `guideai/zombie_reaper.py` - ZombieReaper class
+- `guideai/execution_metrics.py` - Prometheus metrics
+- `packages/amprealize/tests/test_zombie_reaper.py` - 17 tests
+- `packages/amprealize/tests/test_execution_metrics.py` - 20 tests
+- `packages/execution-queue/tests/test_horizontal_scaling.py` - 17 tests
+
+**Files Modified:**
+- `guideai/execution_worker.py` - Metrics integration
+- `docs/AGENT_EXECUTION_ARCHITECTURE.md` - Phase 4 deliverables complete
+
+**Test Results:**
+- ZombieReaper tests: 17 passed
+- Execution metrics tests: 16 passed + 4 skipped (prometheus optional)
+- Horizontal scaling tests: 17 passed
+- Total amprealize package: 232 passed
+
+**Architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Production Worker                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐   │
+│  │   Consumer   │  │ ZombieReaper │  │    Metrics      │   │
+│  │ (XREADGROUP) │  │ (background) │  │  (prometheus)   │   │
+│  └──────────────┘  └──────────────┘  └─────────────────┘   │
+│                         ↓                    ↓              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │           ExecutionWorker._handle_job()              │  │
+│  │  • Heartbeat loop    • Workspace provisioning        │  │
+│  │  • Timeout handling  • Metrics recording             │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+ |
+| 157 | Quota & Throttling Policies (Phase 3) | ### #157 - Quota & Throttling Policies (Phase 3) ✅ (2026-01-16)
+**Milestone:** Agent Execution Architecture - Multi-Tenant Quota Enforcement
+**Context:** Per AGENT_EXECUTION_ARCHITECTURE.md Phase 3, implementing plan-based resource limits with priority queue boosting.
+
+**Implementation:**
+1. **QuotaService** (`packages/amprealize/src/amprealize/quota.py`):
+   - `QuotaLimits` dataclass - max_concurrent, execution_seconds, memory, cpu, priority_boost
+   - `PLAN_LIMITS` - free/pro/enterprise tier definitions
+   - `get_isolation_scope()` - org-optional scope resolution (org:id or user:id)
+   - `parse_scope()`, `is_org_scope()`, `is_user_scope()` - utility functions
+   - `PlanResolver` protocol with Environment and Database implementations
+   - `QuotaService.get_limits()`, `check_can_execute()`, `get_priority_boost()`
+   - Module singleton with `get_quota_service()`, `reset_quota_service()`
+
+2. **Priority Boost in Publisher** (`packages/execution-queue/src/execution_queue/publisher.py`):
+   - `enqueue_with_quota_boost()` - uses QuotaService for dynamic priority boost
+   - `_apply_priority_boost()` - numeric boost (0-5) applied to priority level
+   - Enterprise gets +5 boost (LOW→HIGH), Pro gets +2, Free gets +0
+
+3. **Orchestrator Integration** (`packages/amprealize/src/amprealize/orchestrator.py`):
+   - `_get_quota_service()` - lazy-init QuotaService singleton
+   - `_enforce_quota()` - uses QuotaService for plan-based limits
+   - `get_limits()` - public method to get limits for a scope
+   - Backward compat: still supports legacy `quota_resolver` parameter
+
+4. **Multi-Tenant Isolation Tests** (`packages/amprealize/tests/test_quota.py`):
+   - 35 tests covering QuotaLimits, scope utils, plan tiers, isolation scenarios
+   - Tests for org vs user scope, plan resolution, quota enforcement
+
+**Files Created:**
+- `packages/amprealize/src/amprealize/quota.py` - QuotaService and utilities
+- `packages/amprealize/tests/test_quota.py` - Quota and isolation tests
+
+**Files Modified:**
+- `packages/amprealize/src/amprealize/__init__.py` - Added quota exports
+- `packages/amprealize/src/amprealize/orchestrator.py` - QuotaService integration
+- `packages/execution-queue/src/execution_queue/publisher.py` - Priority boost
+- `packages/amprealize/tests/test_orchestrator.py` - Fixed tier limits
+- `docs/AGENT_EXECUTION_ARCHITECTURE.md` - Updated Phase 3 deliverables
+
+**Architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      QuotaService                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐   │
+│  │ PlanResolver │  │  ScopeUtils  │  │   PLAN_LIMITS   │   │
+│  │ (DB/Env)     │  │ (isolation)  │  │ (free/pro/ent)  │   │
+│  └──────────────┘  └──────────────┘  └─────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Test Results:** 70 tests passing (orchestrator: 20, runtime: 15, quota: 35) |
+| 156 | Amprealize Workspace Orchestration (Phase 2) | ### #156 - Amprealize Workspace Orchestration (Phase 2) ✅ (2026-01-16)
+**Milestone:** Agent Execution Architecture - Unified Workspace Control Plane
+**Context:** Per AGENT_EXECUTION_ARCHITECTURE.md Phase 2, consolidating workspace management into Amprealize. Replaces workspace-agent gRPC service with direct Podman orchestration.
+
+**Implementation:**
+1. **Runtime Module** (`packages/amprealize/src/amprealize/runtime/`):
+   - `podman.py` - Async-compatible PodmanClient with all container operations
+   - `state.py` - WorkspaceState, StateStore (InMemory/Redis backends)
+   - Auto-discovery of podman socket, async wrappers via `run_in_executor()`
+
+2. **AmpOrchestrator** (`packages/amprealize/src/amprealize/orchestrator.py`):
+   - `WorkspaceConfig` - Provisioning configuration (run_id, scope, resource limits)
+   - `WorkspaceInfo` - Runtime info (container_id, status, workspace_path)
+   - `QuotaLimits` - Per-tenant limits (free: 1, pro: 3, enterprise: 10 concurrent)
+   - Methods: `provision_workspace()`, `exec_in_workspace()`, `send_heartbeat()`
+   - `cleanup_workspace()`, `cleanup_zombies()` for lifecycle management
+   - `OrchestratorHooks` for telemetry/compliance integration
+
+3. **ExecutionWorker Integration** (`guideai/execution_worker.py`):
+   - Updated to use `AmpOrchestrator` for workspace provisioning
+   - Heartbeat loop calls `orchestrator.send_heartbeat()` for zombie detection
+   - Cleanup uses `orchestrator.cleanup_workspace()` with preserve-on-failure support
+
+4. **GuideAI Wrapper** (`guideai/workspace_agent/__init__.py`):
+   - Simplified to re-export from amprealize
+   - `GuideAIWorkspaceClient` now wraps `AmpOrchestrator` (backward compat)
+   - Deprecated gRPC-related parameters (host, token)
+
+**Files Created:**
+- `packages/amprealize/src/amprealize/runtime/__init__.py`
+- `packages/amprealize/src/amprealize/runtime/podman.py` - PodmanClient
+- `packages/amprealize/src/amprealize/runtime/state.py` - StateStore implementations
+- `packages/amprealize/src/amprealize/orchestrator.py` - AmpOrchestrator
+- `packages/amprealize/tests/test_orchestrator.py` - Orchestrator tests
+- `packages/amprealize/tests/test_runtime.py` - Runtime module tests
+
+**Files Modified:**
+- `packages/amprealize/src/amprealize/__init__.py` - Added orchestrator exports
+- `guideai/execution_worker.py` - Integrated AmpOrchestrator
+- `guideai/workspace_agent/__init__.py` - Migrated from gRPC to AmpOrchestrator
+- `docs/AGENT_EXECUTION_ARCHITECTURE.md` - Updated Phase 2 deliverables
+
+**Architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    AmpOrchestrator                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │ PodmanClient│  │  StateStore │  │    QuotaLimits      │ │
+│  │ (runtime)   │  │ (Redis)     │  │   (per-tenant)      │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+│                                                             │
+│  provision_workspace() → cleanup_workspace()                │
+│  exec_in_workspace()   → send_heartbeat()                  │
+│  cleanup_zombies()     → get_workspace_info()              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Testing:**
+- Verified orchestrator creates containers with proper labels
+- Quota enforcement tests with mock state store
+- Heartbeat and zombie detection tests
+- File read/write operations tests
+
+**Behaviors Applied:**
+- `behavior_use_amprealize_for_environments` - All workspace management via Amprealize
+- `behavior_extract_standalone_package` - Runtime module in amprealize package
+- `behavior_update_docs_after_changes` - Updated architecture doc deliverables
+
+| 155 | Execution Queue Foundation (Phase 1) | ### #155 - Execution Queue Foundation (Phase 1) ✅ (2026-01-16)
+**Milestone:** Agent Execution Architecture - Queue-based Worker System
+**Context:** Per AGENT_EXECUTION_ARCHITECTURE.md, decoupling API request handling from agent execution for horizontal scaling. Addresses COLLAB_SAAS_REQUIREMENTS.md latency targets (<100ms API response).
+
+**Implementation:**
+1. **Standalone Package** (`packages/execution-queue/`):
+   - `ExecutionJob` - Dataclass with tenant isolation (`org:{org_id}` or `user:{user_id}`)
+   - `ExecutionQueuePublisher` - XADD to priority streams (`guideai:executions:{high|normal|low}`)
+   - `ExecutionQueueConsumer` - XREADGROUP with consumer groups for horizontal scaling
+   - `BackpressureMonitor` - Queue depth monitoring with `QueueFullError`
+   - `DeadLetterHandler` - DLQ for failed jobs after max retries
+   - Priority boost by tenant tier (enterprise: +2, pro: +1)
+
+2. **Execution Worker** (`guideai/execution_worker.py`):
+   - Standalone worker process consuming from queue
+   - 30-second heartbeat loop for zombie detection
+   - Graceful shutdown with signal handlers
+   - Workspace provisioning placeholders (connects to workspace-agent)
+   - Entry point: `python -m guideai.execution_worker`
+
+3. **WorkItemExecutionService Updates** (`guideai/work_item_execution_service.py`):
+   - Added `EXECUTION_MODE` feature flag (direct|queue)
+   - Queue mode: enqueues `ExecutionJob` instead of `asyncio.create_task()`
+   - Direct mode: preserves existing inline execution
+   - Lazy-init `ExecutionQueuePublisher` when queue mode enabled
+
+4. **Blueprint Updates** (`packages/amprealize/src/amprealize/blueprints/local-test-suite.yaml`):
+   - Added `execution-worker` service in agents module
+   - Added `EXECUTION_MODE` env var to guideai-api
+   - Worker connects to Redis, workspace-agent, databases
+
+**Files Created:**
+- `packages/execution-queue/` - Complete standalone package
+  - `pyproject.toml`, `README.md`
+  - `src/execution_queue/__init__.py`, `py.typed`
+  - `models.py`, `publisher.py`, `consumer.py`
+  - `backpressure.py`, `dead_letter.py`
+- `guideai/execution_worker.py` - Worker process
+- `tests/test_execution_queue.py` - Unit + integration tests
+
+**Files Modified:**
+- `guideai/work_item_execution_service.py` - Added queue mode
+- `packages/amprealize/src/amprealize/blueprints/local-test-suite.yaml` - Added execution-worker
+
+**Architecture:**
+```
+┌─────────────────┐     Redis Streams     ┌──────────────────┐
+│  guideai-api    │ ─────────────────────▶│ execution-worker │
+│                 │     XADD/XREADGROUP   │    (N replicas)  │
+│  EXECUTION_MODE │                       │                  │
+│  = queue        │     Priority Streams: │  - Consumes jobs │
+└─────────────────┘     high|normal|low   │  - Runs agents   │
+                                          │  - Heartbeats    │
+                                          └────────┬─────────┘
+                                                   │ gRPC
+                                                   ▼
+                                          ┌───────────────────┐
+                                          │  workspace-agent  │
+                                          │  (container mgmt) │
+                                          └───────────────────┘
+```
+
+**Behaviors Applied:** `behavior_extract_standalone_package`, `behavior_use_amprealize_for_environments`, `behavior_update_docs_after_changes`
+
+**Impact:** API now responds immediately after enqueuing (<100ms target). Workers scale horizontally. Feature flag enables gradual rollout. Priority queues ensure enterprise/pro tenants get faster processing.
+
+_Last Updated: 2026-01-16_
+
+| 154 | Workspace Agent Service Extraction | ### #154 - Workspace Agent Service Extraction COMPLETE ✅ (2026-01-16)
+**Milestone:** Agent Execution Infrastructure
+**Context:** Agent tasks were executing inside the API container instead of isolated workspaces. The `AgentWorkspaceManager` was tightly coupled to the API server, making it a control plane concern rather than proper service separation.
+
+**Implementation:**
+1. **Standalone Package** (`packages/workspace-agent/`):
+   - `WorkspaceService` - Core container lifecycle management (provision, exec, cleanup)
+   - `PodmanSocketClient` - Socket-based container management via podman Python library
+   - `StateStore` abstraction - InMemoryStateStore (dev) and RedisStateStore (production)
+   - gRPC server with `AuthInterceptor` for bearer token authentication
+   - gRPC client for connecting from API server
+2. **Protobuf Definitions** (`proto/workspace/v1/workspace_agent.proto`):
+   - `WorkspaceAgentService` with 11 RPCs: Provision, Exec, ReadFile, WriteFile, ListDir, Cleanup, etc.
+   - Messages: `WorkspaceConfig`, `WorkspaceInfo`, `ExecResult`, etc.
+3. **GuideAI Integration** (`guideai/workspace_agent/__init__.py`):
+   - `GuideAIWorkspaceClient` - Same interface as old `AgentWorkspaceManager`
+   - `get_workspace_client()` - Factory that connects to gRPC service
+4. **Blueprint Updated** (`packages/amprealize/src/amprealize/blueprints/local-test-suite.yaml`):
+   - Added `workspace-agent` service on port 50051
+   - Mounts podman socket exclusively to workspace-agent
+   - `guideai-api` connects via gRPC with shared token auth
+
+**Files Created:**
+- `packages/workspace-agent/` - Complete standalone package (models, service, grpc_server, grpc_client, cli)
+- `proto/workspace/v1/workspace_agent.proto` - Protobuf service definition
+- `guideai/workspace_agent/__init__.py` - Thin wrapper for guideai integration
+
+**Files Modified:**
+- `guideai/work_item_execution_service.py` - Updated imports to use `workspace_agent`
+- `guideai/tool_executor.py` - Updated docstrings for new client type
+- `guideai/agent_workspace_manager.py` - Added deprecation notice
+- `packages/amprealize/src/amprealize/blueprints/local-test-suite.yaml` - Added workspace-agent service
+
+**Architecture:**
+```
+┌─────────────────┐     gRPC (50051)     ┌──────────────────┐
+│  guideai-api    │ ─────────────────────▶│  workspace-agent │
+│                 │                       │                  │
+│  - Orchestrates │    Auth: Bearer       │  - Owns podman   │
+│  - Runs agents  │    Token              │  - Creates       │
+└─────────────────┘                       │    containers    │
+                                          │  - Executes cmds │
+                                          └────────┬─────────┘
+                                                   │
+                                                   ▼
+                                          ┌───────────────────┐
+                                          │  Podman Socket    │
+                                          │  /run/podman.sock │
+                                          └───────────────────┘
+```
+
+**Behaviors Applied:** `behavior_extract_standalone_package`, `behavior_prefer_mcp_tools`, `behavior_update_docs_after_changes`
+
+**Impact:** Proper separation of concerns - API server is now a pure control plane while workspace-agent handles container management. Enables horizontal scaling of API servers while workspace-agent remains singleton. gRPC provides high-performance inter-service communication with bearer token auth.
+
+_Last Updated: 2026-01-16_
+
 | 153 | Work Item Comments UI + API | ### #153 - Work Item Comments UI + API COMPLETE ✅ (2026-01-14)
 **Milestone:** SaaS Web Console & Real-Time Collaboration
 **Context:** Work item comments existed in BoardService and MCP tooling but were not visible in the web console work item drawer.
@@ -2168,3 +2943,6 @@ _Last Updated: 2025-12-21_
 
 | 134 | ✅ 8.8.2 Telemetry Surface Parity COMPLETE | **Achievement:** ✅ **Telemetry query/dashboard across CLI and MCP surfaces** – Implemented telemetry query/dashboard CLI commands with RazeService integration, MCP tool manifests, and parity test suite (15 tests passing).<br><br>**What shipped:**<br>- ✅ **CLI telemetry query:** `guideai telemetry query --event-type <type> --from <date> --to <date> --run-id <id> --limit N --format json/table` with relative date parsing ("7d", "24h")<br>- ✅ **CLI telemetry dashboard:** `guideai telemetry dashboard --run-id <id> --from <date> --to <date> --watch` with 5s polling, Rich console table output, daily/run summary views<br>- ✅ **MCP tool telemetry.query:** `mcp/tools/telemetry.query.json` with filters (event_type, from, to, run_id, action_id, session_id, actor_surface, level, search, limit, offset)<br>- ✅ **MCP tool telemetry.dashboard:** `mcp/tools/telemetry.dashboard.json` with run_id, from, to, format parameters<br>- ✅ **Parity test suite:** `tests/test_telemetry_parity.py` (15 unit tests) validating CLI/MCP schema alignment, date parsing, output formats<br><br>**Behaviors applied:** `behavior_validate_cross_surface_parity`, `behavior_use_raze_for_logging`, `behavior_update_docs_after_changes`<br><br>**Files created:**<br>- `mcp/tools/telemetry.query.json` (MCP tool manifest)<br>- `mcp/tools/telemetry.dashboard.json` (MCP tool manifest)<br>- `tests/test_telemetry_parity.py` (404 lines, 15 tests)<br><br>**Files modified:**<br>- `guideai/cli.py` (added telemetry query/dashboard subcommands)<br>- `guideai/mcp_server.py` (added telemetry tool handlers)<br>- `WORK_STRUCTURE.md` (marked 8.8.2 complete)<br><br>**Impact:** Telemetry observability now available across all surfaces. Developers can query logs and view dashboards via CLI (`guideai telemetry query`) or MCP tools (`telemetry.query`, `telemetry.dashboard`). Test suite validates parity between surfaces.<br><br>_Last Updated: 2025-12-02_ | 2025-12-02 |
 | 135 | 🧩 Agent assignment schema alignment | **Achievement:** Added `project_id` support to `public.agents` and aligned personal agent listing with org/project assignment storage to fix assignment failures.<br><br>**What shipped:**<br>- **Migration:** `migrations/versions/20260111_add_project_id_to_agents.py` adds `project_id` + index to `public.agents`.<br>- **Service fix:** `guideai/multi_tenant/organization_service.py` now reads personal agents from `public.agents` with optional `project_id` filter.<br><br>**Behaviors applied:** `behavior_migrate_postgres_schema`, `behavior_update_docs_after_changes`<br><br>**Impact:** Assigning agents to projects no longer fails with missing `project_id` column; personal agent assignment now aligns with org/project agent storage.<br><br>_Last Updated: 2026-01-11_ | 2026-01-11 |
+| 136 | 🛡️ Alembic Migration Safeguards Implemented | **Achievement:** ✅ **Comprehensive migration validation system preventing broken revision chains, unsupported parameters, and multiple heads** – Created `scripts/validate_migrations.py` (300 lines), integrated with pre-commit hooks, updated `behavior_migrate_postgres_schema` with enhanced steps, created `docs/MIGRATION_GUIDE.md` for developer reference.<br><br>**What shipped:**<br>- ✅ **Validation script:** `scripts/validate_migrations.py` (300 lines) with 4 checks: revision ID references (catches filename vs actual ID mismatch), unsupported parameters (`create_index` comment detection), multiple heads detection, docstring consistency warnings<br>- ✅ **Pre-commit hook:** Added `validate-migrations` hook to `.pre-commit-config.yaml` running on `migrations/versions/*.py` files<br>- ✅ **Template enhancement:** Updated `migrations/script.py.mako` with "Common Pitfalls to Avoid" documentation in docstring<br>- ✅ **Behavior update:** Enhanced `behavior_migrate_postgres_schema` in AGENTS.md with 10 steps including validation, reference to MIGRATION_GUIDE.md<br>- ✅ **Documentation:** Created `docs/MIGRATION_GUIDE.md` (200+ lines) with quick start, common pitfalls, best practices, troubleshooting<br><br>**Issues prevented by validation:**<br>1. **Revision ID mismatch:** Using filename `20260115_add_user_github_links` instead of actual revision ID `add_user_github_links` in `down_revision`<br>2. **Multiple heads:** Building off pre-merge revision instead of merge point `ad1244ed2cf6`<br>3. **Unsupported parameters:** Using `comment=` in `op.create_index()` which SQLAlchemy rejects<br><br>**Behaviors applied:** `behavior_migrate_postgres_schema` (meta: updating the behavior itself), `behavior_prevent_secret_leaks` (pre-commit integration), `behavior_update_docs_after_changes`<br><br>**Files created:**<br>- `scripts/validate_migrations.py` (300 lines): Migration chain validation with 4 checks<br>- `docs/MIGRATION_GUIDE.md` (200+ lines): Developer documentation with examples<br><br>**Files modified:**<br>- `.pre-commit-config.yaml`: Added validate-migrations local hook<br>- `migrations/script.py.mako`: Added pitfall documentation to template<br>- `AGENTS.md`: Enhanced `behavior_migrate_postgres_schema` with 10 steps + reference<br><br>**Validation:**<br>- ✅ `pre-commit run validate-migrations --all-files` PASSED<br>- ✅ `python scripts/validate_migrations.py` detects 2 docstring warnings (non-blocking), 0 errors<br><br>**Impact:** Future migration issues like broken revision chains will be caught before commit. Pre-commit hook runs automatically, CI pipeline validates in PR. Template reminds developers of common pitfalls. Comprehensive documentation provides troubleshooting guidance.<br><br>**References:** `scripts/validate_migrations.py`, `docs/MIGRATION_GUIDE.md`, `.pre-commit-config.yaml`, `AGENTS.md` (`behavior_migrate_postgres_schema`)<br><br>_Last Updated: 2026-01-22_ | 2026-01-22 |
+| 137 | ✅ Phase 7: Dynamic Policy Engine COMPLETE | **Achievement:** ✅ **Dynamic YAML-based policy evaluation engine with full MCP Auth integration** – Created PolicyEngine (guideai/auth/policy_engine.py, 687 lines), enhanced policy bundle (policy/agentauth/bundle.yaml, 514 lines with 6 roles, 28 scopes, 20 rules), integrated with AgentAuthService for dynamic policy preview, all 12 Phase 7 tests passing.<br><br>**What shipped:**<br>- ✅ **PolicyEngine class:** (687 lines) YAML-based rule evaluator with role inheritance resolution, wildcard scope matching (fnmatch), first-match rule semantics, thread-safe hot-reload via SIGHUP signal, singleton pattern via `get_policy_engine()`<br>- ✅ **Enhanced bundle.yaml:** (514 lines) Production policy bundle v2.0.0 with 6 role definitions (ADMIN→STRATEGIST→TEACHER→STUDENT→OBSERVER + SERVICE_PRINCIPAL), 28 scope definitions with risk_level and requires_mfa flags, 20 authorization rules (admin full access, MFA requirements, role-based access, tool-specific rules, default deny), workflow/rollback/observability configuration<br>- ✅ **AgentAuthService integration:** Updated policy_preview() method to use PolicyEngine instead of hardcoded logic, added PolicyDecision enum mapping, fail-safe with deny-by-default on engine errors<br>- ✅ **Test suite:** scripts/test_phase7_policy_engine.py (12 comprehensive tests) validating initialization, role inheritance, wildcard matching, ALLOW/DENY/CONSENT_REQUIRED decisions, MFA enforcement, batch preview, singleton pattern, hot-reload, custom bundle paths<br><br>**Key features:**<br>- **Role inheritance:** ADMIN inherits STRATEGIST→TEACHER→STUDENT→OBSERVER (5-level hierarchy)<br>- **Wildcard scopes:** `behaviors:*` matches `behaviors:read`, `behaviors:write`, `behaviors:delete`<br>- **MFA enforcement:** High-risk scopes (actions.replay, agentauth.manage, behaviors:delete) require mfa_verified=true<br>- **First-match semantics:** Rules evaluated in order, first match determines decision (like firewall rules)<br>- **Hot-reload:** SIGHUP signal triggers bundle reload without restart<br>- **Thread-safe:** RLock protects rule/role/scope state during reload<br><br>**Files created:**<br>- `guideai/auth/policy_engine.py` (687 lines): PolicyEngine, PolicyResult, PolicyRule, PolicyDecision/Reason enums<br>- `scripts/test_phase7_policy_engine.py` (500+ lines): 12 comprehensive tests<br>- `policy/agentauth/bundle.yaml.bak`: Backup of original bundle<br><br>**Files modified:**<br>- `policy/agentauth/bundle.yaml`: Enhanced to v2.0.0 with full RBAC (6 roles, 28 scopes, 20 rules)<br>- `guideai/services/agent_auth_service.py`: Integrated PolicyEngine into policy_preview(), added import<br><br>**Test results (12/12 PASSING ✅):**<br>- ✓ PolicyEngine Initialization (bundle v2.0.0, 6 roles, 28 scopes, 20 rules)<br>- ✓ Role Inheritance Resolution (ADMIN→5 roles, OBSERVER→1 role)<br>- ✓ Wildcard Scope Matching (behaviors:* pattern)<br>- ✓ Rule Evaluation - ALLOW (Admin bypass, Student read, Observer read)<br>- ✓ Rule Evaluation - DENY (MFA required, role not authorized, unknown role)<br>- ✓ Rule Evaluation - CONSENT_REQUIRED (tool-specific rules)<br>- ✓ MFA Requirement Enforcement (high-risk scopes blocked without MFA)<br>- ✓ Batch Scope Preview (4 scopes evaluated)<br>- ✓ Get Allowed Scopes (Admin 28, Student 12, Observer 9)<br>- ✓ Singleton Pattern (same instance, reset works)<br>- ✓ Hot-Reload Simulation (manual reload)<br>- ✓ Custom Bundle Path (temp file loading)<br><br>**Behaviors applied:** `behavior_lock_down_security_surface` (RBAC implementation), `behavior_externalize_configuration` (bundle path via GUIDEAI_POLICY_BUNDLE_PATH), `behavior_design_api_contract` (PolicyResult dataclass), `behavior_update_docs_after_changes`<br><br>**MCP Auth Implementation Plan progress:**<br>- ✅ Phase 1: Session context (MCPSessionContext)<br>- ✅ Phase 2: Token validation (test_phase2_token_validation.py)<br>- ✅ Phase 3: Auth middleware (MCPAuthMiddleware)<br>- ✅ Phase 4: Service adapter (MCPServiceAdapter)<br>- ✅ Phase 5: Rate limiting (mcp_rate_limiter.py)<br>- ✅ Phase 6: Consent flows (consent_service.py)<br>- ✅ **Phase 7: Dynamic policy engine (THIS ENTRY)**<br>- 🔲 Phase 8: Token vault (remaining)<br><br>**Impact:** Policy changes now deploy without code changes – update bundle.yaml and send SIGHUP. Rules support complex matching (role hierarchy, scope wildcards, MFA context, tool-specific). AgentAuthService uses PolicyEngine for dynamic authorization decisions. Test suite validates all rule evaluation paths. Ready for Phase 8: Token Vault implementation.<br><br>**References:**<br>- Implementation: guideai/auth/policy_engine.py (PolicyEngine class)<br>- Policy bundle: policy/agentauth/bundle.yaml (v2.0.0)<br>- Integration: guideai/services/agent_auth_service.py (policy_preview method)<br>- Tests: scripts/test_phase7_policy_engine.py (12 tests)<br>- Plan: docs/MCP_AUTH_IMPLEMENTATION_PLAN.md (Phase 7 specification)<br><br>_Last Updated: 2026-01-22_ | 2026-01-22 |
+| 138 | ✅ Phase 8: Token Vault & Security Hardening COMPLETE | **Achievement:** ✅ **KMS-encrypted token vault with envelope encryption, token rotation, and blacklist revocation** – Created TokenVault class (guideai/auth/token_vault.py, 1268 lines), database migration for vault/blacklist/audit tables, all 12 Phase 8 tests passing. MCP Auth Implementation Plan now 100% COMPLETE.<br><br>**What shipped:**<br>- ✅ **TokenVault class:** (1268 lines) Secure OAuth token storage with envelope encryption supporting Fernet (local), AWS KMS (production), and HashiCorp Vault (enterprise) providers<br>- ✅ **StoredToken dataclass:** Token lifecycle with status tracking (ACTIVE, EXPIRED, REVOKED, ROTATED), expiration checks, rotation detection<br>- ✅ **InMemoryTokenStorage:** Thread-safe in-memory backend for testing<br>- ✅ **PostgresTokenStorage:** Production PostgreSQL backend with upsert and cleanup<br>- ✅ **Token blacklist:** SHA-256 hash-based revocation, prevents reuse of rotated/revoked tokens<br>- ✅ **Database migration:** token_vault, token_blacklist, token_audit_log tables with indexes, triggers, partial indexes for performance<br>- ✅ **Factory methods:** `create_fernet()`, `create_aws_kms()`, `create_hashicorp_vault()` for provider selection<br>- ✅ **Singleton pattern:** `get_token_vault()` / `reset_token_vault()` for global access<br>- ✅ **CLI helper:** `--generate-key`, `--stats`, `--cleanup` commands<br><br>**Key features:**<br>- **Envelope encryption:** Sensitive token data encrypted locally, only metadata stored in clear text<br>- **Token rotation:** `rotate_token()` blacklists old token, updates with new token, increments rotation_count<br>- **Token revocation:** `revoke_token()` adds both access and refresh tokens to blacklist<br>- **Automatic expiration:** `is_expired()` and `needs_rotation()` methods for lifecycle management<br>- **Cleanup:** `cleanup_expired()` removes old tokens and blacklist entries<br>- **Statistics:** `get_stats()` returns TokenVaultStats with counts by status and provider<br>- **Multi-provider:** Supports Google, GitHub, Microsoft, GuideAI internal, and custom providers<br><br>**Files created:**<br>- `guideai/auth/token_vault.py` (1268 lines): TokenVault, StoredToken, InMemoryTokenStorage, PostgresTokenStorage<br>- `migrations/versions/20260122_add_token_vault.py` (~260 lines): token_vault, token_blacklist, token_audit_log tables<br>- `scripts/test_phase8_token_vault.py` (700+ lines): 12 comprehensive tests<br><br>**Test results (12/12 PASSING ✅):**<br>- ✓ TokenVault Initialization<br>- ✓ Token Storage and Retrieval<br>- ✓ Token Expiration Handling<br>- ✓ Token Revocation and Blacklisting<br>- ✓ Token Rotation<br>- ✓ Token Listing<br>- ✓ Cleanup of Expired Entries<br>- ✓ Vault Statistics<br>- ✓ Singleton Pattern<br>- ✓ StoredToken Dataclass<br>- ✓ Multiple OAuth Providers<br>- ✓ Error Handling and Edge Cases<br><br>**Environment variables:**<br>- `GUIDEAI_TOKEN_VAULT_KEY`: Fernet encryption key (local/dev)<br>- `GUIDEAI_KMS_KEY_ID`: AWS KMS key ID (production)<br>- `VAULT_ADDR` + `GUIDEAI_VAULT_TRANSIT_KEY`: HashiCorp Vault (enterprise)<br><br>**Behaviors applied:** `behavior_lock_down_security_surface` (envelope encryption), `behavior_prevent_secret_leaks` (token hashing for blacklist), `behavior_migrate_postgres_schema` (vault tables), `behavior_design_api_contract` (StoredToken/TokenVaultStats dataclasses)<br><br>**MCP Auth Implementation Plan - ALL PHASES COMPLETE ✅:**<br>- ✅ Phase 1: Session context (MCPSessionContext)<br>- ✅ Phase 2: Service principal (auth.clientCredentials)<br>- ✅ Phase 3: Scope enforcement (MCPAuthMiddleware)<br>- ✅ Phase 4: Tenant context (MCPServiceAdapter)<br>- ✅ Phase 5: Rate limiting (DistributedRateLimiter)<br>- ✅ Phase 6: Consent flows (ConsentService)<br>- ✅ Phase 7: Dynamic policy engine (PolicyEngine)<br>- ✅ **Phase 8: Token vault (THIS ENTRY)**<br><br>**Impact:** MCP Authentication is now production-ready with secure token storage, dynamic policy evaluation, rate limiting, consent flows, and tenant isolation. All 8 phases implemented in a single day (2026-01-22). OAuth tokens are encrypted at rest using envelope encryption, with automatic rotation detection and blacklist-based revocation.<br><br>**References:**<br>- Implementation: guideai/auth/token_vault.py (TokenVault class)<br>- Migration: migrations/versions/20260122_add_token_vault.py<br>- Tests: scripts/test_phase8_token_vault.py (12 tests)<br>- Plan: docs/MCP_AUTH_IMPLEMENTATION_PLAN.md (All phases complete)<br><br>_Last Updated: 2026-01-22_ | 2026-01-22 |

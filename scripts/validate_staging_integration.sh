@@ -27,14 +27,14 @@ else
 fi
 echo
 
-# Step 2: Check API connectivity
-echo "2. Checking staging API connectivity..."
-if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
-    echo -e "${GREEN}✓${NC} Staging API responding at http://localhost:8000"
-    curl -s http://localhost:8000/health | python -m json.tool 2>/dev/null || echo "{}"
+# Step 2: Check Gateway connectivity
+echo "2. Checking staging gateway connectivity..."
+if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} Staging gateway responding at http://localhost:8080"
+    curl -s http://localhost:8080/health | python -m json.tool 2>/dev/null || echo "{}"
 else
-    echo -e "${RED}✗${NC} Staging API not responding"
-    echo "   Check logs: podman logs guideai-api-staging"
+    echo -e "${RED}✗${NC} Staging gateway not responding"
+    echo "   Check logs: podman logs guideai-nginx-staging"
     exit 1
 fi
 echo

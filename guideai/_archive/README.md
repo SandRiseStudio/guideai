@@ -9,6 +9,7 @@ by PostgreSQL-backed versions.
 |------|-------------|-------|
 | `behavior_service_sqlite_backup.py` | `behavior_service.py` | In-memory service, PostgreSQL via service factory |
 | `workflow_service_sqlite_backup.py` | `workflow_service.py` | In-memory service, PostgreSQL via service factory |
+| `agent_workspace_manager.py` | `guideai.workspace_agent` | Extracted to standalone `workspace-agent` gRPC service |
 
 ## Why Archived?
 

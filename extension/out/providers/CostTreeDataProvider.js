@@ -55,13 +55,15 @@ class CostTreeDataProvider {
         this.topExpensive = null;
         this.refreshInterval = 60000; // 1 minute
         this.periodDays = 30;
-        this.initializeDataProvider();
+        // NOTE: Do NOT auto-initialize - wait for user to manually refresh
+        // This prevents resource exhaustion on startup
     }
-    async initializeDataProvider() {
-        await this.refresh();
-        this.startAutoRefresh();
-    }
+    /**
+     * Start auto-refresh (call only after user initiates first refresh)
+     */
     startAutoRefresh() {
+        if (this.refreshTimer)
+            return;
         this.refreshTimer = setInterval(async () => {
             await this.refresh();
         }, this.refreshInterval);

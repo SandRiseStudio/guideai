@@ -73,6 +73,8 @@ class Run:
     origin_run_id: Optional[str] = None  # Parent run for delegations
     delegation_id: Optional[str] = None  # Link to DelegationResponse
     handoff_from_run_id: Optional[str] = None  # Previous run in handoff chain
+    # User credential context
+    triggering_user_id: Optional[str] = None  # User whose credentials to use for GitHub ops
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -98,6 +100,8 @@ class RunCreateRequest:
     origin_run_id: Optional[str] = None  # Parent run for delegations
     delegation_id: Optional[str] = None  # Link to DelegationResponse
     handoff_from_run_id: Optional[str] = None  # Previous run in handoff chain
+    # User credential context
+    triggering_user_id: Optional[str] = None  # User whose credentials to use for GitHub ops
 
 
 @dataclass

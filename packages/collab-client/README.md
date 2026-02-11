@@ -42,7 +42,7 @@ function CollaborativeEditor({ documentId }: { documentId: string }) {
     error,
   } = useCollaboration({
     config: {
-      baseUrl: 'http://localhost:8000',
+      baseUrl: 'http://localhost:8080',
       userId: 'user-123',
       sessionId: crypto.randomUUID(),
       debug: true,
@@ -90,7 +90,7 @@ function CollaborativeEditor({ documentId }: { documentId: string }) {
 import { createCollabClient, EditOperationType } from '@guideai/collab-client';
 
 const client = createCollabClient({
-  baseUrl: 'http://localhost:8000',
+  baseUrl: 'http://localhost:8080',
   userId: 'user-123',
   debug: true,
 });
@@ -125,7 +125,7 @@ client.sendEdit({
 import { createCollabApi } from '@guideai/collab-client';
 
 const api = createCollabApi({
-  baseUrl: 'http://localhost:8000',
+  baseUrl: 'http://localhost:8080',
   authToken: 'optional-bearer-token',
 });
 

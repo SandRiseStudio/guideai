@@ -2299,6 +2299,82 @@ class OrganizationService:
             for row in rows
         ]
 
+    def list_all_personal_projects(self) -> List[Project]:
+        """List ALL personal projects across all users (admin only).
+
+        Returns:
+            List of all personal projects in the system.
+        """
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT project_id, owner_id, name, slug, description, visibility,
+                       settings, created_at, updated_at
+                FROM projects
+                WHERE owner_id IS NOT NULL AND org_id IS NULL AND archived_at IS NULL
+                ORDER BY created_at DESC
+                """,
+            )
+            rows = cursor.fetchall()
+
+        return [
+            Project(
+                id=row[0],
+                owner_id=row[1],
+                name=row[2],
+                slug=row[3],
+                description=row[4],
+                visibility=ProjectVisibility(row[5]),
+                settings=row[6] or {},
+                created_at=row[7],
+                updated_at=row[8],
+            )
+            for row in rows
+        ]
+
+    def list_organizations(self, include_deleted: bool = False) -> List[Organization]:
+        """List ALL organizations (admin only).
+
+        Args:
+            include_deleted: Whether to include soft-deleted orgs.
+
+        Returns:
+            List of all organizations in the system.
+        """
+        status_filter = "" if include_deleted else "WHERE status != 'deleted'"
+
+        with self.pool.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT id, name, slug, display_name, plan, status,
+                       stripe_customer_id, settings, metadata,
+                       created_at, updated_at
+                FROM organizations
+                {status_filter}
+                ORDER BY name
+                """,
+            )
+            rows = cursor.fetchall()
+
+        return [
+            Organization(
+                id=row[0],
+                name=row[1],
+                slug=row[2],
+                display_name=row[3],
+                plan=OrgPlan(row[4]) if row[4] else OrgPlan.FREE,
+                status=OrgStatus(row[5]) if row[5] else OrgStatus.ACTIVE,
+                stripe_customer_id=row[6],
+                settings=row[7] or {},
+                metadata=row[8] or {},
+                created_at=row[9],
+                updated_at=row[10],
+            )
+            for row in rows
+        ]
+
     def create_personal_agent(
         self,
         owner_id: str,

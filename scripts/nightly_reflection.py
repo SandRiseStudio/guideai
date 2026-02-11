@@ -413,7 +413,15 @@ def main() -> int:
         config.min_frequency = args.min_frequency
 
     # Initialize services
-    run_service = RunService()
+    from guideai.utils.dsn import apply_host_overrides
+    run_dsn = apply_host_overrides(os.environ.get("GUIDEAI_RUN_PG_DSN"), "RUN")
+    if run_dsn:
+        from guideai.run_service_postgres import PostgresRunService
+        run_service = PostgresRunService(dsn=run_dsn)
+        logger.info("Using PostgresRunService for nightly reflection")
+    else:
+        run_service = RunService()
+        logger.warning("GUIDEAI_RUN_PG_DSN not set - using SQLite RunService")
     behavior_service = BehaviorService()
     reflection_service = ReflectionService(behavior_service=behavior_service)
     trace_analysis = TraceAnalysisService()

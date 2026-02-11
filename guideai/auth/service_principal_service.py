@@ -37,6 +37,7 @@ class ServicePrincipal:
     created_by: Optional[str]  # User ID who created this
     created_at: datetime
     updated_at: datetime
+    org_id: Optional[str] = None  # Optional - service principals can exist without an org
     description: Optional[str] = None
     last_used_at: Optional[datetime] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -48,6 +49,7 @@ class ServicePrincipal:
             "name": self.name,
             "description": self.description,
             "client_id": self.client_id,
+            "org_id": self.org_id,  # Optional - may be None
             "allowed_scopes": self.allowed_scopes,
             "rate_limit": self.rate_limit,
             "role": self.role,

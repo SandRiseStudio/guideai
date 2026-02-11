@@ -15,7 +15,7 @@ Install with CLI support:
 
 import os
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import json
 import sys
 
@@ -971,6 +971,32 @@ def apply(
         return
 
     assert response is not None
+
+    # Verify all services are healthy before showing success
+    console.print("[dim]Verifying all services are healthy...[/dim]")
+
+    import time
+    all_healthy = False
+    for i in range(6):  # Wait up to 30 seconds
+        try:
+            status_response = service.status(response.amp_run_id)
+            all_healthy = all(
+                check.status == "running"
+                for check in status_response.checks
+            )
+            if all_healthy:
+                break
+        except Exception:
+            pass
+        if i < 5:
+            time.sleep(5)
+            console.print(f"[dim]Waiting for services to stabilize... ({(i+1)*5}s)[/dim]")
+
+    if all_healthy:
+        console.print(f"[green]✓ All services healthy[/green]")
+    else:
+        console.print(f"[yellow]⚠ Some services may still be starting[/yellow]")
+
     # Display result
     console.print(Panel(
         f"[bold]Run ID:[/bold] {response.amp_run_id}\n"
@@ -1845,6 +1871,34 @@ def up(
 
     if all_running:
         if not quiet:
+            # Wait for services to be fully healthy (not just running)
+            console.print(f"[dim]Verifying all services are healthy...[/dim]")
+
+            # Get status to verify health
+            from .models import StatusResponse
+            try:
+                status_response = service.status(apply_response.amp_run_id)
+                all_healthy = all(
+                    check.status == "running"
+                    for check in status_response.checks
+                )
+                if not all_healthy:
+                    # Some services may need a few more seconds after container start
+                    import time
+                    for i in range(3):  # Wait up to 15 seconds
+                        time.sleep(5)
+                        status_response = service.status(apply_response.amp_run_id)
+                        all_healthy = all(
+                            check.status == "running"
+                            for check in status_response.checks
+                        )
+                        if all_healthy:
+                            break
+                        if not quiet and i < 2:
+                            console.print(f"[dim]Waiting for services to stabilize... ({(i+1)*5}s)[/dim]")
+            except Exception:
+                pass  # Best effort - continue if status check fails
+
             console.print(f"[green]✓ Environment ready: {apply_response.amp_run_id}[/green]")
 
             # Show connection info
@@ -1876,15 +1930,29 @@ def list_environments(
         "--json", "-j",
         help="Output as JSON",
     ),
+    no_reconcile: bool = typer.Option(
+        False,
+        "--no-reconcile",
+        help="Skip container reality check (faster but may show stale entries)",
+    ),
+    keep_stale: bool = typer.Option(
+        False,
+        "--keep-stale",
+        help="Don't auto-remove stale state files for missing containers",
+    ),
 ) -> None:
     """List active environments.
 
     Shows all environments currently deployed or in progress.
+    By default, reconciles with actual container state and removes stale entries.
     """
     service = get_service()
 
     try:
-        environments = service.list_environments()
+        environments = service.list_environments(
+            reconcile=not no_reconcile,
+            auto_cleanup=not keep_stale,
+        )
     except Exception as e:
         console.print(f"[red]List failed: {e}[/red]")
         raise typer.Exit(1)
@@ -1903,6 +1971,9 @@ def list_environments(
     table.add_column("Phase")
     table.add_column("Blueprint")
     table.add_column("Created")
+    # Show actual status column when reconciling
+    if not no_reconcile:
+        table.add_column("Containers", justify="right")
 
     for env in environments:
         phase_colors = {
@@ -1917,13 +1988,25 @@ def list_environments(
         run_id = env.get("amp_run_id", "")
         display_id = run_id[:12] + "..." if len(run_id) > 12 else run_id
 
-        table.add_row(
+        row = [
             display_id,
             env.get("environment", ""),
             phase_styled,
             env.get("blueprint_id", ""),
             (env.get("created_at", "") or "")[:19],
-        )
+        ]
+
+        if not no_reconcile:
+            container_count = env.get("container_count", 0)
+            actual_status = env.get("actual_status", "")
+            if actual_status == "RUNNING":
+                row.append(f"[green]{container_count}[/green]")
+            elif actual_status == "STALE":
+                row.append("[red]0 (stale)[/red]")
+            else:
+                row.append(str(container_count))
+
+        table.add_row(*row)
 
     console.print(table)
 
@@ -2152,6 +2235,11 @@ def cleanup(
         "--include-volumes",
         help="Include ALL volumes (WARNING: may lose data)",
     ),
+    include_stale_state: bool = typer.Option(
+        False,
+        "--include-stale-state", "-s",
+        help="Remove stale state files (environments, manifests, snapshots) for non-running environments",
+    ),
     scaledown_machines: bool = typer.Option(
         False,
         "--scaledown-machines",
@@ -2166,6 +2254,11 @@ def cleanup(
         None,
         "--preserve-machine", "-p",
         help="Machine names to never stop/remove (can specify multiple times)",
+    ),
+    preserve_environments: Optional[List[str]] = typer.Option(
+        None,
+        "--preserve-env", "-e",
+        help="Environment run IDs to preserve (can specify multiple times, partial IDs work)",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -2187,15 +2280,90 @@ def cleanup(
 
     By default, performs standard cleanup (stopped containers, unused networks).
     Use --aggressive for deeper cleanup including images and cache.
+    Use --include-stale-state to remove orphaned state files for environments
+    that are no longer running (preserves the most recent running environment).
     Use --scaledown-machines as a last resort to stop unused Podman machines.
 
     Examples:
         amprealize cleanup                    # Standard cleanup
         amprealize cleanup --aggressive       # Include images and cache
+        amprealize cleanup -a -s              # Aggressive + clean stale state
+        amprealize cleanup -s --preserve-env amp-abc123  # Clean state but keep specific env
         amprealize cleanup --scaledown-machines --preserve-machine default
         amprealize cleanup --dry-run          # Preview cleanup
     """
+    import subprocess
+    import re
+
     executor = PodmanExecutor()
+
+    # Discover stale state files if requested
+    stale_state_to_remove: Dict[str, List[Path]] = {
+        "environments": [],
+        "manifests": [],
+        "snapshots": [],
+    }
+    running_env_ids: set = set()
+    most_recent_env_id: Optional[str] = None
+
+    if include_stale_state:
+        # First, discover which environments are actually running via containers
+        try:
+            result = subprocess.run(
+                ["podman", "ps", "--format", "{{.Names}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            # Extract run IDs from container names like "amp-5d13e62f-840a-4672-ae03-24e18d05022a-guideai-db"
+            for line in result.stdout.strip().split("\n"):
+                if line.startswith("amp-"):
+                    # Extract the UUID part (amp-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX)
+                    match = re.match(r"(amp-[a-f0-9-]{36})", line)
+                    if match:
+                        running_env_ids.add(match.group(1))
+        except Exception:
+            pass
+
+        # Add explicitly preserved environments
+        if preserve_environments:
+            for env_id in preserve_environments:
+                # Support partial matching
+                running_env_ids.add(env_id)
+
+        # Discover state files
+        state_dir = Path.home() / ".guideai" / "amprealize"
+        if state_dir.exists():
+            # Find the most recent environment state file (by modified time)
+            env_files = list((state_dir / "environments").glob("*.json")) if (state_dir / "environments").exists() else []
+            if env_files:
+                most_recent_file = max(env_files, key=lambda f: f.stat().st_mtime)
+                most_recent_env_id = most_recent_file.stem
+
+            # Categorize state files
+            for category in ["environments", "manifests", "snapshots"]:
+                category_dir = state_dir / category
+                if category_dir.exists():
+                    for f in category_dir.glob("*"):
+                        if f.is_file():
+                            file_id = f.stem
+                            # Check if this file belongs to a running or preserved environment
+                            is_preserved = False
+
+                            # Check running environments
+                            for running_id in running_env_ids:
+                                if running_id in file_id or file_id in running_id:
+                                    is_preserved = True
+                                    break
+
+                            # Also preserve the most recent environment state
+                            if most_recent_env_id and (most_recent_env_id in file_id or file_id in most_recent_env_id):
+                                is_preserved = True
+
+                            if not is_preserved:
+                                stale_state_to_remove[category].append(f)
+
+    total_stale_files = sum(len(files) for files in stale_state_to_remove.values())
 
     if dry_run:
         # Show current resource usage and what could be cleaned
@@ -2223,6 +2391,15 @@ def cleanup(
             console.print("  • Remove dangling volumes")
         if include_volumes:
             console.print("  • [red]Remove ALL volumes (data loss possible)[/red]")
+        if include_stale_state:
+            console.print(f"  • Remove stale state files ({total_stale_files} files)")
+            if running_env_ids:
+                console.print(f"    [green]Preserving running environments: {', '.join(sorted(running_env_ids)[:3])}{'...' if len(running_env_ids) > 3 else ''}[/green]")
+            if most_recent_env_id and most_recent_env_id not in running_env_ids:
+                console.print(f"    [green]Preserving most recent: {most_recent_env_id}[/green]")
+            for category, files in stale_state_to_remove.items():
+                if files:
+                    console.print(f"    • {category}: {len(files)} file(s) to remove")
         if scaledown_machines:
             console.print("  • Stop unused Podman machines")
             if remove_machines:
@@ -2230,6 +2407,13 @@ def cleanup(
             if preserve_machines:
                 console.print(f"  • Preserving machines: {', '.join(preserve_machines)}")
         return
+
+    # Track stale state removal results
+    stale_state_removed = {
+        "environments": 0,
+        "manifests": 0,
+        "snapshots": 0,
+    }
 
     with Progress(
         SpinnerColumn(),
@@ -2245,6 +2429,17 @@ def cleanup(
                 aggressive=aggressive,
                 prune_volumes=include_volumes,
             )
+
+            # Clean stale state files
+            if include_stale_state and total_stale_files > 0:
+                progress.update(task, description="Removing stale state files...")
+                for category, files in stale_state_to_remove.items():
+                    for f in files:
+                        try:
+                            f.unlink()
+                            stale_state_removed[category] += 1
+                        except Exception:
+                            pass  # Non-critical, continue
 
             # Optionally stop/remove machines
             machine_result = None
@@ -2266,11 +2461,16 @@ def cleanup(
             console.print(f"[red]Cleanup failed: {e}[/red]")
             raise typer.Exit(1)
 
+    total_state_removed = sum(stale_state_removed.values())
+
     if json_output:
         output = result.to_dict() if hasattr(result, 'to_dict') else {}
         if machine_result:
             output["machines_stopped"] = machine_result.machines_stopped
             output["machines_removed"] = machine_result.machines_removed
+        if include_stale_state:
+            output["stale_state_removed"] = stale_state_removed
+            output["stale_state_total"] = total_state_removed
         console.print(json.dumps(output, indent=2))
         return
 
@@ -2278,6 +2478,7 @@ def cleanup(
         items = result.items_cleaned if hasattr(result, 'items_cleaned') else 0
         if machine_result:
             items += machine_result.machines_stopped
+        items += total_state_removed
         console.print(f"{items}")
         return
 
@@ -2293,11 +2494,26 @@ def cleanup(
     if hasattr(result, 'cache_cleared') and result.cache_cleared:
         table.add_row("Build Cache", "Yes")
 
+    if include_stale_state and total_state_removed > 0:
+        table.add_row("Stale State Files", str(total_state_removed))
+        # Show breakdown
+        for category, count in stale_state_removed.items():
+            if count > 0:
+                table.add_row(f"  └─ {category.capitalize()}", str(count))
+
     if machine_result:
         table.add_row("Machines Stopped", str(machine_result.machines_stopped))
         table.add_row("Machines Removed", str(machine_result.machines_removed))
 
     console.print(table)
+
+    # Show preserved environments if stale state was cleaned
+    if include_stale_state and running_env_ids:
+        console.print()
+        preserved_ids = list(running_env_ids)
+        if most_recent_env_id and most_recent_env_id not in running_env_ids:
+            preserved_ids.append(most_recent_env_id)
+        console.print(f"[green]Preserved environments: {', '.join(preserved_ids[:5])}{'...' if len(preserved_ids) > 5 else ''}[/green]")
 
     # Show space reclaimed
     space_mb = result.space_reclaimed_mb
@@ -3650,6 +3866,12 @@ def fresh(
     except Exception as e:
         console.print(f"[red]Failed to bring up environment: {e}[/red]")
         raise typer.Exit(1)
+
+    # Additional stabilization time for fresh environments
+    # Services may need extra time after healthchecks pass to be fully ready
+    if not quiet:
+        console.print("[dim]Allowing services to fully stabilize...[/dim]")
+    time.sleep(5)
 
     console.print()
     console.print("[bold green]✓ Fresh environment ready![/bold green]")

@@ -89,16 +89,21 @@ export interface BCIBehaviorMatch {
 	metadata?: Record<string, unknown> | null;
 }
 
-export type AgentStatus = 'draft' | 'active' | 'deprecated' | 'archived';
+export type AgentStatus = 'DRAFT' | 'PUBLISHED' | 'DEPRECATED' | 'ARCHIVED' | 'draft' | 'active' | 'deprecated' | 'archived';
 export type AgentVisibility = 'private' | 'public' | 'org';
-export type RoleAlignment = 'strict' | 'flexible';
+export type RoleAlignment = 'STRATEGIST' | 'TEACHER' | 'STUDENT' | 'MULTI' | 'strict' | 'flexible';
 
 export interface AgentVersion {
 	version: string;
 	status: AgentStatus;
-	created_at: string;
+	created_at?: string;
 	performance_score?: number;
 	change_log?: string;
+	instruction?: string;
+	tags?: string[];
+	capabilities?: string[];
+	behaviors?: string[];
+	role_alignment?: RoleAlignment;
 }
 
 export interface Agent {
@@ -115,8 +120,13 @@ export interface Agent {
 	role_alignment: RoleAlignment;
 	versions: AgentVersion[];
 	owner?: string;
+	owner_id?: string;
 	created_at?: string;
 	updated_at?: string;
+	model?: string;
+	temperature?: number;
+	max_tokens?: number;
+	system_prompt?: string;
 }
 
 export interface AgentSearchResult {
@@ -132,18 +142,27 @@ export interface TopPerformer {
 	metricName: string;
 	changePercent: number;
 	rank?: number;
+	totalTasks?: number;
+	periodDays?: number;
 }
 
 export interface PerformanceAlert {
 	id: string;
+	alertId?: string;
 	agentId: string;
 	agentName: string;
 	metric: string;
 	threshold: number;
+	thresholdValue?: number;
 	value: number;
+	actualValue?: number;
 	timestamp: string;
+	createdAt?: string;
 	status: 'active' | 'acknowledged' | 'resolved';
 	severity: 'low' | 'medium' | 'high' | 'critical';
+	message?: string;
+	acknowledgedAt?: string;
+	resolvedAt?: string;
 }
 
 export interface AgentPerformanceSummary {
@@ -195,6 +214,67 @@ export interface CredentialAuditEntry {
 	actor_id: string;
 	details?: Record<string, unknown>;
 	created_at: string;
+}
+
+// Per-User GitHub Credential Link interfaces
+export interface GitHubLink {
+	id: string;
+	link_type: 'pat' | 'app';
+	github_credential_id?: string;
+	installation_link_id?: string;
+	priority: number;
+	credential_name?: string;
+	github_identity?: string;
+	created_at?: string;
+	last_used_at?: string;
+}
+
+export interface GitHubResolution {
+	has_credential: boolean;
+	source?: string;
+	credential_id?: string;
+	installation_id?: number;
+	github_username?: string;
+	token_type?: string;
+	has_required_scopes?: boolean;
+	scope_warning?: string;
+	resolved_for_user_id?: string;
+	link_id?: string;
+	message?: string;
+	resolution_order?: string[];
+}
+
+export interface GitHubPreferences {
+	default_pat_credential_id?: string;
+	default_app_installation_id?: number;
+	auto_link_new_projects: boolean;
+	prefer_app_over_pat: boolean;
+	created_at?: string;
+	updated_at?: string;
+}
+
+export interface GitHubCredential {
+	id: string;
+	scope_type: string;
+	scope_id: string;
+	token_type: string;
+	name: string;
+	token_prefix: string;
+	is_valid: boolean;
+	failure_count: number;
+	scopes?: string[];
+	github_username?: string;
+	created_at?: string;
+	last_used_at?: string;
+}
+
+export interface GitHubAppInstallation {
+	installation_id: number;
+	account_type: string;
+	account_login: string;
+	account_id: number;
+	permissions?: Record<string, string>;
+	is_active: boolean;
 }
 
 export interface BCIRetrieveOptions {
@@ -422,7 +502,7 @@ export class GuideAIClient {
 		const config = vscode.workspace.getConfiguration('guideai');
 		this.pythonPath = config.get('pythonPath', 'python');
 		this.cliPath = config.get('cliPath', 'guideai');
-		this.apiBaseUrl = config.get('apiBaseUrl', 'http://localhost:8000');
+		this.apiBaseUrl = config.get('apiBaseUrl', 'http://localhost:8080');
 		this.outputChannel = vscode.window.createOutputChannel('GuideAI');
 		this.telemetryEnabled = config.get('telemetryEnabled', true);
 		this.telemetryActorId = config.get('telemetryActorId', 'ide-user');  // IDE-agnostic default
@@ -909,7 +989,10 @@ export class GuideAIClient {
 		return await this.runCLI(args);
 	}
 
-	async listAgents(filters: { tag?: string; status?: AgentStatus; limit?: number } = {}): Promise<Agent[]> {
+	async listAgents(
+		filters: { tag?: string; status?: AgentStatus; visibility?: string; limit?: number } = {},
+		_telemetry?: { source?: string }
+	): Promise<Agent[]> {
 		const args = ['agent-registry', 'list'];
 		if (filters.tag) args.push('--tag', filters.tag);
 		if (filters.status) args.push('--status', filters.status);
@@ -919,7 +1002,11 @@ export class GuideAIClient {
 		return result.agents || [];
 	}
 
-	async searchAgents(query: string, options: { limit?: number; minScore?: number } = {}): Promise<AgentSearchResult[]> {
+	async searchAgents(
+		query: string,
+		options: { limit?: number; minScore?: number; status?: AgentStatus; visibility?: string } = {},
+		_telemetry?: { source?: string; query?: string }
+	): Promise<AgentSearchResult[]> {
 		const args = ['agent-registry', 'search', '--query', query];
 		if (options.limit) args.push('--limit', String(options.limit));
 
@@ -1136,6 +1223,119 @@ export class GuideAIClient {
 			'GET'
 		);
 		return response.audit_log || [];
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────────
+	// Per-User GitHub Credential Links
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Get the current user's GitHub link for a project
+	 */
+	async getMyGitHubLink(projectId: string): Promise<GitHubLink | null> {
+		try {
+			const response = await this.callAPI<GitHubLink | null>(
+				`/api/v1/projects/${projectId}/github/my-link`,
+				'GET'
+			);
+			return response;
+		} catch (error) {
+			// 404 or null response means no link
+			return null;
+		}
+	}
+
+	/**
+	 * Link the current user's PAT credential to a project
+	 */
+	async linkMyPATToProject(
+		projectId: string,
+		options: { github_credential_id?: string; token?: string; name?: string }
+	): Promise<GitHubLink> {
+		return await this.callAPI<GitHubLink>(
+			`/api/v1/projects/${projectId}/github/link-pat`,
+			'POST',
+			options
+		);
+	}
+
+	/**
+	 * Link the current user's GitHub App installation to a project
+	 */
+	async linkMyAppToProject(
+		projectId: string,
+		options: { installation_link_id?: string; installation_id?: number }
+	): Promise<GitHubLink> {
+		return await this.callAPI<GitHubLink>(
+			`/api/v1/projects/${projectId}/github/link-app`,
+			'POST',
+			options
+		);
+	}
+
+	/**
+	 * Remove the current user's GitHub link from a project
+	 */
+	async unlinkMyGitHubFromProject(
+		projectId: string,
+		linkType?: 'pat' | 'app'
+	): Promise<{ unlinked: boolean; deleted_count: number }> {
+		let url = `/api/v1/projects/${projectId}/github/my-link`;
+		if (linkType) {
+			url += `?link_type=${linkType}`;
+		}
+		return await this.callAPI<{ unlinked: boolean; deleted_count: number }>(url, 'DELETE');
+	}
+
+	/**
+	 * Show which GitHub credential would be used for the current user + project
+	 */
+	async getGitHubResolution(projectId: string): Promise<GitHubResolution> {
+		return await this.callAPI<GitHubResolution>(
+			`/api/v1/projects/${projectId}/github/resolution`,
+			'GET'
+		);
+	}
+
+	/**
+	 * Get the current user's GitHub preferences
+	 */
+	async getMyGitHubPreferences(): Promise<GitHubPreferences> {
+		return await this.callAPI<GitHubPreferences>(
+			`/api/v1/users/me/github-preferences`,
+			'GET'
+		);
+	}
+
+	/**
+	 * Update the current user's GitHub preferences
+	 */
+	async updateMyGitHubPreferences(prefs: Partial<GitHubPreferences>): Promise<GitHubPreferences> {
+		return await this.callAPI<GitHubPreferences>(
+			`/api/v1/users/me/github-preferences`,
+			'PUT',
+			prefs
+		);
+	}
+
+	/**
+	 * List GitHub credentials owned by the current user
+	 */
+	async listMyGitHubCredentials(): Promise<GitHubCredential[]> {
+		return await this.callAPI<GitHubCredential[]>(
+			`/api/v1/users/me/github-credentials`,
+			'GET'
+		);
+	}
+
+	/**
+	 * List GitHub App installations accessible to the current user
+	 */
+	async listMyGitHubAppInstallations(): Promise<GitHubAppInstallation[]> {
+		return await this.callAPI<GitHubAppInstallation[]>(
+			`/api/v1/users/me/github-app-installations`,
+			'GET'
+		);
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────────

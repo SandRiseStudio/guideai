@@ -64,6 +64,14 @@ class ExecuteRequest(BaseModel):
         None,
         description="Optional model ID to override agent's default model",
     )
+    callback_url: Optional[str] = Field(
+        None,
+        description=(
+            "Webhook URL to receive gate events (gate.waiting, "
+            "gate.clarification_needed, run.completed, run.failed). "
+            "The URL will receive POST requests with HMAC-signed payloads."
+        ),
+    )
 
 
 class ExecuteResponse(BaseModel):
@@ -116,6 +124,26 @@ class ClarifyResponse(BaseModel):
     message: str
 
 
+class ApproveGateRequest(BaseModel):
+    """Request to approve a strict gate and resume execution."""
+    phase: Optional[str] = Field(
+        None,
+        description="Phase gate to approve (e.g. 'architecting', 'verifying'). If omitted, approves current gate.",
+    )
+    notes: Optional[str] = Field(
+        None,
+        description="Approval notes or feedback for the agent.",
+    )
+
+
+class ApproveGateResponse(BaseModel):
+    """Response from approving a gate."""
+    success: bool
+    message: str
+    run_id: Optional[str] = None
+    resumed: bool = False
+
+
 class ExecutionListItem(BaseModel):
     """Summary of an execution for list responses."""
     run_id: str
@@ -148,6 +176,9 @@ class ExecutionStepResponse(BaseModel):
     output_tokens: int
     tool_calls: int
     content_preview: Optional[str] = None
+    content_full: Optional[str] = None  # Full content for detailed view
+    tool_names: Optional[List[str]] = None  # Names of tools called
+    model_id: Optional[str] = None  # Model used for LLM calls
 
 
 class ExecutionStepsResponse(BaseModel):
@@ -209,6 +240,9 @@ def create_work_item_execution_routes(
                 org_id=org_id,
                 project_id=project_id,
                 model_id=body.model_override,
+                metadata={
+                    "callback_url": body.callback_url,
+                } if body.callback_url else {},
             )
 
             response = await service.execute(exec_request)
@@ -302,7 +336,7 @@ def create_work_item_execution_routes(
                 current_step=response.current_step,
                 total_tokens=None,  # Not in current contract
                 total_cost_usd=None,  # Not in current contract
-                pending_clarifications=None,  # Not in current contract
+                pending_clarifications=response.pending_clarifications,
             )
 
         except Exception as e:
@@ -387,6 +421,61 @@ def create_work_item_execution_routes(
                 )
         except Exception as e:
             logger.exception(f"Error providing clarification for {item_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"error": "internal_error", "message": str(e)},
+            )
+
+    # ==========================================================================
+    # Gate Approval Endpoint
+    # ==========================================================================
+
+    @router.post(
+        "/v1/work-items/{item_id}:approve-gate",
+        response_model=ApproveGateResponse,
+        summary="Approve a strict gate",
+        description=(
+            "Approve a strict gate on a paused execution and resume the agent. "
+            "Required for ARCHITECTING, VERIFYING, and COMPLETING phases."
+        ),
+    )
+    async def approve_gate(
+        item_id: str,
+        request: Request,
+        body: ApproveGateRequest,
+        org_id: Optional[str] = Query(None, description="Organization ID"),
+        project_id: str = Query(..., description="Project ID"),
+    ) -> ApproveGateResponse:
+        """Approve a strict gate and resume execution."""
+        actor = _get_actor(request)
+
+        try:
+            result = await service.approve_gate(
+                work_item_id=item_id,
+                user_id=actor.id,
+                org_id=org_id,
+                project_id=project_id,
+                phase=body.phase,
+                notes=body.notes,
+            )
+
+            return ApproveGateResponse(
+                success=result.get("success", False),
+                message=result.get("message", "Gate approved"),
+                run_id=result.get("run_id"),
+                resumed=result.get("resumed", False),
+            )
+
+        except WorkItemExecutionError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "gate_approval_failed",
+                    "message": str(e),
+                },
+            )
+        except Exception as e:
+            logger.exception(f"Error approving gate for {item_id}: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={"error": "internal_error", "message": str(e)},
@@ -549,6 +638,9 @@ def create_work_item_execution_routes(
                     output_tokens=step.get("output_tokens", 0),
                     tool_calls=step.get("tool_calls", 0),
                     content_preview=step.get("content_preview"),
+                    content_full=step.get("content_full"),
+                    tool_names=step.get("tool_names"),
+                    model_id=step.get("model_id"),
                 ))
 
             return ExecutionStepsResponse(

@@ -9,3 +9,12 @@ repos:
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
+  - repo: local
+    hooks:
+      - id: validate-migrations
+        name: Validate Alembic Migrations
+        entry: python scripts/validate_migrations.py
+        language: python
+        files: ^migrations/versions/.*\.py$
+        pass_filenames: false
+        always_run: true

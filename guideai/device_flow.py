@@ -701,8 +701,9 @@ class DeviceFlowManager:
                 return None
 
             # Build user info from session data
+            # Priority: oauth_user_info > approver > device_code
             user_info: Dict[str, Any] = {
-                "sub": session.device_code,  # Default to device_code
+                "sub": session.approver or session.device_code,  # Use approver if set
                 "scopes": session.scopes,
             }
 

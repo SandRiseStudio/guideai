@@ -880,6 +880,17 @@ class BoardService:
         elif request.item_type == WorkItemType.TASK:
             initial_status = WorkItemStatus.TODO
 
+        # Default column_id to "Backlog" column if not provided
+        column_id = request.column_id
+        if not column_id and request.board_id:
+            columns = self.list_columns(request.board_id, org_id=org_id)
+            # Find "Backlog" column, or fall back to first column
+            backlog_col = next((c for c in columns if c.name.lower() == "backlog"), None)
+            if backlog_col:
+                column_id = backlog_col.column_id
+            elif columns:
+                column_id = columns[0].column_id  # First column as fallback
+
         # Convert acceptance criteria strings to objects
         criteria = [
             AcceptanceCriterion(id=_short_id("ac"), description=c, is_met=False)
@@ -899,18 +910,18 @@ class BoardService:
                 cur.execute(
                     """
                     INSERT INTO work_items (
-                        item_type, board_id, column_id,
+                        item_type, board_id, column_id, parent_id,
                         title, description, status, priority, position,
                         labels, metadata,
                         created_at, updated_at
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                     RETURNING id
                     """,
                     (
                         request.item_type.value,
-                        request.board_id, request.column_id,
+                        request.board_id, column_id, request.parent_id,
                         request.title, request.description,
                         initial_status.value, priority_int, 0,
                         request.labels,  # Postgres array, not JSON
@@ -1142,6 +1153,8 @@ class BoardService:
         List work items with filters.
 
         Args:
+            project_id: Filter by project (matches via boards.project_id since work_items
+                       are linked to boards, which hold the project association).
             labels: Filter by labels (any of - items with at least one matching label).
                    Uses PostgreSQL JSONB ?| operator for efficient GIN index queries.
             sprint_id: Filter by sprint (items assigned to this sprint).
@@ -1149,33 +1162,45 @@ class BoardService:
         def _query(conn: Any) -> List[Dict]:
             self._pool.set_tenant_context(conn, org_id, None)
             conditions, values = [], []
+            # We may need to join with boards table if filtering by project_id
+            needs_board_join = project_id is not None
 
             if project_id:
-                conditions.append("project_id = %s"); values.append(project_id)
+                # Work items link to boards; boards have project_id
+                conditions.append("b.project_id = %s"); values.append(project_id)
             if board_id:
-                conditions.append("board_id = %s"); values.append(board_id)
+                conditions.append("w.board_id = %s"); values.append(board_id)
             if item_type:
-                conditions.append("item_type = %s"); values.append(item_type.value)
+                conditions.append("w.item_type = %s"); values.append(item_type.value)
             if parent_id:
-                conditions.append("parent_id = %s"); values.append(parent_id)
+                conditions.append("w.parent_id = %s"); values.append(parent_id)
             if status:
-                conditions.append("status = %s"); values.append(status.value)
+                conditions.append("w.status = %s"); values.append(status.value)
             if assignee_id:
-                conditions.append("assignee_id = %s"); values.append(assignee_id)
+                conditions.append("w.assignee_id = %s"); values.append(assignee_id)
             if labels:
-                # Use ?| operator for "any of" matching (uses GIN index)
-                conditions.append("labels ?| %s"); values.append(labels)
+                # Use && operator for array overlap (works with varchar[] columns)
+                conditions.append("w.labels && %s::varchar[]"); values.append(labels)
             if sprint_id:
-                conditions.append("sprint_id = %s"); values.append(sprint_id)
+                conditions.append("w.sprint_id = %s"); values.append(sprint_id)
 
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             values.extend([limit, offset])
 
             with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT * FROM work_items {where} ORDER BY position, created_at LIMIT %s OFFSET %s",
-                    values
-                )
+                if needs_board_join:
+                    # Join with boards to filter by project_id
+                    cur.execute(
+                        f"""SELECT w.* FROM work_items w
+                            JOIN boards b ON w.board_id = b.id
+                            {where} ORDER BY w.position, w.created_at LIMIT %s OFFSET %s""",
+                        values
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT * FROM work_items w {where} ORDER BY w.position, w.created_at LIMIT %s OFFSET %s",
+                        values
+                    )
                 cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, row)) for row in cur.fetchall()]
 

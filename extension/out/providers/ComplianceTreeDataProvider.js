@@ -51,13 +51,15 @@ class ComplianceTreeDataProvider {
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
         this.checklists = [];
         this.refreshInterval = 30000; // 30 seconds
-        this.initializeDataProvider();
+        // NOTE: Do NOT auto-initialize - wait for user to manually refresh
+        // This prevents resource exhaustion on startup
     }
-    async initializeDataProvider() {
-        await this.refresh();
-        this.startAutoRefresh();
-    }
+    /**
+     * Start auto-refresh (call only after user initiates first refresh)
+     */
     startAutoRefresh() {
+        if (this.refreshTimer)
+            return;
         this.refreshTimer = setInterval(async () => {
             await this.refresh();
         }, this.refreshInterval);

@@ -192,15 +192,150 @@ class InMemoryProjectStore:
             # Don't fail startup - start with empty store
 
     def get_project(self, *, project_id: str, owner_id: str) -> Optional[StoredProject]:
-        """Get a specific project by ID for a given owner."""
+        """Get a specific project by ID for a given owner.
+
+        If PostgresPool is available, refreshes settings from database to ensure
+        any updates made via SettingsService are reflected immediately.
+        """
         by_owner = self._projects_by_owner.get(owner_id, {})
-        return by_owner.get(project_id)
+        project = by_owner.get(project_id)
+
+        if project is None:
+            return None
+
+        # Refresh settings from database to pick up any SettingsService updates
+        if self._pool is not None:
+            try:
+                with self._pool.connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT settings FROM projects WHERE project_id = %s",
+                            (project_id,)
+                        )
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            fresh_settings = row[0] if isinstance(row[0], dict) else {}
+                            # Update in-memory cache with fresh settings
+                            project = StoredProject(
+                                id=project.id,
+                                name=project.name,
+                                slug=project.slug,
+                                description=project.description,
+                                visibility=project.visibility,
+                                settings=fresh_settings,
+                                org_id=project.org_id,
+                                owner_id=project.owner_id,
+                                created_at=project.created_at,
+                                updated_at=project.updated_at,
+                            )
+                            # Update cache
+                            self._projects_by_owner[owner_id][project_id] = project
+            except Exception as e:
+                logger.warning(f"Failed to refresh project settings from database: {e}")
+                # Fall back to cached settings
+
+        return project
 
     def list_projects(self, *, owner_id: str, org_id: Optional[str] = None) -> List[StoredProject]:
+        """List projects accessible to a user.
+
+        Returns:
+        - Personal projects: where owner_id matches (org_id IS NULL)
+        - Org projects: where user is a member of the org (via org_memberships)
+
+        If org_id is provided, filters to only that org's projects.
+        If org_id is None, returns personal projects PLUS all org projects the user can access.
+        """
+        # If we have PostgreSQL, query directly for accurate org membership data
+        if self._pool is not None:
+            return self._list_projects_from_postgres(owner_id=owner_id, org_id=org_id)
+
+        # Fallback to in-memory (legacy behavior)
         projects = list(self._projects_by_owner.get(owner_id, {}).values())
         if org_id is None:
             return [p for p in projects if p.org_id is None]
         return [p for p in projects if p.org_id == org_id]
+
+    def _list_projects_from_postgres(self, *, owner_id: str, org_id: Optional[str] = None) -> List[StoredProject]:
+        """Query PostgreSQL for projects accessible to a user.
+
+        Includes:
+        1. Personal projects: owner_id = user_id AND org_id IS NULL
+        2. Org projects: user is a member of the org
+        """
+        results: List[StoredProject] = []
+
+        def _execute(conn) -> None:
+            with conn.cursor() as cur:
+                if org_id is not None:
+                    # Filter to specific org - user must be a member
+                    cur.execute(
+                        """
+                        SELECT p.project_id, p.org_id, p.name, p.slug, p.description,
+                               p.visibility, p.settings, p.created_by, p.owner_id,
+                               p.created_at, p.updated_at
+                        FROM projects p
+                        INNER JOIN org_memberships om ON om.org_id = p.org_id
+                        WHERE om.user_id = %s AND p.org_id = %s AND p.archived_at IS NULL
+                        """,
+                        (owner_id, org_id),
+                    )
+                else:
+                    # Return personal projects + all org projects user can access
+                    cur.execute(
+                        """
+                        SELECT p.project_id, p.org_id, p.name, p.slug, p.description,
+                               p.visibility, p.settings, p.created_by, p.owner_id,
+                               p.created_at, p.updated_at
+                        FROM projects p
+                        LEFT JOIN org_memberships om ON om.org_id = p.org_id AND om.user_id = %s
+                        WHERE p.archived_at IS NULL
+                          AND (
+                            -- Personal projects owned by user
+                            (p.owner_id = %s AND p.org_id IS NULL)
+                            OR
+                            -- Org projects where user is a member
+                            (p.org_id IS NOT NULL AND om.membership_id IS NOT NULL)
+                          )
+                        ORDER BY p.created_at DESC
+                        """,
+                        (owner_id, owner_id),
+                    )
+
+                for row in cur.fetchall():
+                    # Handle both old schema (created_by) and new schema (owner_id)
+                    project_owner = row[8] if row[8] else row[7]
+                    results.append(StoredProject(
+                        id=row[0],
+                        org_id=row[1],
+                        name=row[2],
+                        slug=row[3],
+                        description=row[4],
+                        visibility=row[5],
+                        settings=row[6] if isinstance(row[6], dict) else {},
+                        owner_id=project_owner or owner_id,  # Fallback for legacy records
+                        created_at=row[9],
+                        updated_at=row[10],
+                    ))
+
+        try:
+            self._pool.run_transaction(
+                operation="project.list",
+                service_prefix="project",
+                actor=owner_id,
+                metadata={"org_id": org_id},
+                executor=_execute,
+                telemetry=None,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to list projects from PostgreSQL: {e}")
+            # Fallback to in-memory
+            projects = list(self._projects_by_owner.get(owner_id, {}).values())
+            if org_id is None:
+                return [p for p in projects if p.org_id is None]
+            return [p for p in projects if p.org_id == org_id]
+
+        return results
 
     def _persist_to_postgres(self, project: StoredProject) -> None:
         """Persist project to PostgreSQL auth.projects table for FK integrity.

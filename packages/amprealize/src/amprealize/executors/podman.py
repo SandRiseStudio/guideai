@@ -768,6 +768,9 @@ class PodmanExecutor(ResourceCapableExecutor):
         if config.detach:
             args.append("-d")
 
+        if config.privileged:
+            args.append("--privileged")
+
         args.extend(["--name", config.name])
 
         # Network

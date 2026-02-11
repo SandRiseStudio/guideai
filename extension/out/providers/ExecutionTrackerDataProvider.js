@@ -49,18 +49,26 @@ class ExecutionTrackerDataProvider {
         this._onDidChangeTreeData = new vscode.EventEmitter();
         this.onDidChangeTreeData = this._onDidChangeTreeData.event;
         this.runs = [];
-        this.refreshInterval = 5000; // 5 seconds
-        this.initializeDataProvider();
+        this.refreshInterval = 30000; // 30 seconds (was 5s - too aggressive)
+        this.isLoading = false;
+        this.lastRefresh = 0;
+        this.minRefreshInterval = 5000; // Minimum 5s between refreshes
+        // NOTE: Do NOT auto-initialize - wait for user to manually refresh
+        // This prevents resource exhaustion on startup
     }
-    async initializeDataProvider() {
-        await this.refresh();
-        this.startAutoRefresh();
-    }
+    /**
+     * Start auto-refresh (call this when view becomes visible)
+     */
     startAutoRefresh() {
+        if (this.refreshTimer)
+            return; // Already running
         this.refreshTimer = setInterval(async () => {
             await this.refresh();
         }, this.refreshInterval);
     }
+    /**
+     * Stop auto-refresh (call this when view is hidden)
+     */
     stopAutoRefresh() {
         if (this.refreshTimer) {
             clearInterval(this.refreshTimer);
@@ -68,6 +76,13 @@ class ExecutionTrackerDataProvider {
         }
     }
     async refresh() {
+        // Rate limiting - prevent rapid refreshes
+        const now = Date.now();
+        if (this.isLoading || (now - this.lastRefresh < this.minRefreshInterval)) {
+            return;
+        }
+        this.isLoading = true;
+        this.lastRefresh = now;
         try {
             // Get recent runs (last 20 runs)
             const runs = await this.client.listRuns({ limit: 20 });
@@ -76,6 +91,10 @@ class ExecutionTrackerDataProvider {
         }
         catch (error) {
             console.error('Failed to refresh execution tracker:', error);
+            // Don't spam errors - just log once
+        }
+        finally {
+            this.isLoading = false;
         }
     }
     getTreeItem(element) {

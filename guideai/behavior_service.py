@@ -76,6 +76,8 @@ class BehaviorVersion:
     approval_action_id: Optional[str]
     embedding_checksum: Optional[str]
     embedding: Optional[List[float]] = None
+    confidence_score: Optional[float] = None  # 0.0-1.0, >=0.8 eligible for auto-approval
+    historical_validations: Optional[List[str]] = None  # List of run_ids that validated this behavior
 
     def to_dict(self, include_metadata: bool = True) -> Dict[str, Any]:
         payload = {
@@ -91,12 +93,26 @@ class BehaviorVersion:
             "created_by": self.created_by,
             "approval_action_id": self.approval_action_id,
             "embedding_checksum": self.embedding_checksum,
+            "confidence_score": self.confidence_score,
+            "historical_validations": list(self.historical_validations) if self.historical_validations else [],
         }
         if include_metadata:
             payload["metadata"] = dict(self.metadata)
             if self.embedding is not None:
                 payload["embedding"] = list(self.embedding)
         return payload
+
+    @property
+    def eligible_for_auto_approval(self) -> bool:
+        """Check if behavior meets auto-approval threshold per AGENTS.md.
+
+        Auto-approval criteria (confidence >= 0.8):
+        - Validated against 3+ historical cases
+        - Clear, unambiguous triggers
+        - No overlap with existing behaviors
+        - Follows behavior_<verb>_<noun> naming
+        """
+        return (self.confidence_score or 0.0) >= 0.8
 
 
 @dataclass(frozen=True)
@@ -130,6 +146,8 @@ class CreateBehaviorDraftRequest:
     examples: List[Dict[str, Any]] = field(default_factory=list)
     embedding: Optional[List[float]] = None
     base_version: Optional[str] = None
+    confidence_score: Optional[float] = None  # 0.0-1.0, >=0.8 eligible for auto-approval
+    historical_validations: Optional[List[str]] = None  # Run IDs that validated this pattern
 
 
 @dataclass
@@ -143,6 +161,8 @@ class UpdateBehaviorDraftRequest:
     examples: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, Any]] = None
     embedding: Optional[List[float]] = None
+    confidence_score: Optional[float] = None  # 0.0-1.0, >=0.8 eligible for auto-approval
+    historical_validations: Optional[List[str]] = None  # Run IDs to add to validation history
 
 
 @dataclass
@@ -169,6 +189,57 @@ class SearchBehaviorsRequest:
     status: Optional[str] = None
     limit: int = 25
     namespace: Optional[str] = DEFAULT_BEHAVIOR_NAMESPACE
+
+
+@dataclass
+class ProposeBehaviorRequest:
+    """Request to propose a new behavior from observed patterns.
+
+    Follows the Behavior Lifecycle from AGENTS.md:
+    Phase 1 (DISCOVER) -> Phase 2 (PROPOSE) -> Phase 3 (APPROVE) -> Phase 4 (INTEGRATE)
+
+    This request is used by Students to escalate patterns to Strategists,
+    and by Strategists to emit new behaviors from reflection traces.
+    """
+    name: str  # Must follow behavior_<verb>_<noun> pattern
+    description: str
+    instruction: str
+    role_focus: str  # Student, Teacher, or Strategist
+    trigger_keywords: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    examples: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    # Proposal-specific fields
+    confidence_score: float = 0.0  # 0.0-1.0, calculated from historical validation
+    historical_validations: List[str] = field(default_factory=list)  # Run IDs that validated pattern
+    pattern_id: Optional[str] = None  # Link to TraceAnalysisService pattern
+    proposed_by_role: str = "Strategist"  # Role that proposed (Student escalates, Strategist emits)
+    rationale: Optional[str] = None  # Why this behavior should exist
+
+
+@dataclass
+class RoleContext:
+    """Context for role-based execution tracking.
+
+    Used to capture which role (Student/Teacher/Strategist) is performing
+    an operation for telemetry and audit purposes. Role declarations are
+    emphasized but do not fail if missing.
+    """
+    role: str  # Student, Teacher, or Strategist
+    rationale: Optional[str] = None  # Why this role was chosen
+    behaviors_cited: List[str] = field(default_factory=list)  # Behaviors being applied
+    escalated_from: Optional[str] = None  # If escalated, the previous role
+    escalation_reason: Optional[str] = None  # Why escalation occurred
+
+    def to_telemetry_payload(self) -> Dict[str, Any]:
+        """Convert to telemetry payload for tracking."""
+        return {
+            "role": self.role,
+            "rationale": self.rationale,
+            "behaviors_cited": self.behaviors_cited,
+            "escalated_from": self.escalated_from,
+            "escalation_reason": self.escalation_reason,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +424,124 @@ class BehaviorService:
         get_cache().invalidate_behavior()
 
         return version_obj
+
+    def propose_behavior(
+        self,
+        request: ProposeBehaviorRequest,
+        actor: Actor,
+        role_context: Optional[RoleContext] = None,
+    ) -> Dict[str, Any]:
+        """Propose a new behavior from observed patterns.
+
+        Follows the Behavior Lifecycle from AGENTS.md:
+        Phase 1 (DISCOVER): Student escalates pattern to Strategist
+        Phase 2 (PROPOSE): Strategist drafts behavior via this method
+        Phase 3 (APPROVE): Teacher validates, or auto-approve if confidence >= 0.8
+        Phase 4 (INTEGRATE): Add to handbook and retrieval index
+
+        Args:
+            request: ProposeBehaviorRequest with behavior details and confidence scoring
+            actor: The actor proposing the behavior
+            role_context: Optional role context for telemetry (emphasized but not required)
+
+        Returns:
+            Dict with proposal result including auto_approved flag and behavior_id
+        """
+        # Validate behavior name follows pattern: behavior_<verb>_<noun>
+        if not request.name.startswith("behavior_"):
+            raise BehaviorValidationError(
+                f"Behavior name must follow 'behavior_<verb>_<noun>' pattern: {request.name}"
+            )
+
+        # Emit role context telemetry (advisory, not mandatory)
+        if role_context:
+            self._telemetry.emit_event(
+                event_type="behaviors.proposal_role_context",
+                payload=role_context.to_telemetry_payload(),
+                actor=self._actor_payload(actor),
+            )
+        else:
+            # Log that role context was not provided (advisory warning)
+            self._telemetry.emit_event(
+                event_type="behaviors.proposal_role_context_missing",
+                payload={"behavior_name": request.name, "advisory": True},
+                actor=self._actor_payload(actor),
+            )
+
+        # Create the behavior draft with confidence scoring
+        create_request = CreateBehaviorDraftRequest(
+            name=request.name,
+            description=request.description,
+            instruction=request.instruction,
+            role_focus=request.role_focus,
+            trigger_keywords=request.trigger_keywords,
+            tags=request.tags,
+            examples=request.examples,
+            metadata={
+                **request.metadata,
+                "proposed_by_role": request.proposed_by_role,
+                "pattern_id": request.pattern_id,
+                "rationale": request.rationale,
+            },
+            confidence_score=request.confidence_score,
+            historical_validations=request.historical_validations,
+        )
+
+        version_obj = self.create_behavior_draft(create_request, actor)
+
+        # Check for auto-approval eligibility
+        auto_approved = False
+        if request.confidence_score >= 0.8 and len(request.historical_validations) >= 3:
+            # Auto-approve per AGENTS.md criteria
+            approval_request = ApproveBehaviorRequest(
+                behavior_id=version_obj.behavior_id,
+                version=version_obj.version,
+                effective_from=utc_now_iso(),
+                approval_action_id=f"auto_approval_{version_obj.behavior_id}",
+            )
+            self.approve_behavior(approval_request, actor)
+            auto_approved = True
+
+            self._telemetry.emit_event(
+                event_type="behaviors.auto_approved",
+                payload={
+                    "behavior_id": version_obj.behavior_id,
+                    "version": version_obj.version,
+                    "confidence_score": request.confidence_score,
+                    "historical_validations_count": len(request.historical_validations),
+                    "proposed_by_role": request.proposed_by_role,
+                },
+                actor=self._actor_payload(actor),
+            )
+        else:
+            # Emit proposal event for Teacher review
+            self._telemetry.emit_event(
+                event_type="behaviors.proposed",
+                payload={
+                    "behavior_id": version_obj.behavior_id,
+                    "version": version_obj.version,
+                    "confidence_score": request.confidence_score,
+                    "historical_validations_count": len(request.historical_validations),
+                    "needs_teacher_review": True,
+                    "proposed_by_role": request.proposed_by_role,
+                    "rationale": request.rationale,
+                },
+                actor=self._actor_payload(actor),
+            )
+
+        return {
+            "behavior_id": version_obj.behavior_id,
+            "version": version_obj.version,
+            "status": "APPROVED" if auto_approved else "DRAFT",
+            "auto_approved": auto_approved,
+            "confidence_score": request.confidence_score,
+            "needs_teacher_review": not auto_approved,
+            "message": (
+                f"Behavior auto-approved (confidence={request.confidence_score}, validations={len(request.historical_validations)})"
+                if auto_approved
+                else f"Behavior proposed for Teacher review (confidence={request.confidence_score})"
+            ),
+        }
 
     def update_behavior_draft(self, request: UpdateBehaviorDraftRequest, actor: Actor) -> BehaviorVersion:
         """Update an existing draft or in-review behavior version.
@@ -828,6 +1017,127 @@ class BehaviorService:
         )
         return limited
 
+    def get_relevant_behaviors_for_task(
+        self,
+        task_description: str,
+        role: str = "Student",
+        limit: int = 5,
+        actor: Optional[Actor] = None,
+        role_context: Optional[RoleContext] = None,
+    ) -> Dict[str, Any]:
+        """Get relevant behaviors for a task before execution.
+
+        This is the primary method agents should call at the start of any task
+        to retrieve applicable behaviors. Follows behavior_prefer_mcp_tools pattern.
+
+        Args:
+            task_description: Natural language description of the task
+            role: The agent's current role (Student, Teacher, Strategist)
+            limit: Maximum number of behaviors to return
+            actor: Optional actor for telemetry
+            role_context: Optional role context (emphasized for telemetry)
+
+        Returns:
+            Dict with:
+                - behaviors: List of relevant BehaviorSearchResult
+                - recommended_behaviors: Top behaviors formatted for agent prompt
+                - role_advisory: Guidance on role-based behavior application
+        """
+        # Emit role context telemetry (advisory)
+        if role_context:
+            self._telemetry.emit_event(
+                event_type="behaviors.task_retrieval_with_role",
+                payload={
+                    "task_description": task_description[:200],
+                    **role_context.to_telemetry_payload(),
+                },
+                actor=self._actor_payload(actor) if actor else None,
+            )
+
+        # Search for relevant behaviors
+        search_request = SearchBehaviorsRequest(
+            query=task_description,
+            role_focus=role if role != "any" else None,
+            status="APPROVED",
+            limit=limit,
+        )
+        results = self.search_behaviors(search_request, actor)
+
+        # Format behaviors for agent prompt consumption
+        recommended = []
+        for result in results[:limit]:
+            if result.active_version:
+                behavior_info = {
+                    "name": result.behavior.name,
+                    "instruction": result.active_version.instruction,
+                    "role_focus": result.active_version.role_focus,
+                    "trigger_keywords": result.active_version.trigger_keywords,
+                    "score": result.score,
+                    "confidence_score": result.active_version.confidence_score,
+                }
+                recommended.append(behavior_info)
+
+        # Generate role-specific advisory
+        role_advisory = self._get_role_advisory(role, recommended)
+
+        # Emit task context retrieval event
+        self._telemetry.emit_event(
+            event_type="behaviors.task_context_retrieved",
+            payload={
+                "task_description": task_description[:200],
+                "role": role,
+                "behaviors_found": len(results),
+                "recommended_count": len(recommended),
+                "behavior_names": [r.behavior.name for r in results[:limit]],
+            },
+            actor=self._actor_payload(actor) if actor else None,
+        )
+
+        return {
+            "behaviors": results,
+            "recommended_behaviors": recommended,
+            "role_advisory": role_advisory,
+            "role": role,
+            "task_description": task_description,
+        }
+
+    def _get_role_advisory(self, role: str, behaviors: List[Dict[str, Any]]) -> str:
+        """Generate role-specific advisory for behavior application.
+
+        Based on AGENTS.md role definitions:
+        - Student: Execute with guidance, cite behaviors
+        - Teacher: Create examples, validate quality
+        - Strategist: Analyze patterns, propose new behaviors
+        """
+        if not behaviors:
+            return f"No matching behaviors found. As {role}, consider whether this task requires a new behavior proposal."
+
+        behavior_names = [b["name"] for b in behaviors[:3]]
+
+        if role == "Student":
+            return (
+                f"📖 Role: Student\n"
+                f"Apply these behaviors during execution: {', '.join(behavior_names)}\n"
+                f"Cite each behavior in your work output.\n"
+                f"If pattern occurs 3+ times without behavior, escalate to Strategist."
+            )
+        elif role == "Teacher":
+            return (
+                f"🎓 Role: Teacher\n"
+                f"Reference behaviors for validation: {', '.join(behavior_names)}\n"
+                f"Create examples, review for quality, mentor Students.\n"
+                f"If behavior gaps found, escalate to Strategist."
+            )
+        elif role == "Strategist":
+            return (
+                f"🧠 Role: Metacognitive Strategist\n"
+                f"Available behaviors: {', '.join(behavior_names)}\n"
+                f"If novel pattern detected, propose new behavior.\n"
+                f"Follow 3-step process: Solve → Reflect → Emit."
+            )
+        else:
+            return f"Behaviors for task: {', '.join(behavior_names)}"
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1217,6 +1527,19 @@ class BehaviorService:
         # Handle created_by/changed_by
         created_by = data.get("created_by") or data.get("changed_by", "")
 
+        # Handle confidence_score and historical_validations
+        confidence_score = data.get("confidence_score")
+        if confidence_score is not None:
+            confidence_score = float(confidence_score)
+
+        raw_validations = data.get("historical_validations")
+        if isinstance(raw_validations, str):
+            historical_validations = json.loads(raw_validations)
+        elif isinstance(raw_validations, list):
+            historical_validations = raw_validations
+        else:
+            historical_validations = None
+
         return BehaviorVersion(
             behavior_id=str(data["behavior_id"]),
             version=str(data["version"]),  # Convert int to string for consistency
@@ -1232,6 +1555,8 @@ class BehaviorService:
             approval_action_id=str(data["approval_action_id"]) if data.get("approval_action_id") else None,
             embedding_checksum=data.get("embedding_checksum"),
             embedding=embedding,
+            confidence_score=confidence_score,
+            historical_validations=historical_validations,
         )
 
     # ------------------------------------------------------------------

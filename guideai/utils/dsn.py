@@ -91,9 +91,23 @@ def resolve_postgres_dsn(
     env_var: str,
     default_dsn: str,
 ) -> str:
-    """Resolve and normalize DSNs for services with layered fallbacks."""
+    """Resolve and normalize DSNs for services with layered fallbacks.
 
-    candidate = explicit_dsn or os.getenv(env_var) or build_dsn_from_components(service) or default_dsn
+    Resolution order:
+    1. explicit_dsn (passed directly to constructor)
+    2. Service-specific env var (e.g., GUIDEAI_TASK_CYCLE_PG_DSN)
+    3. Build from GUIDEAI_PG_* components
+    4. DATABASE_URL (universal fallback for containerized environments)
+    5. default_dsn (localhost fallback for local development)
+    """
+
+    candidate = (
+        explicit_dsn
+        or os.getenv(env_var)
+        or build_dsn_from_components(service)
+        or os.getenv("DATABASE_URL")  # Universal fallback for containers
+        or default_dsn
+    )
     return apply_host_overrides(candidate, service)
 
 

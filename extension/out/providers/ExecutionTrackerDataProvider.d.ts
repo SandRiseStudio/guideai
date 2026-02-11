@@ -30,10 +30,18 @@ export declare class ExecutionTrackerDataProvider implements vscode.TreeDataProv
     private runs;
     private readonly refreshInterval;
     private refreshTimer?;
+    private isLoading;
+    private lastRefresh;
+    private readonly minRefreshInterval;
     constructor(client: GuideAIClient);
-    private initializeDataProvider;
-    private startAutoRefresh;
-    private stopAutoRefresh;
+    /**
+     * Start auto-refresh (call this when view becomes visible)
+     */
+    startAutoRefresh(): void;
+    /**
+     * Stop auto-refresh (call this when view is hidden)
+     */
+    stopAutoRefresh(): void;
     refresh(): Promise<void>;
     getTreeItem(element: RunTreeItem | RunStepTreeItem): vscode.TreeItem;
     private getRunTreeItem;

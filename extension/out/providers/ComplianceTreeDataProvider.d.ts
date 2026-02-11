@@ -29,7 +29,9 @@ export declare class ComplianceTreeDataProvider implements vscode.TreeDataProvid
     private readonly refreshInterval;
     private refreshTimer?;
     constructor(client: GuideAIClient);
-    private initializeDataProvider;
+    /**
+     * Start auto-refresh (call only after user initiates first refresh)
+     */
     private startAutoRefresh;
     private stopAutoRefresh;
     refresh(): Promise<void>;
