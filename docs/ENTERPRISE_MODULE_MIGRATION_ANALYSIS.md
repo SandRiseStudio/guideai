@@ -137,3 +137,56 @@ After migration, these stubs/no-ops are needed in the OSS repo:
 | `multi_tenant` | Keep contracts + context + basic permissions in OSS; enterprise services behind `try/except ImportError` |
 | `research` | CLI command hidden when module not installed |
 | `midnighter` | No stub needed (zero consumers) |
+
+---
+
+## Infrastructure Files Analysis (A6-T9)
+
+> **Total**: 70 files across Dockerfiles, compose configs, scripts, monitoring, docs
+
+### Files Staying in OSS (`guideai/guideai`)
+
+These support local development and basic self-hosted deployments:
+
+| File | Purpose |
+|------|---------|
+| `infra/Dockerfile.core.simple` | Minimal single-stage build for local dev |
+| `infra/docker-compose.test.yml` | Test infrastructure (Postgres, Redis) |
+| `infra/docker-compose.postgres.yml` | Basic Postgres for local development |
+| `infra/environments/local.env` | Local development environment variables |
+| `infra/environments/dev.env.example` | Dev environment template |
+| `infra/environments/postgres.env.example` | Postgres connection template |
+| `infra/environments.yaml` | Amprealize environment definitions |
+| `infra/scripts/entrypoint.sh` | Container entrypoint |
+| `infra/QUICKSTART.md` | Getting started guide |
+| `infra/README.md` | Infra overview |
+| `infra/CONTAINER_COMPARISON.md` | Container runtime docs |
+| `infra/CONTAINER_RUNTIME_DECISION.md` | Runtime decision docs |
+| `infra/data/test-events/parity_test_events.json` | Test fixtures |
+| `infra/requirements-verify.txt` | Verification requirements |
+
+### Files Moving to Enterprise (`guideai/guideai-enterprise`)
+
+Production, staging, scaling, and cloud deployment configs:
+
+| Category | Files | Count |
+|----------|-------|------:|
+| **Dockerfiles (production)** | `Dockerfile.core`, `Dockerfile.mcp`, `Dockerfile.archive-audit`, `Dockerfile.verify-hash-chain` | 4 |
+| **Compose (staging/prod)** | `docker-compose.staging.yml`, `docker-compose.streaming.yml`, `docker-compose.streaming-simple.yml`, `docker-compose.telemetry.yml`, `docker-compose.metrics.yml`, `docker-compose.analytics-dashboard.yml` | 6 |
+| **Podman (scaling)** | `podman-compose-scaled.yml`, `podman-compose-staging.yml` | 2 |
+| **Cloud Build** | `cloudbuild.verify-hash-chain.yaml` | 1 |
+| **Environments (prod/staging)** | `environments/production.env`, `environments/staging.env.example`, `environments/prod.env.example`, `staging.env` | 4 |
+| **Config (monitoring)** | `config/grafana/`, `config/prometheus/`, `config/prometheus-staging.yml`, `config/pgbouncer.*`, `config/pgadmin_servers.json`, `config/dr_monitoring.yml`, `config/telemetry.*.env`, `config/hybrid-flink.env` | 12 |
+| **Flink** | `flink/telemetry_kpi_job.py` | 1 |
+| **Grafana** | `grafana/README.md`, `grafana/embedding_optimization.json` | 2 |
+| **Prometheus** | `prometheus/embedding_alerts.yml` | 1 |
+| **Scripts (deploy/scale)** | `scripts/deploy-scaled-services.sh`, `scripts/hybrid-*.sh` (4), `scripts/init-warehouse.py`, `scripts/migrate-podman-to-k8s.sh`, `scripts/nginx-entrypoint.sh`, `scripts/scale-specific-services.sh*` (2) | 10 |
+| **Docs (scaling/deploy)** | `CICD_DEPLOYMENT_GUIDE.md`, `CICD_TEST_STATUS.md`, `HORIZONTAL_SCALING_*.md` (3), `HYBRID_FLINK_*.md` (2), `HYBRID_KAFKA_*.md`, `PODMAN.md`, `PODMAN_SCALING_CONFIGURATION.md`, `SCALING_DEPLOYMENT_SCRIPTS.md`, `STAGING_DEPLOYMENT_GUIDE.md` | 13 |
+| | **Total enterprise** | **56** |
+
+### Summary
+
+| Destination | Files | Purpose |
+|------------|------:|---------|
+| OSS | 14 | Local dev, test, basic self-hosted |
+| Enterprise | 56 | Production, staging, scaling, monitoring, cloud |
