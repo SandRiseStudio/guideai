@@ -1,27 +1,24 @@
-"""Research paper ingesters for various source types."""
+"""Research ingesters - OSS Stub. Full implementation in guideai-enterprise."""
 
-from guideai.research.ingesters.base import (
-    BaseIngester,
-    count_words,
-    extract_figure_captions,
-    extract_metadata_from_markdown,
-    extract_table_captions,
-    parse_markdown_sections,
-)
-from guideai.research.ingesters.markdown_ingester import MarkdownIngester
-from guideai.research.ingesters.url_ingester import URLIngester
-from guideai.research.ingesters.pdf_ingester import PDFIngester
-
-__all__ = [
-    # Base
-    "BaseIngester",
-    "count_words",
-    "extract_figure_captions",
-    "extract_metadata_from_markdown",
-    "extract_table_captions",
-    "parse_markdown_sections",
-    # Ingesters
-    "MarkdownIngester",
-    "URLIngester",
-    "PDFIngester",
-]
+try:
+    from guideai_enterprise.research.ingesters import (
+        BaseIngester,
+        MarkdownIngester,
+        URLIngester,
+        PDFIngester,
+        count_words,
+        extract_figure_captions,
+        extract_metadata_from_markdown,
+        extract_table_captions,
+        parse_markdown_sections,
+    )
+except ImportError:
+    BaseIngester = None  # type: ignore[assignment,misc]
+    MarkdownIngester = None  # type: ignore[assignment,misc]
+    URLIngester = None  # type: ignore[assignment,misc]
+    PDFIngester = None  # type: ignore[assignment,misc]
+    count_words = None  # type: ignore[assignment]
+    extract_figure_captions = None  # type: ignore[assignment]
+    extract_metadata_from_markdown = None  # type: ignore[assignment]
+    extract_table_captions = None  # type: ignore[assignment]
+    parse_markdown_sections = None  # type: ignore[assignment]
