@@ -234,7 +234,7 @@ Provide a centralized framework that secures guideAI agents when they act across
    - Publish `proto/agentauth/v1/agent_auth.proto` covering `EnsureGrant`, `RevokeGrant`, `ListGrants`, and `PolicyPreview` RPCs with shared error enums.
    - Generate REST schemas under `schema/agentauth/v1/*.json` mirroring proto types for OpenAPI parity.
    - Create canonical scope catalog (`schema/agentauth/scope_catalog.yaml`) mapping each tool/action to provider scopes and default RBAC roles.
-   - Define policy bundle format (`policy/agentauth/bundle.yaml`) encapsulating contextual rules, version metadata, and rollout annotations.
+   - Define policy bundle format (`schema/policy/agentauth/bundle.yaml`) encapsulating contextual rules, version metadata, and rollout annotations.
    - Produce MCP tool contracts (`auth.ensureGrant`, `auth.revoke`, `auth.listGrants`, `auth.policy.preview`) with capability notes for CLI, Web, and VS Code clients.
    - Update capability matrix with Agent Auth row.
    - Ship SDK stubs and contract tests (`guideai/agent_auth.py`, `tests/test_agent_auth_contracts.py`) validating artifact alignment (CMD-006).

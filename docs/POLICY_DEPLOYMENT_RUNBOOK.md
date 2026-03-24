@@ -1,10 +1,10 @@
 # Policy Deployment Runbook
 
-> Applies to AgentAuth policy bundles stored under `policy/agentauth/` and their downstream consumers (CLI, REST, MCP, IDE surfaces). Follow this runbook whenever updating contextual rules, scope mappings, or rollout annotations to maintain parity, auditability, and compliance targets defined in `PRD.md`.
+> Applies to AgentAuth policy bundles stored under `schema/policy/agentauth/` and their downstream consumers (CLI, REST, MCP, IDE surfaces). Follow this runbook whenever updating contextual rules, scope mappings, or rollout annotations to maintain parity, auditability, and compliance targets defined in `PRD.md`.
 
 ## 1. Purpose & Scope
 - Guarantee that every policy change is versioned, reviewed, dry-run validated, and rolled out in a staged manner across staging and production.
-- Preserve evidence trails for SOC2/GDPR coverage (95% compliance) and reproducibility commitments linked to ActionService (`ACTION_SERVICE_CONTRACT.md`).
+- Preserve evidence trails for SOC2/GDPR coverage (95% compliance) and reproducibility commitments linked to ActionService (`contracts/ACTION_SERVICE_CONTRACT.md`).
 - Ensure telemetry (`auth.policy.evaluate`, `auth_grant_*`) and governance artifacts (`PRD_ALIGNMENT_LOG.md`, `BUILD_TIMELINE.md`, `PROGRESS_TRACKER.md`) remain accurate after each change.
 
 ## 2. Roles & Behaviors
@@ -17,7 +17,7 @@
 
 ## 3. Pre-Deployment Checklist
 - [ ] Run through `behavior_handbook_compliance_prompt` triggers.
-- [ ] Confirm policy diffs are limited to declarative YAML under `policy/agentauth/` (no inline secrets per `SECRETS_MANAGEMENT_PLAN.md`).
+- [ ] Confirm policy diffs are limited to declarative YAML under `schema/policy/agentauth/` (no inline secrets per `SECRETS_MANAGEMENT_PLAN.md`).
 - [ ] Update scope catalog (`schema/agentauth/scope_catalog.yaml`) if new scopes or MFA requirements are introduced.
 - [ ] Sync references in `docs/AGENT_AUTH_ARCHITECTURE.md` §§16–18 when policy semantics change.
 - [ ] Sign into required environments (GitHub/GitLab + staging cluster) with MFA.
@@ -39,16 +39,16 @@
    - Assign Security Strategist (DRI) and Product Strategist (approver).
 2. **Author Policy Change**
    - Branch from `main`: `git checkout -b security/policy-<slug>`.
-   - Edit `policy/agentauth/bundle.yaml`; update version tag (`policy-major.minor.patch`).
+   - Edit `schema/policy/agentauth/bundle.yaml`; update version tag (`policy-major.minor.patch`).
    - If scope catalog or consent copy shifts, update corresponding docs and SDK fixtures.
    - Commit message format: `policy: <short summary>` and cite behaviors in PR body.
 3. **Local Validation**
-   - Run formatting check: `yamllint policy/agentauth/bundle.yaml` (install via `pipx` if needed).
+   - Run formatting check: `yamllint schema/policy/agentauth/bundle.yaml` (install via `pipx` if needed).
    - Execute contract tests: `pytest tests/test_agent_auth_contracts.py` (and future `tests/test_policy_contracts.py`).
    - Preview change:
      ```bash
      guideai auth policy preview \
-       --bundle policy/agentauth/bundle.yaml \
+       --bundle schema/policy/agentauth/bundle.yaml \
        --environment staging \
        --output tmp/policy-preview.json
      ```
@@ -68,7 +68,7 @@
    - Record ActionService evidence:
      ```bash
      guideai record-action \
-       --artifact policy/agentauth/bundle.yaml \
+       --artifact schema/policy/agentauth/bundle.yaml \
        --summary "Promote policy <version> to staging" \
        --behavior behavior_orchestrate_cicd \
        --behavior behavior_instrument_metrics_pipeline
@@ -92,7 +92,7 @@
    - Notify incident channel, create hot fix branch `revert/policy-<version>`.
    - Run:
      ```bash
-     guideai auth policy rollback --target policy/agentauth/bundle.yaml --environment production
+     guideai auth policy rollback --target schema/policy/agentauth/bundle.yaml --environment production
      ```
      *(Until CLI command ships, manually revert Git tag to prior semantic version and push to `policy/main`)*
    - Confirm rollback success through `auth.policy.evaluate` telemetry and ActionService log.
@@ -108,7 +108,7 @@
 - **Audit Logs**: Ensure WORM storage records `auth.policy.evaluate` events with the new version hash; include links in compliance reports.
 
 ## 8. Appendix
-- **Related Documents**: `docs/AGENT_AUTH_ARCHITECTURE.md`, `policy/agentauth/bundle.yaml`, `schema/agentauth/scope_catalog.yaml`, `docs/CONSENT_UX_PROTOTYPE.md`, `docs/COMPLIANCE_CONTROL_MATRIX.md`.
+- **Related Documents**: `docs/AGENT_AUTH_ARCHITECTURE.md`, `schema/policy/agentauth/bundle.yaml`, `schema/agentauth/scope_catalog.yaml`, `docs/CONSENT_UX_PROTOTYPE.md`, `docs/COMPLIANCE_CONTROL_MATRIX.md`.
 - **Telemetry Fields**: `event_type`, `policy_version`, `decision`, `scope`, `mfa_verified`, `actor_role`, `surface`, `action_id`.
 - **Checklist Template** (copy into change ticket):
   1. [ ] Ticket approved by Security & Product.

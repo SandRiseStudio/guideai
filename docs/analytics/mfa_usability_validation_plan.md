@@ -11,9 +11,9 @@ Ensure MFA re-prompts feel consistent, fast, and trustworthy across Web, CLI, an
 - \*User sentiment\*: Collect qualitative pain points and classify blockers vs. nits; funnel blockers into `PRD_NEXT_STEPS.md`.
 
 ## Inputs & Dependencies
-- Telemetry schema (`TELEMETRY_SCHEMA.md`) and AgentAuth instrumentation (`guideai/agent_auth.py`, `dashboard/src/telemetry.ts`).
+- Telemetry schema (`contracts/TELEMETRY_SCHEMA.md`) and AgentAuth instrumentation (`guideai/agent_auth.py`, `web-console/dashboard/src/telemetry.ts`).
 - Consent UX prototypes (`docs/CONSENT_UX_PROTOTYPE.md`, `designs/consent/mockups.md`).
-- Scope catalog high-risk mapping (`schema/agentauth/scope_catalog.yaml`) and policy bundle (`policy/agentauth/bundle.yaml`).
+- Scope catalog high-risk mapping (`schema/agentauth/scope_catalog.yaml`) and policy bundle (`schema/policy/agentauth/bundle.yaml`).
 - Dashboard baseline snapshot (`docs/analytics/consent_mfa_snapshot.md`).
 - Behavior handbook entries: `behavior_prototype_consent_ux`, `behavior_instrument_metrics_pipeline`, `behavior_update_docs_after_changes`.
 
@@ -37,7 +37,7 @@ Ensure MFA re-prompts feel consistent, fast, and trustworthy across Web, CLI, an
 - Required event fields: `surface`, `agent_id`, `scopes`, `consent_request_id`, `mfa_required`, `mfa_verified`, `decision_latency_ms`, `audit_action_id`.
 - Dashboard updates: add consent/MFA card deltas compared to baseline snapshot; highlight surfaces breaching latency goals.
 - Alerting: configure warning if `mfa_verified=false` occurs >5% within 1h window per surface; escalate on repeated failures.
-- Storage: verify audit log WORM retention captures MFA transcript references (see `AUDIT_LOG_STORAGE.md`).
+- Storage: verify audit log WORM retention captures MFA transcript references (see `contracts/AUDIT_LOG_STORAGE.md`).
 
 ## Execution Checklist
 1. **Pre-flight**
@@ -49,7 +49,7 @@ Ensure MFA re-prompts feel consistent, fast, and trustworthy across Web, CLI, an
    - Record screen captures or CLI transcripts for each failure.
    - Trigger forced re-prompts and offline flows explicitly.
 3. **Telemetry QA**
-   - Query analytics sink for each event; confirm schema alignment with `TELEMETRY_SCHEMA.md`.
+   - Query analytics sink for each event; confirm schema alignment with `contracts/TELEMETRY_SCHEMA.md`.
    - Update `docs/analytics/consent_mfa_snapshot.md` with refreshed stats.
 4. **Synthesis**
    - Summarize findings (latency, success rate, friction) and map to PRD KPIs.
@@ -81,7 +81,7 @@ We executed a dry-run of the playbook using the current telemetry harness and Ac
 ### Summary
 - Triggered synthetic MFA-required events through the integration tests in `tests/test_telemetry_integration.py` to verify required fields (`mfa_required`, `mfa_verified`, `consent_request_id`, `audit_action_id`).
 - Exercised CLI denial and replay flows via the new `guideai` action parity commands to ensure ActionService logging still captures MFA metadata.
-- Confirmed dashboards ingest consent/MFA payloads without schema drift by running the dashboard build (`npm run build` in `dashboard/`).
+- Confirmed dashboards ingest consent/MFA payloads without schema drift by running the dashboard build (`npm run build` in `web-console/dashboard/`).
 - Captured qualitative notes for surfaces that still require manual UX observation (flagged in the table below).
 
 ### Scenario Results

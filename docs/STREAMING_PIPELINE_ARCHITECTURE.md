@@ -335,7 +335,7 @@ metabase:
 ```
 
 ### Audit Requirements
-- All telemetry events include `actor.id`, `session_id`, `run_id` per `TELEMETRY_SCHEMA.md`
+- All telemetry events include `actor.id`, `session_id`, `run_id` per `contracts/TELEMETRY_SCHEMA.md`
 - Pipeline health events logged to `audit.pipeline_health` table
 - Schema changes versioned and tracked in migration log
 - Dashboard query logs retained for 90 days
@@ -542,7 +542,7 @@ async def test_10k_events_per_second():
 - **High Kafka lag**: Check Flink task manager logs, validate checkpoint success
 - **Dashboard stale**: Verify continuous aggregate refresh policy, check TimescaleDB load
 - **Flink job stuck**: Restart from last checkpoint: `flink run -s <checkpoint-path> ...`
-- **Event validation errors**: Check `TELEMETRY_SCHEMA.md`, validate producer payload
+- **Event validation errors**: Check `contracts/TELEMETRY_SCHEMA.md`, validate producer payload
 
 ## Owners & Dependencies
 
@@ -585,4 +585,4 @@ async def test_10k_events_per_second():
 5. Run comprehensive load tests
 6. Update tracking documents
 
-_References:_ `TELEMETRY_SCHEMA.md`, `PRD.md`, `BUILD_TIMELINE.md` #114-115-122, `PROGRESS_TRACKER.md` Phase 5
+_References:_ `contracts/TELEMETRY_SCHEMA.md`, `PRD.md`, `BUILD_TIMELINE.md` #114-115-122, `PROGRESS_TRACKER.md` Phase 5

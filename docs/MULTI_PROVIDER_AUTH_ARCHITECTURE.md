@@ -329,7 +329,7 @@ OAUTH_GOOGLE_ENABLED=true
 **Status:** Production ready (November 2025)
 **Implementation:** `guideai/auth/providers/internal.py`
 **API Endpoints:** `GET /api/v1/auth/providers`, `POST /api/v1/auth/internal/register`, `POST /api/v1/auth/internal/login`
-**Documentation:** [`INTERNAL_AUTH_GUIDE.md`](../INTERNAL_AUTH_GUIDE.md)
+**Documentation:** [`INTERNAL_AUTH_GUIDE.md`](INTERNAL_AUTH_GUIDE.md)
 
 The Internal Auth Provider implements username/password authentication with JWT tokens, providing an alternative to OAuth for air-gapped environments, local development, and users without OAuth provider accounts.
 
@@ -617,7 +617,7 @@ JWT_ALGORITHM="HS256"                             # Default: HS256
 **Total:** 13/16 passing (81%)
 **Known Limitation:** 2 CLI tests timeout due to `getpass.getpass()` reading from `/dev/tty` (not testable via subprocess stdin, but works correctly in interactive use)
 
-For complete API documentation, usage examples, and troubleshooting, see [`INTERNAL_AUTH_GUIDE.md`](../INTERNAL_AUTH_GUIDE.md).
+For complete API documentation, usage examples, and troubleshooting, see [`INTERNAL_AUTH_GUIDE.md`](INTERNAL_AUTH_GUIDE.md).
 
 ---
 

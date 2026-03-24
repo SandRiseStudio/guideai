@@ -3,7 +3,8 @@
 > **TL;DR**: **Use the role that makes the most sense to begin with. Declare your role at task start.** Use GuideAI MCP tools directly (they work natively in VS Code Copilot Chat!).
 > Log with Raze. Manage environments with Amprealize. Extract reusable code to `packages/`.
 > Never hardcode secrets. Run `pre-commit` before pushing. **Cite both behavior AND role in your work.**
-
+> Refer to WORK_MANAGEMENT_GUIDE.md for how to use the guideai platform for tracking work items, bugs, and project management.
+> Use  ui-ux-pro-max skill for UI work.
 ---
 
 ## 🚨 Critical Rules (Always Follow)
@@ -347,6 +348,10 @@ Scan this table before starting any task. If keywords match, follow the linked b
 | copywriting, messaging, tone, voice, brand copy | `behavior_craft_messaging` | 🎓 Teacher |
 | data pipeline, ETL, feature engineering, data quality | `behavior_create_data_pipeline` | 🎓 Teacher |
 | test strategy, test plan, coverage analysis, test pyramid | `behavior_design_test_strategy` | 🎓 Teacher |
+| feature flag, rollout, percentage flag, gradual release | `behavior_manage_feature_flags` | 📖 Student |
+| quality gate, regression check, benchmark validation | `behavior_enforce_quality_gates` | 📖 Student |
+| pack bootstrap, workspace migration, pack rollback | `behavior_bootstrap_pack_migration` | 📖 Student |
+| auto-reflection, learning loop, reflection trigger | `behavior_run_auto_reflection` | 📖 Student |
 | **pattern observed 3+ times, need new behavior** | `behaviors.propose` → propose new behavior | 🧠 Metacognitive Strategist |
 | **creating examples, documentation, tutorials** | Relevant domain behavior | 🎓 Teacher |
 | **code review, quality validation** | Relevant domain behavior | 🎓 Teacher |
@@ -391,7 +396,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 ### `behavior_prefer_mcp_tools`
 - **When**: Working in an IDE with MCP server extensions, or when guideai MCP tools could replace CLI/API interactions.
 - **Steps**:
-  1. **Check available tools**: GuideAI MCP server exposes **220 tools** including `behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`, `projects.*`, `orgs.*`, `boards.*`. See `MCP_SERVER_DESIGN.md` for full catalog.
+  1. **Check available tools**: GuideAI MCP server exposes **220 tools** including `behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`, `projects.*`, `orgs.*`, `boards.*`. See `docs/contracts/MCP_SERVER_DESIGN.md` for full catalog.
   2. **Use MCP directly in VS Code Copilot Chat**: GuideAI MCP tools work natively—just invoke them by name (e.g., `mcp_guideai_projects_list`, `mcp_guideai_behaviors_getfortask`). No CLI fallback needed.
   3. **Prefer MCP over CLI/API**: MCP provides consistent schemas, automatic telemetry, and cross-surface parity.
   4. **Leverage IDE extensions**: VS Code Copilot Chat can invoke GuideAI tools directly for real-time behavior retrieval, project management, run status, and compliance validation.
@@ -455,7 +460,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **When**: Work involves run persistence, SSE updates, CLI status, or execution records.
 - **Steps**:
   1. Inventory all execution record definitions and storage adapters.
-  2. Align fields with RunService contract (`MCP_SERVER_DESIGN.md`), ActionService payloads (`ACTION_SERVICE_CONTRACT.md`).
+  2. Align fields with RunService contract (`docs/contracts/MCP_SERVER_DESIGN.md`), ActionService payloads (`docs/contracts/ACTION_SERVICE_CONTRACT.md`).
   3. Route mutations through canonical RunService/ActionService APIs.
   4. Validate state transitions across Web/CLI/API/MCP surfaces.
   5. Add regression tests covering create/progress/complete/failure paths.
@@ -464,7 +469,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **When**: Modifying UnifiedStorage, JSON/SQLite/Firestore adapters, PostgresPool.
 - **Steps**:
   1. Check for duplicate methods or mismatched field names.
-  2. Normalize signatures per `AUDIT_LOG_STORAGE.md` and `REPRODUCIBILITY_STRATEGY.md`.
+  2. Normalize signatures per `docs/contracts/AUDIT_LOG_STORAGE.md` and `docs/contracts/REPRODUCIBILITY_STRATEGY.md`.
   3. Verify PostgresPool commits before returning connections.
   4. Update schema docs and indexes.
   5. Test across at least two backends.
@@ -519,15 +524,15 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **When**: Touching action registry schemas, defaults, or multi-tier storage.
 - **Steps**:
   1. Keep registry modules inside package tree.
-  2. Ensure default URLs match `ACTION_REGISTRY_SPEC.md`.
-  3. Provide graceful fallbacks per `REPRODUCIBILITY_STRATEGY.md`.
+  2. Ensure default URLs match `docs/contracts/ACTION_REGISTRY_SPEC.md`.
+  3. Provide graceful fallbacks per `docs/contracts/REPRODUCIBILITY_STRATEGY.md`.
   4. Add tests for resolution order and CLI/API parity.
   5. Update packaging and docs.
 
 ### `behavior_instrument_metrics_pipeline`
 - **When**: Telemetry events, dashboards, or metrics contracts need updates.
 - **Steps**:
-  1. Map against `TELEMETRY_SCHEMA.md`, `MCP_SERVER_DESIGN.md` MetricsService.
+  1. Map against `docs/contracts/TELEMETRY_SCHEMA.md`, `docs/contracts/MCP_SERVER_DESIGN.md` MetricsService.
   2. Ensure events carry run IDs, behavior refs, token accounting for PRD metrics.
   3. Update Kafka topics, warehouse schemas, retention notes.
   4. Add automated validation checks.
@@ -536,8 +541,8 @@ Scan this table before starting any task. If keywords match, follow the linked b
 ### `behavior_wire_cli_to_orchestrator`
 - **When**: Implementing or modifying CLI commands controlling runs.
 - **Steps**:
-  1. Map CLI to RunService/ActionService/BehaviorService per `MCP_SERVER_DESIGN.md`.
-  2. Support key ops with clear args per `ACTION_REGISTRY_SPEC.md`.
+  1. Map CLI to RunService/ActionService/BehaviorService per `docs/contracts/MCP_SERVER_DESIGN.md`.
+  2. Support key ops with clear args per `docs/contracts/ACTION_REGISTRY_SPEC.md`.
   3. Add Click tests including CLI/API/MCP parity.
   4. Ensure output references unified run IDs.
   5. Update CLI docs.
@@ -625,7 +630,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **Role**: 🎓 Teacher (design/document) or 📖 Student (follow established patterns)
 - **Steps**:
   1. **Define schema first**: Draft OpenAPI 3.x spec before implementing; include request/response schemas, error codes, examples.
-  2. **Follow naming conventions**: Use kebab-case paths, plural nouns for collections, consistent verb usage per `ACTION_REGISTRY_SPEC.md`.
+  2. **Follow naming conventions**: Use kebab-case paths, plural nouns for collections, consistent verb usage per `docs/contracts/ACTION_REGISTRY_SPEC.md`.
   3. **Version appropriately**: Include version in path (`/v1/`) or header; document breaking vs. non-breaking changes.
   4. **Add validation**: Use Pydantic models with strict typing; validate request bodies, query params, path params.
   5. **Document thoroughly**: Include descriptions, examples, and edge cases in OpenAPI spec; generate SDK types from spec.
@@ -684,7 +689,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
   6. **Test locally**: Run `alembic upgrade head`, verify, then test rollback with `alembic downgrade -1`.
   7. **Validate before commit**: Run `python scripts/validate_migrations.py` or let pre-commit check.
   8. **Handle data migrations**: For existing data, write idempotent transforms; never lose production data.
-  9. **Update schema docs**: Reflect changes in `AUDIT_LOG_STORAGE.md` and relevant service contracts.
+  9. **Update schema docs**: Reflect changes in `docs/contracts/AUDIT_LOG_STORAGE.md` and relevant service contracts.
   10. **Log in BUILD_TIMELINE.md**: Document migration number, purpose, and any breaking changes.
 
 ### `behavior_design_mcp_tool_schema`
@@ -781,6 +786,52 @@ Scan this table before starting any task. If keywords match, follow the linked b
   7. **Keep tests fast**: Unit tests <100ms each; slow tests should be marked and run separately.
   8. **Maintain test quality**: Tests are code—review, refactor, and deduplicate test logic.
   9. **Integrate with CI**: All tests run on PR; coverage gates prevent regression.
+
+### `behavior_manage_feature_flags`
+- **When**: Adding gradual rollout controls, toggling features per user/percentage, or managing flag lifecycle.
+- **Role**: 📖 Student (follow established patterns)
+- **Steps**:
+  1. **Register flag**: Use `FeatureFlagService.register_flag()` with name, type (BOOLEAN/PERCENTAGE/USER_LIST), and default value.
+  2. **Check flags at runtime**: Call `feature_flags.is_enabled(flag_name, context)` — never hard-code feature checks.
+  3. **Use consistent hashing**: PERCENTAGE flags use SHA-256 on `user_id + flag_name` for deterministic rollout.
+  4. **Expose via CLI/MCP**: Flags are manageable through `guideai flags list|get|set` and MCP tools `flags.list`, `flags.get`, `flags.set`.
+  5. **Migrate schema**: Use Alembic migration `20260319_add_feature_flags` for persistent storage; rollback supported.
+  6. **Clean up stale flags**: Remove flags once fully rolled out; update MIGRATION_GUIDE.md if schema changes.
+  7. **Test flag behavior**: Test both enabled/disabled paths; use `_build_loop_with_flag()` pattern in tests.
+
+### `behavior_enforce_quality_gates`
+- **When**: Validating behavior adherence before pack promotion, checking for regressions in evaluation metrics.
+- **Role**: 📖 Student (follow established patterns) or 🎓 Teacher (define new gate types)
+- **Steps**:
+  1. **Define gate checks**: Use `QualityGateService.run_all_gates()` with behavior approval, pack validation, and regression checks.
+  2. **Set thresholds**: Configure `adherence_min`, `hallucination_max`, `citation_min` per gate; use defaults when not specified.
+  3. **Check regressions**: Compare current vs. baseline metrics; flag regressions exceeding configurable thresholds.
+  4. **Store gate results**: Attach `QualityGateReport` to behaviors via `BehaviorService` quality gate hook.
+  5. **Emit telemetry**: Fire `quality_gate.evaluated` and `quality_gate.regression_detected` events per TELEMETRY_SCHEMA.
+  6. **Block promotion on failure**: `PackBuilder.validate_build()` delegates to quality gates; failing gates prevent pack builds.
+  7. **Review failures**: Use comparison harness (`EvaluationService.compare()`) for detailed metric breakdowns.
+
+### `behavior_bootstrap_pack_migration`
+- **When**: Bootstrapping knowledge packs into existing workspaces, rolling back failed migrations, or detecting storage backends.
+- **Role**: 📖 Student (follow established patterns)
+- **Steps**:
+  1. **Detect storage**: Use `StorageDetector.detect()` to identify backend (Postgres, SQLite, JSON, Unknown).
+  2. **Bootstrap pack**: Call `PackMigrationService.bootstrap()` — creates tables/directories, seeds default config, applies pending migrations.
+  3. **Verify status**: Use `guideai pack status` or MCP `pack.status` to confirm bootstrap success.
+  4. **Rollback if needed**: Call `PackMigrationService.rollback()` to revert; idempotent and safe.
+  5. **Handle backward compat**: `RuntimeInjector` gracefully handles missing ContextResolver, BehaviorRetriever, BCIService, or active pack.
+  6. **Test all paths**: Test bootstrap + rollback for each storage backend; verify RuntimeInjector works with/without pack.
+
+### `behavior_run_auto_reflection`
+- **When**: Triggering automatic behavior reflection after execution runs, implementing learning loop feedback.
+- **Role**: 📖 Student (follow established patterns)
+- **Steps**:
+  1. **Check feature flag**: Auto-reflection is gated by `ENABLE_AUTO_REFLECTION` feature flag; verify it is enabled.
+  2. **Trigger after runs**: Reflection fires post-execution via `agent_execution_loop` integration.
+  3. **Process through review queue**: Reflections route to review queue (`ReviewQueueService`) for approval/rejection.
+  4. **Apply lifecycle policies**: Use `LifecyclePolicyService` to manage behavior promotion, deprecation, and archival.
+  5. **Emit telemetry**: Fire events per TELEMETRY_SCHEMA for reflection triggers, queue operations, and policy applications.
+  6. **Test with flag toggling**: Use `_build_loop_with_flag()` to test both enabled and disabled auto-reflection paths.
 
 ---
 
@@ -898,4 +949,4 @@ https://arxiv.org/pdf/2509.13237
 
 ---
 
-_Last updated: 2025-12-02_
+_Last updated: 2026-03-19_

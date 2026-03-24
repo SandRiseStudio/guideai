@@ -1484,12 +1484,12 @@ async def consent_status(user_code: str):
 | File | Description |
 |------|-------------|
 | `guideai/auth/policy_engine.py` | PolicyEngine class (687 lines), role inheritance, wildcard matching |
-| `policy/agentauth/bundle.yaml` | Production policy bundle v2.0.0 (6 roles, 28 scopes, 20 rules) |
+| `schema/policy/agentauth/bundle.yaml` | Production policy bundle v2.0.0 (6 roles, 28 scopes, 20 rules) |
 | `scripts/test_phase7_policy_engine.py` | Phase validation script (12 tests) |
 
 **Implementation Summary**:
 - ✅ **PolicyEngine class** (`guideai/auth/policy_engine.py`, 687 lines): YAML-based rule evaluator with role inheritance, wildcard scope matching, first-match semantics, thread-safe hot-reload via SIGHUP
-- ✅ **Enhanced bundle.yaml** (`policy/agentauth/bundle.yaml`, 514 lines): Production policy bundle v2.0.0 with 6 roles, 28 scopes, 20 authorization rules
+- ✅ **Enhanced bundle.yaml** (`schema/policy/agentauth/bundle.yaml`, 514 lines): Production policy bundle v2.0.0 with 6 roles, 28 scopes, 20 authorization rules
 - ✅ **AgentAuthService integration** (`guideai/services/agent_auth_service.py`): `policy_preview()` now uses PolicyEngine instead of hardcoded logic
 - ✅ **Test suite** (`scripts/test_phase7_policy_engine.py`, 12 tests): All passing
 
@@ -1681,7 +1681,7 @@ class PolicyEngine:
 
 #### 7.2 Enhanced Policy Bundle
 
-**File**: `policy/agentauth/bundle.yaml`
+**File**: `schema/policy/agentauth/bundle.yaml`
 
 ```yaml
 version: "1.0.0"
@@ -1826,7 +1826,7 @@ scope_catalog:
 | Deliverable | File | Description |
 |-------------|------|-------------|
 | Policy engine | `auth/policy_engine.py` | YAML rule evaluator |
-| Enhanced bundle | `policy/agentauth/bundle.yaml` | Complete RBAC rules |
+| Enhanced bundle | `schema/policy/agentauth/bundle.yaml` | Complete RBAC rules |
 | Hot-reload support | `policy_engine.py` | SIGHUP handler |
 | Integration | `agent_auth_service.py` | Wire engine to ensure_grant |
 | Tests | `tests/test_policy_engine.py` | Policy evaluation tests |
@@ -2173,8 +2173,8 @@ Each phase can be rolled back independently:
 - [AGENT_AUTH_ARCHITECTURE.md](AGENT_AUTH_ARCHITECTURE.md) - Core architecture
 - [MULTI_PROVIDER_AUTH_ARCHITECTURE.md](MULTI_PROVIDER_AUTH_ARCHITECTURE.md) - OAuth providers
 - [MCP Security Best Practices](https://modelcontextprotocol.io/specification/draft/basic/security_best_practices) - MCP spec
-- [MCP_SERVER_DESIGN.md](../MCP_SERVER_DESIGN.md) - MCP tool catalog
-- [SECRETS_MANAGEMENT_PLAN.md](../SECRETS_MANAGEMENT_PLAN.md) - Token storage requirements
+- [MCP_SERVER_DESIGN.md](contracts/MCP_SERVER_DESIGN.md) - MCP tool catalog
+- [SECRETS_MANAGEMENT_PLAN.md](SECRETS_MANAGEMENT_PLAN.md) - Token storage requirements
 
 ---
 

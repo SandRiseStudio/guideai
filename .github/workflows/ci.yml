@@ -432,25 +432,25 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
-          cache-dependency-path: dashboard/package-lock.json
+          cache-dependency-path: web-console/dashboard/package-lock.json
 
       - name: Install dependencies
-        working-directory: dashboard
+        working-directory: web-console/dashboard
         run: npm ci
 
       - name: Run linter
-        working-directory: dashboard
+        working-directory: web-console/dashboard
         run: npm run lint || true
 
       - name: Build dashboard
-        working-directory: dashboard
+        working-directory: web-console/dashboard
         run: npm run build
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dashboard-build
-          path: dashboard/dist/
+          path: web-console/dashboard/dist/
           retention-days: 7
 
   # ============================================================================

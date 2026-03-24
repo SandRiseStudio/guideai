@@ -1,7 +1,7 @@
 # Behavior Versioning & Migration Strategy
 
 ## Mission
-Guarantee that every behavior change is traceable, reproducible, and backwards-compatible across Web, REST API, CLI, and MCP surfaces. This document supplements the Data Model section of the PRD and the contracts in `MCP_SERVER_DESIGN.md` and `ACTION_REGISTRY_SPEC.md`.
+Guarantee that every behavior change is traceable, reproducible, and backwards-compatible across Web, REST API, CLI, and MCP surfaces. This document supplements the Data Model section of the PRD and the contracts in `contracts/MCP_SERVER_DESIGN.md` and `contracts/ACTION_REGISTRY_SPEC.md`.
 
 ## Versioning model
 - **Identifier:** `behavior_id` remains immutable (UUID).

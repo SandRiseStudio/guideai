@@ -212,7 +212,7 @@ podman-compose -f docker-compose.test.yml up -d
 
 - [GitHub Device Flow Documentation](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow)
 - [RFC 8628: OAuth 2.0 Device Authorization Grant](https://datatracker.ietf.org/doc/html/rfc8628)
-- [GuideAI MCP Server Design](../MCP_SERVER_DESIGN.md)
+- [GuideAI MCP Server Design](contracts/MCP_SERVER_DESIGN.md)
 - [Device Flow Implementation](../guideai/device_flow.py)
 
 ## Next Steps

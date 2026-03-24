@@ -1023,17 +1023,18 @@ Delete a work item.
 
 ---
 
-### `workitems.move`
+### `workitems.move` *(DEPRECATED)*
 
-Move a work item to a different column or board.
+> **Deprecated**: Use `workItems.moveToColumn` instead, which is a strict superset supporting both `column_id` and `status_mapping` parameters plus audit fields.
+
+Move a work item to a different column. Calls through to `workItems.moveToColumn` internally.
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `item_id` | string | **required** | Work item ID to move |
+| `item_id` | string | **required** | Work item ID to move (mapped to `work_item_id`) |
 | `column_id` | string | optional | Target column ID |
-| `board_id` | string | optional | Target board ID (for cross-board moves) |
 | `position` | integer | optional | Position in target column |
 
 ---

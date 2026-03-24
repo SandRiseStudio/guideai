@@ -46,6 +46,11 @@ paths = [
     '''package-lock\.json$''',
     '''poetry\.lock$''',
     '''Pipfile\.lock$''',
+
+    # Agent skill definitions (third-party, contain env-var references not real secrets)
+    '''\.agents/skills/.*''',
+    '''\.claude/skills/.*''',
+    '''\.cline/skills/.*''',
 ]
 
 # Commits known to contain resolved false positives
@@ -114,7 +119,7 @@ allowlist.paths = [
     '''packages/amprealize/.*''',
     '''deployment/.*''',
     '''cloudbuild.*\.yaml$''',
-    '''dashboard/.*\.json$''',
+    '''web-console/dashboard/.*\.json$''',
 ]
 
 # Allow JWT secret placeholders in environments.yaml

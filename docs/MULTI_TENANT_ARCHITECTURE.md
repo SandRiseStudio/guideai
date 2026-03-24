@@ -1093,8 +1093,8 @@ ROLE_PERMISSIONS = {
 
 - [`WEB_UI_DESIGN.md`](./WEB_UI_DESIGN.md) - Modern web frontend architecture
 - [`WORK_STRUCTURE.md`](../WORK_STRUCTURE.md) - Epic 13 tracking
-- [`MCP_SERVER_DESIGN.md`](../MCP_SERVER_DESIGN.md) - MCP tool patterns
-- [`BEHAVIOR_SERVICE_CONTRACT.md`](../BEHAVIOR_SERVICE_CONTRACT.md) - Service contract patterns
+- [`MCP_SERVER_DESIGN.md`](contracts/MCP_SERVER_DESIGN.md) - MCP tool patterns
+- [`BEHAVIOR_SERVICE_CONTRACT.md`](contracts/BEHAVIOR_SERVICE_CONTRACT.md) - Service contract patterns
 
 ---
 

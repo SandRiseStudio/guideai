@@ -527,7 +527,7 @@ At completion (or failure), the agent posts:
 - ✅ `workItems.postComment(work_item_id, body)` — Posts comment to work item with author validation
 - ✅ `workItems.moveToColumn(work_item_id, column_id | status_mapping)` — Moves item by column_id or status_mapping
 - ✅ `workItems.listComments(work_item_id)` — Lists comments on a work item
-- ✅ `workItems.create`, `workItems.get`, `workItems.list`, `workItems.update`, `workItems.delete`, `workItems.move`
+- ✅ `workItems.create`, `workItems.get`, `workItems.list`, `workItems.update`, `workItems.delete`, `workItems.move` *(deprecated — use `workItems.moveToColumn`)*
 
 > **Note**: Board management tools (create/get/list/update/delete/move/postComment/listComments) handle **kanban board CRUD operations** via BoardService. Execution tools (execute/executionStatus/cancelExecution/provideClarification/listExecutions) handle **GEP execution flows** via WorkItemExecutionService. MCP routing at lines 3158-3186 intelligently splits these namespaces.
 

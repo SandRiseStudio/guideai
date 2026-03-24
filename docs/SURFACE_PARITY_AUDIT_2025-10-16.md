@@ -114,7 +114,7 @@ Conducted comprehensive surface parity audit across 12 major capabilities. **Ove
 | Project KPI | ✅ `analytics project-kpi` | ❌ | ❌ | ❌ | `tests/test_cli_analytics.py` |
 | Behavior Usage | ❌ | ❌ | ❌ | ❌ | `guideai/analytics/telemetry_kpi_projector.py` |
 | Token Savings | ❌ | ❌ | ❌ | ❌ | Snowflake schema exists |
-| Onboarding Metrics | ❌ Web only | ❌ | ❌ | ❌ | `dashboard/src/components/OnboardingDashboard.tsx` |
+| Onboarding Metrics | ❌ Web only | ❌ | ❌ | ❌ | `web-console/dashboard/src/components/OnboardingDashboard.tsx` |
 
 **Gaps:**
 - **REST API**: No `/v1/analytics/*` endpoints implemented

@@ -229,6 +229,63 @@ Migrations are validated in CI via pre-commit. The workflow:
 2. If validation fails, CI fails
 3. Migrations are applied in staging before production
 
+## Feature Flags Migration (E4)
+
+Epic E4 introduced a `feature_flags` table via Alembic migration `20260319_add_feature_flags`.
+
+### Applying the Migration
+
+```bash
+# Check current head
+alembic heads
+
+# Apply
+alembic upgrade head
+
+# Verify
+alembic current
+```
+
+The migration creates:
+- Table `feature_flags` with composite PK (`flag_name`, `scope`, `scope_id`)
+- Columns: `flag_type` (boolean|percentage|user_list), `enabled`, `percentage` (0-100), `user_list` (TEXT[]), `description`, `metadata_json` (JSONB), `created_at`, `updated_at`
+- Indexes: `ix_feature_flags_scope`, `ix_feature_flags_name`
+
+### Rollback
+
+```bash
+alembic downgrade 20260318_add_kp_tables
+```
+
+## Pack Bootstrap for Existing Workspaces
+
+Existing workspaces without an active knowledge pack can adopt one via the bootstrap workflow:
+
+```bash
+# Detect workspace profile and activate a pack
+guideai pack bootstrap --workspace .
+
+# Force re-bootstrap (overwrites existing activation)
+guideai pack bootstrap --workspace . --force
+
+# Specify a profile explicitly
+guideai pack bootstrap --workspace . --profile SOLO_DEV
+
+# Check current status
+guideai pack status --workspace .
+
+# Rollback (deactivate pack, restore pre-pack behavior)
+guideai pack rollback --workspace .
+```
+
+The bootstrap process:
+1. Detects storage backend (Postgres / SQLite / JSON / Unknown)
+2. Detects workspace profile via `WorkspaceDetector`
+3. Builds a deterministic pack ID from `AGENTS.md` content hash
+4. Activates the pack via `BootstrapService` or `ActivationService`
+
+MCP equivalents: `pack.bootstrap`, `pack.rollback`, `pack.status`.
+
 ## Related Documentation
 
 - [AUDIT_LOG_STORAGE.md](./AUDIT_LOG_STORAGE.md) - Storage layer schemas

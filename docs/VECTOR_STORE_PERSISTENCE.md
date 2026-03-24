@@ -279,8 +279,8 @@ VECTOR_STORE_BACKEND=filesystem  # Default for dev/single-node
 - **pgvector Documentation:** https://github.com/pgvector/pgvector
 - **FAISS Documentation:** https://github.com/facebookresearch/faiss
 - **BGE-M3 Model:** https://huggingface.co/BAAI/bge-m3
-- **guideAI Contracts:** `MCP_SERVER_DESIGN.md` § 8.2 (BehaviorRetriever Architecture)
-- **Performance Targets:** `RETRIEVAL_ENGINE_PERFORMANCE.md`
+- **guideAI Contracts:** `contracts/MCP_SERVER_DESIGN.md` § 8.2 (BehaviorRetriever Architecture)
+- **Performance Targets:** `contracts/RETRIEVAL_ENGINE_PERFORMANCE.md`
 
 ---
 

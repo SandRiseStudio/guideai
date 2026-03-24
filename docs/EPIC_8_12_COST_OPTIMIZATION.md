@@ -235,7 +235,7 @@ class AnalyticsWarehouse:
 **Behavior Reference**: `behavior_instrument_metrics_pipeline` (dashboard instrumentation, PRD KPI alignment)
 
 #### 4. Budget Alerts (Task 5)
-**Grafana Dashboard**: `dashboard/grafana/cost-alerts-dashboard.json`
+**Grafana Dashboard**: `web-console/dashboard/grafana/cost-alerts-dashboard.json`
 
 **Alert 1: Daily Budget Threshold**
 - **Condition**: `SUM(total_cost_usd) > 80` (daily budget for $2400/month = $80/day)

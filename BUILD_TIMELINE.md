@@ -1,3 +1,312 @@
+| 175 | Web Console Flat Glass Refinement Pass | ### #175 - Web Console Flat Glass Refinement Pass (2026-03-10)
+**Milestone:** The web console now uses a flatter blue/teal glass system with no purple accents, no rendered gradients, tighter typography, and cleaner route/page motion across primary and secondary surfaces
+**Context:** After the chromatic redesign, the visual direction needed a corrective art pass: remove purple and gradient treatments entirely, keep the sleek glass depth, and finish the component sweep so secondary panels and flows matched the updated shell language.
+
+**Implementation (Completed):**
+
+1. **Token + Motion Retune** (`web-console/src/styles/design-system.css`, `web-console/src/App.css`, `web-console/src/App.tsx`):
+   - replaced purple-forward accents with blue / teal / cyan-tinted tokens
+   - converted shared surface variables away from true gradients and into flat translucent fills
+   - added keyed route-stage transitions and tightened type scale / spacing rhythm for a more editorial hierarchy
+
+2. **Shell + Core Page Alignment** (`web-console/src/components/workspace/WorkspaceShell.css`, `web-console/src/components/sidebar/SidebarNav.css`, `web-console/src/components/Dashboard.css`, `web-console/src/components/projects/ProjectsPage.css`, `web-console/src/components/projects/ProjectPage.css`, `web-console/src/components/boards/BoardPage.css`, `web-console/src/components/agents/AgentsPage.css`):
+   - flattened the shell, header, breadcrumbs, nav states, and dashboard hero/stat surfaces into the new non-gradient glass language
+   - refined page title tracking, CTA treatments, and hover/press feedback to feel lighter and more precise
+   - repaired and normalized the dashboard stylesheet so the home experience matches the rest of the console again
+
+3. **Secondary Surface Sweep** (`web-console/src/components/boards/WorkItemDrawer.css`, `web-console/src/components/BCIResponsePanel.css`, `web-console/src/components/ExtractionCandidates.css`, `web-console/src/components/TokenSavingsChart.css`, `web-console/src/components/CitationHighlighter.css`, `web-console/src/pages/GitHubAppCallbackPage.css`, `web-console/src/components/projects/GitHubAppConnection.css`):
+   - brought behavior tools, charts, drawer progress UI, callback flows, and GitHub connection panels into the same flat glass system
+   - removed lingering purple callouts, gradient buttons, and shadow-based hover treatments from touched secondary components
+   - kept depth through border, translucency, blur, and motion rather than shadows or color ramps
+
+**Validation:**
+- Gradient / purple audit across `web-console/src/**/*.{css,tsx}` now only returns one harmless comment hit ✅
+- Editor diagnostics clean for repaired `Dashboard.css` ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `web-console/src/styles/design-system.css`
+- `web-console/src/App.css`
+- `web-console/src/App.tsx`
+- `web-console/src/components/workspace/WorkspaceShell.tsx`
+- `web-console/src/components/workspace/WorkspaceShell.css`
+- `web-console/src/components/sidebar/SidebarNav.css`
+- `web-console/src/components/Dashboard.css`
+- `web-console/src/components/projects/ProjectsPage.css`
+- `web-console/src/components/projects/ProjectPage.css`
+- `web-console/src/components/boards/BoardPage.css`
+- `web-console/src/components/agents/AgentsPage.css`
+- `web-console/src/components/boards/WorkItemDrawer.css`
+- `web-console/src/components/BCIResponsePanel.css`
+- `web-console/src/components/ExtractionCandidates.css`
+- `web-console/src/components/TokenSavingsChart.css`
+- `web-console/src/components/CitationHighlighter.css`
+- `web-console/src/pages/GitHubAppCallbackPage.css`
+- `web-console/src/components/projects/GitHubAppConnection.css`
+
+| 174 | Web Console Chromatic Glass Redesign | ### #174 - Web Console Chromatic Glass Redesign (2026-03-10)
+**Milestone:** Navigation, dashboard, and major pages now use a more colorful glassmorphism treatment with deeper visual layering and no reliance on box shadows
+**Context:** After the accessibility and keyboard polish passes, the web console still felt visually restrained. The goal for this pass was to add more color, atmosphere, and sleekness across the shell and core pages while preserving clarity and the project's no-shadow direction.
+
+**Implementation (Completed):**
+
+1. **Global Design Tokens** (`web-console/src/styles/design-system.css`, `web-console/src/App.css`):
+   - introduced a richer chromatic token system with blue / violet / cyan accents
+   - added shared gradient and glass surface variables for consistent page, panel, and card styling
+   - refreshed app-level fallback and notification styling to match the new surface language without box shadows
+
+2. **Navigation + Shell Restyle** (`web-console/src/components/workspace/WorkspaceShell.css`, `web-console/src/components/sidebar/SidebarNav.css`):
+   - added layered ambient color washes behind the shell for more spatial depth
+   - upgraded sidebar, header, profile menu, command palette, and nav items with stronger blur, tinted surfaces, and polished active states
+   - improved the visual hierarchy of scope, breadcrumb, and action areas with gradients and brighter borders instead of shadow-based elevation
+
+3. **Dashboard + Page Surface Refresh** (`web-console/src/components/Dashboard.css`, `web-console/src/components/agents/AgentsPage.css`, `web-console/src/components/projects/ProjectsPage.css`, `web-console/src/components/projects/ProjectPage.css`, `web-console/src/components/boards/BoardPage.css`):
+   - refreshed hero cards, stats, lists, project/agent cards, modals, board columns, and work item cards with consistent glass surfaces
+   - applied more vibrant accent treatments to CTAs, pills, badges, and focus sections
+   - removed remaining shadow-based depth from touched board progress and toast surfaces, replacing it with color, border, and blur layering
+
+**Validation:**
+- Editor diagnostics clean for touched files ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `web-console/src/styles/design-system.css`
+- `web-console/src/App.css`
+- `web-console/src/components/workspace/WorkspaceShell.css`
+- `web-console/src/components/sidebar/SidebarNav.css`
+- `web-console/src/components/Dashboard.css`
+- `web-console/src/components/agents/AgentsPage.css`
+- `web-console/src/components/projects/ProjectsPage.css`
+- `web-console/src/components/projects/ProjectPage.css`
+- `web-console/src/components/boards/BoardPage.css`
+
+| 173 | Web Console Keyboard Navigation Audit | ### #173 - Web Console Keyboard Navigation Audit (2026-03-10)
+**Milestone:** Menus, dialogs, drawers, and board filter controls now behave more predictably for keyboard users across the web console
+**Context:** After the scope IA and microcopy accessibility passes, the remaining sharp edges were interaction-level: several menus opened visually but lacked robust arrow-key support, dialogs did not consistently trap focus, drawers needed reliable focus containment, and board filter popovers did not always close cleanly with Escape or return focus to their triggers.
+
+**Implementation (Completed):**
+
+1. **Scope + Profile Menus** (`web-console/src/components/OrgSwitcher.tsx`, `web-console/src/components/workspace/WorkspaceShell.tsx`):
+   - added keyboard-first menu behavior for trigger buttons and menu items
+   - supports `ArrowUp`, `ArrowDown`, `Home`, `End`, `Escape`, and `Tab` close semantics
+   - restores focus to the originating trigger after keyboard dismissal
+
+2. **Create Board Dialog + Work Item Drawer** (`web-console/src/components/projects/ProjectPage.tsx`, `web-console/src/components/boards/WorkItemDrawer.tsx`):
+   - added explicit focus trapping for modal and drawer flows
+   - closes on `Escape` and keeps `Tab` / `Shift+Tab` cycling inside the active surface
+   - improved dialog labelling with `aria-labelledby` so assistive tech announces the visible title
+
+3. **Board Filter Popovers** (`web-console/src/components/boards/BoardFilterBar.tsx`):
+   - added Escape-based dismissal with focus restoration to the relevant filter trigger
+   - enabled keyboard activation for sort direction controls via `Enter` / `Space`
+   - aligned popover close behavior so board filtering feels consistent with the rest of the shell
+
+**Validation:**
+- Editor diagnostics clean for touched files ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `web-console/src/components/OrgSwitcher.tsx`
+- `web-console/src/components/workspace/WorkspaceShell.tsx`
+- `web-console/src/components/projects/ProjectPage.tsx`
+- `web-console/src/components/boards/WorkItemDrawer.tsx`
+- `web-console/src/components/boards/BoardFilterBar.tsx`
+
+| 172 | Web Console Microcopy + Accessibility Audit | ### #172 - Web Console Microcopy + Accessibility Audit (2026-03-10)
+**Milestone:** Tooltips, aria labels, empty states, and onboarding nudges now use clearer, more action-oriented language across the web console
+**Context:** After the scope IA rewrite, several interaction details still used generic copy (`Continue`, `More actions`, `View projects`) or weak accessibility semantics (tab-like controls without tab roles, scope selection labels that did not explain themselves).
+
+**Implementation (Completed):**
+
+1. **Scope + Navigation Labels** (`web-console/src/components/OrgSwitcher.tsx`, `web-console/src/components/sidebar/SidebarNav.tsx`):
+   - clarified the scope switcher trigger with an explicit current-scope label and intent
+   - renamed generic sidebar action tooltips to action-oriented labels like `Create project` and `Create board`
+
+2. **Document + Project Action Copy** (`web-console/src/components/workspace/DocumentList.tsx`, `web-console/src/components/projects/ProjectPage.tsx`, `web-console/src/components/projects/NewProjectPage.tsx`, `web-console/src/components/projects/ProjectsPage.tsx`, `web-console/src/components/boards/BoardPage.tsx`, `web-console/src/components/workspace/WorkspaceShell.tsx`):
+   - replaced ambiguous CTAs such as `Continue`, `New document`, and `Project settings` with clearer verbs
+   - improved per-item action labels so assistive tech announces the target of each action
+   - aligned board/project entry points around `Create` / `Open` phrasing
+
+3. **Empty States + Connection Flows** (`web-console/src/components/orgs/OrganizationsPage.tsx`, `web-console/src/components/agents/AgentsPage.tsx`, `web-console/src/components/projects/GitHubAppConnection.tsx`):
+   - made empty states more actionable by explaining the next step
+   - added proper tablist/tab/tabpanel semantics to the GitHub connection method switcher
+   - clarified installation/linking language in the GitHub App setup flow
+
+**Validation:**
+- Editor diagnostics clean for touched files ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `web-console/src/components/OrgSwitcher.tsx`
+- `web-console/src/components/sidebar/SidebarNav.tsx`
+- `web-console/src/components/workspace/DocumentList.tsx`
+- `web-console/src/components/projects/ProjectPage.tsx`
+- `web-console/src/components/projects/NewProjectPage.tsx`
+- `web-console/src/components/projects/ProjectsPage.tsx`
+- `web-console/src/components/boards/BoardPage.tsx`
+- `web-console/src/components/workspace/WorkspaceShell.tsx`
+- `web-console/src/components/orgs/OrganizationsPage.tsx`
+- `web-console/src/components/agents/AgentsPage.tsx`
+- `web-console/src/components/projects/GitHubAppConnection.tsx`
+
+| 171 | Web Console Scope Header Polish | ### #171 - Web Console Scope Header Polish (2026-03-10)
+**Milestone:** Current scope is now visually separated from page location, with final CTA and copy cleanup across the web console
+**Context:** After the terminology rewrite and consistency pass, the shell still blended scope selection into breadcrumb semantics and a few project flow labels were still being normalized onto the shared scope vocabulary.
+
+**Implementation (Completed):**
+
+1. **Shared IA Utility Expansion** (`web-console/src/copy/scopeLabels.ts`):
+   - added shared CTA constants for `Manage Scopes`, `New Project`, `Create Project`, and `Create Organization`
+   - added scope subtitle helpers so the shell can describe Personal vs Organization context consistently
+
+2. **Top Navigation Scope Panel** (`web-console/src/components/workspace/WorkspaceShell.tsx`, `web-console/src/components/workspace/WorkspaceShell.css`):
+   - separated the current scope presentation from breadcrumb/location semantics
+   - introduced a dedicated current-scope panel with explicit label, subtitle, and switcher placement
+   - styled the shell header so active scope stays visually prominent across desktop, tablet, and mobile layouts
+
+3. **Residual Copy + CTA Alignment** (`web-console/src/components/Dashboard.tsx`, `web-console/src/components/projects/NewProjectPage.tsx`, `web-console/src/components/projects/ProjectsPage.tsx`, `web-console/src/components/projects/ProjectSettingsPage.tsx`):
+   - replaced remaining hardcoded project CTA labels with shared constants
+   - finished project creation and settings copy cleanup to avoid user-facing `workspace` ambiguity
+   - aligned dashboard scope actions with the shared IA wording
+
+**Validation:**
+- Editor diagnostics clean for touched files ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `web-console/src/copy/scopeLabels.ts`
+- `web-console/src/components/workspace/WorkspaceShell.tsx`
+- `web-console/src/components/workspace/WorkspaceShell.css`
+- `web-console/src/components/Dashboard.tsx`
+- `web-console/src/components/projects/NewProjectPage.tsx`
+- `web-console/src/components/projects/ProjectsPage.tsx`
+- `web-console/src/components/projects/ProjectSettingsPage.tsx`
+
+| 170 | Web Console IA Consistency Pass | ### #170 - Web Console IA Consistency Pass (2026-03-10)
+**Milestone:** Top-nav wording, remaining page copy, and shared scope labels aligned behind a single vocabulary source
+**Context:** After the initial scope terminology rewrite, a second audit found remaining user-facing `workspace` phrasing in top-nav affordances, login, and project creation flows. The shell component name also needed an explicit decision.
+
+**Implementation (Completed):**
+
+1. **Shared Scope Copy Layer** (`web-console/src/copy/scopeLabels.ts`):
+   - added shared constants for `Personal`, `Organization`, `Current Scope`, `Scope`, and `Scope access`
+   - added helpers for resolving displayed scope names consistently across views
+
+2. **Top Navigation Tightening** (`web-console/src/components/workspace/WorkspaceShell.tsx`):
+   - changed sidebar aria label from `Workspace navigation` to `Primary navigation`
+   - changed unknown-route breadcrumb fallback from `Workspace` to `GuideAI`
+   - updated command palette copy to include scopes explicitly
+   - documented that `WorkspaceShell` remains an internal compatibility name, not a user-facing concept
+
+3. **Remaining User-Facing Copy Audit**:
+   - `LoginPage.tsx`: `Sign in to continue to your workspace` → `Sign in to continue to GuideAI`
+   - `NewProjectPage.tsx`: project setup copy now describes scope and collaboration-ready structure
+   - `ProjectsPage.tsx`: project list subtitle now refers to creating projects within the right scope
+   - updated existing dashboard, org, and agent pages to consume shared scope constants
+
+**Decision:**
+- Keep `WorkspaceShell` as an internal code name for now.
+- Do not expose `workspace` in visible UI language unless it becomes a first-class product object later.
+
+**Validation:**
+- Editor diagnostics clean for all updated files ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `web-console/src/copy/scopeLabels.ts`
+- `web-console/src/components/workspace/WorkspaceShell.tsx`
+- `web-console/src/components/OrgSwitcher.tsx`
+- `web-console/src/components/Dashboard.tsx`
+- `web-console/src/components/agents/AgentsPage.tsx`
+- `web-console/src/components/orgs/OrganizationsPage.tsx`
+- `web-console/src/components/projects/NewProjectPage.tsx`
+- `web-console/src/components/projects/ProjectsPage.tsx`
+- `web-console/src/components/LoginPage.tsx`
+- `docs/COLLAB_SAAS_REQUIREMENTS.md`
+
+| 169 | Web Console Scope Terminology Rewrite | ### #169 - Web Console Scope Terminology Rewrite (2026-03-10)
+**Milestone:** User-facing IA now centers on Personal/Organization scopes instead of the overloaded workspace label
+**Context:** The web console was using "workspace" to mean several different things at once: personal context, organization context, and collaborative shell state. That made navigation and assignment controls harder to understand.
+
+**Implementation (Completed):**
+
+1. **Top Navigation Scope Labeling** (`web-console/src/components/OrgSwitcher.tsx`):
+   - renamed `Personal workspace` to `Personal`
+   - updated the switcher menu to use clearer Personal vs Organization language
+
+2. **Sidebar IA Cleanup** (`web-console/src/components/sidebar/SidebarNav.tsx`):
+   - removed the ambiguous `Workspace` section heading
+   - flattened `Organizations` and `Agents` into direct primary navigation items
+
+3. **Dashboard Scope Framing** (`web-console/src/components/Dashboard.tsx`):
+   - renamed the `Workspaces` section to `Current Scope`
+   - updated supporting copy to talk about projects, scopes, and places rather than workspaces
+   - changed the sync banner to `Syncing current scope`
+
+4. **Agent + Organization Copy Refresh** (`web-console/src/components/agents/AgentsPage.tsx`, `web-console/src/components/orgs/OrganizationsPage.tsx`):
+   - changed `Workspace scope` and `Workspace access` to `Scope` / `Scope access`
+   - clarified that Personal is a scope and Organizations provide shared access across projects
+   - removed lingering `Personal workspace` and `shared workspace` phrasing from visible UI copy
+
+5. **Requirements Alignment** (`docs/COLLAB_SAAS_REQUIREMENTS.md`):
+   - added canonical user-facing IA guidance: `Scope → Projects → Boards / Items / Runs / Agents`
+   - documented that `workspace` should remain internal unless it becomes a real product object
+   - updated scale and architecture wording from `workspace` to `active scope` where appropriate
+
+**Validation:**
+- TypeScript/TSX editor diagnostics clean for updated files ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `web-console/src/components/OrgSwitcher.tsx`
+- `web-console/src/components/sidebar/SidebarNav.tsx`
+- `web-console/src/components/Dashboard.tsx`
+- `web-console/src/components/agents/AgentsPage.tsx`
+- `web-console/src/components/orgs/OrganizationsPage.tsx`
+- `docs/COLLAB_SAAS_REQUIREMENTS.md`
+
+| 168 | Live Collaboration Presence in Web Console | ### #168 - Live Collaboration Presence in Web Console (2026-03-10)
+**Milestone:** Web Console real-time shell presence and connection fidelity
+**Context:** The top navigation was showing a default disconnected state because the shell's collaboration store was never wired to live document sessions, and agent activity was not represented in presence avatars.
+
+**Implementation (Completed):**
+
+1. **Shared Collab Hook Presence State** (`packages/collab-client/src/react.ts`):
+   - `useCollaboration()` now exposes a `presence` map alongside cursors
+   - presence entries are updated from server `presence` and `cursor` events
+   - disconnect clears stale cursors and presence state
+
+2. **Collaboration Store Bridging** (`web-console/src/store/collabStore.ts`, `web-console/src/components/plan/PlanComposer.tsx`):
+   - added `replacePresence()` and `clearPresence()` store actions
+   - `PlanComposer` now syncs active document/workspace, connection state, and presence into the shell store
+
+3. **Server Presence Broadcasts** (`guideai/api.py`, `guideai/collaboration_service.py`):
+   - collaboration websocket now creates live sessions per connection
+   - supports `cursor` and `presence` message types in addition to edits/ping
+   - broadcasts collaborator presence on connect/disconnect
+   - tracks session status, cursor position, selection end, and last activity
+
+4. **Shell Agent + User Presence** (`web-console/src/components/workspace/WorkspaceShell.tsx`):
+   - header connection indicator now prefers the active execution stream connection when available
+   - presence avatars now merge human collaborators from the collab store with active agents from project execution activity
+   - agent presence is derived from live/polled execution state so running and paused agents appear in the shell
+
+5. **Shared Package Rebuild** (`packages/collab-client/dist/*`):
+   - rebuilt generated declarations and bundles so web-console consumes the updated presence-enabled API
+
+**Validation:**
+- `npm run build` in `packages/collab-client` ✅
+- `npm run build` in `web-console` ✅
+
+**Files Modified:**
+- `packages/collab-client/src/react.ts`
+- `web-console/src/store/collabStore.ts`
+- `web-console/src/components/plan/PlanComposer.tsx`
+- `web-console/src/components/workspace/WorkspaceShell.tsx`
+- `guideai/collaboration_service.py`
+- `guideai/api.py`
+- `packages/collab-client/README.md`
+
 | 167 | PostgreSQL Device Flow Store | ### #167 - PostgreSQL Device Flow Store (2026-01-23)
 **Milestone:** Production-grade shared auth state between MCP server and REST API
 **Context:** Device flow tokens created via MCP couldn't be validated by REST API (separate in-memory stores).
@@ -2946,3 +3255,5 @@ _Last Updated: 2025-12-21_
 | 136 | 🛡️ Alembic Migration Safeguards Implemented | **Achievement:** ✅ **Comprehensive migration validation system preventing broken revision chains, unsupported parameters, and multiple heads** – Created `scripts/validate_migrations.py` (300 lines), integrated with pre-commit hooks, updated `behavior_migrate_postgres_schema` with enhanced steps, created `docs/MIGRATION_GUIDE.md` for developer reference.<br><br>**What shipped:**<br>- ✅ **Validation script:** `scripts/validate_migrations.py` (300 lines) with 4 checks: revision ID references (catches filename vs actual ID mismatch), unsupported parameters (`create_index` comment detection), multiple heads detection, docstring consistency warnings<br>- ✅ **Pre-commit hook:** Added `validate-migrations` hook to `.pre-commit-config.yaml` running on `migrations/versions/*.py` files<br>- ✅ **Template enhancement:** Updated `migrations/script.py.mako` with "Common Pitfalls to Avoid" documentation in docstring<br>- ✅ **Behavior update:** Enhanced `behavior_migrate_postgres_schema` in AGENTS.md with 10 steps including validation, reference to MIGRATION_GUIDE.md<br>- ✅ **Documentation:** Created `docs/MIGRATION_GUIDE.md` (200+ lines) with quick start, common pitfalls, best practices, troubleshooting<br><br>**Issues prevented by validation:**<br>1. **Revision ID mismatch:** Using filename `20260115_add_user_github_links` instead of actual revision ID `add_user_github_links` in `down_revision`<br>2. **Multiple heads:** Building off pre-merge revision instead of merge point `ad1244ed2cf6`<br>3. **Unsupported parameters:** Using `comment=` in `op.create_index()` which SQLAlchemy rejects<br><br>**Behaviors applied:** `behavior_migrate_postgres_schema` (meta: updating the behavior itself), `behavior_prevent_secret_leaks` (pre-commit integration), `behavior_update_docs_after_changes`<br><br>**Files created:**<br>- `scripts/validate_migrations.py` (300 lines): Migration chain validation with 4 checks<br>- `docs/MIGRATION_GUIDE.md` (200+ lines): Developer documentation with examples<br><br>**Files modified:**<br>- `.pre-commit-config.yaml`: Added validate-migrations local hook<br>- `migrations/script.py.mako`: Added pitfall documentation to template<br>- `AGENTS.md`: Enhanced `behavior_migrate_postgres_schema` with 10 steps + reference<br><br>**Validation:**<br>- ✅ `pre-commit run validate-migrations --all-files` PASSED<br>- ✅ `python scripts/validate_migrations.py` detects 2 docstring warnings (non-blocking), 0 errors<br><br>**Impact:** Future migration issues like broken revision chains will be caught before commit. Pre-commit hook runs automatically, CI pipeline validates in PR. Template reminds developers of common pitfalls. Comprehensive documentation provides troubleshooting guidance.<br><br>**References:** `scripts/validate_migrations.py`, `docs/MIGRATION_GUIDE.md`, `.pre-commit-config.yaml`, `AGENTS.md` (`behavior_migrate_postgres_schema`)<br><br>_Last Updated: 2026-01-22_ | 2026-01-22 |
 | 137 | ✅ Phase 7: Dynamic Policy Engine COMPLETE | **Achievement:** ✅ **Dynamic YAML-based policy evaluation engine with full MCP Auth integration** – Created PolicyEngine (guideai/auth/policy_engine.py, 687 lines), enhanced policy bundle (policy/agentauth/bundle.yaml, 514 lines with 6 roles, 28 scopes, 20 rules), integrated with AgentAuthService for dynamic policy preview, all 12 Phase 7 tests passing.<br><br>**What shipped:**<br>- ✅ **PolicyEngine class:** (687 lines) YAML-based rule evaluator with role inheritance resolution, wildcard scope matching (fnmatch), first-match rule semantics, thread-safe hot-reload via SIGHUP signal, singleton pattern via `get_policy_engine()`<br>- ✅ **Enhanced bundle.yaml:** (514 lines) Production policy bundle v2.0.0 with 6 role definitions (ADMIN→STRATEGIST→TEACHER→STUDENT→OBSERVER + SERVICE_PRINCIPAL), 28 scope definitions with risk_level and requires_mfa flags, 20 authorization rules (admin full access, MFA requirements, role-based access, tool-specific rules, default deny), workflow/rollback/observability configuration<br>- ✅ **AgentAuthService integration:** Updated policy_preview() method to use PolicyEngine instead of hardcoded logic, added PolicyDecision enum mapping, fail-safe with deny-by-default on engine errors<br>- ✅ **Test suite:** scripts/test_phase7_policy_engine.py (12 comprehensive tests) validating initialization, role inheritance, wildcard matching, ALLOW/DENY/CONSENT_REQUIRED decisions, MFA enforcement, batch preview, singleton pattern, hot-reload, custom bundle paths<br><br>**Key features:**<br>- **Role inheritance:** ADMIN inherits STRATEGIST→TEACHER→STUDENT→OBSERVER (5-level hierarchy)<br>- **Wildcard scopes:** `behaviors:*` matches `behaviors:read`, `behaviors:write`, `behaviors:delete`<br>- **MFA enforcement:** High-risk scopes (actions.replay, agentauth.manage, behaviors:delete) require mfa_verified=true<br>- **First-match semantics:** Rules evaluated in order, first match determines decision (like firewall rules)<br>- **Hot-reload:** SIGHUP signal triggers bundle reload without restart<br>- **Thread-safe:** RLock protects rule/role/scope state during reload<br><br>**Files created:**<br>- `guideai/auth/policy_engine.py` (687 lines): PolicyEngine, PolicyResult, PolicyRule, PolicyDecision/Reason enums<br>- `scripts/test_phase7_policy_engine.py` (500+ lines): 12 comprehensive tests<br>- `policy/agentauth/bundle.yaml.bak`: Backup of original bundle<br><br>**Files modified:**<br>- `policy/agentauth/bundle.yaml`: Enhanced to v2.0.0 with full RBAC (6 roles, 28 scopes, 20 rules)<br>- `guideai/services/agent_auth_service.py`: Integrated PolicyEngine into policy_preview(), added import<br><br>**Test results (12/12 PASSING ✅):**<br>- ✓ PolicyEngine Initialization (bundle v2.0.0, 6 roles, 28 scopes, 20 rules)<br>- ✓ Role Inheritance Resolution (ADMIN→5 roles, OBSERVER→1 role)<br>- ✓ Wildcard Scope Matching (behaviors:* pattern)<br>- ✓ Rule Evaluation - ALLOW (Admin bypass, Student read, Observer read)<br>- ✓ Rule Evaluation - DENY (MFA required, role not authorized, unknown role)<br>- ✓ Rule Evaluation - CONSENT_REQUIRED (tool-specific rules)<br>- ✓ MFA Requirement Enforcement (high-risk scopes blocked without MFA)<br>- ✓ Batch Scope Preview (4 scopes evaluated)<br>- ✓ Get Allowed Scopes (Admin 28, Student 12, Observer 9)<br>- ✓ Singleton Pattern (same instance, reset works)<br>- ✓ Hot-Reload Simulation (manual reload)<br>- ✓ Custom Bundle Path (temp file loading)<br><br>**Behaviors applied:** `behavior_lock_down_security_surface` (RBAC implementation), `behavior_externalize_configuration` (bundle path via GUIDEAI_POLICY_BUNDLE_PATH), `behavior_design_api_contract` (PolicyResult dataclass), `behavior_update_docs_after_changes`<br><br>**MCP Auth Implementation Plan progress:**<br>- ✅ Phase 1: Session context (MCPSessionContext)<br>- ✅ Phase 2: Token validation (test_phase2_token_validation.py)<br>- ✅ Phase 3: Auth middleware (MCPAuthMiddleware)<br>- ✅ Phase 4: Service adapter (MCPServiceAdapter)<br>- ✅ Phase 5: Rate limiting (mcp_rate_limiter.py)<br>- ✅ Phase 6: Consent flows (consent_service.py)<br>- ✅ **Phase 7: Dynamic policy engine (THIS ENTRY)**<br>- 🔲 Phase 8: Token vault (remaining)<br><br>**Impact:** Policy changes now deploy without code changes – update bundle.yaml and send SIGHUP. Rules support complex matching (role hierarchy, scope wildcards, MFA context, tool-specific). AgentAuthService uses PolicyEngine for dynamic authorization decisions. Test suite validates all rule evaluation paths. Ready for Phase 8: Token Vault implementation.<br><br>**References:**<br>- Implementation: guideai/auth/policy_engine.py (PolicyEngine class)<br>- Policy bundle: policy/agentauth/bundle.yaml (v2.0.0)<br>- Integration: guideai/services/agent_auth_service.py (policy_preview method)<br>- Tests: scripts/test_phase7_policy_engine.py (12 tests)<br>- Plan: docs/MCP_AUTH_IMPLEMENTATION_PLAN.md (Phase 7 specification)<br><br>_Last Updated: 2026-01-22_ | 2026-01-22 |
 | 138 | ✅ Phase 8: Token Vault & Security Hardening COMPLETE | **Achievement:** ✅ **KMS-encrypted token vault with envelope encryption, token rotation, and blacklist revocation** – Created TokenVault class (guideai/auth/token_vault.py, 1268 lines), database migration for vault/blacklist/audit tables, all 12 Phase 8 tests passing. MCP Auth Implementation Plan now 100% COMPLETE.<br><br>**What shipped:**<br>- ✅ **TokenVault class:** (1268 lines) Secure OAuth token storage with envelope encryption supporting Fernet (local), AWS KMS (production), and HashiCorp Vault (enterprise) providers<br>- ✅ **StoredToken dataclass:** Token lifecycle with status tracking (ACTIVE, EXPIRED, REVOKED, ROTATED), expiration checks, rotation detection<br>- ✅ **InMemoryTokenStorage:** Thread-safe in-memory backend for testing<br>- ✅ **PostgresTokenStorage:** Production PostgreSQL backend with upsert and cleanup<br>- ✅ **Token blacklist:** SHA-256 hash-based revocation, prevents reuse of rotated/revoked tokens<br>- ✅ **Database migration:** token_vault, token_blacklist, token_audit_log tables with indexes, triggers, partial indexes for performance<br>- ✅ **Factory methods:** `create_fernet()`, `create_aws_kms()`, `create_hashicorp_vault()` for provider selection<br>- ✅ **Singleton pattern:** `get_token_vault()` / `reset_token_vault()` for global access<br>- ✅ **CLI helper:** `--generate-key`, `--stats`, `--cleanup` commands<br><br>**Key features:**<br>- **Envelope encryption:** Sensitive token data encrypted locally, only metadata stored in clear text<br>- **Token rotation:** `rotate_token()` blacklists old token, updates with new token, increments rotation_count<br>- **Token revocation:** `revoke_token()` adds both access and refresh tokens to blacklist<br>- **Automatic expiration:** `is_expired()` and `needs_rotation()` methods for lifecycle management<br>- **Cleanup:** `cleanup_expired()` removes old tokens and blacklist entries<br>- **Statistics:** `get_stats()` returns TokenVaultStats with counts by status and provider<br>- **Multi-provider:** Supports Google, GitHub, Microsoft, GuideAI internal, and custom providers<br><br>**Files created:**<br>- `guideai/auth/token_vault.py` (1268 lines): TokenVault, StoredToken, InMemoryTokenStorage, PostgresTokenStorage<br>- `migrations/versions/20260122_add_token_vault.py` (~260 lines): token_vault, token_blacklist, token_audit_log tables<br>- `scripts/test_phase8_token_vault.py` (700+ lines): 12 comprehensive tests<br><br>**Test results (12/12 PASSING ✅):**<br>- ✓ TokenVault Initialization<br>- ✓ Token Storage and Retrieval<br>- ✓ Token Expiration Handling<br>- ✓ Token Revocation and Blacklisting<br>- ✓ Token Rotation<br>- ✓ Token Listing<br>- ✓ Cleanup of Expired Entries<br>- ✓ Vault Statistics<br>- ✓ Singleton Pattern<br>- ✓ StoredToken Dataclass<br>- ✓ Multiple OAuth Providers<br>- ✓ Error Handling and Edge Cases<br><br>**Environment variables:**<br>- `GUIDEAI_TOKEN_VAULT_KEY`: Fernet encryption key (local/dev)<br>- `GUIDEAI_KMS_KEY_ID`: AWS KMS key ID (production)<br>- `VAULT_ADDR` + `GUIDEAI_VAULT_TRANSIT_KEY`: HashiCorp Vault (enterprise)<br><br>**Behaviors applied:** `behavior_lock_down_security_surface` (envelope encryption), `behavior_prevent_secret_leaks` (token hashing for blacklist), `behavior_migrate_postgres_schema` (vault tables), `behavior_design_api_contract` (StoredToken/TokenVaultStats dataclasses)<br><br>**MCP Auth Implementation Plan - ALL PHASES COMPLETE ✅:**<br>- ✅ Phase 1: Session context (MCPSessionContext)<br>- ✅ Phase 2: Service principal (auth.clientCredentials)<br>- ✅ Phase 3: Scope enforcement (MCPAuthMiddleware)<br>- ✅ Phase 4: Tenant context (MCPServiceAdapter)<br>- ✅ Phase 5: Rate limiting (DistributedRateLimiter)<br>- ✅ Phase 6: Consent flows (ConsentService)<br>- ✅ Phase 7: Dynamic policy engine (PolicyEngine)<br>- ✅ **Phase 8: Token vault (THIS ENTRY)**<br><br>**Impact:** MCP Authentication is now production-ready with secure token storage, dynamic policy evaluation, rate limiting, consent flows, and tenant isolation. All 8 phases implemented in a single day (2026-01-22). OAuth tokens are encrypted at rest using envelope encryption, with automatic rotation detection and blacklist-based revocation.<br><br>**References:**<br>- Implementation: guideai/auth/token_vault.py (TokenVault class)<br>- Migration: migrations/versions/20260122_add_token_vault.py<br>- Tests: scripts/test_phase8_token_vault.py (12 tests)<br>- Plan: docs/MCP_AUTH_IMPLEMENTATION_PLAN.md (All phases complete)<br><br>_Last Updated: 2026-01-22_ | 2026-01-22 |
+| 139 | ✅ GUIDEAI-275: E1 — Knowledge Pack Foundations COMPLETE | **Achievement:** ✅ **Full Knowledge Pack infrastructure** – Implemented complete knowledge pack system with schema validation, builder pipeline, overlay rules engine, activation service, and MCP integration. 153 unit tests passing across 5 test files.<br><br>**What shipped:**<br>- ✅ **Schema & Validation (Phase A):** `guideai/knowledge_pack/schema.py` (~450 lines) with Pydantic models (KnowledgePackManifest, PackSchema, BehaviorSource, OverlayRule), JSON Schema export, versioning support; `guideai/knowledge_pack/validator.py` (~280 lines) with comprehensive validation; `docs/KNOWLEDGE_PACK_VERSIONING.md` documentation<br>- ✅ **Provenance Tracking (Phase B):** `guideai/knowledge_pack/source_registry.py` (~200 lines) for source management; `guideai/knowledge_pack/extractor.py` (~350 lines) for behavior extraction from AGENTS.md with SHA-256 content hashing<br>- ✅ **Builder & Overlay (Phase C):** `guideai/knowledge_pack/builder.py` (~400 lines) KnowledgePackBuilder with discover/extract/validate/build pipeline; `guideai/knowledge_pack/overlay_rules.py` (~380 lines) OverlayRulesEngine with condition evaluation, action application, priority ordering<br>- ✅ **Activation Service (Phase D):** `guideai/knowledge_pack/activation_service.py` (~280 lines) ActivationService with activate/deactivate/list/get_active operations, workspace-to-pack binding; MCP server integration via `_get_current_context()` workspace_id parameter<br>- ✅ **CLI Commands:** `guideai pack build`, `guideai pack validate`, `guideai pack activate`, `guideai pack deactivate`, `guideai pack list-activations`<br>- ✅ **MCP Tool Manifests:** `mcp/tools/pack.build.json`, `pack.validate.json`, `pack.activate.json`, `pack.deactivate.json`<br><br>**Test results (153/153 PASSING ✅):**<br>- `tests/test_knowledge_pack_schema.py` (~46 tests): Schema models, validation, JSON Schema export<br>- `tests/test_knowledge_pack_provenance.py` (~17 tests): Source registry, extractor, content hashing<br>- `tests/test_knowledge_pack_builder.py` (~28 tests): Builder pipeline, discovery, extraction<br>- `tests/test_knowledge_pack_overlay.py` (~37 tests): Overlay rules, conditions, actions, priority<br>- `tests/test_knowledge_pack_activation.py` (25 tests): Activation lifecycle, workspace binding, context integration<br><br>**Files created (18 new files):**<br>- `guideai/knowledge_pack/__init__.py`<br>- `guideai/knowledge_pack/schema.py` (~450 lines)<br>- `guideai/knowledge_pack/validator.py` (~280 lines)<br>- `guideai/knowledge_pack/source_registry.py` (~200 lines)<br>- `guideai/knowledge_pack/extractor.py` (~350 lines)<br>- `guideai/knowledge_pack/builder.py` (~400 lines)<br>- `guideai/knowledge_pack/overlay_rules.py` (~380 lines)<br>- `guideai/knowledge_pack/activation_service.py` (~280 lines)<br>- `docs/KNOWLEDGE_PACK_VERSIONING.md`<br>- `mcp/tools/pack.build.json`<br>- `mcp/tools/pack.validate.json`<br>- `mcp/tools/pack.activate.json`<br>- `mcp/tools/pack.deactivate.json`<br>- `tests/test_knowledge_pack_schema.py`<br>- `tests/test_knowledge_pack_provenance.py`<br>- `tests/test_knowledge_pack_builder.py`<br>- `tests/test_knowledge_pack_overlay.py`<br>- `tests/test_knowledge_pack_activation.py`<br><br>**Files modified (4 files):**<br>- `guideai/cli.py`: Added pack command group with build/validate/activate/deactivate/list subcommands<br>- `guideai/mcp_server.py`: Added pack tool handlers, updated `_get_current_context()` with workspace_id parameter<br>- `schema/migrations/`: Added knowledge_packs and pack_activations tables<br>- `BUILD_TIMELINE.md`: This entry<br><br>**Key features:**<br>- **Versioning:** SemVer-compliant pack versions with compatibility checking<br>- **Provenance:** SHA-256 content hashing tracks behavior source changes<br>- **Overlay rules:** Condition-based behavior modifications (add/remove/modify/replace actions)<br>- **Workspace activation:** One active pack per workspace, automatic context injection<br>- **MCP integration:** Active pack info included in `_get_current_context()` response<br><br>**Behaviors applied:** `behavior_design_api_contract` (Pydantic models), `behavior_design_test_strategy` (153 unit tests), `behavior_validate_cross_surface_parity` (CLI/MCP alignment), `behavior_update_docs_after_changes`<br><br>**Impact:** Knowledge Pack infrastructure enables packaging, versioning, and distributing behavior collections. Overlay rules allow workspace-specific customizations without modifying source packs. Activation service binds packs to workspaces with automatic MCP context injection. Foundation ready for E2 (Pack Distribution) and E3 (Pack Marketplace).<br><br>**References:**<br>- Implementation: `guideai/knowledge_pack/` (8 modules, ~2600 lines total)<br>- Tests: `tests/test_knowledge_pack_*.py` (5 files, 153 tests)<br>- Documentation: `docs/KNOWLEDGE_PACK_VERSIONING.md`<br>- MCP tools: `mcp/tools/pack.*.json` (4 manifests)<br>- Plan: `/memories/session/plan.md` (GUIDEAI-275 implementation plan)<br><br>_Last Updated: 2026-01-23_ | 2026-01-23 |
+| 140 | ✅ GUIDEAI-278: E4 — Learning Loop, Analytics, and Governance COMPLETE | **Achievement:** ✅ **Epic E4 fully delivered** — 4 stories, 12 tasks, 209 tests all passing across telemetry, auto-reflection, quality gates, feature flags, backward-compat migration, and documentation.<br><br>**What shipped (12 tasks across 4 stories):**<br><br>**Story 4.1 — Telemetry & Analytics:**<br>- ✅ T4.1.1: Typed telemetry event payloads (`guideai/telemetry_events.py`), JSON Schemas (`schema/telemetry/v1/`), 8 E4 domain events<br>- ✅ T4.1.2: RuntimeInjector, BCIService, ReflectionService wired to FileTelemetrySink<br>- ✅ T4.1.3: CLI `guideai telemetry query/dashboard`, MCP tools `telemetry.query`/`telemetry.dashboard`, 15 parity tests<br><br>**Story 4.2 — Behavior Learning Loop:**<br>- ✅ T4.2.1: Post-run auto-reflection pipeline gated by `feature.auto_reflection` flag, 8 tests<br>- ✅ T4.2.2: Human-in-the-loop review queue with MCP tools, 24 tests<br>- ✅ T4.2.3: Behavior lifecycle policies (deprecation, promotion, decay), 18 tests<br><br>**Story 4.3 — Quality Gates & Benchmarking:**<br>- ✅ T4.3.1: Domain benchmark task corpus, 28 tests (Midnighter)<br>- ✅ T4.3.2: A/B comparison harness with statistical significance, 25 tests (Midnighter)<br>- ✅ T4.3.3: `QualityGateService` with CI-enforced thresholds, 31 tests<br><br>**Story 4.4 — Operational Readiness:**<br>- ✅ T4.4.1: `FeatureFlagService` (BOOLEAN/PERCENTAGE/USER_LIST), 7 default flags, MCP tools `flags.list/get/set`, 46 tests<br>- ✅ T4.4.2: Alembic migration `feature_flags` table, `StorageBackend` detector, `PackMigrationService`, CLI `guideai pack bootstrap\|rollback\|status`, 29 tests<br>- ✅ T4.4.3: Updated PRD.md, MIGRATION_GUIDE.md, TELEMETRY_SCHEMA.md, capability_matrix.md, BUILD_TIMELINE.md<br><br>**Files created (E4):**<br>- `guideai/feature_flags.py`, `guideai/bootstrap/storage_detector.py`, `guideai/bootstrap/pack_migration.py`<br>- `migrations/versions/20260319_add_feature_flags_table.py`<br>- `mcp/tools/flags.list.json`, `flags.get.json`, `flags.set.json`, `pack.bootstrap.json`, `pack.rollback.json`, `pack.status.json`<br>- `tests/test_feature_flags.py`, `tests/test_auto_reflection.py` (modified), `tests/test_reflection_review_queue.py`, `tests/test_behavior_lifecycle_policies.py`, `tests/test_quality_gates.py`, `tests/test_backward_compat_migration.py`<br>- `packages/midnighter/tests/test_comparison_harness.py`, `packages/midnighter/tests/test_domain_benchmark.py`<br><br>**Files modified (E4):**<br>- `guideai/agent_execution_loop.py` (FeatureFlagService integration)<br>- `guideai/runtime_context.py` (added `metadata` field to RuntimeInjectionResult)<br>- `guideai/cli.py` (pack + flags command groups)<br>- `docs/PRD.md`, `docs/MIGRATION_GUIDE.md`, `docs/contracts/TELEMETRY_SCHEMA.md`, `docs/capability_matrix.md`<br><br>**Test coverage:** 209 total (156 root + 53 Midnighter), all passing<br><br>**Behaviors applied:** `behavior_design_test_strategy`, `behavior_validate_cross_surface_parity`, `behavior_migrate_postgres_schema`, `behavior_externalize_configuration`, `behavior_update_docs_after_changes`<br><br>**Impact:** Epic E4 completes the learning loop and governance layer: telemetry events capture BCI and reflection activity, quality gates enforce regression thresholds in CI, feature flags enable safe rollout of new capabilities, and backward-compat migration lets existing workspaces adopt packs without disruption. All 209 tests green, docs updated, no stale "planned" markers for shipped features.<br><br>**References:**<br>- Epic: GUIDEAI-278 (Stories GUIDEAI-291/292/293/294, Tasks GUIDEAI-331–342)<br>- PRD section: docs/PRD.md "Epic E4"<br>- Telemetry: docs/contracts/TELEMETRY_SCHEMA.md (16 E4 events)<br>- Capability matrix: docs/capability_matrix.md "E4 Capabilities" table<br>- Migration guide: docs/MIGRATION_GUIDE.md "Feature Flags Migration" and "Pack Bootstrap"<br><br>_Last Updated: 2026-03-19_ | 2026-03-19 |

@@ -329,7 +329,7 @@ All foundation deliverables successfully shipped and validated:
 - ✅ CLI/API parity for action capture and replay (`guideai record-action`, `guideai replay`, `/v1/actions/*`); comprehensive parity test coverage (`tests/test_cli_actions.py`).
 
 ### Security & Compliance (Complete)
-- ✅ Agent Auth Phase A contract artifacts shipped (`proto/agentauth/v1/agent_auth.proto`, `schema/agentauth/v1/agent_auth.json`, `schema/agentauth/scope_catalog.yaml`, `policy/agentauth/bundle.yaml`, `mcp/tools/auth.*.json`, `guideai/agent_auth.py`, `tests/test_agent_auth_contracts.py`) — CMD-006.
+- ✅ Agent Auth Phase A contract artifacts shipped (`proto/agentauth/v1/agent_auth.proto`, `schema/agentauth/v1/agent_auth.json`, `schema/agentauth/scope_catalog.yaml`, `schema/policy/agentauth/bundle.yaml`, `mcp/tools/auth.*.json`, `guideai/agent_auth.py`, `tests/test_agent_auth_contracts.py`) — CMD-006.
 - ✅ MFA enforcement defined for `high_risk` scopes (`actions.replay`, `agentauth.manage`) via scope catalog, policy bundle, and SDK updates.
 - ✅ Operationalize automated secret scanning across CLI/UI/CI surfaces (`guideai scan-secrets`, pre-commit hooks, `.github/workflows/ci.yml`) and enforce remediation logging via ActionService.
 - ✅ Compliance control mapping matrix covering SOC2/GDPR obligations (`docs/COMPLIANCE_CONTROL_MATRIX.md`).
@@ -347,12 +347,12 @@ All foundation deliverables successfully shipped and validated:
 - ✅ Document VS Code extension roadmap in `docs/capability_matrix.md` with parity evidence tracking.
 
 ### Analytics & Monitoring (Complete)
-- ✅ Milestone Zero progress dashboard shipped under `dashboard/` to visualize PRD metrics from source artifacts — CMD-003.
-- ✅ Cross-surface telemetry instrumentation shipped for dashboard, ActionService, and AgentAuth with automated coverage (`dashboard/src/telemetry.ts`, `guideai/action_service.py`, `guideai/agent_auth.py`, `tests/test_telemetry_integration.py`).
+- ✅ Milestone Zero progress dashboard shipped under `web-console/dashboard/` to visualize PRD metrics from source artifacts — CMD-003.
+- ✅ Cross-surface telemetry instrumentation shipped for dashboard, ActionService, and AgentAuth with automated coverage (`web-console/dashboard/src/telemetry.ts`, `guideai/action_service.py`, `guideai/agent_auth.py`, `tests/test_telemetry_integration.py`).
 - ✅ Consent UX prototypes, usability study recap, and telemetry wiring plan published (`docs/CONSENT_UX_PROTOTYPE.md`, `designs/consent/mockups.md`) — CMD-007.
-- ✅ Stand up consent/MFA analytics dashboards leveraging the new telemetry events (`dashboard/src/app.tsx`, `dashboard/src/hooks/useConsentTelemetry.ts`, `docs/analytics/consent_mfa_snapshot.md`).
+- ✅ Stand up consent/MFA analytics dashboards leveraging the new telemetry events (`web-console/dashboard/src/app.tsx`, `web-console/dashboard/src/hooks/useConsentTelemetry.ts`, `docs/analytics/consent_mfa_snapshot.md`).
 - ✅ Validate MFA re-prompt UX across surfaces and document monitoring hooks (`docs/analytics/mfa_usability_validation_plan.md`).
-- ✅ Instrument onboarding and adoption metrics (time-to-first-behavior, checklist completion, behavior search-to-insert conversion) aligned with PRD targets (`docs/analytics/onboarding_adoption_snapshot.md`, `dashboard/src/hooks/useOnboardingTelemetry.ts`, `dashboard/src/components/OnboardingDashboard.tsx`).
+- ✅ Instrument onboarding and adoption metrics (time-to-first-behavior, checklist completion, behavior search-to-insert conversion) aligned with PRD targets (`docs/analytics/onboarding_adoption_snapshot.md`, `web-console/dashboard/src/hooks/useOnboardingTelemetry.ts`, `web-console/dashboard/src/components/OnboardingDashboard.tsx`).
 
 ## Immediate (Milestone 0)
 _All Milestone 0 actions complete; work shifts to Milestone 1 deliverables._
@@ -939,7 +939,7 @@ Following successful BehaviorService + WorkflowService cutover, remaining Postgr
 - ✅ **PostgresPool metrics integration**: Updated `__init__` to accept `service_name` parameter, calls `register_pool_metrics(engine, service_name)` for SQLAlchemy pool event listening. Instrumented `run_transaction()` to emit lifecycle metrics (record_transaction_start/retry/failure, observe transaction_duration_seconds). Added `get_pool_stats()` method returning dict with checked_out/pool_size/overflow/available
 - ✅ **REST monitoring endpoints**: Added `GET /health` (67 lines checking 5 services with pool stats, overall health calculation) and `GET /metrics` (26 lines updating pool metrics, returning Prometheus exposition format)
 - ✅ **PostgreSQL slow query logging**: Configured all 5 containers with `log_min_duration_statement=1000 -c log_line_prefix='%m [%p] %q%u@%d '` to capture queries >1s with timestamp/PID/user/database context
-- ✅ **Grafana dashboards**: Created `dashboard/grafana/service-health-dashboard.json` (~175 lines) with 10 panels (pool utilization, overflow, transaction P95/P99, retry/failure rates, slow queries, query duration, checkout duration/timeouts) and 5 alert rules (overflow >5, failures >0.01/s, slow queries >0.1/s, checkout P95 >500ms, any timeouts)
+- ✅ **Grafana dashboards**: Created `web-console/dashboard/grafana/service-health-dashboard.json` (~175 lines) with 10 panels (pool utilization, overflow, transaction P95/P99, retry/failure rates, slow queries, query duration, checkout duration/timeouts) and 5 alert rules (overflow >5, failures >0.01/s, slow queries >0.1/s, checkout P95 >500ms, any timeouts)
 - ✅ **Load testing framework**: Created `tests/load/test_service_load.py` (~380 lines) with ServiceLoadTester class, measure_latency() using ThreadPoolExecutor, pytest fixtures (--concurrent=50, --total=1000), 7 tests with P95/P99 assertions (health <500ms, metrics <1s, behavior/workflow/action <100ms per RETRIEVAL_ENGINE_PERFORMANCE.md)
 - ✅ **Baseline metrics captured (2025-01-28)**: Executed load tests against live services (43.87s duration, 5000 total requests). **Infrastructure validated**: Health endpoint P95 456ms ✅ (<500ms target), Metrics endpoint P95 518ms ✅ (<1s target), 0% error rate. **Performance gaps identified**: BehaviorService P95 1315ms ❌ (13.15x over 100ms target - CRITICAL), WorkflowService P95 339ms ❌ (3.39x over - HIGH), ActionService P95 161ms ❌ (1.61x over - MEDIUM). All services show excellent reliability (0% errors) but need optimization (missing indexes, no caching, inefficient queries)
 - ✅ **Documentation**: Created `docs/MONITORING_GUIDE.md` (metrics catalog, Prometheus/Grafana setup, alert runbook, troubleshooting) and `docs/LOAD_TEST_RESULTS.md` (complete baseline with executive summary, service-by-service analysis, comparison to targets, immediate action items)
@@ -1236,7 +1236,7 @@ After semantic dependency installation and Phase 3 optimization work (2025-10-29
 - **Scope:** Build public-facing web dashboard complementing VS Code extension
 - **Status:** ⏳ **PLANNED** – Metabase analytics operational; no guideAI-branded web UI
 - **Deliverables:**
-  - React-based dashboard (`dashboard/` already exists with Vite setup)
+  - React-based dashboard (`web-console/dashboard/` already exists with Vite setup)
   - Pages: Behavior Library (browse/search), Run Explorer (execution history), Analytics (PRD metrics)
   - Authentication: OAuth integration with AgentAuthService
   - Responsive design: desktop + tablet + mobile

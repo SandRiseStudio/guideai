@@ -185,6 +185,6 @@ Result: Returns all 5 projects (4 personal + 1 org)
 
 ## Related Documentation
 
-- [MCP_SERVER_DESIGN.md](MCP_SERVER_DESIGN.md) - Full MCP server architecture
+- [MCP_SERVER_DESIGN.md](contracts/MCP_SERVER_DESIGN.md) - Full MCP server architecture
 - [AGENT_AUTH_ARCHITECTURE.md](AGENT_AUTH_ARCHITECTURE.md) - Authentication flow
-- [ACTION_SERVICE_CONTRACT.md](ACTION_SERVICE_CONTRACT.md) - Service contracts
+- [ACTION_SERVICE_CONTRACT.md](contracts/ACTION_SERVICE_CONTRACT.md) - Service contracts

@@ -15,6 +15,28 @@ The platform serves **both AI agents and human users simultaneously**, potential
 
 The platform core is designed to use AI agents to advance a user's development of their project.  AI agents using existing behaviors and creating new behaviors as different roles and agents is at the core of achieving this on the platform.
 
+### User-Facing Information Architecture
+
+GuideAI's user-facing mental model is:
+
+**Scope → Projects → Boards / Items / Runs / Agents**
+
+- **Scope** means either **Personal** or an **Organization**.
+- **Projects** are the primary containers where work happens.
+- **Boards**, **items**, **runs**, and **agents** are anchored to a project or to the currently selected scope.
+- The term **workspace** should remain internal or implementation-focused unless GuideAI later promotes it to a first-class product object with a distinct user-facing meaning.
+
+When updating UI copy, prefer:
+
+- **Personal** over **Personal workspace**
+- **Organization** over **workspace** when referring to a shared team context
+- **Scope** when the choice is between Personal and Organization
+
+Implementation note:
+
+- Internal component names such as `WorkspaceShell` may remain in code for compatibility during staged IA migrations.
+- User-facing copy should be centralized in shared copy helpers/constants when terminology must stay consistent across routes.
+
 ---
 
 ## 🚫 Non-Negotiable Constraints
@@ -74,6 +96,8 @@ The platform must embody these qualities in every interaction:
 
 9.  **Not too SaaS(y)** - Don't want it too look like every old school SaaS plaftorm.  I want this to be very modern and have some consumer app type look & feel.
 
+10. **Never use purple, Gradients, or shadows** - Explicit requirement. Never use the color purple (or similar colors), gradients, or shadows.
+
 ### Animation & Motion Design System
 
 ```css
@@ -100,9 +124,9 @@ The platform must embody these qualities in every interaction:
 
 ### Scale Requirements
 
-- **Concurrent agents per workspace**: 1,000+
-- **Concurrent human users per workspace**: 100+
-- **Operations per second (workspace)**: 10,000+
+- **Concurrent agents per active scope**: 1,000+
+- **Concurrent human users per active scope**: 100+
+- **Operations per second (active scope)**: 10,000+
 - **Total platform concurrent connections**: 100,000+
 
 ### Agent-Specific Considerations
@@ -337,7 +361,7 @@ These artifacts have live cursors, presence, and sub-second sync:
 These artifacts sync state but don't need character-level collaboration:
 
 1. **Dashboards** — Layout and widget configuration
-2. **Settings** — Workspace/project settings
+2. **Settings** — Scope/project settings
 3. **Permissions** — Access control lists
 
 ### Tier 3: Read-Only Shared Views
@@ -346,7 +370,7 @@ These are broadcast from server, no client edits:
 
 1. **Execution Logs** — Live streaming of agent runs
 2. **Metrics/Analytics** — Real-time charts and counters
-3. **Activity Feeds** — Timeline of workspace events
+3. **Activity Feeds** — Timeline of scope events
 
 ---
 
@@ -369,7 +393,7 @@ These are broadcast from server, no client edits:
 
 ### Phase 3: Scale & Polish
 - [ ] WebSocket connection pooling for 1000+ agents
-- [ ] Presence hierarchy (workspace → document → region)
+- [ ] Presence hierarchy (scope → document → region)
 - [ ] Animation performance audit (60fps under load)
 - [ ] Accessibility audit (WCAG 2.1 AA)
 - [ ] Load testing with simulated agent swarms
@@ -455,9 +479,9 @@ Every feature must pass identical tests on:
 ## 🔗 Related Documents
 
 - `PRD.md` — Product requirements (business context)
-- `MCP_SERVER_DESIGN.md` — MCP tool specifications
-- `ACTION_SERVICE_CONTRACT.md` — Backend API contracts
-- `BEHAVIOR_SERVICE_CONTRACT.md` — Agent behavior system
+- `contracts/MCP_SERVER_DESIGN.md` — MCP tool specifications
+- `contracts/ACTION_SERVICE_CONTRACT.md` — Backend API contracts
+- `contracts/BEHAVIOR_SERVICE_CONTRACT.md` — Agent behavior system
 - `packages/collab-client/README.md` — Collaboration client docs
 - `web-console/src/styles/design-system.css` — CSS design tokens
 

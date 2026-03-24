@@ -57,3 +57,6 @@ environments.yaml
 
 # Archive files with old secrets
 *.archive
+
+# Local data (databases, caches, backups)
+data/

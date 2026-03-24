@@ -1503,7 +1503,7 @@ server {
 
 - [`MULTI_TENANT_ARCHITECTURE.md`](./MULTI_TENANT_ARCHITECTURE.md) - Backend multi-tenancy design
 - [`WORK_STRUCTURE.md`](../WORK_STRUCTURE.md) - Epic 13 tracking
-- [`MCP_SERVER_DESIGN.md`](../MCP_SERVER_DESIGN.md) - MCP integration patterns
+- [`MCP_SERVER_DESIGN.md`](contracts/MCP_SERVER_DESIGN.md) - MCP integration patterns
 
 ---
 

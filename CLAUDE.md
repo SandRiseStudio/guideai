@@ -418,7 +418,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 ### `behavior_prefer_mcp_tools`
 - **When**: Working in an IDE with MCP server extensions, or when guideai MCP tools could replace CLI/API interactions.
 - **Steps**:
-  1. **Check available tools**: GuideAI MCP server exposes **220 tools** including `behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`, `projects.*`, `orgs.*`, `boards.*`. See `MCP_SERVER_DESIGN.md` for full catalog.
+  1. **Check available tools**: GuideAI MCP server exposes **220 tools** including `behaviors.*`, `runs.*`, `compliance.*`, `actions.*`, `bci.*`, `raze.*`, `amprealize.*`, `projects.*`, `orgs.*`, `boards.*`. See `docs/contracts/MCP_SERVER_DESIGN.md` for full catalog.
   2. **Use MCP directly in VS Code Copilot Chat**: GuideAI MCP tools work natively—just invoke them by name (e.g., `mcp_guideai_projects_list`, `mcp_guideai_behaviors_getfortask`). No CLI fallback needed.
   3. **Prefer MCP over CLI/API**: MCP provides consistent schemas, automatic telemetry, and cross-surface parity.
   4. **Leverage IDE extensions**: VS Code Copilot Chat can invoke GuideAI tools directly for real-time behavior retrieval, project management, run status, and compliance validation.
@@ -482,7 +482,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **When**: Work involves run persistence, SSE updates, CLI status, or execution records.
 - **Steps**:
   1. Inventory all execution record definitions and storage adapters.
-  2. Align fields with RunService contract (`MCP_SERVER_DESIGN.md`), ActionService payloads (`ACTION_SERVICE_CONTRACT.md`).
+  2. Align fields with RunService contract (`docs/contracts/MCP_SERVER_DESIGN.md`), ActionService payloads (`docs/contracts/ACTION_SERVICE_CONTRACT.md`).
   3. Route mutations through canonical RunService/ActionService APIs.
   4. Validate state transitions across Web/CLI/API/MCP surfaces.
   5. Add regression tests covering create/progress/complete/failure paths.
@@ -491,7 +491,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **When**: Modifying UnifiedStorage, JSON/SQLite/Firestore adapters, PostgresPool.
 - **Steps**:
   1. Check for duplicate methods or mismatched field names.
-  2. Normalize signatures per `AUDIT_LOG_STORAGE.md` and `REPRODUCIBILITY_STRATEGY.md`.
+  2. Normalize signatures per `docs/contracts/AUDIT_LOG_STORAGE.md` and `docs/contracts/REPRODUCIBILITY_STRATEGY.md`.
   3. Verify PostgresPool commits before returning connections.
   4. Update schema docs and indexes.
   5. Test across at least two backends.
@@ -546,15 +546,15 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **When**: Touching action registry schemas, defaults, or multi-tier storage.
 - **Steps**:
   1. Keep registry modules inside package tree.
-  2. Ensure default URLs match `ACTION_REGISTRY_SPEC.md`.
-  3. Provide graceful fallbacks per `REPRODUCIBILITY_STRATEGY.md`.
+  2. Ensure default URLs match `docs/contracts/ACTION_REGISTRY_SPEC.md`.
+  3. Provide graceful fallbacks per `docs/contracts/REPRODUCIBILITY_STRATEGY.md`.
   4. Add tests for resolution order and CLI/API parity.
   5. Update packaging and docs.
 
 ### `behavior_instrument_metrics_pipeline`
 - **When**: Telemetry events, dashboards, or metrics contracts need updates.
 - **Steps**:
-  1. Map against `TELEMETRY_SCHEMA.md`, `MCP_SERVER_DESIGN.md` MetricsService.
+  1. Map against `docs/contracts/TELEMETRY_SCHEMA.md`, `docs/contracts/MCP_SERVER_DESIGN.md` MetricsService.
   2. Ensure events carry run IDs, behavior refs, token accounting for PRD metrics.
   3. Update Kafka topics, warehouse schemas, retention notes.
   4. Add automated validation checks.
@@ -563,8 +563,8 @@ Scan this table before starting any task. If keywords match, follow the linked b
 ### `behavior_wire_cli_to_orchestrator`
 - **When**: Implementing or modifying CLI commands controlling runs.
 - **Steps**:
-  1. Map CLI to RunService/ActionService/BehaviorService per `MCP_SERVER_DESIGN.md`.
-  2. Support key ops with clear args per `ACTION_REGISTRY_SPEC.md`.
+  1. Map CLI to RunService/ActionService/BehaviorService per `docs/contracts/MCP_SERVER_DESIGN.md`.
+  2. Support key ops with clear args per `docs/contracts/ACTION_REGISTRY_SPEC.md`.
   3. Add Click tests including CLI/API/MCP parity.
   4. Ensure output references unified run IDs.
   5. Update CLI docs.
@@ -652,7 +652,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 - **Role**: 🎓 Teacher (design/document) or 📖 Student (follow established patterns)
 - **Steps**:
   1. **Define schema first**: Draft OpenAPI 3.x spec before implementing; include request/response schemas, error codes, examples.
-  2. **Follow naming conventions**: Use kebab-case paths, plural nouns for collections, consistent verb usage per `ACTION_REGISTRY_SPEC.md`.
+  2. **Follow naming conventions**: Use kebab-case paths, plural nouns for collections, consistent verb usage per `docs/contracts/ACTION_REGISTRY_SPEC.md`.
   3. **Version appropriately**: Include version in path (`/v1/`) or header; document breaking vs. non-breaking changes.
   4. **Add validation**: Use Pydantic models with strict typing; validate request bodies, query params, path params.
   5. **Document thoroughly**: Include descriptions, examples, and edge cases in OpenAPI spec; generate SDK types from spec.
@@ -706,7 +706,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
   2. **Include rollback**: Every migration must have corresponding DOWN migration or be documented as irreversible.
   3. **Test locally first**: Run migration against local PostgresPool; verify with `\d+ table_name`.
   4. **Handle data migrations**: For existing data, write idempotent transforms; never lose production data.
-  5. **Update schema docs**: Reflect changes in `AUDIT_LOG_STORAGE.md` and relevant service contracts.
+  5. **Update schema docs**: Reflect changes in `docs/contracts/AUDIT_LOG_STORAGE.md` and relevant service contracts.
   6. **Add connection handling**: Ensure PostgresPool commits before returning; handle connection exhaustion gracefully.
   7. **Verify indexes**: Add indexes for foreign keys and common query patterns; run `EXPLAIN ANALYZE`.
   8. **Log in BUILD_TIMELINE.md**: Document migration number, purpose, and any breaking changes.

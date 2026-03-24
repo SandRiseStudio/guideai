@@ -22,10 +22,10 @@ from .telemetry import TelemetryClient
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-PROTO_PATH = REPO_ROOT / "proto" / "agentauth" / "v1" / "agent_auth.proto"
+PROTO_PATH = REPO_ROOT / "schema" / "proto" / "agentauth" / "v1" / "agent_auth.proto"
 REST_SCHEMA_PATH = REPO_ROOT / "schema" / "agentauth" / "v1" / "agent_auth.json"
 SCOPE_CATALOG_PATH = REPO_ROOT / "schema" / "agentauth" / "scope_catalog.yaml"
-POLICY_BUNDLE_PATH = REPO_ROOT / "policy" / "agentauth" / "bundle.yaml"
+POLICY_BUNDLE_PATH = REPO_ROOT / "schema" / "policy" / "agentauth" / "bundle.yaml"
 MCP_TOOLS_DIR = REPO_ROOT / "mcp" / "tools"
 MCP_AUTH_TOOL_NAMES: Tuple[str, ...] = (
     "auth.deviceLogin",

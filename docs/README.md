@@ -24,7 +24,7 @@ Maintain an auditable, replayable history of every change to the platform so any
      --behaviors behavior_update_docs_after_changes behavior_handbook_compliance_prompt
    ```
 
-   - For REST, call `POST /v1/actions` using the schema in `ACTION_SERVICE_CONTRACT.md`.
+   - For REST, call `POST /v1/actions` using the schema in `contracts/ACTION_SERVICE_CONTRACT.md`.
    - MCP users can invoke the `actions.create` tool with the same payload.
 3. Store the resulting `action_id`—it ties the work to audit logs, telemetry, and replay pipelines.
 
@@ -77,9 +77,9 @@ Maintain an auditable, replayable history of every change to the platform so any
    - See `guideai/cli.py` and `tests/test_cli_analytics.py` for command implementation and regression coverage.
 
 ### 8. Key References
-- `REPRODUCIBILITY_STRATEGY.md` – overarching principles and taxonomy.
+- `contracts/REPRODUCIBILITY_STRATEGY.md` – overarching principles and taxonomy.
 - `BUILD_TIMELINE.md` – chronological artifact log consumed by the dashboard and replay flows.
 - `PROGRESS_TRACKER.md` – milestone status table that surfaces in the dashboard.
 - `PRD_ALIGNMENT_LOG.md` – narrative change log explaining how updates align with PRD goals.
-- `ACTION_SERVICE_CONTRACT.md` – API/CLI payloads for action capture and replay.
+- `contracts/ACTION_SERVICE_CONTRACT.md` – API/CLI payloads for action capture and replay.
 - `docs/capability_matrix.md` – parity evidence that confirms action capture works across surfaces.

@@ -199,6 +199,6 @@ Achieved **100% cross-surface consistency** validation with 11/11 tests passing.
 **Related Documents**:
 - `CROSS_SURFACE_CONSISTENCY_REPORT.md` - Initial baseline analysis
 - `PHASE1_CROSS_SURFACE_FIXES.md` - Phase 1 completion (7/11 passing)
-- `ACTION_SERVICE_CONTRACT.md` - Parity contract specifications
-- `MCP_SERVER_DESIGN.md` - Control-plane architecture
+- `contracts/ACTION_SERVICE_CONTRACT.md` - Parity contract specifications
+- `contracts/MCP_SERVER_DESIGN.md` - Control-plane architecture
 - `PRD.md` - Product requirements and metrics

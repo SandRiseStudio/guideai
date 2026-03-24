@@ -16,7 +16,7 @@ Usage:
 References:
 - docs/MCP_AUTH_IMPLEMENTATION_PLAN.md: Phase 7 specification
 - guideai/auth/policy_engine.py: PolicyEngine implementation
-- policy/agentauth/bundle.yaml: Production policy bundle
+- schema/policy/agentauth/bundle.yaml: Production policy bundle
 """
 
 import os

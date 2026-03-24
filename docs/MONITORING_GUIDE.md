@@ -186,7 +186,7 @@ guideai_pool_connections_active{service="workflow"} 1.0
 
 ## Grafana Dashboards
 
-Pre-built dashboard configuration: `dashboard/grafana/service-health-dashboard.json`
+Pre-built dashboard configuration: `web-console/dashboard/grafana/service-health-dashboard.json`
 
 **Panels:**
 1. **Connection Pool Utilization** - Active/idle connections by service
@@ -620,4 +620,4 @@ curl -s http://localhost:8001/metrics | grep guideai_embedding_model_load_count_
 - **Retrieval Performance Targets:** `RETRIEVAL_ENGINE_PERFORMANCE.md`
 - **PostgreSQL Pool Configuration:** `guideai/storage/postgres_pool.py`
 - **Metrics Implementation:** `guideai/storage/postgres_metrics.py`
-- **Grafana Dashboard:** `dashboard/grafana/service-health-dashboard.json`
+- **Grafana Dashboard:** `web-console/dashboard/grafana/service-health-dashboard.json`

@@ -342,7 +342,7 @@ Track BCI pipeline execution to measure success criteria and identify optimizati
 
 ### Event Schema
 
-See `TELEMETRY_SCHEMA.md` for full schema. BCI-specific events:
+See `contracts/TELEMETRY_SCHEMA.md` for full schema. BCI-specific events:
 
 - `telemetry.bci.retrieval_start` → query, top_k, strategy
 - `telemetry.bci.retrieval_complete` → behavior_ids, scores, latency_ms
@@ -519,7 +519,7 @@ Before marking BCI implementation complete, confirm:
 - **Meta Paper**: `Metacognitive_reuse.txt` (full paper text)
 - **Behavior Handbook**: `AGENTS.md` (existing behaviors)
 - **BehaviorService**: `guideai/behavior_service.py` (storage layer)
-- **Telemetry Schema**: `TELEMETRY_SCHEMA.md` (event definitions)
+- **Telemetry Schema**: `contracts/TELEMETRY_SCHEMA.md` (event definitions)
 - **PRD Success Metrics**: `PRD.md` §§3.2 (70% reuse, 30% token savings targets)
 
 ---

@@ -505,7 +505,7 @@ pytest tests/test_device_flow.py -k "end_to_end"   # Integration tests
 GuideAI provides Model Context Protocol (MCP) tools for device flow authentication, enabling AI assistants like Claude Desktop, Cursor, and Cline to authenticate via OAuth 2.0 without embedded browsers.
 
 **MCP Tools:**
-- `auth.deviceLogin` – Initiate device authorization and poll until completion
+- `auth.deviceLogin` – Initiate device authorization (non-blocking by default; optional blocking mode)
 - `auth.authStatus` – Check authentication status and token validity
 - `auth.refreshToken` – Refresh expired access tokens using refresh token
 - `auth.logout` – Revoke tokens and clear local storage
@@ -523,7 +523,7 @@ All MCP tool manifests follow JSON Schema draft-07 and are located in `mcp/tools
 
 ### Tool: auth.deviceLogin
 
-**Description:** Initiate OAuth 2.0 device authorization flow. Returns device code and user code, then polls authorization server until user approves or denies.
+**Description:** Initiate OAuth 2.0 device authorization flow. Best practice for MCP agents is non-blocking login: return `device_code`/`user_code` immediately, then call `auth.devicePoll` until authorization completes.
 
 **Input Parameters:**
 ```json
@@ -531,6 +531,7 @@ All MCP tool manifests follow JSON Schema draft-07 and are located in `mcp/tools
   "client_id": "guideai-mcp-client",
   "scopes": ["behaviors.read", "runs.create"],
   "poll_interval": 5,
+  "wait_for_authorization": false,
   "timeout": 300,
   "store_tokens": true
 }
@@ -568,13 +569,15 @@ All MCP tool manifests follow JSON Schema draft-07 and are located in `mcp/tools
 }
 ```
 
-**Workflow:**
-1. MCP client calls `auth.deviceLogin`
-2. Service starts device authorization via `DeviceFlowManager`
+**Workflow (recommended for agents):**
+1. MCP client calls `auth.deviceLogin` with `wait_for_authorization=false` (default)
+2. Service returns `status="pending"` + `device_code` + browser instructions
 3. User navigates to `verification_uri` and enters `user_code`
-4. Service polls authorization server every `poll_interval` seconds
-5. When user approves, service returns tokens and persists to keychain
-6. If user denies or timeout occurs, service returns error status
+4. MCP client calls `auth.devicePoll(device_code=...)` on interval until status changes
+5. When authorized, client receives tokens and session can proceed without blocking
+
+**Workflow (legacy blocking mode):**
+- Call `auth.deviceLogin(wait_for_authorization=true)` to have the server poll until authorized/denied/expired/timeout.
 
 ### Tool: auth.authStatus
 

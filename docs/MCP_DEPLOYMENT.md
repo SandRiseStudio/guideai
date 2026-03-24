@@ -518,7 +518,7 @@ curl -X POST localhost:8000/v1/cache/warm
 
 - [PODMAN_DEPLOYMENT.md](./PODMAN_DEPLOYMENT.md) - Streaming pipeline deployment
 - [SECRETS_MANAGEMENT_PLAN.md](./SECRETS_MANAGEMENT_PLAN.md) - Credential rotation procedures
-- [MCP_SERVER_DESIGN.md](../MCP_SERVER_DESIGN.md) - MCP architecture and tool catalog
+- [MCP_SERVER_DESIGN.md](contracts/MCP_SERVER_DESIGN.md) - MCP architecture and tool catalog
 - [environments.yaml](../environments.yaml) - Environment configuration reference
 
 ---

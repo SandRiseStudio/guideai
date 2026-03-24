@@ -278,7 +278,7 @@ To update budget thresholds:
    ```
 
 3. **Grafana Alerts** (for alert thresholds):
-   - Edit `dashboard/grafana/cost-optimization-dashboard.json`
+   - Edit `web-console/dashboard/grafana/cost-optimization-dashboard.json`
    - Update `threshold` values in panel definitions
    - Restart Grafana or reload dashboard
 

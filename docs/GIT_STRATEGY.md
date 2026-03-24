@@ -5,7 +5,7 @@ Establish a platform-agnostic Git operating model for Strategist → Teacher →
 
 ## Pillars
 1. **Predictable history** – Main stays releasable; feature branches capture isolated work; merge strategies remain consistent across hosting providers.
-2. **Auditable changes** – Every commit references an action log entry and behaviors, echoing `ACTION_REGISTRY_SPEC.md` and `PROGRESS_TRACKER.md` requirements.
+2. **Auditable changes** – Every commit references an action log entry and behaviors, echoing `contracts/ACTION_REGISTRY_SPEC.md` and `PROGRESS_TRACKER.md` requirements.
 3. **Secret & env hygiene** – Enforce `behavior_prevent_secret_leaks` and `behavior_rotate_leaked_credentials` with automated scans and documented remediation.
 4. **Cross-surface parity** – CLI, UI, MCP tools, and automation (CI/CD) apply the same rules for branch naming, reviews, and guardrails.
 
@@ -72,6 +72,6 @@ Establish a platform-agnostic Git operating model for Strategist → Teacher →
 - `AGENTS.md` behaviors: `behavior_prevent_secret_leaks`, `behavior_rotate_leaked_credentials`, `behavior_update_docs_after_changes`.
 - `SECRETS_MANAGEMENT_PLAN.md` for secret rotation runbooks.
 - `.pre-commit-config.yaml` and `scripts/scan_secrets.sh` for tooling setup.
-- `ACTION_REGISTRY_SPEC.md` (`security.scanSecrets`) for reproducible scanning actions.
+- `contracts/ACTION_REGISTRY_SPEC.md` (`security.scanSecrets`) for reproducible scanning actions.
 
 _Last updated: 2025-10-15_

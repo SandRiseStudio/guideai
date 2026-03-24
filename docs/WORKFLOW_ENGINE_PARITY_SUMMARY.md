@@ -8,13 +8,13 @@
 
 ## Overview
 
-This document summarizes the cross-surface parity implementation for the Workflow Engine, demonstrating compliance with the parity contract outlined in `MCP_SERVER_DESIGN.md` and `ACTION_SERVICE_CONTRACT.md`.
+This document summarizes the cross-surface parity implementation for the Workflow Engine, demonstrating compliance with the parity contract outlined in `contracts/MCP_SERVER_DESIGN.md` and `contracts/ACTION_SERVICE_CONTRACT.md`.
 
 **Alignment:**
 - **PRD.md**: Milestone 1 – Workflow Engine Foundation
-- **MCP_SERVER_DESIGN.md**: "Every control-plane capability must achieve parity across Web, API, CLI, and MCP surfaces"
-- **ACTION_SERVICE_CONTRACT.md**: "All action contracts must be reproducible via CLI, REST API, and MCP tools"
-- **REPRODUCIBILITY_STRATEGY.md**: Platform actions must be recordable and replayable across all surfaces
+- **contracts/MCP_SERVER_DESIGN.md**: "Every control-plane capability must achieve parity across Web, API, CLI, and MCP surfaces"
+- **contracts/ACTION_SERVICE_CONTRACT.md**: "All action contracts must be reproducible via CLI, REST API, and MCP tools"
+- **contracts/REPRODUCIBILITY_STRATEGY.md**: Platform actions must be recordable and replayable across all surfaces
 
 ---
 
@@ -314,8 +314,8 @@ The Workflow Engine tracks metrics aligned with PRD success criteria:
 
 - **Service Contract:** `WORKFLOW_SERVICE_CONTRACT.md`
 - **Capability Matrix:** `docs/capability_matrix.md`
-- **Parity Strategy:** `MCP_SERVER_DESIGN.md`
-- **Action Contract:** `ACTION_SERVICE_CONTRACT.md`
+- **Parity Strategy:** `contracts/MCP_SERVER_DESIGN.md`
+- **Action Contract:** `contracts/ACTION_SERVICE_CONTRACT.md`
 - **PRD:** `PRD.md` Milestone 1 § Workflow Engine Foundation
 - **Agent Workflows:** `AGENTS.md` (Strategist/Teacher/Student behaviors)
 - **Timeline:** `BUILD_TIMELINE.md` #40

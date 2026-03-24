@@ -287,5 +287,5 @@ After resolving the root cause:
 - [WORK_STRUCTURE.md](../WORK_STRUCTURE.md) - Epic 8.10.1 progress tracking
 - [deployment/prometheus/embedding_alerts.yml](../deployment/prometheus/embedding_alerts.yml) - Alert definitions
 - [docs/MONITORING_GUIDE.md](MONITORING_GUIDE.md) - Metrics catalog
-- [RETRIEVAL_ENGINE_PERFORMANCE.md](../RETRIEVAL_ENGINE_PERFORMANCE.md) - SLO definitions
+- [RETRIEVAL_ENGINE_PERFORMANCE.md](contracts/RETRIEVAL_ENGINE_PERFORMANCE.md) - SLO definitions
 - [environments.yaml](../environments.yaml) - Environment configurations

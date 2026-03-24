@@ -11,7 +11,7 @@ Loads and evaluates authorization policies from YAML bundles with support for:
 References:
 - docs/MCP_AUTH_IMPLEMENTATION_PLAN.md: Phase 7 specification
 - docs/AGENT_AUTH_ARCHITECTURE.md: Policy contract
-- policy/agentauth/bundle.yaml: Production policy bundle
+- schema/policy/agentauth/bundle.yaml: Production policy bundle
 """
 
 from __future__ import annotations
@@ -187,7 +187,7 @@ class PolicyEngine:
         """Initialize policy engine.
 
         Args:
-            bundle_path: Path to YAML bundle file. Defaults to policy/agentauth/bundle.yaml
+            bundle_path: Path to YAML bundle file. Defaults to schema/policy/agentauth/bundle.yaml
             enable_hot_reload: Whether to register SIGHUP handler for hot reload
             on_reload: Optional callback invoked after successful reload
         """
@@ -195,7 +195,7 @@ class PolicyEngine:
             # Default to project's policy bundle
             bundle_path = os.environ.get(
                 "GUIDEAI_POLICY_BUNDLE_PATH",
-                str(Path(__file__).parent.parent.parent / "policy" / "agentauth" / "bundle.yaml"),
+                str(Path(__file__).parent.parent.parent / "schema" / "policy" / "agentauth" / "bundle.yaml"),
             )
 
         self._bundle_path = Path(bundle_path)

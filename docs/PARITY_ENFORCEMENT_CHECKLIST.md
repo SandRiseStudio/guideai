@@ -1,6 +1,6 @@
 # Cross-Surface Parity Enforcement Checklist
 
-> **Purpose:** Ensure every control-plane capability achieves parity across CLI, REST API, and MCP surfaces as required by `MCP_SERVER_DESIGN.md` and `ACTION_SERVICE_CONTRACT.md`.
+> **Purpose:** Ensure every control-plane capability achieves parity across CLI, REST API, and MCP surfaces as required by `contracts/MCP_SERVER_DESIGN.md` and `contracts/ACTION_SERVICE_CONTRACT.md`.
 
 ## Context
 
@@ -252,4 +252,4 @@ After completing parity implementation, update `docs/capability_matrix.md`:
 
 **Last Updated:** 2025-10-15
 **Owner:** Agent Engineering (see `AGENT_ENGINEERING.md`)
-**Related:** `MCP_SERVER_DESIGN.md`, `ACTION_SERVICE_CONTRACT.md`, `PRD.md` (Milestone 1 requirements)
+**Related:** `contracts/MCP_SERVER_DESIGN.md`, `contracts/ACTION_SERVICE_CONTRACT.md`, `PRD.md` (Milestone 1 requirements)
