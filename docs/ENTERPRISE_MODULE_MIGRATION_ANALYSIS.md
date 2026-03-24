@@ -1,0 +1,139 @@
+# Enterprise Module Migration Analysis
+
+> **Date**: 2026-03-24 | **Status**: Planning | **Author**: Architecture Review
+
+---
+
+## Executive Summary
+
+This analysis evaluates six candidate modules for enterprise/OSS repository split. The `multi_tenant` module is the most deeply coupled (27 external consumers, 11K LOC) and requires a hybrid approach. `billing` is already well-architected as a standalone package wrapper. `analytics`, `crypto`, and `research` are cleanly separable. `midnighter` is a thin wrapper with zero external consumers.
+
+---
+
+## Primary Enterprise Modules
+
+### Module Inventory
+
+| Module | Files | LOC | Key Classes / Functions | Migration Complexity |
+|--------|------:|----:|------------------------|---------------------|
+| `guideai/billing/` | 4 | 1,764 | `GuideAIBillingService`, `GuideAIBillingHooks`, `create_billing_router`, `create_webhook_router`, `create_guideai_webhook_router` | **Easy** |
+| `guideai/analytics/` | 3 | 962 | `AnalyticsWarehouse`, `TelemetryKPIProjector`, `TelemetryProjection` | **Easy** |
+| `guideai/multi_tenant/` | 11 | 11,048 | `OrganizationService`, `PermissionService`, `TenantContext`, `TenantMiddleware`, `InvitationService`, `SettingsService`, 30+ Pydantic contracts, Board contracts (enums, `WorkItem`, `Board`, `BoardColumn`), `create_org_routes`, `create_settings_routes` | **Hard** |
+
+### Detailed Dependency Map
+
+#### 1. `guideai/billing/` — Stripe Billing Integration
+
+| Attribute | Detail |
+|-----------|--------|
+| **Files** | `__init__.py`, `service.py`, `api.py`, `webhook_routes.py` |
+| **LOC** | 1,764 |
+| **Architecture** | Thin wrapper around standalone `packages/billing/` package. Core logic lives outside `guideai/`. |
+| **Internal Imports** | `guideai.action_service` (ActionService, ActionCreateRequest, Actor, Action) · `guideai.action_contracts` · `guideai.compliance_service` (ComplianceService, RecordStepRequest) · `guideai.metrics_service` (MetricsService) |
+| **External Consumers** | `tests/billing/test_billing_service.py` (1 consumer) |
+| **Standalone Package** | ✅ Already exists at `packages/billing/` — `guideai/billing/` is only the integration glue |
+| **Complexity** | **Easy** — Already follows standalone pattern. Only 1 test file consumes it. Wrapper imports 3 core services via hooks. |
+| **Recommendation** | **Move to enterprise.** Keep `packages/billing/` as-is (provider-agnostic). Move `guideai/billing/` wrapper to enterprise repo. OSS can stub billing checks or use a `NoOpBillingProvider`. |
+
+#### 2. `guideai/analytics/` — KPI Projector & Warehouse
+
+| Attribute | Detail |
+|-----------|--------|
+| **Files** | `__init__.py`, `warehouse.py`, `telemetry_kpi_projector.py` |
+| **LOC** | 962 |
+| **Architecture** | DuckDB + Postgres/Timescale dual-backend warehouse. KPI projector transforms telemetry events into fact tables (Snowflake schema). |
+| **Internal Imports** | `guideai.telemetry.TelemetryEvent` · `guideai.utils.dsn.apply_host_overrides` |
+| **External Consumers** | `guideai/cli.py` · `guideai/metrics_service.py` · `tests/test_analytics_parity.py` · `tests/test_analytics_warehouse_parity.py` · `tests/test_telemetry_kpi_projector.py` (5 consumers) |
+| **Complexity** | **Easy** — Only 2 internal imports, both utility-level. Consumers are CLI (optional), metrics service (can be feature-flagged), and tests. |
+| **Recommendation** | **Move to enterprise.** Advanced analytics/KPI dashboards are enterprise features. OSS retains basic `TelemetryEvent` and `MetricsService`. Add a `analytics_enabled` feature flag to gate CLI commands and metrics integrations. |
+
+#### 3. `guideai/multi_tenant/` — Multi-Tenancy, Orgs, Permissions, Boards
+
+| Attribute | Detail |
+|-----------|--------|
+| **Files** | `__init__.py`, `api.py`, `board_contracts.py`, `board_contracts_backup.py`, `context.py`, `contracts.py`, `invitation_service.py`, `organization_service.py`, `permissions.py`, `settings.py`, `settings_api.py` |
+| **LOC** | 11,048 |
+| **Architecture** | PostgreSQL RLS-based tenant isolation. Full RBAC permission system. Org/project/member CRUD. Board/WorkItem contracts used across the platform. |
+| **Internal Imports** | `guideai.storage.postgres_pool.PostgresPool` (6 files) · `guideai.notify.GuideAINotifyService` · `guideai.services.board_service.BoardService` |
+| **External Consumers** | **27 files** across core, services, MCP, auth, API, and tests: |
+
+<details>
+<summary>Full consumer list (27 files)</summary>
+
+| Layer | Files |
+|-------|-------|
+| **Core** | `guideai/adapters.py`, `guideai/api.py`, `guideai/cli.py`, `guideai/execution_worker.py`, `guideai/migration.py`, `guideai/projects_api.py`, `guideai/research_service.py`, `guideai/work_item_execution_service.py` |
+| **Auth** | `guideai/auth/middleware.py` |
+| **MCP** | `guideai/mcp/handlers/org_agent_handlers.py` |
+| **Services** | `guideai/services/assignment_service.py`, `guideai/services/board_api_v2.py`, `guideai/services/board_service.py`, `guideai/services/board_service_backup.py`, `guideai/services/work_item_assignment.py` |
+| **Tests** | `tests/test_board_service.py`, `tests/test_execution_gateway.py`, `tests/test_invitation_service.py`, `tests/test_mcp_multi_tenant_handlers.py`, `tests/test_mcp_suggest_agent.py`, `tests/test_org_api_endpoints.py`, `tests/test_organization_service.py`, `tests/test_permission_integration.py`, `tests/test_permission_service.py`, `tests/test_settings_api.py`, `tests/unit/test_board_boards_rest_contract.py`, `tests/unit/test_board_labels_cross_surface.py`, `tests/unit/test_projects_api.py` |
+
+</details>
+
+| Attribute | Detail |
+|-----------|--------|
+| **Complexity** | **Hard** — 27 consumers across every layer. Board contracts are used by work item system (OSS-critical). Permission system is woven into auth middleware and API layer. RLS context is foundational to all multi-org queries. |
+| **Recommendation** | **Hybrid.** See split strategy below. |
+
+**Multi-Tenant Split Strategy:**
+
+| Sub-module | Destination | Rationale |
+|------------|-------------|-----------|
+| `contracts.py` (base enums, `Organization`, `Project`, `MemberRole`, `ProjectRole`) | **OSS** | Needed as interface types everywhere |
+| `board_contracts.py` (`WorkItem`, `Board`, `BoardColumn`, status enums) | **OSS** | Core work management types used across platform |
+| `context.py` (`TenantContext`, `TenantMiddleware`) | **OSS** | Foundational infrastructure, needed for any multi-org support |
+| `permissions.py` (`PermissionService`, RBAC enums) | **OSS** | Basic permission checking needed even in single-tenant mode |
+| `organization_service.py` (full org CRUD, billing integration) | **Enterprise** | Advanced multi-org management, subscription tiers |
+| `invitation_service.py` (email invitations, notification hooks) | **Enterprise** | Team management feature |
+| `settings.py` + `settings_api.py` (org/project settings, branding, integrations) | **Enterprise** | Advanced configuration, branding, webhook management |
+| `api.py` (REST routes for org management) | **Enterprise** | Full org management API |
+
+---
+
+## Additional Enterprise Candidates
+
+| Module | Files | LOC | Internal Imports | External Consumers | Complexity | Recommendation |
+|--------|------:|----:|-----------------|-------------------|------------|----------------|
+| `guideai/crypto/` | 2 | 475 | `guideai.config.settings` (conditional) | `guideai/services/audit_log_service.py`, `tests/test_s3_worm_storage.py` (2) | **Easy** | **Move to enterprise.** Ed25519 audit log signing is a compliance/enterprise feature. OSS can skip signature verification. |
+| `guideai/research/` | 9 | 2,097 | None (zero guideai imports) | `guideai/cli.py`, `guideai/research_service.py` (2) | **Easy** | **Move to enterprise.** Research evaluation pipeline (PDF/URL ingestion, codebase analysis) is a premium feature. Zero coupling to core. |
+| `guideai/midnighter/` | 1 | 146 | `guideai.behavior_service.BehaviorService` (TYPE_CHECKING only) | None (0 consumers) | **Easy** | **Move to enterprise.** BC-SFT training integration. Wraps standalone `packages/midnighter/`. No consumers — cleanest extraction possible. |
+
+---
+
+## Migration Complexity Summary
+
+| Complexity | Module | LOC | Consumers | Action |
+|:----------:|--------|----:|----------:|--------|
+| 🟢 Easy | `billing/` | 1,764 | 1 | Move to enterprise (standalone pkg stays) |
+| 🟢 Easy | `analytics/` | 962 | 5 | Move to enterprise, feature-flag CLI |
+| 🟢 Easy | `crypto/` | 475 | 2 | Move to enterprise, stub signer in OSS |
+| 🟢 Easy | `research/` | 2,097 | 2 | Move to enterprise, zero core deps |
+| 🟢 Easy | `midnighter/` | 146 | 0 | Move to enterprise, no changes needed |
+| 🔴 Hard | `multi_tenant/` | 11,048 | 27 | Hybrid split (contracts+context in OSS, services in enterprise) |
+| | **Total** | **16,492** | | |
+
+---
+
+## Recommended Migration Order
+
+| Phase | Module(s) | Risk | Notes |
+|:-----:|-----------|------|-------|
+| 1 | `midnighter/`, `research/` | Minimal | Zero or near-zero consumers. Safe first moves. |
+| 2 | `crypto/`, `billing/` | Low | Few consumers, already well-isolated. Add OSS stubs. |
+| 3 | `analytics/` | Low | Feature-flag gating in CLI and metrics_service. |
+| 4 | `multi_tenant/` | High | Requires interface extraction, hybrid split, and consumer rewiring across 27 files. Plan 2-3 sprints. |
+
+---
+
+## Interface Stubs Required in OSS
+
+After migration, these stubs/no-ops are needed in the OSS repo:
+
+| Module | OSS Stub |
+|--------|----------|
+| `billing` | `NoOpBillingProvider` (already exists in `packages/billing/`) |
+| `analytics` | Feature flag `analytics_enabled=false`; skip KPI projector initialization |
+| `crypto` | `NoOpAuditSigner` returning empty signatures; skip verification |
+| `multi_tenant` | Keep contracts + context + basic permissions in OSS; enterprise services behind `try/except ImportError` |
+| `research` | CLI command hidden when module not installed |
+| `midnighter` | No stub needed (zero consumers) |
