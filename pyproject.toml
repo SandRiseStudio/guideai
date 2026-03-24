@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "guideai"
 version = "0.1.0"
 description = "GuideAI developer tooling and task orchestration helpers"
-readme = "docs/README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 keywords = ["guideai", "cli", "developer-tools"]
-license = { text = "Proprietary" }
+license = { text = "Apache-2.0" }
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -40,11 +40,15 @@ dependencies = [
   "redis>=5.0,<6.0",  # Redis cache client
   "alembic>=1.13,<2.0",  # Database migrations
   "podman>=5.0,<6.0",  # Podman socket API for container management
+  "pyyaml>=6.0,<7.0",  # YAML config loader
 ]
 
 [project.urls]
-Documentation = "https://example.com/guideai"
+Homepage = "https://amprealize.ai"
+Documentation = "https://amprealize.ai/docs"
 Source = "https://github.com/Nas4146/guideai"
+"Bug Tracker" = "https://github.com/Nas4146/guideai/issues"
+Changelog = "https://github.com/Nas4146/guideai/blob/main/BUILD_TIMELINE.md"
 
 [project.optional-dependencies]
 dev = [
@@ -88,11 +92,15 @@ ml = [
   "scipy>=1.10,<2.0",
 ]
 amprealize = [
-  "amprealize>=0.1.0",
+  "amprealize[cli]>=0.1.0",
+]
+enterprise = [
+  "guideai-enterprise>=0.1.0",
 ]
 
 [project.scripts]
 guideai = "guideai.cli:main"
+guideai-mcp-server = "guideai.cli:main_mcp_server"
 
 [tool.setuptools]
 include-package-data = true
@@ -122,6 +130,7 @@ markers = [
     "unit: marks tests as unit tests",
     "parity: marks tests as service parity tests",
     "asyncio: marks tests as async",
+    "requires_services: marks tests requiring external services (postgres, etc.)",
 ]
 asyncio_mode = "auto"
 timeout = 30
