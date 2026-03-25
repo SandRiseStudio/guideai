@@ -194,6 +194,9 @@ except ImportError:
     create_org_routes = None  # type: ignore[assignment, misc]
     create_settings_routes = None  # type: ignore[assignment, misc]
 
+# Lightweight OSS project service (fallback when enterprise not installed)
+from .multi_tenant.oss_project_service import OSSProjectService
+
 # Billing service (optional - requires billing package)
 try:
     from billing import BillingService, MockBillingProvider
@@ -496,22 +499,25 @@ class _ServiceContainer:
         self.org_service: Optional[Any] = None
         self.invitation_service: Optional[Any] = None
         self.settings_service: Optional[Any] = None
-        if MULTI_TENANT_AVAILABLE:
-            org_dsn = resolve_optional_postgres_dsn(
-                service="ORG",
-                explicit_dsn=os.getenv("GUIDEAI_ORG_PG_DSN") or os.getenv("GUIDEAI_AUTH_PG_DSN"),
-                env_var="GUIDEAI_ORG_PG_DSN",
+        org_dsn = resolve_optional_postgres_dsn(
+            service="ORG",
+            explicit_dsn=os.getenv("GUIDEAI_ORG_PG_DSN") or os.getenv("GUIDEAI_AUTH_PG_DSN"),
+            env_var="GUIDEAI_ORG_PG_DSN",
+        )
+        if MULTI_TENANT_AVAILABLE and org_dsn:
+            self.org_service = OrganizationService(
+                dsn=org_dsn,
+                board_service=self.board_service,
             )
-            if org_dsn:
-                self.org_service = OrganizationService(
-                    dsn=org_dsn,
-                    board_service=self.board_service,
-                )
-                self.invitation_service = InvitationService(
-                    dsn=org_dsn,
-                    base_url=os.getenv("GUIDEAI_BASE_URL", "https://guideai.dev"),
-                )
-                self.settings_service = SettingsService(dsn=org_dsn)
+            self.invitation_service = InvitationService(
+                dsn=org_dsn,
+                base_url=os.getenv("GUIDEAI_BASE_URL", "https://guideai.dev"),
+            )
+            self.settings_service = SettingsService(dsn=org_dsn)
+        elif org_dsn:
+            # Enterprise not installed — use lightweight OSS project service
+            self.org_service = OSSProjectService(dsn=org_dsn)
+            logger.info("Using OSS project service (enterprise not installed)")
 
         # Billing service (uses Stripe if credentials provided, otherwise mock)
         self.billing_service: Optional[Any] = None
@@ -7805,16 +7811,19 @@ def create_app(
         app.include_router(settings_routes, prefix="/api")
 
     # ------------------------------------------------------------------
-    # Projects (always available)
+    # Projects (always available when a project service exists)
     # ------------------------------------------------------------------
-    app.include_router(
-        create_project_routes(
-            org_service=container.org_service,
-            get_user_id=_require_user_id,
-            tags=["projects"],
-        ),
-        prefix="/api",
-    )
+    if container.org_service is not None:
+        app.include_router(
+            create_project_routes(
+                org_service=container.org_service,
+                get_user_id=_require_user_id,
+                tags=["projects"],
+            ),
+            prefix="/api",
+        )
+    else:
+        logger.warning("Project routes unavailable — no database DSN configured")
 
     # ------------------------------------------------------------------
     # Board Management (Unified WorkItem CRUD)
