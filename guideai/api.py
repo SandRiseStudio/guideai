@@ -108,6 +108,7 @@ from .device_flow import (
     DeviceAuthorizationStatus,
     DeviceAuthorizationSession,
     DeviceFlowManager,
+    DeviceTokens,
     DeviceCodeNotFoundError,
     UserCodeNotFoundError,
     DeviceCodeExpiredError,
@@ -135,7 +136,7 @@ from .collaboration_contracts import (
 )
 from .collaboration_service import CollaborationService, VersionConflictError
 from .collaboration_service_postgres import PostgresCollaborationService
-from .projects_api import InMemoryProjectStore, create_project_routes
+from .projects_api import create_project_routes
 from .run_service import RunService, RunNotFoundError
 from .run_service_postgres import PostgresRunService
 from .utils.dsn import resolve_optional_postgres_dsn
@@ -183,7 +184,8 @@ try:
     from .multi_tenant.settings import SettingsService
     from .multi_tenant.api import create_org_routes
     from .multi_tenant.settings_api import create_settings_routes
-    MULTI_TENANT_AVAILABLE = True
+    # Stubs set these to None when enterprise is not installed
+    MULTI_TENANT_AVAILABLE = OrganizationService is not None
 except ImportError:
     MULTI_TENANT_AVAILABLE = False
     OrganizationService = None  # type: ignore[assignment, misc]
@@ -458,18 +460,7 @@ class _ServiceContainer:
         self.task_assignment_service = TaskAssignmentService()
         self.task_adapter = RestTaskAssignmentAdapter(self.task_assignment_service)
 
-        # Projects with PostgreSQL persistence for FK integrity (boards, runs reference projects)
-        # Use auth schema since that's where projects table lives
-        project_dsn = resolve_optional_postgres_dsn(
-            service="PROJECT",
-            explicit_dsn=os.getenv("GUIDEAI_AUTH_PG_DSN"),
-            env_var="GUIDEAI_AUTH_PG_DSN",
-        )
-        project_pool = None
-        if project_dsn:
-            from guideai.storage.postgres_pool import PostgresPool
-            project_pool = PostgresPool(project_dsn, schema="auth")
-        self.project_store = InMemoryProjectStore(pool=project_pool)
+        # Projects use OrganizationService exclusively
 
         # Board/Assignment services for agent suggestions
         self.board_service = BoardService(pool=None, telemetry=telemetry)
@@ -546,7 +537,9 @@ class _ServiceContainer:
             explicit_dsn=os.getenv("GUIDEAI_ANALYTICS_PG_DSN") or os.getenv("GUIDEAI_TELEMETRY_PG_DSN"),
             env_var="GUIDEAI_ANALYTICS_PG_DSN",
         )
-        if warehouse_path:
+        if AnalyticsWarehouse is None:
+            self.analytics_warehouse = _UnavailableWarehouse("Analytics warehouse not available (enterprise)")
+        elif warehouse_path:
             self.analytics_warehouse = AnalyticsWarehouse(db_path=Path(warehouse_path))
         elif analytics_dsn:
             self.analytics_warehouse = AnalyticsWarehouse(dsn=analytics_dsn)
@@ -1831,7 +1824,7 @@ def create_app(
         2. Org credential (BYOK) - if project belongs to an org
         3. Platform credential - admin-managed defaults
 
-        Works for both personal projects and org projects.
+        Works for both user-owned projects and org projects.
         """
         from .work_item_execution_service import CredentialStore
         from .mcp.handlers.config_handlers import handle_get_model_availability
@@ -3918,7 +3911,8 @@ def create_app(
         hub: _CollaborationHub = app.state.collaboration_hub
 
         user_id = websocket.query_params.get("user_id") or ""
-        session_id = websocket.query_params.get("session_id")
+        requested_session_id = websocket.query_params.get("session_id")
+        session_id: Optional[str] = None
 
         document = container.collaboration_service.get_document(document_id)
         if document is None:
@@ -3931,14 +3925,89 @@ def create_app(
 
         await hub.connect(document_id, websocket)
         try:
+            session_id = requested_session_id or container.collaboration_service.start_collaboration_session(document_id, user_id)
             await websocket.send_json({"type": "snapshot", "document": document.to_dict()})
+
+            collaborators = container.collaboration_service.get_active_collaborators(document_id)
+            for collaborator in collaborators:
+                collaborator_user_id = collaborator.get("user_id")
+                if not collaborator_user_id or collaborator_user_id == user_id:
+                    continue
+
+                await websocket.send_json(
+                    {
+                        "type": "presence",
+                        "user_id": collaborator_user_id,
+                        "status": collaborator.get("status", "active"),
+                    }
+                )
+
+                cursor_position = collaborator.get("cursor_position")
+                if cursor_position is not None:
+                    await websocket.send_json(
+                        {
+                            "type": "cursor",
+                            "user_id": collaborator_user_id,
+                            "position": cursor_position,
+                            "selection_end": collaborator.get("selection_end"),
+                        }
+                    )
+
+            await hub.broadcast(
+                document_id,
+                {
+                    "type": "presence",
+                    "user_id": user_id,
+                    "status": "active",
+                },
+            )
 
             while True:
                 message = await websocket.receive_json()
                 msg_type = message.get("type")
 
                 if msg_type == "ping":
+                    if session_id:
+                        container.collaboration_service.touch_collaboration_session(session_id, status="active")
                     await websocket.send_json({"type": "pong"})
+                    continue
+
+                if msg_type == "cursor":
+                    position = int(message.get("position", 0))
+                    selection_end = message.get("selection_end")
+                    if session_id:
+                        container.collaboration_service.touch_collaboration_session(
+                            session_id,
+                            cursor_position=position,
+                            selection_end=int(selection_end) if selection_end is not None else None,
+                            status="active",
+                        )
+                    await hub.broadcast(
+                        document_id,
+                        {
+                            "type": "cursor",
+                            "user_id": user_id,
+                            "position": position,
+                            "selection_end": selection_end,
+                        },
+                    )
+                    continue
+
+                if msg_type == "presence":
+                    status_value = str(message.get("status") or "active")
+                    if session_id:
+                        container.collaboration_service.touch_collaboration_session(
+                            session_id,
+                            status=status_value,
+                        )
+                    await hub.broadcast(
+                        document_id,
+                        {
+                            "type": "presence",
+                            "user_id": user_id,
+                            "status": status_value,
+                        },
+                    )
                     continue
 
                 if msg_type != "edit":
@@ -3975,6 +4044,8 @@ def create_app(
 
                 async with hub._lock_for(document_id):
                     try:
+                        if session_id:
+                            container.collaboration_service.touch_collaboration_session(session_id, status="active")
                         operation = container.collaboration_service.apply_real_time_edit(request)
                         updated = container.collaboration_service.get_document(document_id)
                         await hub.broadcast(
@@ -4002,8 +4073,28 @@ def create_app(
                             {"type": "error", "code": "APPLY_FAILED", "message": str(exc)}
                         )
         except WebSocketDisconnect:
+            if session_id:
+                container.collaboration_service.end_collaboration_session(session_id)
+                await hub.broadcast(
+                    document_id,
+                    {
+                        "type": "presence",
+                        "user_id": user_id,
+                        "status": "disconnected",
+                    },
+                )
             await hub.disconnect(document_id, websocket)
         except Exception:
+            if session_id:
+                container.collaboration_service.end_collaboration_session(session_id)
+                await hub.broadcast(
+                    document_id,
+                    {
+                        "type": "presence",
+                        "user_id": user_id,
+                        "status": "disconnected",
+                    },
+                )
             await hub.disconnect(document_id, websocket)
             raise
 
@@ -4261,6 +4352,35 @@ def create_app(
     @app.post("/api/v1/reflection/extract")
     def reflection_extract_rest(payload: Dict[str, Any]) -> Dict[str, Any]:
         return container.reflection_adapter.extract(payload)
+
+    @app.get("/api/v1/reflection/candidates")
+    def list_reflection_candidates(
+        status_filter: Optional[str] = Query(default=None, alias="status"),
+        role: Optional[str] = Query(default=None),
+        min_confidence: Optional[float] = Query(default=None),
+        limit: int = Query(default=50),
+        offset: int = Query(default=0),
+    ) -> Dict[str, Any]:
+        """List extracted behavior candidates for review.
+
+        Query params:
+            status: Filter by status (proposed, approved, rejected, merged)
+            role: Filter by role (Student, Teacher, Metacognitive Strategist)
+            min_confidence: Filter by minimum confidence score (0.0-1.0)
+            limit: Maximum number of results (default: 50)
+            offset: Pagination offset (default: 0)
+
+        Returns:
+            { candidates: [...], total: int }
+        """
+        payload: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if status_filter:
+            payload["status"] = status_filter
+        if role:
+            payload["role"] = role
+        if min_confidence is not None:
+            payload["min_confidence"] = min_confidence
+        return container.reflection_adapter.list_candidates(payload)
 
     @app.post("/api/v1/reflection/candidates/approve")
     def reflection_approve_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4952,6 +5072,16 @@ def create_app(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail=f"No pending authorization request found for user code: {normalized}",
                     )
+
+                # Resolve the approver's identity from auth.users so the
+                # resulting token maps to a real user. This fixes the bug
+                # where oauth_user_id was never set during device approval.
+                _resolve_approver_identity(
+                    container.postgres_device_store,
+                    session.device_code,
+                    approver,
+                )
+
                 return {
                     "status": session.status,
                     "client_id": session.client_id,
@@ -5262,6 +5392,73 @@ def create_app(
             "roles": ["STUDENT"],  # Default role for device flow auth
             "scopes": user_info.get("scopes", []),
         }
+
+    def _resolve_approver_identity(
+        postgres_store,
+        device_code: str,
+        approver: str,
+    ) -> None:
+        """Look up the approver in auth.users and populate oauth identity fields.
+
+        Tries to match the approver string against auth.users by id first,
+        then by email. If found, updates the device session with the user's
+        identity so the resulting token resolves to a real user_id.
+
+        This is a best-effort operation — if the lookup fails, the session
+        still works with the approver string as the 'sub' claim.
+        """
+        import logging
+        _logger = logging.getLogger("guideai.auth.resolve_approver")
+
+        try:
+            user_row = None
+
+            def _lookup(conn) -> None:
+                nonlocal user_row
+                with conn.cursor() as cur:
+                    # Try by id first (e.g., "112316240869466547718")
+                    cur.execute(
+                        "SELECT id, email, display_name FROM auth.users WHERE id = %s",
+                        (approver,),
+                    )
+                    user_row = cur.fetchone()
+                    if not user_row:
+                        # Try by email (e.g., "nick.sanders.a@gmail.com")
+                        cur.execute(
+                            "SELECT id, email, display_name FROM auth.users WHERE email = %s",
+                            (approver,),
+                        )
+                        user_row = cur.fetchone()
+
+            if hasattr(postgres_store, '_pool'):
+                postgres_store._pool.run_transaction(
+                    operation="resolve_approver_identity",
+                    service_prefix="auth",
+                    actor=approver,
+                    metadata={"device_code": device_code},
+                    executor=_lookup,
+                    telemetry=None,
+                )
+
+            if user_row:
+                user_id, email, display_name = user_row
+                postgres_store.update_oauth_identity(
+                    device_code=device_code,
+                    oauth_user_id=user_id,
+                    oauth_email=email,
+                    oauth_display_name=display_name,
+                    oauth_provider="device_flow",
+                )
+                _logger.info(
+                    f"Resolved approver identity: approver={approver} -> user_id={user_id}, email={email}"
+                )
+            else:
+                _logger.info(
+                    f"Approver '{approver}' not found in auth.users — "
+                    f"token will use approver string as sub claim"
+                )
+        except Exception as e:
+            _logger.warning(f"Failed to resolve approver identity: {e}")
 
     def _require_user_id(request: Request) -> str:
         """Extract authenticated user_id from bearer token."""
@@ -5715,9 +5912,9 @@ def create_app(
         try:
             # First try to get from auth.users table (OAuth users)
             # Try multiple sources for database pool
-            pool = getattr(container.project_store, '_pool', None)
+            pool = getattr(container.org_service, 'pool', None) if hasattr(container, 'org_service') else None
 
-            # If no pool from project_store, try DATABASE_URL directly
+            # If no pool from org_service, try DATABASE_URL directly
             if pool is None:
                 database_url = os.environ.get("DATABASE_URL")
                 if database_url:
@@ -6198,8 +6395,8 @@ def create_app(
 
         # Ensure user exists in auth.users for FK constraints (projects, boards, etc.)
         try:
-            # Get pool from project_store which has the auth schema connection
-            pool = getattr(container.project_store, '_pool', None)
+            # Get pool from org_service which has the auth schema connection
+            pool = getattr(container.org_service, 'pool', None) if hasattr(container, 'org_service') else None
             if pool:
                 with pool.connection() as conn:
                     with conn.cursor() as cur:
@@ -6493,16 +6690,69 @@ def create_app(
                 detail="Invalid client credentials",
             )
 
-        # Generate access token for the service principal
-        # For now, return a simple token structure - can integrate with device_flow_manager
-        # or a dedicated token service later
-        import secrets
-        access_token = secrets.token_urlsafe(32)
+        # Create a device session for the SP so the token is stored and
+        # validatable by _require_user_id() and the auth middleware.
+        # This fixes the bug where SP tokens were random strings that
+        # could never be validated (GS2.1).
+        access_token_ttl = 3600  # 1 hour
+        refresh_token_ttl = 604800  # 7 days
+
+        if container.postgres_device_store:
+            # Create a pre-approved session with SP identity
+            session = container.postgres_device_store.create_session(
+                client_id=client_id,
+                scopes=sp.allowed_scopes,
+                surface="SERVICE_PRINCIPAL",
+                metadata={
+                    "sp_id": sp.id,
+                    "sp_name": sp.name,
+                    "sp_role": sp.role,
+                    "auth_method": "client_credentials",
+                },
+            )
+            # Immediately approve with SP identity
+            approved = container.postgres_device_store.approve(
+                session.device_code,
+                approver=sp.id,
+                approver_surface="SERVICE_PRINCIPAL",
+                access_token_ttl=access_token_ttl,
+                refresh_token_ttl=refresh_token_ttl,
+            )
+            if not approved:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to generate access token for service principal",
+                )
+            # Update the session with SP identity info so token resolves
+            # to the SP user via get_user_info_from_access_token()
+            container.postgres_device_store.update_oauth_identity(
+                device_code=session.device_code,
+                oauth_user_id=sp.id,
+                oauth_username=sp.name,
+                oauth_email=f"{sp.client_id}@service-principal.guideai.local",
+                oauth_display_name=sp.name,
+                oauth_provider="service_principal",
+            )
+            access_token = approved.access_token
+            refresh_token = approved.refresh_token
+        else:
+            # Fallback to in-memory device flow manager
+            session = container.device_flow_manager.create_session(
+                client_id=client_id,
+                scopes=sp.allowed_scopes,
+            )
+            container.device_flow_manager.approve_user_code(
+                session.user_code,
+                approver=sp.id,
+                approver_surface="SERVICE_PRINCIPAL",
+            )
+            access_token = session.access_token
+            refresh_token = getattr(session, 'refresh_token', None)
 
         return {
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": 3600,  # 1 hour
+            "expires_in": access_token_ttl,
             "scope": " ".join(sp.allowed_scopes),
             "service_principal": {
                 "id": sp.id,
@@ -7022,24 +7272,79 @@ def create_app(
     def get_telemetry_events(
         event_type: Optional[str] = Query(None),
         since: Optional[str] = Query(None),
+        until: Optional[str] = Query(None),
+        run_id: Optional[str] = Query(None),
+        session_id: Optional[str] = Query(None),
+        actor_surface: Optional[str] = Query(None),
         limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
     ) -> Dict[str, Any]:
         """
-        Fetch telemetry events from staging observability stack.
-        Note: This is a placeholder - actual implementation depends on telemetry backend.
+        Query telemetry events with filtering and pagination.
+
+        Part of E4 — Learning Loop, Analytics, and Governance (GUIDEAI-278 / T4.1.3).
         """
-        # TODO: Implement actual telemetry query against backend storage
-        # For now, return empty list to allow tests to proceed
-        return {
-            "events": [],
-            "count": 0,
-            "message": "Telemetry query not yet implemented - placeholder endpoint",
-            "filters": {
-                "event_type": event_type,
-                "since": since,
-                "limit": limit,
-            },
-        }
+        from guideai.storage.postgres_telemetry import PostgresTelemetrySink
+
+        telemetry_dsn = resolve_optional_postgres_dsn(
+            service="TELEMETRY",
+            explicit_dsn=None,
+            env_var="GUIDEAI_TELEMETRY_PG_DSN",
+        )
+        if not telemetry_dsn:
+            return {
+                "events": [],
+                "count": 0,
+                "message": "Telemetry query requires PostgreSQL (set GUIDEAI_TELEMETRY_PG_DSN)",
+                "filters": {"event_type": event_type, "since": since, "limit": limit},
+            }
+
+        try:
+            sink = PostgresTelemetrySink(dsn=telemetry_dsn)
+            events = sink.query_events(
+                event_type=event_type,
+                since=since,
+                until=until,
+                run_id=run_id,
+                session_id=session_id,
+                actor_surface=actor_surface,
+                limit=limit,
+                offset=offset,
+            )
+            return {"events": events, "count": len(events)}
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Telemetry query failed: {exc}",
+            ) from exc
+
+    def _pg_session_to_auth_session(pg_session) -> DeviceAuthorizationSession:
+        """Convert a PostgreSQL DeviceSession to DeviceAuthorizationSession for rendering."""
+        tokens = None
+        if pg_session.access_token and pg_session.access_token_expires_at:
+            tokens = DeviceTokens(
+                access_token=pg_session.access_token,
+                refresh_token=pg_session.refresh_token or "",
+                access_token_expires_at=pg_session.access_token_expires_at,
+                refresh_token_expires_at=pg_session.refresh_token_expires_at or pg_session.access_token_expires_at,
+            )
+        return DeviceAuthorizationSession(
+            device_code=pg_session.device_code,
+            user_code=pg_session.user_code,
+            client_id=pg_session.client_id,
+            scopes=pg_session.scopes if isinstance(pg_session.scopes, list) else [pg_session.scopes],
+            surface=pg_session.surface,
+            verification_uri="",
+            verification_uri_complete="",
+            created_at=pg_session.created_at,
+            expires_at=pg_session.expires_at,
+            poll_interval=pg_session.poll_interval,
+            metadata=pg_session.metadata or {},
+            status=DeviceAuthorizationStatus(pg_session.status),
+            tokens=tokens,
+            approver=pg_session.approver,
+            approved_at=pg_session.approved_at,
+        )
 
     @app.get("/device/activate", response_class=HTMLResponse)
     def show_device_activation_form(user_code: Optional[str] = None) -> HTMLResponse:
@@ -7050,7 +7355,19 @@ def create_app(
         if user_code:
             try:
                 normalized = _normalize_user_code(user_code)
-                session = container.device_flow_manager.describe_user_code(normalized)
+                # Check PostgreSQL store first
+                if container.postgres_device_store:
+                    pg_session = container.postgres_device_store.get_by_user_code(normalized)
+                    if pg_session:
+                        session = _pg_session_to_auth_session(pg_session)
+                if session is None and not error:
+                    # Fall back to in-memory device flow manager
+                    try:
+                        session = container.device_flow_manager.describe_user_code(normalized)
+                    except Exception:
+                        pass
+                if session is None and not error:
+                    error = "No consent request found for that code."
             except ValueError as exc:
                 error = str(exc)
                 normalized = user_code
@@ -7089,34 +7406,76 @@ def create_app(
         role_list = [role.strip() for role in roles_value.split(",") if role.strip()]
         mfa_flag = bool(mfa_verified)
 
-        session: Optional[DeviceAuthorizationSession]
+        session: Optional[DeviceAuthorizationSession] = None
         message: Optional[str] = None
         error: Optional[str] = None
 
         try:
-            if action_key == "lookup":
-                session = container.device_flow_manager.describe_user_code(normalized)
-                message = "Consent request loaded."
-            elif action_key == "approve":
-                session = container.device_flow_manager.approve_user_code(
-                    normalized,
-                    approver,
-                    approver_surface="WEB",
-                    roles=role_list,
-                    mfa_verified=mfa_flag,
-                )
-                message = "Consent approved successfully."
-            elif action_key == "deny":
-                session = container.device_flow_manager.deny_user_code(
-                    normalized,
-                    approver,
-                    approver_surface="WEB",
-                    reason=reason,
-                )
-                message = "Consent request denied."
+            if container.postgres_device_store:
+                # Use PostgreSQL store for shared state
+                if action_key == "lookup":
+                    pg_session = container.postgres_device_store.get_by_user_code(normalized)
+                    if pg_session:
+                        session = _pg_session_to_auth_session(pg_session)
+                        message = "Consent request loaded."
+                    else:
+                        error = "No consent request found for that code."
+                elif action_key == "approve":
+                    pg_session = container.postgres_device_store.approve_by_user_code(
+                        normalized,
+                        approver=approver,
+                        approver_surface="WEB",
+                    )
+                    if pg_session:
+                        _resolve_approver_identity(
+                            container.postgres_device_store,
+                            pg_session.device_code,
+                            approver,
+                        )
+                        session = _pg_session_to_auth_session(pg_session)
+                        message = "Consent approved successfully."
+                    else:
+                        error = "No consent request found for that code."
+                elif action_key == "deny":
+                    pg_session = container.postgres_device_store.deny_by_user_code(
+                        normalized,
+                        approver=approver,
+                        approver_surface="WEB",
+                        reason=reason,
+                    )
+                    if pg_session:
+                        session = _pg_session_to_auth_session(pg_session)
+                        message = "Consent request denied."
+                    else:
+                        error = "No consent request found for that code."
+                else:
+                    session = None
+                    error = "Unsupported action requested."
             else:
-                session = None
-                error = "Unsupported action requested."
+                # Fallback to in-memory manager
+                if action_key == "lookup":
+                    session = container.device_flow_manager.describe_user_code(normalized)
+                    message = "Consent request loaded."
+                elif action_key == "approve":
+                    session = container.device_flow_manager.approve_user_code(
+                        normalized,
+                        approver,
+                        approver_surface="WEB",
+                        roles=role_list,
+                        mfa_verified=mfa_flag,
+                    )
+                    message = "Consent approved successfully."
+                elif action_key == "deny":
+                    session = container.device_flow_manager.deny_user_code(
+                        normalized,
+                        approver,
+                        approver_surface="WEB",
+                        reason=reason,
+                    )
+                    message = "Consent request denied."
+                else:
+                    session = None
+                    error = "Unsupported action requested."
         except UserCodeNotFoundError:
             session = None
             error = "No consent request found for that code."
@@ -7446,13 +7805,12 @@ def create_app(
         app.include_router(settings_routes, prefix="/api")
 
     # ------------------------------------------------------------------
-    # Projects (Personal projects always available)
+    # Projects (always available)
     # ------------------------------------------------------------------
     app.include_router(
         create_project_routes(
-            store=container.project_store,
+            org_service=container.org_service,
             get_user_id=_require_user_id,
-            org_service=container.org_service if MULTI_TENANT_AVAILABLE else None,
             tags=["projects"],
         ),
         prefix="/api",
@@ -7487,7 +7845,7 @@ def create_app(
     # ------------------------------------------------------------------
     # Billing Service
     # ------------------------------------------------------------------
-    if BILLING_AVAILABLE and container.billing_service is not None:
+    if BILLING_AVAILABLE and container.billing_service is not None and create_billing_router is not None:
         # Add billing routes at /api/v1/billing/*
         billing_routes = create_billing_router(
             billing_service=container.billing_service,
