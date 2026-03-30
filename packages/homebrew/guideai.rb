@@ -14,8 +14,8 @@ class Guideai < Formula
 
   desc "AI-powered developer tooling and task orchestration"
   homepage "https://amprealize.ai"
-  url "https://files.pythonhosted.org/packages/source/g/guideai/guideai-0.1.0.tar.gz"
-  sha256 "REPLACE_WITH_ACTUAL_SHA256_AFTER_PYPI_PUBLISH"
+  url "https://files.pythonhosted.org/packages/3f/eb/777ee881ea777a0fe1a838ef99cd0449b59b89ef4a274c6bf5573c6caf15/guideai-0.1.0.tar.gz"
+  sha256 "ccfc75ded83260f2fdad0bfcdd5aa6cdde08bdacab28f915da0650de4bf3423c"
   license "Apache-2.0"
   head "https://github.com/SandRiseStudio/guideai.git", branch: "main"
 
@@ -24,18 +24,18 @@ class Guideai < Formula
 
   # Core dependencies (pinned for reproducibility)
   resource "fastapi" do
-    url "https://files.pythonhosted.org/packages/source/f/fastapi/fastapi-0.115.0.tar.gz"
-    sha256 "REPLACE_WITH_ACTUAL_SHA256"
+    url "https://files.pythonhosted.org/packages/7b/5e/bf0471f14bf6ebfbee8208148a3396d1a23298531a6cc10776c59f4c0f87/fastapi-0.115.0.tar.gz"
+    sha256 "f93b4ca3529a8ebc6fc3fcf710e5efa8de3df9b41570958abf1d97d843138004"
   end
 
   resource "pydantic" do
-    url "https://files.pythonhosted.org/packages/source/p/pydantic/pydantic-2.9.0.tar.gz"
-    sha256 "REPLACE_WITH_ACTUAL_SHA256"
+    url "https://files.pythonhosted.org/packages/f6/8f/3b9f7a38caa3fa0bcb3cea7ee9958e89a9a6efc0e6f51fd6096f24cac140/pydantic-2.9.0.tar.gz"
+    sha256 "c7a8a9fdf7d100afa49647eae340e2d23efa382466a8d177efcd1381e9be5598"
   end
 
   resource "httpx" do
-    url "https://files.pythonhosted.org/packages/source/h/httpx/httpx-0.27.0.tar.gz"
-    sha256 "REPLACE_WITH_ACTUAL_SHA256"
+    url "https://files.pythonhosted.org/packages/5c/2d/3da5bdf4408b8b2800061c339f240c1802f2e82d55e50bd39c5a881f47f0/httpx-0.27.0.tar.gz"
+    sha256 "a0cb88a46f32dc874e04ee956e4c2764aba2aa228f650b06788ba6bda2962ab5"
   end
 
   resource "click" do

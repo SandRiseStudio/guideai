@@ -1,9 +1,10 @@
 # GuideAI — The Behavior Engine for AI Agents
 
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)]()
+[![CI](https://img.shields.io/github/actions/workflow/status/SandRiseStudio/guideai/ci.yml?branch=main&label=CI)](https://github.com/SandRiseStudio/guideai/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/guideai)](https://pypi.org/project/guideai/)
+[![Python 3.10+](https://img.shields.io/pypi/pyversions/guideai)](https://pypi.org/project/guideai/)
+[![License](https://img.shields.io/github/license/SandRiseStudio/guideai)](LICENSE)
+[![Homebrew](https://img.shields.io/badge/brew-sandrisestudio%2Fguideai-orange)](https://github.com/SandRiseStudio/homebrew-guideai)
 
 **Turn your LLM chains-of-thought into a reusable procedural handbook — cut reasoning tokens by up to 46% while maintaining or improving quality.**
 

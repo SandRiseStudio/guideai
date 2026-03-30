@@ -7,7 +7,7 @@
 **Transform your IDE into an intelligent development companion with AI agent orchestration, real-time monitoring, and compliance validation.**
 
 [![Version](https://img.shields.io/github/v/release/SandRiseStudio/guideai?label=version)](https://github.com/SandRiseStudio/guideai/releases)
-[![Build Status](https://img.shields.io/github/workflow/status/SandRiseStudio/guideai/CI?label=build)](https://github.com/SandRiseStudio/guideai/actions/workflows/ci.yml)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/SandRiseStudio/guideai/ci.yml?branch=main&label=build)](https://github.com/SandRiseStudio/guideai/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/SandRiseStudio/guideai/blob/main/LICENSE)
 [![VSCode Marketplace](https://img.shields.io/badge/vscode-marketplace-blue)](https://marketplace.visualstudio.com/items?itemName=guideai.guideai-ide-extension)
 
