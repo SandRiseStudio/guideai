@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/guideai/guideai"
 	},
-	"homepage": "https://guideai.com",
+	"homepage": "https://github.com/guideai/guideai",
 	"bugs": {
 		"url": "https://github.com/guideai/guideai/issues"
 	},
@@ -43,7 +43,7 @@
 			"description": "Build Status"
 		}
 	],
-	"license": "MIT",
+	"license": "Apache-2.0",
 	"galleryBanner": {
 		"color": "#1e1e1e",
 		"theme": "dark"
@@ -213,6 +213,11 @@
 				"command": "guideai.openBehaviorAccuracy",
 				"title": "GuideAI: Behavior Accuracy Dashboard",
 				"icon": "$(graph)"
+			},
+			{
+				"command": "guideai.openOnboarding",
+				"title": "GuideAI: Set Up Workspace",
+				"icon": "$(rocket)"
 			},
 			{
 				"command": "guideai.submitBehaviorFeedback",

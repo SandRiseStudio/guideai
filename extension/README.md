@@ -8,7 +8,7 @@
 
 [![Version](https://img.shields.io/github/v/release/guideai/guideai?label=version)](https://github.com/guideai/guideai/releases)
 [![Build Status](https://img.shields.io/github/workflow/status/guideai/guideai/CI?label=build)](https://github.com/guideai/guideai/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/guideai/guideai/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/guideai/guideai/blob/main/LICENSE)
 [![VSCode Marketplace](https://img.shields.io/badge/vscode-marketplace-blue)](https://marketplace.visualstudio.com/items?itemName=guideai.guideai-ide-extension)
 
 </div>
