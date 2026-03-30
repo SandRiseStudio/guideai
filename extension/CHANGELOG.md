@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Comprehensive integration testing (13/16 tests passing, 81% coverage)
 
 ### Documentation
-- 📚 **New Guide**: [`INTERNAL_AUTH_GUIDE.md`](../INTERNAL_AUTH_GUIDE.md) - Complete API reference, CLI usage, and troubleshooting
+- 📚 **New Guide**: [`INTERNAL_AUTH_GUIDE.md`](../docs/INTERNAL_AUTH_GUIDE.md) - Complete API reference, CLI usage, and troubleshooting
 - 📚 **Updated**: [`MULTI_PROVIDER_AUTH_ARCHITECTURE.md`](../docs/MULTI_PROVIDER_AUTH_ARCHITECTURE.md) - Internal auth implementation details
 
 ### Security
