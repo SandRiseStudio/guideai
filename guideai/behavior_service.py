@@ -277,10 +277,12 @@ class BehaviorService:
         dsn: Optional[str] = None,
         telemetry: Optional[TelemetryClient] = None,
         behavior_retriever: Optional[Any] = None,
+        quality_gate: Optional[Any] = None,
     ) -> None:
         self._dsn = self._resolve_dsn(dsn)
         self._telemetry = telemetry or TelemetryClient.noop()
         self._behavior_retriever = behavior_retriever
+        self._quality_gate = quality_gate
         self._pool = PostgresPool(self._dsn)
         self._embedding_model = None
 
@@ -686,12 +688,36 @@ class BehaviorService:
     def approve_behavior(self, request: ApproveBehaviorRequest, actor: Actor) -> BehaviorVersion:
         """Approve a behavior version and mark it active.
 
-        Uses actual DB schema: is_active/is_deprecated flags instead of status column
+        Uses actual DB schema: is_active/is_deprecated flags instead of status column.
+        When a quality_gate is configured, checks adherence score before approval.
         """
 
         version_obj = self._fetch_behavior_version(request.behavior_id, request.version)
         if version_obj.status not in {"IN_REVIEW", "DRAFT"}:
             raise BehaviorVersionError(f"Cannot approve version with status={version_obj.status}.")
+
+        # Quality gate: pre-approval check
+        if self._quality_gate is not None and hasattr(self._quality_gate, "check_behavior_approval"):
+            adherence = getattr(request, "adherence_score", None)
+            if adherence is not None:
+                gate_result = self._quality_gate.check_behavior_approval(
+                    behavior_id=request.behavior_id,
+                    adherence_score=adherence,
+                )
+                if not gate_result.passed:
+                    self._telemetry.emit_event(
+                        event_type="behaviors.approval_gate_failed",
+                        payload={
+                            "behavior_id": request.behavior_id,
+                            "version": request.version,
+                            "gate_failures": gate_result.failures,
+                        },
+                        actor=self._actor_payload(actor),
+                    )
+                    raise BehaviorVersionError(
+                        f"Quality gate failed for {request.behavior_id}: "
+                        + "; ".join(gate_result.failures)
+                    )
 
         def _execute(conn: Any) -> None:
             with conn.cursor() as cur:
@@ -948,7 +974,7 @@ class BehaviorService:
             'query': (request.query or "").lower(),
             'status': request.status,
             'namespace': request.namespace,
-            'role_focus': request.role_focus,
+            'role_focus': request.role_focus.upper() if request.role_focus else None,
             'tags': sorted(request.tags) if request.tags else [],
             'limit': request.limit,
         }
@@ -980,7 +1006,7 @@ class BehaviorService:
             active = next((v for v in versions if v.status == "APPROVED"), versions[0] if versions else None)
             if not active:
                 continue
-            if request.role_focus and active.role_focus != request.role_focus:
+            if request.role_focus and active.role_focus.upper() != request.role_focus.upper():
                 continue
             if request.tags and not set(request.tags).issubset(set(behavior.tags)):
                 continue
@@ -1751,4 +1777,221 @@ class BehaviorService:
             "message": "Benchmark table not available in current schema",
             "sample_size": sample_size,
             "triggered_at": timestamp,
+        }
+
+    # ------------------------------------------------------------------
+    # Lifecycle policies (T4.2.3)
+    # ------------------------------------------------------------------
+
+    def promote_candidate_to_behavior(
+        self,
+        *,
+        candidate_name: str,
+        candidate_summary: str,
+        candidate_triggers: List[str],
+        candidate_steps: List[str],
+        candidate_keywords: List[str],
+        candidate_confidence: float,
+        candidate_role: str = "Student",
+        actor: Actor,
+    ) -> Dict[str, Any]:
+        """Promote an approved reflection candidate to a full behavior.
+
+        Creates a new behavior via propose_behavior() which handles
+        auto-approval when confidence >= 0.8 and historical_validations >= 3.
+
+        Returns:
+            Dict with behavior_id, version, status, auto_approved flag.
+        """
+        # Ensure name follows behavior_<verb>_<noun> pattern
+        name = candidate_name
+        if not name.startswith("behavior_"):
+            name = f"behavior_{name}"
+
+        request = ProposeBehaviorRequest(
+            name=name,
+            description=candidate_summary,
+            instruction="\n".join(candidate_steps) if candidate_steps else candidate_summary,
+            role_focus=candidate_role,
+            trigger_keywords=candidate_triggers,
+            tags=candidate_keywords,
+            examples=[],
+            confidence_score=candidate_confidence,
+            historical_validations=[],
+            proposed_by_role="Strategist",
+            rationale="Auto-promoted from approved reflection candidate",
+        )
+
+        return self.propose_behavior(request, actor)
+
+    def list_expiring_behaviors(self, *, days: int = 30) -> List[Dict[str, Any]]:
+        """List active behaviors that haven't been reviewed/updated recently.
+
+        Since effective_to is not a dedicated DB column, we use updated_at
+        as a staleness proxy: behaviors not updated in (days) days are
+        considered candidates for review.
+
+        Returns:
+            List of behavior dicts with staleness info.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_iso = cutoff.isoformat()
+
+        conn = self._ensure_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, description, version, updated_at, keywords
+                FROM behavior.behaviors
+                WHERE is_active = true AND is_deprecated = false
+                  AND updated_at < %s
+                ORDER BY updated_at ASC
+                """,
+                (cutoff_iso,),
+            )
+            rows = cur.fetchall()
+
+        results = []
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            updated_str = row[4]
+            if isinstance(updated_str, str):
+                try:
+                    updated_dt = datetime.fromisoformat(updated_str)
+                except ValueError:
+                    updated_dt = now
+            else:
+                updated_dt = updated_str if updated_str else now
+
+            if updated_dt.tzinfo is None:
+                updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+
+            stale_days = (now - updated_dt).days
+            results.append({
+                "behavior_id": row[0],
+                "name": row[1],
+                "description": row[2],
+                "version": row[3],
+                "updated_at": str(row[4]),
+                "keywords": row[5] if row[5] else [],
+                "stale_days": stale_days,
+            })
+
+        return results
+
+    def flag_stale_behaviors(
+        self,
+        *,
+        stale_days: int = 90,
+        actor: Actor,
+    ) -> Dict[str, Any]:
+        """Flag behaviors that exceed staleness threshold for deprecation review.
+
+        Emits telemetry events for each flagged behavior so dashboards and
+        GateNotifier consumers can act on them.
+
+        Returns:
+            Dict with flagged behavior IDs and count.
+        """
+        expiring = self.list_expiring_behaviors(days=stale_days)
+
+        flagged_ids = []
+        for beh in expiring:
+            flagged_ids.append(beh["behavior_id"])
+            self._telemetry.emit_event(
+                event_type="behaviors.flagged_stale",
+                payload={
+                    "behavior_id": beh["behavior_id"],
+                    "name": beh["name"],
+                    "stale_days": beh["stale_days"],
+                    "threshold_days": stale_days,
+                },
+                actor=self._actor_payload(actor),
+            )
+
+        return {
+            "flagged_count": len(flagged_ids),
+            "flagged_behavior_ids": flagged_ids,
+            "threshold_days": stale_days,
+        }
+
+    def check_overlay_compliance(
+        self,
+        *,
+        min_citation_rate: float = 0.3,
+        lookback_days: int = 30,
+        actor: Actor,
+    ) -> Dict[str, Any]:
+        """Check overlay/behavior citation compliance and flag poor outcomes.
+
+        Identifies behaviors that were retrieved but rarely cited in outputs,
+        indicating poor adherence or relevance. Emits telemetry events for
+        each flagged item so that GateNotifier consumers can trigger
+        review notifications.
+
+        Args:
+            min_citation_rate: Minimum ratio of citations/retrievals (0.0-1.0).
+            lookback_days: Number of days to look back for telemetry data.
+            actor: Actor performing the compliance check.
+
+        Returns:
+            Dict with flagged behaviors and compliance stats.
+        """
+        flagged = []
+
+        # Query behavior effectiveness from DB if available
+        try:
+            conn = self._ensure_connection()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, description
+                    FROM behavior.behaviors
+                    WHERE is_active = true AND is_deprecated = false
+                    """,
+                )
+                active_rows = cur.fetchall()
+        except Exception:
+            active_rows = []
+
+        # For each active behavior, check if effectiveness data exists
+        for row in active_rows:
+            behavior_id, name, description = row[0], row[1], row[2]
+            try:
+                metrics = self.get_effectiveness_metrics(behavior_id)
+                retrieval_count = metrics.get("retrieval_count", 0)
+                citation_count = metrics.get("citation_count", 0)
+                if retrieval_count > 0:
+                    citation_rate = citation_count / retrieval_count
+                    if citation_rate < min_citation_rate:
+                        flagged.append({
+                            "behavior_id": behavior_id,
+                            "name": name,
+                            "retrieval_count": retrieval_count,
+                            "citation_count": citation_count,
+                            "citation_rate": round(citation_rate, 3),
+                        })
+                        self._telemetry.emit_event(
+                            event_type="behaviors.poor_compliance",
+                            payload={
+                                "behavior_id": behavior_id,
+                                "name": name,
+                                "citation_rate": round(citation_rate, 3),
+                                "min_citation_rate": min_citation_rate,
+                                "retrieval_count": retrieval_count,
+                                "citation_count": citation_count,
+                                "lookback_days": lookback_days,
+                            },
+                            actor=self._actor_payload(actor),
+                        )
+            except Exception:
+                continue
+
+        return {
+            "flagged_count": len(flagged),
+            "flagged_behaviors": flagged,
+            "min_citation_rate": min_citation_rate,
+            "lookback_days": lookback_days,
         }

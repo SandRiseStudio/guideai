@@ -1,7 +1,7 @@
 """Minimal telemetry client and event structures used across guideAI stubs.
 
 The telemetry implementation aligns with the envelope described in
-`TELEMETRY_SCHEMA.md` while remaining lightweight for unit tests. Surfaces emit
+`docs/contracts/TELEMETRY_SCHEMA.md` while remaining lightweight for unit tests. Surfaces emit
 structured events that can be inspected via in-memory sinks during tests or
 forwarded to real backends in future implementations.
 """
@@ -240,6 +240,8 @@ class TelemetryClient:
         return event
 
 
+from guideai.telemetry_events import TelemetryEventType  # noqa: E402 – late import to avoid circular deps
+
 __all__ = [
     "TelemetrySink",
     "TelemetryEvent",
@@ -249,4 +251,5 @@ __all__ = [
     "KafkaTelemetrySink",
     "create_sink_from_env",
     "TelemetryClient",
+    "TelemetryEventType",
 ]

@@ -1,6 +1,6 @@
 """Audit Log Service for compliance-grade event logging.
 
-Implements multi-tier audit log storage per AUDIT_LOG_STORAGE.md:
+Implements multi-tier audit log storage per docs/contracts/AUDIT_LOG_STORAGE.md:
 - Hot tier: PostgreSQL for 30-day queryable events (INSERT-only)
 - Warm tier: S3 with Object Lock for long-term WORM storage
 - Cold tier: S3 Glacier Deep Archive (via lifecycle policy)

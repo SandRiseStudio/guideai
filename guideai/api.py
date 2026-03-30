@@ -7862,6 +7862,28 @@ def create_app(
         app.include_router(billing_routes, prefix="/api")
 
     # ------------------------------------------------------------------
+    # Research (AI Paper Evaluation — read-only)
+    # ------------------------------------------------------------------
+    research_dsn = resolve_optional_postgres_dsn(
+        service="RESEARCH",
+        explicit_dsn=None,
+        env_var="GUIDEAI_RESEARCH_PG_DSN",
+    )
+    if research_dsn:
+        try:
+            from guideai.storage.postgres_pool import PostgresPool
+            from guideai.storage.research_storage_postgres import ResearchStoragePostgres
+            from guideai.services.research_api import create_research_routes
+
+            research_pool = PostgresPool(research_dsn, "research")
+            research_storage = ResearchStoragePostgres(research_pool)
+            research_routes = create_research_routes(storage=research_storage, tags=["research"])
+            app.include_router(research_routes, prefix="/api")
+            logger.info("Research routes registered at /api/v1/research/*")
+        except Exception as exc:
+            logger.warning("Research routes unavailable: %s", exc)
+
+    # ------------------------------------------------------------------
     # Dashboard Stats
     # ------------------------------------------------------------------
     @app.get("/api/v1/dashboard/stats")

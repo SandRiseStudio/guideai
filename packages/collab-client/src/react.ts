@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { CollabClient, ConnectionState, createCollabClient, type CollabClientConfig } from './client.js';
-import type { Document, DocumentId, EditOperation, EditOperationType, UserId } from './types.js';
+import type { Document, DocumentId, EditOperation, EditOperationType, UserId, UserPresence } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Hook Types
@@ -43,6 +43,8 @@ export interface UseCollaborationReturn {
   updateCursor: (position: number, selectionEnd?: number) => void;
   /** Remote user cursors */
   cursors: Map<UserId, { position: number; selectionEnd?: number }>;
+  /** Remote user presence */
+  presence: Map<UserId, UserPresence>;
   /** Recent operations (for undo/redo, debugging) */
   operations: EditOperation[];
   /** Last error */
@@ -74,6 +76,7 @@ export function useCollaboration(options: UseCollaborationOptions): UseCollabora
   const [document, setDocument] = useState<Document | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.Disconnected);
   const [cursors, setCursors] = useState<Map<UserId, { position: number; selectionEnd?: number }>>(new Map());
+  const [presence, setPresence] = useState<Map<UserId, UserPresence>>(new Map());
   const [operations, setOperations] = useState<EditOperation[]>([]);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
 
@@ -93,6 +96,8 @@ export function useCollaboration(options: UseCollaborationOptions): UseCollabora
 
     const handleDisconnected = (reason: string) => {
       setConnectionState(ConnectionState.Disconnected);
+      setPresence(new Map());
+      setCursors(new Map());
       setError({ code: 'DISCONNECTED', message: reason });
     };
 
@@ -129,9 +134,46 @@ export function useCollaboration(options: UseCollaborationOptions): UseCollabora
         next.set(userId, { position, selectionEnd });
         return next;
       });
+
+      setPresence((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(userId);
+        next.set(userId, {
+          user_id: userId,
+          session_id: existing?.session_id,
+          display_name: existing?.display_name,
+          color: existing?.color,
+          status: existing?.status ?? 'active',
+          cursor_position: position,
+          selection_end: selectionEnd,
+          last_active: new Date().toISOString(),
+        });
+        return next;
+      });
     };
 
-    const handlePresence = (userId: UserId, status: string) => {
+    const handlePresence = (userId: UserId, status: UserPresence['status']) => {
+      setPresence((prev) => {
+        const next = new Map(prev);
+        if (status === 'disconnected') {
+          next.delete(userId);
+          return next;
+        }
+
+        const existing = next.get(userId);
+        next.set(userId, {
+          user_id: userId,
+          session_id: existing?.session_id,
+          display_name: existing?.display_name,
+          color: existing?.color,
+          status,
+          cursor_position: existing?.cursor_position,
+          selection_end: existing?.selection_end,
+          last_active: new Date().toISOString(),
+        });
+        return next;
+      });
+
       if (status === 'disconnected') {
         setCursors((prev) => {
           const next = new Map(prev);
@@ -227,6 +269,7 @@ export function useCollaboration(options: UseCollaborationOptions): UseCollabora
     replace,
     updateCursor,
     cursors,
+    presence,
     operations,
     error,
     reconnect,

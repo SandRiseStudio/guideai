@@ -61,6 +61,13 @@ class EvaluationMetric(str, Enum):
     TOKEN_EFFICIENCY = "token_efficiency"
 
 
+class InjectionStrategy(str, Enum):
+    """Prompt injection strategies for BCI comparison."""
+    BASELINE = "baseline"         # No BCI, no pack, no overlay
+    BCI_ONLY = "bci_only"         # Behavior retrieval without knowledge pack
+    PACK_BCI = "pack_bci"         # Full pack activation + BCI + overlay
+
+
 @dataclass
 class BenchmarkExample:
     """Single example in an evaluation benchmark."""
@@ -163,6 +170,38 @@ class ComparisonResult:
             "winner": self.winner,
             "confidence": self.confidence,
             "example_comparisons": self.example_comparisons,
+            "status": self.status,
+        }
+
+
+@dataclass
+class StrategyComparisonResult:
+    """Result of comparing injection strategies on the same model and benchmark."""
+    comparison_id: str
+    model_id: str
+    benchmark_name: str
+    started_at: datetime
+    completed_at: Optional[datetime]
+    total_examples: int
+    strategy_results: Dict[str, EvaluationResult]  # strategy -> result
+    strategy_metrics: Dict[str, Dict[str, float]]   # strategy -> metrics
+    improvements: Dict[str, Dict[str, float]]        # strategy -> improvement over baseline
+    token_accounting: Dict[str, Dict[str, float]]    # strategy -> token stats
+    winner: str   # best strategy name
+    status: str = "running"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "comparison_id": self.comparison_id,
+            "model_id": self.model_id,
+            "benchmark_name": self.benchmark_name,
+            "started_at": self.started_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "total_examples": self.total_examples,
+            "strategy_metrics": self.strategy_metrics,
+            "improvements": self.improvements,
+            "token_accounting": self.token_accounting,
+            "winner": self.winner,
             "status": self.status,
         }
 
@@ -571,6 +610,281 @@ class EvaluationService:
             status="completed",
         )
 
+    async def compare_injection_strategies(
+        self,
+        model_id: str,
+        benchmark: str | Benchmark,
+        strategies: Optional[List[InjectionStrategy]] = None,
+        *,
+        sample_size: Optional[int] = None,
+        system_prompt_builder: Optional[Callable[[InjectionStrategy, BenchmarkExample], List[Dict[str, str]]]] = None,
+    ) -> StrategyComparisonResult:
+        """Compare BCI injection strategies on the same model and benchmark.
+
+        Runs the same prompts with different injection strategies:
+        - BASELINE: No BCI, no pack, no overlay
+        - BCI_ONLY: Behavior retrieval without knowledge pack
+        - PACK_BCI: Full pack activation + BCI + overlay
+
+        Args:
+            model_id: Model to evaluate across all strategies.
+            benchmark: Benchmark name or Benchmark object.
+            strategies: Strategies to compare (default: all three).
+            sample_size: Limit examples (None = all).
+            system_prompt_builder: Optional callback that builds system
+                messages for a given strategy and example. Signature:
+                (strategy, example) -> list of message dicts.
+                If None, a default prompt is used per strategy.
+
+        Returns:
+            StrategyComparisonResult with per-strategy metrics and improvements.
+        """
+        if strategies is None:
+            strategies = list(InjectionStrategy)
+
+        comparison_id = str(uuid.uuid4())
+        started_at = datetime.utcnow()
+
+        # Load benchmark once
+        if isinstance(benchmark, str):
+            bench = self.get_benchmark(benchmark)
+            if not bench:
+                raise ValueError(f"Benchmark not found: {benchmark}")
+        else:
+            bench = benchmark
+
+        # Select examples
+        examples = bench.examples
+        if sample_size and sample_size < len(examples):
+            import random
+            examples = random.sample(examples, sample_size)
+
+        # Run evaluation for each strategy
+        strategy_results: Dict[str, EvaluationResult] = {}
+        for strategy in strategies:
+            # Create a strategy-specific benchmark with modified prompts
+            strategy_bench = self._build_strategy_benchmark(
+                bench, examples, strategy, system_prompt_builder
+            )
+            result = await self.evaluate_model(
+                model_id, strategy_bench, sample_size=None
+            )
+            strategy_results[strategy.value] = result
+
+        # Collect per-strategy metrics
+        strategy_metrics: Dict[str, Dict[str, float]] = {}
+        for s_name, s_result in strategy_results.items():
+            strategy_metrics[s_name] = dict(s_result.metrics)
+
+        # Compute improvements over baseline
+        baseline_key = InjectionStrategy.BASELINE.value
+        improvements: Dict[str, Dict[str, float]] = {}
+        baseline_metrics = strategy_metrics.get(baseline_key, {})
+        for s_name, s_metrics in strategy_metrics.items():
+            if s_name == baseline_key:
+                improvements[s_name] = {k: 0.0 for k in s_metrics}
+                continue
+            imp: Dict[str, float] = {}
+            for metric_key in [
+                EvaluationMetric.BEHAVIOR_ADHERENCE.value,
+                EvaluationMetric.CITATION_ACCURACY.value,
+            ]:
+                base_val = baseline_metrics.get(metric_key, 0)
+                cand_val = s_metrics.get(metric_key, 0)
+                imp[metric_key] = (cand_val - base_val) / base_val if base_val > 0 else cand_val
+            # Hallucination: lower is better
+            base_hall = baseline_metrics.get(EvaluationMetric.HALLUCINATION_RATE.value, 0)
+            cand_hall = s_metrics.get(EvaluationMetric.HALLUCINATION_RATE.value, 0)
+            imp[EvaluationMetric.HALLUCINATION_RATE.value] = (
+                (base_hall - cand_hall) / base_hall if base_hall > 0 else -cand_hall
+            )
+            improvements[s_name] = imp
+
+        # Token accounting
+        token_accounting: Dict[str, Dict[str, float]] = {}
+        baseline_tokens = baseline_metrics.get("total_tokens", 0)
+        for s_name, s_metrics in strategy_metrics.items():
+            total = s_metrics.get("total_tokens", 0)
+            savings = baseline_tokens - total
+            pct = savings / baseline_tokens if baseline_tokens > 0 else 0.0
+            token_accounting[s_name] = {
+                "total_tokens": total,
+                "token_savings": savings,
+                "token_savings_pct": round(pct, 4),
+            }
+
+        # Determine winner (highest behavior adherence among non-baseline)
+        best_strategy = baseline_key
+        best_adherence = baseline_metrics.get(EvaluationMetric.BEHAVIOR_ADHERENCE.value, 0)
+        for s_name, s_metrics in strategy_metrics.items():
+            adh = s_metrics.get(EvaluationMetric.BEHAVIOR_ADHERENCE.value, 0)
+            if adh > best_adherence:
+                best_adherence = adh
+                best_strategy = s_name
+
+        return StrategyComparisonResult(
+            comparison_id=comparison_id,
+            model_id=model_id,
+            benchmark_name=bench.name,
+            started_at=started_at,
+            completed_at=datetime.utcnow(),
+            total_examples=len(examples),
+            strategy_results=strategy_results,
+            strategy_metrics=strategy_metrics,
+            improvements=improvements,
+            token_accounting=token_accounting,
+            winner=best_strategy,
+            status="completed",
+        )
+
+    def _build_strategy_benchmark(
+        self,
+        original: Benchmark,
+        examples: List[BenchmarkExample],
+        strategy: InjectionStrategy,
+        prompt_builder: Optional[Callable] = None,
+    ) -> Benchmark:
+        """Build a benchmark copy whose context field encodes the injection strategy.
+
+        For the default builder:
+        - BASELINE: no extra context
+        - BCI_ONLY: context includes "[BCI] Retrieved behaviors: ..."
+        - PACK_BCI: context includes "[PACK+BCI] Knowledge pack + behaviors: ..."
+        """
+        new_examples: List[BenchmarkExample] = []
+        for ex in examples:
+            if prompt_builder:
+                # Custom builder returns messages, but we encode via context for now
+                msgs = prompt_builder(strategy, ex)
+                ctx = "\n".join(m.get("content", "") for m in msgs if m.get("role") == "system")
+            else:
+                ctx = self._default_strategy_context(strategy, ex)
+            new_examples.append(BenchmarkExample(
+                example_id=f"{ex.example_id}_{strategy.value}",
+                prompt=ex.prompt,
+                expected_behaviors=ex.expected_behaviors,
+                context=ctx or ex.context,
+                expected_response_contains=ex.expected_response_contains,
+                expected_response_excludes=ex.expected_response_excludes,
+                difficulty=ex.difficulty,
+                category=ex.category,
+            ))
+        return Benchmark(
+            name=f"{original.name}_{strategy.value}",
+            description=f"{original.description} [{strategy.value}]",
+            examples=new_examples,
+            version=original.version,
+            created_at=original.created_at,
+        )
+
+    @staticmethod
+    def _default_strategy_context(strategy: InjectionStrategy, ex: BenchmarkExample) -> Optional[str]:
+        """Build default context string for a given injection strategy."""
+        if strategy == InjectionStrategy.BASELINE:
+            return None
+        elif strategy == InjectionStrategy.BCI_ONLY:
+            behaviors_str = ", ".join(ex.expected_behaviors) if ex.expected_behaviors else "none"
+            return f"[BCI] Retrieved behaviors: {behaviors_str}. Apply these behaviors in your response."
+        elif strategy == InjectionStrategy.PACK_BCI:
+            behaviors_str = ", ".join(ex.expected_behaviors) if ex.expected_behaviors else "none"
+            base_ctx = ex.context or ""
+            return (
+                f"[PACK+BCI] Knowledge pack active. {base_ctx} "
+                f"Retrieved behaviors: {behaviors_str}. "
+                f"Apply the knowledge pack overlays and cited behaviors."
+            ).strip()
+        return None
+
+    def check_regression_anchors(
+        self,
+        strategy_result: StrategyComparisonResult,
+        anchors_path: str,
+    ) -> Dict[str, Any]:
+        """Check strategy comparison results against regression anchor thresholds.
+
+        Args:
+            strategy_result: Output of compare_injection_strategies().
+            anchors_path: Path to regression_anchors.json.
+
+        Returns:
+            Dict with 'passed' (bool), 'failures' (list of failures),
+            and 'summary' per strategy.
+        """
+        with open(anchors_path) as f:
+            anchors = json.load(f)
+
+        global_thresholds = anchors.get("global_thresholds", {})
+        comparison_thresholds = anchors.get("comparison_thresholds", {})
+        failures: List[Dict[str, Any]] = []
+        summary: Dict[str, Dict[str, Any]] = {}
+
+        for s_name, s_metrics in strategy_result.strategy_metrics.items():
+            s_failures: List[str] = []
+
+            # Check global thresholds
+            for metric_name, thresh in global_thresholds.items():
+                val = s_metrics.get(metric_name)
+                if val is None:
+                    continue
+                if "min" in thresh and val < thresh["min"]:
+                    s_failures.append(
+                        f"{metric_name}: {val:.4f} < min {thresh['min']}"
+                    )
+                if "max" in thresh and val > thresh["max"]:
+                    s_failures.append(
+                        f"{metric_name}: {val:.4f} > max {thresh['max']}"
+                    )
+
+            summary[s_name] = {
+                "metrics": s_metrics,
+                "failures": s_failures,
+                "passed": len(s_failures) == 0,
+            }
+            for f_msg in s_failures:
+                failures.append({"strategy": s_name, "failure": f_msg})
+
+        # Check comparison thresholds (strategy vs baseline)
+        for comp_key, comp_thresh in comparison_thresholds.items():
+            # Map comp_key to strategy
+            if comp_key == "pack_bci_vs_baseline":
+                target = InjectionStrategy.PACK_BCI.value
+            elif comp_key == "bci_only_vs_baseline":
+                target = InjectionStrategy.BCI_ONLY.value
+            else:
+                continue
+            imp = strategy_result.improvements.get(target, {})
+            for imp_key, min_val in comp_thresh.items():
+                if imp_key == "description":
+                    continue
+                if imp_key.startswith("min_improvement_"):
+                    metric = imp_key.replace("min_improvement_", "")
+                    actual = imp.get(metric, 0)
+                    if actual < min_val:
+                        failures.append({
+                            "strategy": target,
+                            "failure": f"{comp_key}.{imp_key}: {actual:.4f} < {min_val}",
+                        })
+
+        # Token efficiency
+        token_thresh = comparison_thresholds.get("token_efficiency", {})
+        max_increase = token_thresh.get("max_token_increase_percent", 100)
+        for s_name, t_acct in strategy_result.token_accounting.items():
+            savings_pct = t_acct.get("token_savings_pct", 0)
+            if savings_pct < -(max_increase / 100):
+                failures.append({
+                    "strategy": s_name,
+                    "failure": (
+                        f"Token increase {-savings_pct*100:.1f}% exceeds "
+                        f"max {max_increase}%"
+                    ),
+                })
+
+        return {
+            "passed": len(failures) == 0,
+            "failures": failures,
+            "summary": summary,
+        }
+
     def get_benchmark(self, name: str) -> Optional[Benchmark]:
         """Get a benchmark by name."""
         if name in self._benchmarks:
@@ -866,3 +1180,375 @@ def generate_benchmark_from_agents_md(
         logger.info("Saved benchmark to %s (%d examples)", output_path, len(examples))
 
     return benchmark
+
+
+def load_domain_benchmark(benchmarks_dir: Optional[str] = None) -> Benchmark:
+    """Load the domain expertise benchmark from JSONL.
+
+    Args:
+        benchmarks_dir: Directory containing domain_expertise_benchmark.jsonl.
+            Defaults to the package's benchmarks/ directory.
+
+    Returns:
+        Benchmark loaded from the JSONL file.
+    """
+    if benchmarks_dir is None:
+        benchmarks_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "benchmarks",
+        )
+    jsonl_path = os.path.join(benchmarks_dir, "domain_expertise_benchmark.jsonl")
+    examples: List[BenchmarkExample] = []
+    with open(jsonl_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            examples.append(BenchmarkExample.from_dict(data))
+    return Benchmark(
+        name="domain_expertise",
+        description=f"Domain expertise benchmark ({len(examples)} examples across task families and GEP phases)",
+        examples=examples,
+        version="1.0",
+        created_at=datetime.utcnow(),
+    )
+
+
+def load_regression_anchors(benchmarks_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Load regression anchor thresholds.
+
+    Args:
+        benchmarks_dir: Directory containing regression_anchors.json.
+            Defaults to the package's benchmarks/ directory.
+
+    Returns:
+        Parsed JSON dict with threshold definitions.
+    """
+    if benchmarks_dir is None:
+        benchmarks_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "benchmarks",
+        )
+    anchors_path = os.path.join(benchmarks_dir, "regression_anchors.json")
+    with open(anchors_path) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Quality Gate Service — CI & pre-promotion gates (T4.3.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class QualityGateResult:
+    """Result of a quality gate evaluation."""
+
+    gate_name: str
+    passed: bool
+    score: float
+    threshold: float
+    details: Dict[str, Any] = field(default_factory=dict)
+    failures: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "gate_name": self.gate_name,
+            "passed": self.passed,
+            "score": self.score,
+            "threshold": self.threshold,
+            "details": self.details,
+            "failures": list(self.failures),
+        }
+
+
+@dataclass
+class QualityGateReport:
+    """Aggregated report of all quality gate checks."""
+
+    gates: List[QualityGateResult] = field(default_factory=list)
+    overall_passed: bool = True
+    regression_detected: bool = False
+    regression_details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "overall_passed": self.overall_passed,
+            "gates": [g.to_dict() for g in self.gates],
+            "total_gates": len(self.gates),
+            "passed_gates": sum(1 for g in self.gates if g.passed),
+            "failed_gates": sum(1 for g in self.gates if not g.passed),
+            "regression_detected": self.regression_detected,
+            "regression_details": self.regression_details,
+        }
+
+
+class QualityGateService:
+    """Enforces quality thresholds for behavior promotions, pack builds, and CI.
+
+    Gates:
+    - pre_approval: checks a single behavior's adherence score before promotion
+    - pack_validation: checks strategy comparison results after pack build
+    - regression_check: compares current benchmark results to previous baseline
+    """
+
+    DEFAULT_BEHAVIOR_ADHERENCE_MIN = 0.7
+    DEFAULT_CITATION_ACCURACY_MIN = 0.65
+    DEFAULT_HALLUCINATION_MAX = 0.10
+    DEFAULT_REGRESSION_THRESHOLD = 0.05  # 5% degradation triggers flag
+
+    def __init__(
+        self,
+        *,
+        behavior_adherence_min: float = DEFAULT_BEHAVIOR_ADHERENCE_MIN,
+        citation_accuracy_min: float = DEFAULT_CITATION_ACCURACY_MIN,
+        hallucination_max: float = DEFAULT_HALLUCINATION_MAX,
+        regression_threshold: float = DEFAULT_REGRESSION_THRESHOLD,
+        anchors: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.behavior_adherence_min = behavior_adherence_min
+        self.citation_accuracy_min = citation_accuracy_min
+        self.hallucination_max = hallucination_max
+        self.regression_threshold = regression_threshold
+        self._anchors = anchors
+
+    @property
+    def anchors(self) -> Dict[str, Any]:
+        if self._anchors is None:
+            self._anchors = load_regression_anchors()
+        return self._anchors
+
+    # ------------------------------------------------------------------
+    # Gate: Pre-approval behavior check
+    # ------------------------------------------------------------------
+
+    def check_behavior_approval(
+        self,
+        behavior_id: str,
+        adherence_score: float,
+        citation_score: float = 0.0,
+        hallucination_rate: float = 0.0,
+    ) -> QualityGateResult:
+        """Gate for behavior promotion — checks minimum quality thresholds.
+
+        Args:
+            behavior_id: The behavior being promoted.
+            adherence_score: Measured behavior adherence (0.0-1.0).
+            citation_score: Measured citation accuracy (0.0-1.0).
+            hallucination_rate: Measured hallucination rate (0.0-1.0).
+
+        Returns:
+            QualityGateResult indicating pass/fail.
+        """
+        failures: List[str] = []
+        if adherence_score < self.behavior_adherence_min:
+            failures.append(
+                f"behavior_adherence {adherence_score:.4f} < min {self.behavior_adherence_min}"
+            )
+        if citation_score > 0 and citation_score < self.citation_accuracy_min:
+            failures.append(
+                f"citation_accuracy {citation_score:.4f} < min {self.citation_accuracy_min}"
+            )
+        if hallucination_rate > self.hallucination_max:
+            failures.append(
+                f"hallucination_rate {hallucination_rate:.4f} > max {self.hallucination_max}"
+            )
+
+        passed = len(failures) == 0
+        return QualityGateResult(
+            gate_name="pre_approval",
+            passed=passed,
+            score=adherence_score,
+            threshold=self.behavior_adherence_min,
+            details={
+                "behavior_id": behavior_id,
+                "adherence_score": adherence_score,
+                "citation_score": citation_score,
+                "hallucination_rate": hallucination_rate,
+            },
+            failures=failures,
+        )
+
+    # ------------------------------------------------------------------
+    # Gate: Pack build validation
+    # ------------------------------------------------------------------
+
+    def check_pack_validation(
+        self,
+        strategy_result: StrategyComparisonResult,
+        anchors_path: Optional[str] = None,
+    ) -> QualityGateResult:
+        """Gate for pack release — validates strategy comparison against anchors.
+
+        Args:
+            strategy_result: Output of compare_injection_strategies().
+            anchors_path: Path to regression_anchors.json (uses default if None).
+
+        Returns:
+            QualityGateResult summarizing whether pack meets thresholds.
+        """
+        if anchors_path:
+            with open(anchors_path) as f:
+                anchors = json.load(f)
+        else:
+            anchors = self.anchors
+
+        # Reuse EvaluationService.check_regression_anchors logic
+        failures: List[str] = []
+        global_thresholds = anchors.get("global_thresholds", {})
+        comparison_thresholds = anchors.get("comparison_thresholds", {})
+
+        # Check pack_bci strategy metrics against global thresholds
+        pack_metrics = strategy_result.strategy_metrics.get("pack_bci", {})
+        for metric_name, thresh in global_thresholds.items():
+            val = pack_metrics.get(metric_name)
+            if val is None:
+                continue
+            if "min" in thresh and val < thresh["min"]:
+                failures.append(f"pack_bci.{metric_name}: {val:.4f} < min {thresh['min']}")
+            if "max" in thresh and val > thresh["max"]:
+                failures.append(f"pack_bci.{metric_name}: {val:.4f} > max {thresh['max']}")
+
+        # Check improvement over baseline
+        pack_bci_thresh = comparison_thresholds.get("pack_bci_vs_baseline", {})
+        pack_improvements = strategy_result.improvements.get("pack_bci", {})
+        for key, min_val in pack_bci_thresh.items():
+            if key == "description":
+                continue
+            if key.startswith("min_improvement_"):
+                metric = key.replace("min_improvement_", "")
+                actual = pack_improvements.get(metric, 0)
+                if actual < min_val:
+                    failures.append(f"improvement.{metric}: {actual:.4f} < min {min_val}")
+
+        # Primary score = pack_bci behavior adherence
+        score = pack_metrics.get("behavior_adherence", 0.0)
+        passed = len(failures) == 0
+
+        return QualityGateResult(
+            gate_name="pack_validation",
+            passed=passed,
+            score=score,
+            threshold=global_thresholds.get("behavior_adherence", {}).get("min", self.behavior_adherence_min),
+            details={
+                "strategy_metrics": strategy_result.strategy_metrics,
+                "improvements": strategy_result.improvements,
+            },
+            failures=failures,
+        )
+
+    # ------------------------------------------------------------------
+    # Gate: Regression detection
+    # ------------------------------------------------------------------
+
+    def check_regression(
+        self,
+        current_metrics: Dict[str, float],
+        previous_metrics: Dict[str, float],
+    ) -> QualityGateResult:
+        """Compare current benchmark metrics against previous baseline.
+
+        Flags a regression if any key metric degrades by more than the
+        configured regression_threshold (default 5%).
+
+        Args:
+            current_metrics: Current benchmark run metrics.
+            previous_metrics: Previous benchmark run metrics (the baseline).
+
+        Returns:
+            QualityGateResult with regression details.
+        """
+        regressions: List[str] = []
+        details: Dict[str, Any] = {"comparisons": {}}
+
+        for metric in ("behavior_adherence", "citation_accuracy", "mrr"):
+            curr = current_metrics.get(metric)
+            prev = previous_metrics.get(metric)
+            if curr is None or prev is None or prev == 0:
+                continue
+            delta_pct = (curr - prev) / prev
+            details["comparisons"][metric] = {
+                "current": curr,
+                "previous": prev,
+                "delta_pct": delta_pct,
+            }
+            if delta_pct < -self.regression_threshold:
+                regressions.append(
+                    f"{metric} regressed {abs(delta_pct)*100:.1f}% "
+                    f"(prev={prev:.4f}, curr={curr:.4f}, threshold={self.regression_threshold*100:.0f}%)"
+                )
+
+        # Also check hallucination increase
+        for metric in ("hallucination_rate",):
+            curr = current_metrics.get(metric)
+            prev = previous_metrics.get(metric)
+            if curr is None or prev is None:
+                continue
+            # For hallucination, increasing is bad
+            if prev > 0:
+                delta_pct = (curr - prev) / prev
+            else:
+                delta_pct = curr  # was 0, any increase is bad
+            details["comparisons"][metric] = {
+                "current": curr,
+                "previous": prev,
+                "delta_pct": delta_pct,
+            }
+            if delta_pct > self.regression_threshold:
+                regressions.append(
+                    f"{metric} increased {abs(delta_pct)*100:.1f}% "
+                    f"(prev={prev:.4f}, curr={curr:.4f}, threshold={self.regression_threshold*100:.0f}%)"
+                )
+
+        adherence = current_metrics.get("behavior_adherence", 0.0)
+        passed = len(regressions) == 0
+
+        return QualityGateResult(
+            gate_name="regression_check",
+            passed=passed,
+            score=adherence,
+            threshold=self.regression_threshold,
+            details=details,
+            failures=regressions,
+        )
+
+    # ------------------------------------------------------------------
+    # Run all gates
+    # ------------------------------------------------------------------
+
+    def run_all_gates(
+        self,
+        *,
+        strategy_result: Optional[StrategyComparisonResult] = None,
+        previous_metrics: Optional[Dict[str, float]] = None,
+        anchors_path: Optional[str] = None,
+    ) -> QualityGateReport:
+        """Run all applicable quality gates and return an aggregated report.
+
+        Args:
+            strategy_result: If provided, runs pack_validation gate.
+            previous_metrics: If provided, runs regression_check gate against
+                the pack_bci strategy metrics from strategy_result.
+            anchors_path: Optional path to regression_anchors.json.
+
+        Returns:
+            QualityGateReport with all gate results.
+        """
+        report = QualityGateReport()
+
+        if strategy_result is not None:
+            pack_gate = self.check_pack_validation(
+                strategy_result, anchors_path=anchors_path
+            )
+            report.gates.append(pack_gate)
+
+            if previous_metrics is not None:
+                current_metrics = strategy_result.strategy_metrics.get("pack_bci", {})
+                reg_gate = self.check_regression(current_metrics, previous_metrics)
+                report.gates.append(reg_gate)
+                report.regression_detected = not reg_gate.passed
+                if not reg_gate.passed:
+                    report.regression_details = reg_gate.details
+
+        report.overall_passed = all(g.passed for g in report.gates)
+        return report

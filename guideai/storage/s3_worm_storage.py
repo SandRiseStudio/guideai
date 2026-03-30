@@ -5,7 +5,7 @@ Implements S3 Object Lock for immutable, tamper-proof audit log storage with:
 - GOVERNANCE mode: Can be overridden by users with special permissions
 - Legal Hold: Indefinite retention for litigation/investigation
 
-Supports multi-tier storage per AUDIT_LOG_STORAGE.md:
+Supports multi-tier storage per docs/contracts/AUDIT_LOG_STORAGE.md:
 - Hot: PostgreSQL (30-day retention)
 - Warm: S3 Standard with Object Lock
 - Cold: S3 Glacier Deep Archive (after 3 years)

@@ -5,7 +5,7 @@
  */
 
 import { useCallback, useMemo, memo } from 'react';
-import type { Document } from '@guideai/collab-client';
+import type { Document } from '../../lib/collab-client';
 import './DocumentList.css';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,7 +149,7 @@ const DocumentItem = memo<DocumentItemProps>(({ document, isSelected, onSelect, 
       onKeyDown={handleKeyDown}
       tabIndex={0}
       role="button"
-      aria-selected={isSelected}
+      aria-label={`Open ${document.document_type} document ${document.title}`}
       data-document-id={document.id}
     >
       {getDocumentIcon(document.document_type)}
@@ -165,7 +165,7 @@ const DocumentItem = memo<DocumentItemProps>(({ document, isSelected, onSelect, 
       </div>
 
       {presence.length > 0 && (
-        <div className="document-presence-dots">
+        <div className="document-presence-dots" aria-label={`${presence.length} collaborators active`}>
           {presence.slice(0, 3).map((user) => (
             <div
               key={user.id}
@@ -184,7 +184,8 @@ const DocumentItem = memo<DocumentItemProps>(({ document, isSelected, onSelect, 
             e.stopPropagation();
             // TODO: Open context menu
           }}
-          aria-label="More actions"
+          aria-label={`More actions for ${document.title}`}
+          title={`More actions for ${document.title}`}
         >
           <MoreIcon />
         </button>
@@ -257,9 +258,10 @@ export const DocumentList = memo<DocumentListProps>(
           <button
             className="new-document-button"
             onClick={() => handleCreateNew('plan')}
+            aria-label="Create your first plan"
           >
             <PlusIcon />
-            Create your first document
+            Create your first plan
           </button>
         </div>
       );
@@ -290,9 +292,10 @@ export const DocumentList = memo<DocumentListProps>(
           <button
             className="new-document-button"
             onClick={() => handleCreateNew('plan')}
+            aria-label="Create a new plan"
           >
             <PlusIcon />
-            New document
+            New plan
           </button>
         )}
       </div>

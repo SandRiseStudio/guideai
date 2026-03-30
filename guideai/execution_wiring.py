@@ -101,7 +101,7 @@ def wire_execution_service(
 
     1. Creates WorkItemExecutionService
     2. Creates AgentExecutionLoop
-    3. Creates AgentLLMClient
+    3. Creates LLMClient
     4. Wires: WorkItemExecutionService.set_execution_loop(loop)
     5. Wires: AgentExecutionLoop.set_llm_client(client)
 
@@ -121,7 +121,7 @@ def wire_execution_service(
         Fully wired WorkItemExecutionService instance
     """
     from .agent_execution_loop import AgentExecutionLoop
-    from .agent_llm_client import AgentLLMClient
+    from .llm import LLMClient
     from .work_item_execution_service import WorkItemExecutionService
 
     logger.info("Wiring execution service components...")
@@ -158,12 +158,11 @@ def wire_execution_service(
         logger.info("Created credential resolver from WorkItemExecutionService's CredentialStore")
 
     # Create the LLM client
-    llm_client = AgentLLMClient(
+    llm_client = LLMClient(
         credential_resolver=credential_resolver,
         tool_registry=tool_registry,
-        telemetry=telemetry,
     )
-    logger.info("Created AgentLLMClient")
+    logger.info("Created LLMClient")
 
     # Create BCIService for Early Knowledge Alignment if not provided
     if bci_service is None:
@@ -230,13 +229,12 @@ def wire_execution_loop(
         AgentExecutionLoop with LLM client and EKA wired
     """
     from .agent_execution_loop import AgentExecutionLoop
-    from .agent_llm_client import AgentLLMClient
+    from .llm import LLMClient
 
     # Create LLM client
-    llm_client = AgentLLMClient(
+    llm_client = LLMClient(
         credential_resolver=credential_resolver,
         tool_registry=tool_registry,
-        telemetry=telemetry,
     )
 
     # Create run service if not provided - prefer PostgreSQL when DSN is available
@@ -325,3 +323,154 @@ def create_tool_executor_for_run(
         workspace_info=workspace_info,
         workspace_manager=workspace_manager,
     )
+
+
+def wire_execution_gateway(
+    *,
+    dsn: Optional[str] = None,
+    board_service: Optional[BoardService] = None,
+    run_service: Optional[RunService] = None,
+    task_cycle_service: Optional[TaskCycleService] = None,
+    telemetry: Optional[TelemetryClient] = None,
+    credential_resolver: Optional[CredentialResolver] = None,
+    bci_service: Optional[Any] = None,
+    enable_early_retrieval: Optional[bool] = None,
+    gate_notifier: Optional[Any] = None,
+    agent_registry: Optional[Any] = None,
+    settings_service: Optional[Any] = None,
+    orchestrator: Optional[Any] = None,
+    github_service: Optional[Any] = None,
+    github_credential_store: Optional[Any] = None,
+    gitlab_credential_store: Optional[Any] = None,
+    gitlab_host: str = "gitlab.com",
+) -> Any:
+    """Create a fully-wired ExecutionGateway with registered mode executors.
+
+    This is the new entry point (Phase 1+2 of E3 rearchitecture) that
+    builds an ExecutionGateway alongside the legacy WorkItemExecutionService
+    returned by ``wire_execution_service``.
+
+    Args:
+        dsn: PostgreSQL connection string.
+        board_service: BoardService for work item lookup.
+        run_service: RunService for run tracking.
+        task_cycle_service: TaskCycleService for GEP phases.
+        telemetry: TelemetryClient for event emission.
+        credential_resolver: LLM API key resolver.
+        bci_service: BCIService for EKA.
+        enable_early_retrieval: Override env var for EKA.
+        gate_notifier: GateNotifier for gate events.
+        agent_registry: AgentRegistryService for agent lookup.
+        settings_service: SettingsService for project-level config.
+        orchestrator: AmpOrchestrator (or GuideAIWorkspaceClient).
+        github_service: GitHubService for token/PR resolution (legacy).
+        github_credential_store: GitHubCredentialStore for SourceProvider.
+        gitlab_credential_store: Credential store with get_gitlab_token().
+        gitlab_host: Default GitLab host for SourceProvider.
+
+    Returns:
+        Fully wired ExecutionGateway instance.
+    """
+    from .execution_gateway import ExecutionGateway
+    from .mode_executors import (
+        ContainerConnectedExecutor,
+        ContainerIsolatedExecutor,
+        LocalDirectExecutor,
+    )
+    from .source_providers import build_source_provider_registry
+
+    logger.info("Wiring ExecutionGateway components...")
+
+    # --- Ensure core services exist ---
+    if task_cycle_service is None:
+        from .storage.postgres_pool import PostgresPool
+        pool = PostgresPool(dsn) if dsn else None
+        task_cycle_service = TaskCycleService(pool=pool)
+
+    if run_service is None:
+        if dsn:
+            from .run_service_postgres import PostgresRunService
+            run_service = PostgresRunService(dsn=dsn, telemetry=telemetry)
+        else:
+            run_service = RunService()
+
+    # --- Credential store ---
+    # If no credential_resolver was passed we still need a CredentialStore
+    # instance for the gateway's _resolve_model().  Build one from the
+    # WorkItemExecutionService module.
+    credential_store = None
+    if agent_registry is None or credential_resolver is None:
+        try:
+            from .work_item_execution_service import CredentialStore
+            credential_store = CredentialStore(dsn=dsn)
+        except Exception as e:
+            logger.warning(f"Could not create CredentialStore: {e}")
+
+    if agent_registry is None:
+        try:
+            from .agent_registry_service import AgentRegistryService
+            agent_registry = AgentRegistryService(dsn=dsn, telemetry=telemetry)
+        except Exception as e:
+            logger.warning(f"Could not create AgentRegistryService: {e}")
+
+    # --- Build execution loop factory ---
+    def _loop_factory(resolved: Any) -> Any:
+        return wire_execution_loop(
+            dsn=dsn,
+            run_service=run_service,
+            task_cycle_service=task_cycle_service,
+            telemetry=telemetry,
+            credential_resolver=credential_resolver,
+            bci_service=bci_service,
+            enable_early_retrieval=enable_early_retrieval,
+        )
+
+    # --- Build gateway ---
+    gateway = ExecutionGateway(
+        board_service=board_service,
+        run_service=run_service,
+        task_cycle_service=task_cycle_service,
+        agent_registry=agent_registry,
+        credential_store=credential_store,
+        telemetry=telemetry,
+        execution_loop_factory=_loop_factory,
+        settings_service=settings_service,
+    )
+
+    # --- Build source provider registry (Phase 2) ---
+    source_providers = build_source_provider_registry(
+        github_credential_store=github_credential_store,
+        gitlab_credential_store=gitlab_credential_store,
+        gitlab_host=gitlab_host,
+    )
+    logger.info(
+        f"Built source provider registry: "
+        f"{[st.value for st in source_providers.keys()]}"
+    )
+
+    # --- Register mode executors ---
+    if orchestrator is not None:
+        gateway.register_executor(
+            ContainerIsolatedExecutor(
+                orchestrator, github_service,
+                source_providers=source_providers,
+            )
+        )
+        gateway.register_executor(
+            ContainerConnectedExecutor(
+                orchestrator, github_service,
+                source_providers=source_providers,
+            )
+        )
+        logger.info("Registered CONTAINER_ISOLATED and CONTAINER_CONNECTED executors")
+    else:
+        logger.warning(
+            "No orchestrator provided — container-based execution modes "
+            "will not be available."
+        )
+
+    gateway.register_executor(LocalDirectExecutor())
+    logger.info("Registered LOCAL_DIRECT executor")
+
+    logger.info("ExecutionGateway wiring complete")
+    return gateway

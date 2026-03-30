@@ -136,6 +136,7 @@ def sample_project() -> Project:
     """Sample project fixture."""
     return Project(
         id="proj-abc123",
+        owner_id="user-test123",
         org_id="org-xyz789",
         name="Test Project",
         slug="test-project",
@@ -152,6 +153,7 @@ def sample_agent() -> Agent:
     """Sample agent fixture."""
     return Agent(
         id="agent-abc123",
+        owner_id="user-test123",
         org_id="org-xyz789",
         name="Test Agent",
         agent_type=AgentType.SPECIALIST,  # Use agent_type, not type
@@ -677,6 +679,7 @@ class TestProjectHandlers:
 
         updated_project = Project(
             id=sample_project.id,
+            owner_id=sample_project.owner_id,
             org_id=sample_project.org_id,
             name="Updated Project",
             slug=sample_project.slug,
@@ -835,6 +838,7 @@ class TestOrgAgentHandlers:
         """Test pausing an agent."""
         paused_agent = Agent(
             id=sample_agent.id,
+            owner_id=sample_agent.owner_id,
             org_id=sample_agent.org_id,
             name=sample_agent.name,
             agent_type=sample_agent.agent_type,
@@ -878,6 +882,7 @@ class TestOrgAgentHandlers:
         """Test stopping an agent."""
         stopped_agent = Agent(
             id=sample_agent.id,
+            owner_id=sample_agent.owner_id,
             org_id=sample_agent.org_id,
             name=sample_agent.name,
             agent_type=sample_agent.agent_type,

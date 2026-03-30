@@ -8,6 +8,7 @@
 
 import * as vscode from 'vscode';
 import { GuideAIClient, Agent, AgentStatus, AgentVisibility, RoleAlignment, AgentSearchResult } from '../client/GuideAIClient';
+import { buildActorAvatarDataUri, createActorViewModel } from '../utils/actorAvatar';
 
 type AgentNode = AgentTreeItem | StatusGroupTreeItem | RoleGroupTreeItem | MessageTreeItem;
 
@@ -196,7 +197,18 @@ class AgentTreeItem extends vscode.TreeItem {
 		this.contextValue = this.getContextValue();
 
 		// Icon based on status and role
-		this.iconPath = new vscode.ThemeIcon(this.getIconName());
+		this.iconPath = vscode.Uri.parse(
+			buildActorAvatarDataUri(
+				createActorViewModel({
+					id: agent.agent_id,
+					kind: 'agent',
+					displayName: agent.name,
+					subtitle: agent.role_alignment,
+					presenceState: agent.status === 'DEPRECATED' ? 'offline' : agent.status === 'DRAFT' ? 'paused' : 'available',
+				}),
+				32,
+			)
+		);
 
 		// Command to view details on click
 		this.command = {
@@ -241,29 +253,6 @@ class AgentTreeItem extends vscode.TreeItem {
 		return parts.join('.');
 	}
 
-	private getIconName(): string {
-		// Choose icon based on status first, then role
-		if (this.agent.status === 'DEPRECATED') {
-			return 'archive';
-		}
-		if (this.agent.status === 'DRAFT') {
-			return 'edit';
-		}
-
-		// Published agents get role-based icon
-		switch (this.agent.role_alignment) {
-			case 'STRATEGIST':
-				return 'graph';
-			case 'TEACHER':
-				return 'mortar-board';
-			case 'STUDENT':
-				return 'check';
-			case 'MULTI':
-				return 'symbol-misc';
-			default:
-				return 'robot';
-		}
-	}
 }
 
 class MessageTreeItem extends vscode.TreeItem {

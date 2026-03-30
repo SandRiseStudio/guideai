@@ -2,7 +2,7 @@
 MCP Rate Limiter - Request-level rate limiting for MCP tool invocations.
 
 Implements per-client and per-tool throttling with configurable limits to prevent
-abuse by automated agents per MCP_SERVER_DESIGN.md §9.
+abuse by automated agents per docs/contracts/MCP_SERVER_DESIGN.md §9.
 
 Key Features:
 - Token bucket algorithm for smooth rate limiting

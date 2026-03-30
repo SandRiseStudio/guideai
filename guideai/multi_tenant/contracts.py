@@ -207,32 +207,20 @@ class UpdateMembershipRequest(BaseModel):
 # =============================================================================
 
 class Project(TimestampMixin):
-    """Project within an organization or owned by a user.
+    """Project always owned by a user, optionally in an organization.
 
-    Projects can be either:
-    - Org-owned: org_id is set, owner_id is None
-    - User-owned: owner_id is set, org_id is None (personal project)
-
-    Exactly one of org_id or owner_id must be set (XOR constraint).
+    Every project has an owner_id (required). Projects may also belong to
+    an organization via org_id (optional).
     """
 
     id: str = Field(default_factory=lambda: f"proj-{uuid.uuid4().hex[:12]}")
-    org_id: Optional[str] = None  # Set for org-owned projects
-    owner_id: Optional[str] = None  # Set for user-owned (personal) projects
+    org_id: Optional[str] = None  # Optional org association
+    owner_id: str  # Always required — the user who owns/created the project
     name: str = Field(..., min_length=1, max_length=255)
     slug: str = Field(..., min_length=1, max_length=100, pattern=r"^[a-z0-9-]+$")
     description: Optional[str] = None
     visibility: ProjectVisibility = ProjectVisibility.PRIVATE
     settings: Dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def validate_ownership(self) -> "Project":
-        """Ensure exactly one of org_id or owner_id is set."""
-        if self.org_id and self.owner_id:
-            raise ValueError("Cannot set both org_id and owner_id - project must be org-owned OR user-owned")
-        if not self.org_id and not self.owner_id:
-            raise ValueError("Must set either org_id or owner_id")
-        return self
 
     class Config:
         from_attributes = True
@@ -241,8 +229,8 @@ class Project(TimestampMixin):
 class CreateProjectRequest(BaseModel):
     """Request to create a new project.
 
-    For org-owned projects, the org_id is typically passed at the service level.
-    For user-owned (personal) projects, set owner_id.
+    owner_id is required — every project has an owner.
+    org_id is optional — set when project belongs to an organization.
     """
 
     name: str = Field(..., min_length=1, max_length=255)
@@ -250,7 +238,7 @@ class CreateProjectRequest(BaseModel):
     description: Optional[str] = None
     visibility: ProjectVisibility = ProjectVisibility.PRIVATE
     settings: Dict[str, Any] = Field(default_factory=dict)
-    owner_id: Optional[str] = None  # Set for personal projects (no org)
+    owner_id: str  # Always required
 
 
 class UpdateProjectRequest(BaseModel):
@@ -290,18 +278,16 @@ class CreateProjectMembershipRequest(BaseModel):
 # =============================================================================
 
 class Agent(TimestampMixin):
-    """AI agent within an organization or owned by a user.
+    """AI agent created by a user, optionally belonging to an organization.
 
-    Agents can be either:
-    - Org-owned: org_id is set, owner_id is None
-    - User-owned: owner_id is set, org_id is None (personal agent)
-
-    Exactly one of org_id or owner_id must be set (XOR constraint).
+    Every agent has an owner (the user who created it). Agents may also
+    belong to an organization (org_id set). Agents can be public
+    (discoverable by all) or private (assignable to specific projects).
     """
 
     id: str = Field(default_factory=lambda: f"agent-{uuid.uuid4().hex[:12]}")
-    org_id: Optional[str] = None  # Set for org-owned agents
-    owner_id: Optional[str] = None  # Set for user-owned (personal) agents
+    org_id: Optional[str] = None
+    owner_id: str  # The user who created the agent (required)
     project_id: Optional[str] = None
     name: str = Field(..., min_length=1, max_length=255)
     agent_type: AgentType = AgentType.SPECIALIST
@@ -309,32 +295,8 @@ class Agent(TimestampMixin):
     config: Dict[str, Any] = Field(default_factory=dict)
     capabilities: List[str] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def validate_ownership(self) -> "Agent":
-        """Ensure exactly one of org_id or owner_id is set."""
-        if self.org_id and self.owner_id:
-            raise ValueError("Cannot set both org_id and owner_id - agent must be org-owned OR user-owned")
-        if not self.org_id and not self.owner_id:
-            raise ValueError("Must set either org_id or owner_id")
-        return self
-
     class Config:
         from_attributes = True
-
-
-class CreateAgentRequest(BaseModel):
-    """Request to create a new agent.
-
-    For org-owned agents, the org_id is typically passed at the service level.
-    For user-owned (personal) agents, set owner_id.
-    """
-
-    name: str = Field(..., min_length=1, max_length=255)
-    project_id: Optional[str] = None
-    agent_type: AgentType = AgentType.SPECIALIST
-    config: Dict[str, Any] = Field(default_factory=dict)
-    capabilities: List[str] = Field(default_factory=list)
-    owner_id: Optional[str] = None  # Set for personal agents (no org)
 
 
 class UpdateAgentRequest(BaseModel):
@@ -355,6 +317,7 @@ class ProjectAgentRole(str, Enum):
     """Role of an agent within a project context."""
 
     PRIMARY = "primary"  # Main agent for the project
+    CONTRIBUTOR = "contributor"  # Contributing agent
     SUPPORTING = "supporting"  # Helper/secondary agent
     SPECIALIST = "specialist"  # Domain-specific specialist
     REVIEWER = "reviewer"  # Code review, compliance, etc.
@@ -441,6 +404,75 @@ class ProjectAgentAssignmentResponse(BaseModel):
 
 
 # =============================================================================
+# Agent Presence Models (Runtime state)
+# =============================================================================
+
+
+class PresenceStatus(str, Enum):
+    """Runtime presence state for an agent within a project.
+
+    Distinct from AgentStatus (lifecycle) and ProjectAgentStatus (assignment).
+    """
+
+    AVAILABLE = "available"
+    WORKING = "working"
+    FINISHED_RECENTLY = "finished_recently"
+    PAUSED = "paused"
+    OFFLINE = "offline"
+    AT_CAPACITY = "at_capacity"
+
+
+class AgentPresence(BaseModel):
+    """Runtime presence record for an agent in a project context."""
+
+    agent_id: str
+    project_id: str
+    presence_status: PresenceStatus = PresenceStatus.OFFLINE
+    last_activity_at: Optional[datetime] = None
+    last_completed_at: Optional[datetime] = None
+    active_item_count: int = 0
+    capacity_max: int = 4
+    current_work_item_id: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AgentPresenceResponse(BaseModel):
+    """Response model enriched with agent name/slug for frontend display."""
+
+    agent_id: str
+    project_id: str
+    name: str = ""
+    agent_slug: Optional[str] = None
+    presence_status: PresenceStatus = PresenceStatus.OFFLINE
+    last_activity_at: Optional[datetime] = None
+    last_completed_at: Optional[datetime] = None
+    active_item_count: int = 0
+    capacity_max: int = 4
+    current_work_item_id: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ProjectAgentPresenceListResponse(BaseModel):
+    """Response for GET /projects/{id}/agents/presence."""
+
+    agents: List[AgentPresenceResponse]
+    total: int
+
+
+class UpdateAgentPresenceRequest(BaseModel):
+    """Request to update an agent's presence in a project."""
+
+    presence_status: Optional[PresenceStatus] = None
+    active_item_count: Optional[int] = Field(None, ge=0)
+    capacity_max: Optional[int] = Field(None, ge=1)
+    current_work_item_id: Optional[str] = None
+
+
+# =============================================================================
 # Subscription Models
 # =============================================================================
 
@@ -452,7 +484,7 @@ class Subscription(TimestampMixin):
     - User-level: user_id is set, org_id is None
 
     Billing priority: When a user works in an org context, the org subscription
-    takes precedence. User subscriptions are used for personal projects.
+    takes precedence. User subscriptions are used for user-owned projects.
     """
 
     id: str = Field(default_factory=lambda: f"sub-{uuid.uuid4().hex[:12]}")
@@ -488,14 +520,14 @@ class UsageRecord(BaseModel):
 
     Usage can be attributed to either:
     - Org-level: org_id is set (usage within org context)
-    - User-level: user_id is set, org_id is None (personal project usage)
+    - User-level: user_id is set, org_id is None (user-owned project usage)
 
     When user works in org context, usage goes to org subscription.
     """
 
     id: str = Field(default_factory=lambda: f"usage-{uuid.uuid4().hex[:12]}")
     org_id: Optional[str] = None  # Set for org-level usage
-    user_id: Optional[str] = None  # Set for personal project usage
+    user_id: Optional[str] = None  # Set for user-owned project usage
     metric_name: str
     quantity: int = 0
     recorded_at: datetime = Field(default_factory=datetime.utcnow)
@@ -565,13 +597,13 @@ class OrgContext(BaseModel):
 
 
 # =============================================================================
-# Project Collaborator Models (for sharing personal projects without orgs)
+# Project Collaborator Models (for sharing user-owned projects without orgs)
 # =============================================================================
 
 class ProjectCollaborator(TimestampMixin):
-    """Collaborator on a user-owned project (personal project sharing).
+    """Collaborator on a user-owned project.
 
-    This enables users to share personal projects without creating an org.
+    This enables users to share projects without creating an org.
     The project owner invites collaborators directly.
     """
 
@@ -588,7 +620,7 @@ class ProjectCollaborator(TimestampMixin):
 
 
 class AddCollaboratorRequest(BaseModel):
-    """Request to add a collaborator to a personal project."""
+    """Request to add a collaborator to a user-owned project."""
 
     user_id: str  # Collaborator to invite
     role: ProjectRole = ProjectRole.CONTRIBUTOR
@@ -609,7 +641,7 @@ class BillingContext(BaseModel):
 
     Determines which subscription to bill based on:
     1. If working in org context (org_id set) → use org subscription
-    2. If working on personal project → use user subscription
+    2. If working on user-owned project → use user subscription
 
     Org subscription takes precedence when working in org context.
     """
@@ -741,116 +773,3 @@ class InvitationListResponse(BaseModel):
     total: int
     pending_count: int
     page_info: Optional[PageInfo] = None
-
-
-# =============================================================================
-# Agent Status Tracking Models
-# =============================================================================
-
-
-class AgentStatusTransitionTrigger(str, Enum):
-    """What triggered an agent status change.
-
-    Used for auditing and to differentiate automatic transitions
-    from manual administrative actions.
-    """
-
-    MANUAL = "manual"           # Admin/user explicitly changed status
-    TASK_START = "task_start"   # Agent started working on a task (IDLE→BUSY)
-    TASK_COMPLETE = "task_complete"  # Agent finished a task (BUSY→IDLE)
-    TASK_ERROR = "task_error"   # Task failed (BUSY→IDLE)
-    SCHEDULED = "scheduled"     # Scheduled maintenance or policy
-    API = "api"                 # External API call
-    TIMEOUT = "timeout"         # Idle timeout reached
-    SYSTEM = "system"           # System-initiated (startup, shutdown)
-
-
-class AgentStatusChangeRequest(BaseModel):
-    """Request to change an agent's status.
-
-    Includes validation for allowed transitions and required fields
-    based on target status.
-    """
-
-    status: AgentStatus = Field(..., description="Target status")
-    reason: Optional[str] = Field(None, max_length=500, description="Reason for status change")
-    trigger: AgentStatusTransitionTrigger = Field(
-        default=AgentStatusTransitionTrigger.MANUAL,
-        description="What triggered this change"
-    )
-    task_id: Optional[str] = Field(None, description="Associated task ID (for BUSY transitions)")
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def validate_task_requirement(self) -> "AgentStatusChangeRequest":
-        """Validate that task_id is provided when trigger is task-related."""
-        task_triggers = {
-            AgentStatusTransitionTrigger.TASK_START,
-            AgentStatusTransitionTrigger.TASK_COMPLETE,
-            AgentStatusTransitionTrigger.TASK_ERROR,
-        }
-        if self.trigger in task_triggers and not self.task_id:
-            raise ValueError(f"task_id is required when trigger is {self.trigger.value}")
-        return self
-
-
-class AgentStatusEvent(BaseModel):
-    """Event tracking agent status changes.
-
-    This event is emitted whenever an agent's status changes, providing
-    a complete audit trail for compliance and enabling real-time notifications
-    via SSE/WebSocket hooks.
-    """
-
-    id: str = Field(default_factory=lambda: f"ase-{uuid.uuid4().hex[:12]}")
-    agent_id: str
-    org_id: str
-    from_status: AgentStatus
-    to_status: AgentStatus
-    reason: Optional[str] = None
-    trigger: AgentStatusTransitionTrigger
-    triggered_by: str = Field(..., description="User ID who triggered the change")
-    task_id: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-
-    # Hook data for SSE/WebSocket integration
-    notification_channel: Optional[str] = Field(
-        None,
-        description="Channel name for real-time notifications (e.g., 'agent:{agent_id}:status')"
-    )
-
-
-class AgentStatusHistory(BaseModel):
-    """Response containing agent status change history."""
-
-    agent_id: str
-    events: List[AgentStatusEvent]
-    total: int
-    current_status: AgentStatus
-
-
-# Valid status transitions matrix
-VALID_AGENT_STATUS_TRANSITIONS: Dict[AgentStatus, Set[AgentStatus]] = {
-    AgentStatus.ACTIVE: {AgentStatus.BUSY, AgentStatus.PAUSED, AgentStatus.DISABLED, AgentStatus.ARCHIVED},
-    AgentStatus.BUSY: {AgentStatus.IDLE, AgentStatus.ACTIVE, AgentStatus.PAUSED},
-    AgentStatus.IDLE: {AgentStatus.BUSY, AgentStatus.ACTIVE, AgentStatus.PAUSED, AgentStatus.DISABLED},
-    AgentStatus.PAUSED: {AgentStatus.ACTIVE, AgentStatus.IDLE, AgentStatus.DISABLED, AgentStatus.ARCHIVED},
-    AgentStatus.DISABLED: {AgentStatus.ACTIVE, AgentStatus.IDLE, AgentStatus.ARCHIVED},
-    AgentStatus.ARCHIVED: set(),  # Terminal state - no transitions out
-}
-
-
-def is_valid_status_transition(from_status: AgentStatus, to_status: AgentStatus) -> bool:
-    """Check if a status transition is valid.
-
-    Args:
-        from_status: Current agent status
-        to_status: Desired target status
-
-    Returns:
-        True if transition is allowed, False otherwise
-    """
-    if from_status == to_status:
-        return False  # No-op transitions not allowed
-    return to_status in VALID_AGENT_STATUS_TRANSITIONS.get(from_status, set())

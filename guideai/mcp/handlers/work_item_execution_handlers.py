@@ -28,7 +28,7 @@ from ...work_item_execution_contracts import (
     ExecutionState,
     GEPPhase,
 )
-from ...services.board_service import Actor
+from ...services.board_service import Actor, BoardService
 
 
 # ==============================================================================
@@ -92,7 +92,7 @@ WORK_ITEM_EXECUTION_TOOLS = [
             "properties": {
                 "work_item_id": {
                     "type": "string",
-                    "description": "ID of the work item to execute",
+                    "description": "ID or display ID (e.g. 'myproject-42') of the work item to execute",
                 },
                 "org_id": {
                     "type": "string",
@@ -135,7 +135,7 @@ WORK_ITEM_EXECUTION_TOOLS = [
             "properties": {
                 "work_item_id": {
                     "type": "string",
-                    "description": "ID of the work item",
+                    "description": "ID or display ID (e.g. 'myproject-42') of the work item",
                 },
                 "org_id": {
                     "type": "string",
@@ -157,7 +157,7 @@ WORK_ITEM_EXECUTION_TOOLS = [
             "properties": {
                 "work_item_id": {
                     "type": "string",
-                    "description": "ID of the work item",
+                    "description": "ID or display ID (e.g. 'myproject-42') of the work item",
                 },
                 "org_id": {
                     "type": "string",
@@ -183,7 +183,7 @@ WORK_ITEM_EXECUTION_TOOLS = [
             "properties": {
                 "work_item_id": {
                     "type": "string",
-                    "description": "ID of the work item",
+                    "description": "ID or display ID (e.g. 'myproject-42') of the work item",
                 },
                 "org_id": {
                     "type": "string",
@@ -248,7 +248,7 @@ WORK_ITEM_EXECUTION_TOOLS = [
             "properties": {
                 "work_item_id": {
                     "type": "string",
-                    "description": "ID of the work item with a paused execution",
+                    "description": "ID or display ID (e.g. 'myproject-42') of the work item with a paused execution",
                 },
                 "org_id": {
                     "type": "string",
@@ -284,23 +284,36 @@ WORK_ITEM_EXECUTION_TOOLS = [
 
 def create_work_item_execution_handlers(
     service: WorkItemExecutionService,
+    board_service: Optional[BoardService] = None,
 ) -> Dict[str, callable]:
     """Create handler functions for work item execution tools.
 
     Args:
         service: The WorkItemExecutionService instance
+        board_service: Optional BoardService for resolving display IDs
 
     Returns:
         Dict mapping tool names to handler functions
     """
+
+    def _resolve_id(identifier: str, arguments: Dict[str, Any]) -> str:
+        """Resolve display ID to internal ID if board_service available."""
+        if board_service is None:
+            return identifier
+        return board_service.resolve_work_item_id(
+            identifier,
+            org_id=arguments.get("org_id"),
+            project_id=arguments.get("project_id"),
+        )
 
     async def handle_execute(arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Handle workItems.execute tool call."""
         actor = _get_actor(arguments)
 
         try:
+            work_item_id = _resolve_id(arguments["work_item_id"], arguments)
             request = ExecuteWorkItemRequest(
-                work_item_id=arguments["work_item_id"],
+                work_item_id=work_item_id,
                 user_id=actor.id,
                 org_id=arguments.get("org_id"),
                 project_id=arguments["project_id"],
@@ -373,8 +386,9 @@ def create_work_item_execution_handlers(
     async def handle_execution_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Handle workItems.executionStatus tool call."""
         try:
+            work_item_id = _resolve_id(arguments["work_item_id"], arguments)
             response = await service.get_status(
-                work_item_id=arguments["work_item_id"],
+                work_item_id=work_item_id,
                 org_id=arguments.get("org_id"),
                 project_id=arguments["project_id"],
             )
@@ -404,8 +418,9 @@ def create_work_item_execution_handlers(
         actor = _get_actor(arguments)
 
         try:
+            work_item_id = _resolve_id(arguments["work_item_id"], arguments)
             success = await service.cancel(
-                work_item_id=arguments["work_item_id"],
+                work_item_id=work_item_id,
                 org_id=arguments.get("org_id"),
                 project_id=arguments["project_id"],
                 reason=arguments.get("reason", "User requested cancellation"),
@@ -429,10 +444,11 @@ def create_work_item_execution_handlers(
         actor = _get_actor(arguments)
 
         try:
+            work_item_id = _resolve_id(arguments["work_item_id"], arguments)
             # This will be implemented in the service
             # For now, return a placeholder
             success = await service.provide_clarification(
-                work_item_id=arguments["work_item_id"],
+                work_item_id=work_item_id,
                 org_id=arguments.get("org_id"),
                 project_id=arguments["project_id"],
                 clarification_id=arguments["clarification_id"],
@@ -488,8 +504,9 @@ def create_work_item_execution_handlers(
         actor = _get_actor(arguments)
 
         try:
+            work_item_id = _resolve_id(arguments["work_item_id"], arguments)
             result = await service.approve_gate(
-                work_item_id=arguments["work_item_id"],
+                work_item_id=work_item_id,
                 user_id=actor.id,
                 org_id=arguments.get("org_id"),
                 project_id=arguments["project_id"],

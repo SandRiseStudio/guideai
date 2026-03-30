@@ -101,18 +101,21 @@ export function useOrgMembers(orgId?: string | null) {
           const response = await apiClient.get<MemberListResponse>(`${endpoint}?limit=200`);
           return response.members ?? [];
         } catch (error) {
-          if (error instanceof ApiError && error.status === 404) {
+          if (error instanceof ApiError && (error.status === 404 || error.status === 403)) {
             continue;
           }
           lastError = error;
         }
       }
-      if (lastError) {
-        throw lastError;
-      }
+      if (lastError) throw lastError;
       return [];
     },
     enabled: Boolean(orgId),
-    staleTime: 15_000,
+    staleTime: 30_000,
+    retry: (failureCount, error) => {
+      if (error instanceof ApiError && error.status < 500) return false;
+      return failureCount < 2;
+    },
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 }

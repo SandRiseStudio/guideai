@@ -45,6 +45,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RunDetailPanel = void 0;
 const vscode = __importStar(require("vscode"));
+const actorAvatar_1 = require("../utils/actorAvatar");
 class RunDetailPanel {
     constructor(panel, extensionUri) {
         this._disposables = [];
@@ -191,6 +192,17 @@ class RunDetailPanel {
 </body>
 </html>`;
         }
+        const actorAvatarHtml = (0, actorAvatar_1.buildActorAvatarHtml)((0, actorAvatar_1.createActorViewModel)({
+            id: run.actor.id,
+            kind: 'agent',
+            displayName: run.actor.id,
+            subtitle: run.actor.role,
+            presenceState: run.status.toLowerCase() === 'running' || run.status.toLowerCase() === 'in_progress'
+                ? 'working'
+                : run.status.toLowerCase() === 'failed' || run.status.toLowerCase() === 'cancelled'
+                    ? 'paused'
+                    : 'available',
+        }), 44);
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -204,10 +216,15 @@ class RunDetailPanel {
 	<div class="container">
 		<header class="run-header">
 			<div class="run-title">
-				<h1>${run.workflow_name || run.template_name || 'Unnamed Workflow'}</h1>
-				<div class="run-meta">
-					<span class="run-id" id="runId">${run.run_id}</span>
-					<button class="copy-btn" onclick="vscode.postMessage({type: 'copyRunId'})">Copy ID</button>
+				<div style="display:flex;align-items:center;gap:12px;">
+					${actorAvatarHtml}
+					<div>
+						<h1>${run.workflow_name || run.template_name || 'Unnamed Workflow'}</h1>
+						<div class="run-meta">
+							<span class="run-id" id="runId">${run.run_id}</span>
+							<button class="copy-btn" onclick="vscode.postMessage({type: 'copyRunId'})">Copy ID</button>
+						</div>
+					</div>
 				</div>
 			</div>
 			<div class="run-status">

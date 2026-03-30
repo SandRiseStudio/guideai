@@ -18,6 +18,7 @@ Test Coverage:
 import asyncio
 import json
 import pytest
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,7 @@ from guideai.mcp_device_flow import (
     MCPDeviceFlowService,
     MCPDeviceFlowHandler,
 )
+from guideai.mcp_server import MCPServer
 from guideai.device_flow import (
     DeviceFlowManager,
     DeviceAuthorizationSession,
@@ -64,6 +66,12 @@ def file_token_store(temp_token_file: Path) -> FileTokenStore:
 def telemetry_sink() -> InMemoryTelemetrySink:
     """In-memory telemetry sink for testing event emission."""
     return InMemoryTelemetrySink()
+
+
+@pytest.fixture(autouse=True)
+def _disable_auto_approve(monkeypatch):
+    """Disable auto-approve so denial/timeout tests work."""
+    monkeypatch.setenv("MCP_AUTO_APPROVE_DEVICE_FLOW", "false")
 
 
 @pytest.fixture
@@ -168,6 +176,49 @@ class TestMCPDeviceLogin:
     """Test auth.deviceLogin MCP tool implementation."""
 
     @pytest.mark.asyncio
+    async def test_device_login_defaults_to_non_blocking_pending(
+        self,
+        mcp_service: MCPDeviceFlowService,
+    ) -> None:
+        """Device login returns pending immediately by default for MCP-agent-friendly flow."""
+        result = await mcp_service.device_login(
+            client_id="test-client",
+            scopes=["behaviors.read"],
+            poll_interval=1,
+            timeout=10,
+            store_tokens=False,
+        )
+
+        assert result["status"] == "pending"
+        assert "device_code" in result
+        assert "user_code" in result
+        assert "verification_uri" in result
+        assert "access_token" not in result
+
+    @pytest.mark.asyncio
+    async def test_device_init_falls_back_when_postgres_store_times_out(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """device_init should never hang: timeout on postgres store falls back to in-memory flow."""
+        slow_store = Mock()
+
+        def _slow_create_session(*args: Any, **kwargs: Any) -> Any:
+            time.sleep(0.05)
+            return Mock()
+
+        slow_store.create_session.side_effect = _slow_create_session
+        service = MCPDeviceFlowService(postgres_store=slow_store)
+
+        monkeypatch.setenv("MCP_DB_CALL_TIMEOUT_SECONDS", "0.01")
+
+        result = await service.device_init(client_id="test-client", scopes=["behaviors.read"])
+
+        assert "device_code" in result
+        assert "user_code" in result
+        assert "verification_uri" in result
+
+    @pytest.mark.asyncio
     async def test_device_login_successful_authorization(
         self,
         mcp_service: MCPDeviceFlowService,
@@ -183,6 +234,7 @@ class TestMCPDeviceLogin:
                 poll_interval=1,
                 timeout=10,
                 store_tokens=True,
+                wait_for_authorization=True,
             )
         )
 
@@ -231,6 +283,7 @@ class TestMCPDeviceLogin:
                 poll_interval=1,
                 timeout=10,
                 store_tokens=True,
+                wait_for_authorization=True,
             )
         )
 
@@ -268,6 +321,7 @@ class TestMCPDeviceLogin:
             poll_interval=1,
             timeout=2,  # Short timeout to speed up test
             store_tokens=False,
+            wait_for_authorization=True,
         )
 
         assert result["status"] == "error"
@@ -290,6 +344,7 @@ class TestMCPDeviceLogin:
                 poll_interval=1,
                 timeout=10,
                 store_tokens=False,  # Don't persist tokens
+                wait_for_authorization=True,
             )
         )
 
@@ -422,6 +477,57 @@ class TestMCPAuthStatus:
         assert result["access_token_valid"] is False
         assert result["refresh_token_valid"] is False
         assert result["needs_login"] is True
+
+    @pytest.mark.asyncio
+    async def test_auth_status_returns_fast_on_token_store_timeout(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """auth_status should fail fast when token store load blocks (e.g., keychain stall)."""
+
+        class SlowTokenStore(TokenStore):
+            def save(self, bundle: AuthTokenBundle) -> None:
+                return None
+
+            def load(self) -> Optional[AuthTokenBundle]:
+                time.sleep(0.05)
+                return None
+
+            def clear(self) -> None:
+                return None
+
+        monkeypatch.setenv("MCP_AUTH_STORE_TIMEOUT_SECONDS", "0.01")
+        service = MCPDeviceFlowService(token_store=SlowTokenStore())
+
+        result = await service.auth_status(client_id="test-client")
+
+        assert result["is_authenticated"] is False
+        assert result["needs_login"] is True
+        assert result.get("error_description") == "Token store operation timed out"
+
+
+class TestMCPServerStartupSafety:
+    """Regression tests for startup behavior that can impact public auth/context tools."""
+
+    def test_mcp_server_does_not_prewarm_pools_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default startup should skip prewarm to avoid blocking when DB is slow/unavailable."""
+        from unittest.mock import patch
+
+        monkeypatch.delenv("MCP_PREWARM_POOLS", raising=False)
+
+        with patch("guideai.mcp_server.MCPServiceRegistry.prewarm_pools") as mock_prewarm:
+            MCPServer()
+            mock_prewarm.assert_not_called()
+
+    def test_mcp_server_can_opt_in_to_prewarm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prewarm remains available via explicit opt-in env var."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("MCP_PREWARM_POOLS", "true")
+
+        with patch("guideai.mcp_server.MCPServiceRegistry.prewarm_pools") as mock_prewarm:
+            MCPServer()
+            mock_prewarm.assert_called_once()
 
 
 # --- Token Refresh Tests ---
@@ -717,6 +823,7 @@ class TestMCPTokenStorageParity:
                 poll_interval=1,
                 timeout=10,
                 store_tokens=True,
+                wait_for_authorization=True,
             )
         )
 
@@ -762,6 +869,24 @@ class TestMCPDeviceFlowHandler:
 
         assert "status" in result
         assert "device_code" in result or "error" in result
+
+    @pytest.mark.asyncio
+    async def test_handler_device_login_supports_blocking_mode(
+        self,
+        mcp_handler: MCPDeviceFlowHandler,
+    ) -> None:
+        """Handler forwards wait_for_authorization to service for explicit blocking mode."""
+        result = await mcp_handler.handle_tool_call(
+            "auth.deviceLogin",
+            {
+                "client_id": "test-client",
+                "timeout": 1,
+                "store_tokens": False,
+                "wait_for_authorization": True,
+            },
+        )
+
+        assert result["status"] in {"error", "denied", "expired", "authorized"}
 
     @pytest.mark.asyncio
     async def test_handler_dispatches_auth_status(
@@ -834,6 +959,7 @@ class TestMCPDeviceFlowTelemetry:
                 poll_interval=1,
                 timeout=10,
                 store_tokens=True,
+                wait_for_authorization=True,
             )
         )
 

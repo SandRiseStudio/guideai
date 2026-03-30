@@ -2,6 +2,7 @@
 
 import pytest
 from typing import Any, Dict, List
+from unittest.mock import MagicMock
 
 from amprealize.executors.base import (
     ContainerRunConfig,
@@ -363,3 +364,133 @@ class TestPodmanExecutorNativeProcessMethods:
         assert result[8000] is None  # Was cleaned up
         assert result[8001] is None  # Was free
         assert result[8002] is None  # Was free
+
+
+class TestSmartCleanup:
+    """Tests for PodmanExecutor.smart_cleanup."""
+
+    def _make_executor(self, mocker, ps_output="", ps_all_output="",
+                       volume_ls_output="", images_output="",
+                       ps_mounts_output=""):
+        """Create a PodmanExecutor with mocked _run_podman."""
+        from amprealize.executors.podman import PodmanExecutor
+
+        executor = PodmanExecutor()
+
+        call_responses = {
+            # dead containers query
+            ("ps", "-a", "--filter", "status=exited", "--filter", "status=dead",
+             "--filter", "status=created", "--format"): ps_all_output,
+            # volumes in use (mounts)
+            ("ps", "--format"): ps_mounts_output,
+            # volume list
+            ("volume", "ls", "--format"): volume_ls_output,
+            # images used by containers
+            ("ps", "-a", "--format"): ps_output,
+            # all images
+            ("images", "--format"): images_output,
+            # remove commands (succeed silently)
+            ("rm",): "",
+            ("volume", "rm"): "",
+            ("rmi",): "",
+            ("builder", "prune", "-f"): "",
+        }
+
+        def mock_run_podman(args, check=True):
+            mock_result = MagicMock()
+            # Match by the first portion of args
+            for key_tuple, output in call_responses.items():
+                key_list = list(key_tuple)
+                if args[:len(key_list)] == key_list:
+                    mock_result.stdout = output
+                    return mock_result
+            mock_result.stdout = ""
+            return mock_result
+
+        mocker.patch.object(executor, "_run_podman", side_effect=mock_run_podman)
+        return executor
+
+    def test_dry_run_does_not_remove(self, mocker):
+        """Dry run discovers resources but does not call remove."""
+        executor = self._make_executor(
+            mocker,
+            ps_all_output="abc123|old-worker|Exited (137) 2 hours ago\n",
+            volume_ls_output="a" * 64 + "\n" + "guideai-db-data\n",
+            ps_mounts_output="",
+        )
+        result = executor.smart_cleanup(dry_run=True)
+
+        assert len(result["dead_containers"]) == 1
+        assert len(result["anonymous_volumes"]) == 1
+        assert "guideai-db-data" in result["preserved_volumes"]
+        assert not result["errors"]
+
+    def test_preserves_db_volumes(self, mocker):
+        """Named DB volumes are always preserved."""
+        vol_names = [
+            "guideai-db-data",
+            "telemetry-db-data",
+            "postgres-behavior-data",
+            "pgadmin-data",
+        ]
+        executor = self._make_executor(
+            mocker,
+            volume_ls_output="\n".join(vol_names) + "\n",
+            ps_mounts_output="",
+        )
+        result = executor.smart_cleanup(
+            dry_run=True,
+            remove_dead_containers=False,
+            remove_anonymous_volumes=True,
+        )
+
+        assert len(result["anonymous_volumes"]) == 0
+        for vol in vol_names:
+            assert vol in result["preserved_volumes"]
+
+    def test_removes_anonymous_volumes(self, mocker):
+        """Hash-named volumes not in use are removed."""
+        anon_vol = "a1b2c3d4" * 8  # 64-char hex
+        executor = self._make_executor(
+            mocker,
+            volume_ls_output=anon_vol + "\n",
+            ps_mounts_output="",
+        )
+        result = executor.smart_cleanup(
+            dry_run=False,
+            remove_dead_containers=False,
+            remove_anonymous_volumes=True,
+        )
+
+        assert len(result["anonymous_volumes"]) == 1
+        assert result["anonymous_volumes"][0] == anon_vol
+
+    def test_custom_preserve_patterns(self, mocker):
+        """Custom preserve patterns protect matching volumes."""
+        anon_vol = "a1b2c3d4" * 8
+        executor = self._make_executor(
+            mocker,
+            volume_ls_output=anon_vol + "\nmyapp-cache\n",
+            ps_mounts_output="",
+        )
+        result = executor.smart_cleanup(
+            dry_run=True,
+            remove_dead_containers=False,
+            remove_anonymous_volumes=True,
+            preserve_volume_patterns=["myapp"],
+        )
+
+        assert "myapp-cache" in result["preserved_volumes"]
+        assert anon_vol in result["anonymous_volumes"]
+
+    def test_build_cache_prune(self, mocker):
+        """Build cache is pruned when requested."""
+        executor = self._make_executor(mocker)
+        result = executor.smart_cleanup(
+            dry_run=False,
+            remove_dead_containers=False,
+            remove_anonymous_volumes=False,
+            prune_build_cache=True,
+        )
+
+        assert result["build_cache_cleared"] is True

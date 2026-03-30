@@ -24,12 +24,9 @@ services:
       - "shared_preload_libraries=timescaledb"
     volumes:
       - postgres-telemetry-data:/var/lib/postgresql/data
-      - ./schema/migrations/001_create_telemetry_warehouse.sql:/docker-entrypoint-initdb.d/001_create_telemetry_warehouse.sql:ro
-      - ./schema/migrations/012_create_metrics_service.sql:/docker-entrypoint-initdb.d/012_create_metrics_service.sql:ro
-      - ./schema/migrations/013_create_trace_analysis.sql:/docker-entrypoint-initdb.d/013_create_trace_analysis.sql:ro
-      - ./schema/migrations/014_create_telemetry_warehouse_timescale.sql:/docker-entrypoint-initdb.d/014_create_telemetry_warehouse_timescale.sql:ro
+      # Schema managed by Alembic (alembic.telemetry.ini → migrations_telemetry/)
   postgres-behavior:
-    image: pgvector/pgvector:pg16
+    image: timescale/timescaledb:latest-pg16
     ports:
       - "5433:5432"
     environment:
@@ -49,9 +46,7 @@ services:
       - "log_duration=off"
     volumes:
       - postgres-behavior-data:/var/lib/postgresql/data
-      - ./schema/migrations/002_create_behavior_service.sql:/docker-entrypoint-initdb.d/002_create_behavior_service.sql:ro
-      - ./schema/migrations/008_optimize_behavior_indexes.sql:/docker-entrypoint-initdb.d/008_optimize_behavior_indexes.sql:ro
-      - ./schema/migrations/010_create_behavior_embeddings.sql:/docker-entrypoint-initdb.d/010_create_behavior_embeddings.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
   postgres-workflow:
     image: postgres:16-alpine
     ports:
@@ -73,8 +68,7 @@ services:
       - "log_duration=off"
     volumes:
       - postgres-workflow-data:/var/lib/postgresql/data
-      - ./schema/migrations/003_create_workflow_service.sql:/docker-entrypoint-initdb.d/003_create_workflow_service.sql:ro
-      - ./schema/migrations/009_refactor_workflow_schema.sql:/docker-entrypoint-initdb.d/009_refactor_workflow_schema.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
   postgres-action:
     image: postgres:16-alpine
     ports:
@@ -96,8 +90,7 @@ services:
       - "log_duration=off"
     volumes:
       - postgres-action-data:/var/lib/postgresql/data
-      - ./schema/migrations/004_create_action_service.sql:/docker-entrypoint-initdb.d/004_create_action_service.sql:ro
-      - ./schema/migrations/007_extend_replays_metadata.sql:/docker-entrypoint-initdb.d/007_extend_replays_metadata.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
   postgres-run:
     image: postgres:16-alpine
     ports:
@@ -119,7 +112,7 @@ services:
       - "log_duration=off"
     volumes:
       - postgres-run-data:/var/lib/postgresql/data
-      - ./schema/migrations/005_create_run_service.sql:/docker-entrypoint-initdb.d/005_create_run_service.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
   postgres-compliance:
     image: postgres:16-alpine
     ports:
@@ -141,7 +134,7 @@ services:
       - "log_duration=off"
     volumes:
       - postgres-compliance-data:/var/lib/postgresql/data
-      - ./schema/migrations/006_create_compliance_service.sql:/docker-entrypoint-initdb.d/006_create_compliance_service.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
   postgres-agent-orchestrator:
     image: postgres:16-alpine
     ports:
@@ -163,7 +156,7 @@ services:
       - "log_duration=off"
     volumes:
       - postgres-agent-orchestrator-data:/var/lib/postgresql/data
-      - ./schema/migrations/011_create_agent_orchestrator.sql:/docker-entrypoint-initdb.d/011_create_agent_orchestrator.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
   redis:
     image: redis:7-alpine
     ports:
@@ -190,9 +183,10 @@ services:
       POOL_MODE: "transaction"
       MAX_CLIENT_CONN: "1000"
       DEFAULT_POOL_SIZE: "20"
-    volumes:
-      - ./deployment/config/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./deployment/config/pgbouncer.userlist:/etc/pgbouncer/userlist.txt:ro
+    volumes: []
+      # pgbouncer config files not yet created (deployment/config/ missing)
+      # - ./deployment/config/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      # - ./deployment/config/pgbouncer.userlist:/etc/pgbouncer/userlist.txt:ro
   pgadmin:
     image: dpage/pgadmin4:latest
     ports:
@@ -204,4 +198,5 @@ services:
       PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
     volumes:
       - pgadmin-data:/var/lib/pgadmin
-      - ./deployment/config/pgadmin_servers.json:/pgadmin4/servers.json:ro
+      # pgadmin server config not yet created (deployment/config/ missing)
+      # - ./deployment/config/pgadmin_servers.json:/pgadmin4/servers.json:ro

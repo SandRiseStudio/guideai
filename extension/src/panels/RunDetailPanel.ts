@@ -12,6 +12,7 @@
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { Run } from '../client/GuideAIClient';
+import { buildActorAvatarHtml, createActorViewModel } from '../utils/actorAvatar';
 
 export class RunDetailPanel {
 	public static currentPanel: RunDetailPanel | undefined;
@@ -193,6 +194,22 @@ export class RunDetailPanel {
 </html>`;
 		}
 
+		const actorAvatarHtml = buildActorAvatarHtml(
+			createActorViewModel({
+				id: run.actor.id,
+				kind: 'agent',
+				displayName: run.actor.id,
+				subtitle: run.actor.role,
+				presenceState:
+					run.status.toLowerCase() === 'running' || run.status.toLowerCase() === 'in_progress'
+						? 'working'
+						: run.status.toLowerCase() === 'failed' || run.status.toLowerCase() === 'cancelled'
+							? 'paused'
+							: 'available',
+			}),
+			44,
+		);
+
 		return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -206,10 +223,15 @@ export class RunDetailPanel {
 	<div class="container">
 		<header class="run-header">
 			<div class="run-title">
-				<h1>${run.workflow_name || run.template_name || 'Unnamed Workflow'}</h1>
-				<div class="run-meta">
-					<span class="run-id" id="runId">${run.run_id}</span>
-					<button class="copy-btn" onclick="vscode.postMessage({type: 'copyRunId'})">Copy ID</button>
+				<div style="display:flex;align-items:center;gap:12px;">
+					${actorAvatarHtml}
+					<div>
+						<h1>${run.workflow_name || run.template_name || 'Unnamed Workflow'}</h1>
+						<div class="run-meta">
+							<span class="run-id" id="runId">${run.run_id}</span>
+							<button class="copy-btn" onclick="vscode.postMessage({type: 'copyRunId'})">Copy ID</button>
+						</div>
+					</div>
 				</div>
 			</div>
 			<div class="run-status">

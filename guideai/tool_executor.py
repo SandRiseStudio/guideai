@@ -39,6 +39,77 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _research_evaluate_handler(
+    source: str,
+    source_type: Optional[str] = None,
+    context_documents: Optional[List[str]] = None,
+    _executor_context: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Handler for research_evaluate tool — bridges to ResearchService."""
+    from guideai.research_service import ResearchService
+    from guideai.research_contracts import EvaluatePaperRequest, SourceType
+
+    # Build service with Postgres pool when DSN is available
+    pool = None
+    try:
+        from guideai.utils.dsn import apply_host_overrides
+        dsn = apply_host_overrides(
+            os.environ.get("GUIDEAI_RESEARCH_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+            "RESEARCH",
+        )
+        if dsn:
+            from guideai.storage.postgres_pool import PostgresPool
+            pool = PostgresPool(dsn, "research")
+    except Exception:
+        pass  # Fall back to SQLite
+
+    service = ResearchService(pool=pool)
+
+    # Extract execution identity from executor context
+    ctx = _executor_context or {}
+    gh = ctx.get("github_context") or {}
+    owner_id = gh.get("user_id")
+    org_id = gh.get("org_id")
+    project_id = gh.get("project_id")
+
+    request = EvaluatePaperRequest(source=source)
+    if source_type:
+        try:
+            request.source_type = SourceType(source_type.upper())
+        except (ValueError, KeyError):
+            pass
+    if context_documents:
+        request.context_documents = context_documents
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: service.evaluate(
+            request, owner_id=owner_id, org_id=org_id, project_id=project_id
+        ),
+    )
+
+    verdict_str = result.recommendation.verdict.value if result.recommendation else "unknown"
+    score = result.evaluation.overall_score if result.evaluation else 0.0
+
+    return {
+        "success": True,
+        "paper_id": result.paper_id,
+        "title": result.paper_title,
+        "verdict": verdict_str,
+        "verdict_rationale": result.recommendation.verdict_rationale if result.recommendation else None,
+        "overall_score": score,
+        "core_idea": result.comprehension.core_idea if result.comprehension else None,
+        "next_agent": result.recommendation.next_agent if result.recommendation else None,
+        "priority": result.recommendation.priority.value if result.recommendation else None,
+        # Full markdown report for rich rendering in ExecutionTimeline
+        "text": result.markdown_report or "",
+        # Short summary for collapsed step preview
+        "content_preview": f"\U0001f4c4 {result.paper_title} \u2014 Verdict: {verdict_str} (Score: {score:.1f}/5.0)",
+    }
+
+
 def _short_id(prefix: str) -> str:
     """Generate a short prefixed ID."""
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
@@ -399,6 +470,25 @@ class ToolRegistry:
             is_write_operation=False,
         ))
 
+        # Research tools - for AI research agent work item execution
+        self.register(ToolDefinition(
+            name="research_evaluate",
+            description="Evaluate a research paper or article through the 4-phase AI research pipeline (Ingest → Comprehend → Evaluate → Recommend). Returns structured verdict with implementation roadmap.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "URL, file path, or arXiv ID of the paper to evaluate"},
+                    "source_type": {"type": "string", "enum": ["url", "arxiv", "markdown", "pdf", "docx"], "description": "Type of source (auto-detected if not specified)"},
+                    "context_documents": {"type": "array", "items": {"type": "string"}, "description": "Additional context document paths"},
+                },
+                "required": ["source"],
+            },
+            category=ToolCategory.NETWORK,
+            requires_internet=True,
+            is_write_operation=False,
+            handler=_research_evaluate_handler,
+        ))
+
     def register(self, tool: ToolDefinition) -> None:
         """Register a tool definition."""
         self._tools[tool.name] = tool
@@ -750,7 +840,13 @@ class ToolExecutor:
         # Check for custom handler
         if tool_def.handler:
             try:
-                result = await tool_def.handler(**tool_call.tool_args)
+                # Inject executor context so handlers can access pool, identity, etc.
+                handler_args = dict(tool_call.tool_args)
+                handler_args["_executor_context"] = {
+                    "github_context": self._github_context,
+                    "project_root": self._project_root,
+                }
+                result = await tool_def.handler(**handler_args)
                 return json.dumps(result) if not isinstance(result, str) else result
             except Exception as e:
                 raise ToolExecutionError(

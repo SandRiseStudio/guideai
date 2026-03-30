@@ -10,6 +10,7 @@
 
 import * as vscode from 'vscode';
 import { GuideAIClient, TopPerformer, PerformanceAlert, AgentPerformanceSummary } from '../client/GuideAIClient';
+import { buildActorAvatarDataUri, createActorViewModel } from '../utils/actorAvatar';
 
 export interface AgentPerformanceTreeItem extends vscode.TreeItem {
 	contextValue: string;
@@ -202,9 +203,20 @@ export class AgentPerformanceTreeDataProvider implements vscode.TreeDataProvider
 				: metricValuePct.toFixed(0);
 
 			return {
-				label: `${medal} ${performer.agentId}`,
+				label: `${medal} ${performer.agentName || performer.agentId}`,
 				description: `${displayValue} ${performer.metricName} • ${performer.totalTasks} tasks`,
-				iconPath: new vscode.ThemeIcon('account'),
+				iconPath: vscode.Uri.parse(
+					buildActorAvatarDataUri(
+						createActorViewModel({
+							id: performer.agentId,
+							kind: 'agent',
+							displayName: performer.agentName || performer.agentId,
+							subtitle: performer.metricName,
+							presenceState: 'available',
+						}),
+						28,
+					)
+				),
 				collapsibleState: vscode.TreeItemCollapsibleState.None,
 				contextValue: 'top-performer',
 				agentId: performer.agentId,

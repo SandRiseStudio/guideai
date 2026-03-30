@@ -7,7 +7,7 @@
     "properties": {
       "work_item_id": {
         "type": "string",
-        "description": "ID of the work item to list comments for (required)"
+        "description": "ID or display ID (e.g. 'myproject-42') of the work item to list comments for (required)"
       },
       "limit": {
         "type": "integer",

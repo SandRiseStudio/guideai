@@ -6,7 +6,8 @@
  * - behavior_use_raze_for_logging (Student)
  */
 
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import React from 'react';
+import { useIsMutating, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient, ApiError } from './client';
 import { razeLog } from '../telemetry/raze';
 
@@ -14,15 +15,22 @@ import { razeLog } from '../telemetry/raze';
 // Types (mirrors guideai.multi_tenant.board_contracts)
 // ---------------------------------------------------------------------------
 
-export type WorkItemType = 'epic' | 'story' | 'task';
+export type WorkItemType = 'goal' | 'feature' | 'task' | 'bug';
+
+/** Map legacy API type names to current names (pre-migration compat). */
+const ITEM_TYPE_ALIASES: Record<string, WorkItemType> = {
+  epic: 'goal',
+  story: 'feature',
+};
+function normalizeItemType(raw: string): WorkItemType {
+  return (ITEM_TYPE_ALIASES[raw] ?? raw) as WorkItemType;
+}
+
 export type WorkItemStatus =
-  | 'draft'
   | 'backlog'
-  | 'todo'
   | 'in_progress'
   | 'in_review'
-  | 'done'
-  | 'cancelled';
+  | 'done';
 
 export type WorkItemPriority = 'critical' | 'high' | 'medium' | 'low';
 
@@ -32,6 +40,7 @@ export interface Board {
   name: string;
   description?: string | null;
   is_default: boolean;
+  display_number?: number | null;
   created_at: string;
   updated_at: string;
   created_by: string;
@@ -68,6 +77,8 @@ export interface WorkItem {
   priority: WorkItemPriority;
   position: number;
   labels: string[];
+  points?: number | null;
+  /** @deprecated Use points instead */
   story_points?: number | null;
   estimated_hours?: string | number | null;
   actual_hours?: string | number | null;
@@ -79,11 +90,54 @@ export interface WorkItem {
   completed_at?: string | null;
   behavior_id?: string | null;
   run_id?: string | null;
+  display_number?: number | null;
   metadata?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
   created_by: string;
   org_id?: string | null;
+}
+
+export interface ProgressBucketCounts {
+  not_started: number;
+  in_progress: number;
+  completed: number;
+  total: number;
+}
+
+export interface RemainingWorkSummary {
+  items_remaining: number;
+  estimated_hours_remaining?: number | null;
+  points_remaining?: number | null;
+  /** @deprecated Use points_remaining instead */
+  story_points_remaining?: number | null;
+  estimate_coverage_ratio?: number | null;
+}
+
+export interface IncompleteWorkItemSummary {
+  item_id: string;
+  item_type: WorkItemType;
+  title: string;
+  status: WorkItemStatus;
+  parent_id?: string | null;
+  assignee_id?: string | null;
+  assignee_type?: 'user' | 'agent' | null;
+  points?: number | null;
+  /** @deprecated Use points instead */
+  story_points?: number | null;
+  estimated_hours?: number | null;
+  actual_hours?: number | null;
+}
+
+export interface WorkItemProgressRollup {
+  item_id: string;
+  item_type: WorkItemType;
+  title: string;
+  status: WorkItemStatus;
+  buckets: ProgressBucketCounts;
+  remaining: RemainingWorkSummary;
+  completion_percent: number;
+  incomplete_items: IncompleteWorkItemSummary[];
 }
 
 export type WorkItemCommentAuthorType = 'user' | 'agent';
@@ -132,6 +186,8 @@ export interface UpdateWorkItemRequest {
   priority?: WorkItemPriority;
   labels?: string[];
   parent_id?: string | null;
+  points?: number | null;
+  /** @deprecated Use points instead */
   story_points?: number | null;
   estimated_hours?: string | number | null;
   actual_hours?: string | number | null;
@@ -161,6 +217,16 @@ interface AssignmentResponse {
   message?: string;
 }
 
+interface DeleteResult {
+  deleted_id: string;
+  deleted_type: string;
+  cascade_deleted?: string[];
+}
+
+interface DeleteResponse {
+  result: DeleteResult;
+}
+
 // ---------------------------------------------------------------------------
 // Query Keys
 // ---------------------------------------------------------------------------
@@ -169,9 +235,14 @@ export const boardKeys = {
   all: ['boards'] as const,
   list: (projectId?: string) => [...boardKeys.all, 'list', projectId] as const,
   board: (boardId?: string) => [...boardKeys.all, 'board', boardId] as const,
-  items: (boardId?: string) => [...boardKeys.all, 'items', boardId] as const,
+  items: (boardId?: string, serverParams?: Record<string, string>) =>
+    [...boardKeys.all, 'items', boardId, ...(serverParams && Object.keys(serverParams).length ? [serverParams] : [])] as const,
   item: (itemId?: string) => [...boardKeys.all, 'item', itemId] as const,
   comments: (itemId?: string) => [...boardKeys.all, 'comments', itemId] as const,
+  rollups: (boardId?: string, itemType?: WorkItemType, includeIncomplete?: boolean) =>
+    [...boardKeys.all, 'rollups', boardId, itemType ?? 'all', includeIncomplete ? 'with-incomplete' : 'summary'] as const,
+  rollup: (itemId?: string, includeIncomplete?: boolean) =>
+    [...boardKeys.all, 'rollup', itemId, includeIncomplete ? 'with-incomplete' : 'summary'] as const,
 };
 
 // ---------------------------------------------------------------------------
@@ -267,18 +338,262 @@ export function useBoard(boardId?: string) {
   });
 }
 
-export function useWorkItems(boardId?: string) {
-  return useQuery({
-    queryKey: boardKeys.items(boardId),
-    queryFn: async (): Promise<WorkItem[]> => {
-      if (!boardId) return [];
-      const response = await apiClient.get<{ items: WorkItem[] }>(
-        `/v1/work-items?board_id=${encodeURIComponent(boardId)}&limit=100`
-      );
-      return response.items ?? [];
-    },
+/* ─────────────────────────────────────────────────────────────────────────────
+   Work Item Loading
+   
+   Fetches all work items for a board in a single query (paginating internally
+   so the UI never sees a partial set). Background polling silently refreshes
+   the data every few seconds without any visual loading indicators.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+const ITEMS_PAGE_SIZE = 100;
+
+/** Stable empty array to avoid reference changes when data is null */
+const EMPTY_ITEMS: WorkItem[] = [];
+
+interface WorkItemsResult {
+  /** All work items for the board */
+  data: WorkItem[];
+  /** True only during first fetch (shows skeleton) */
+  isInitialLoading: boolean;
+  /** Timestamp of last successful sync */
+  lastSyncedAt: Date | null;
+  /** True only during user-initiated refetch (not background polls) */
+  isRefreshing: boolean;
+  /** Error state */
+  error: Error | null;
+  /** Manual refetch trigger */
+  refetch: () => Promise<void>;
+}
+
+/** Background polling interval when tab is visible (ms) */
+const BACKGROUND_POLL_INTERVAL = 15_000;
+
+/** Hook to track document visibility for smart polling */
+function useDocumentVisible(): boolean {
+  const [isVisible, setIsVisible] = React.useState(() => 
+    typeof document !== 'undefined' ? !document.hidden : true
+  );
+
+  React.useEffect(() => {
+    const handleVisibility = () => setIsVisible(!document.hidden);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, []);
+
+  return isVisible;
+}
+
+function buildWorkItemsQs(
+  boardId: string,
+  limit: number,
+  offset: number,
+  serverParams?: Record<string, string>,
+): string {
+  const qs = new URLSearchParams({
+    board_id: boardId,
+    limit: String(limit),
+    offset: String(offset),
+  });
+  if (serverParams) {
+    for (const [key, value] of Object.entries(serverParams)) {
+      if (value) qs.set(key, value);
+    }
+  }
+  return qs.toString();
+}
+
+function normalizePageItems(items: WorkItem[]): WorkItem[] {
+  return items.map((item) => ({
+    ...item,
+    item_type: normalizeItemType(item.item_type),
+    points: item.points ?? item.story_points ?? null,
+  }));
+}
+
+/**
+ * Fetch all work items for a board. The first page is fetched sequentially to
+ * check `has_more`. If more pages exist, pages 2–10 are fired in parallel
+ * (one round-trip for up to 1000 items). If the board has even more items the
+ * remaining pages are fetched sequentially as a fallback.
+ */
+const MAX_PARALLEL_PAGES = 9;
+
+async function fetchAllWorkItems(
+  boardId: string,
+  serverParams?: Record<string, string>,
+): Promise<WorkItem[]> {
+  const fetchPage = async (offset: number) => {
+    const r = await apiClient.get<{ items: WorkItem[]; has_more?: boolean }>(
+      `/v1/work-items?${buildWorkItemsQs(boardId, ITEMS_PAGE_SIZE, offset, serverParams)}`
+    );
+    return { items: normalizePageItems(r.items ?? []), hasMore: r.has_more === true };
+  };
+
+  const first = await fetchPage(0);
+  if (!first.hasMore || first.items.length < ITEMS_PAGE_SIZE) {
+    return first.items;
+  }
+
+  const parallelResults = await Promise.all(
+    Array.from({ length: MAX_PARALLEL_PAGES }, (_, i) => fetchPage((i + 1) * ITEMS_PAGE_SIZE))
+  );
+
+  let all = first.items;
+  let exhausted = false;
+  for (const page of parallelResults) {
+    if (page.items.length === 0) { exhausted = true; break; }
+    all = all.concat(page.items);
+    if (!page.hasMore) { exhausted = true; break; }
+  }
+
+  if (!exhausted) {
+    let offset = (MAX_PARALLEL_PAGES + 1) * ITEMS_PAGE_SIZE;
+    let more = true;
+    while (more) {
+      const page = await fetchPage(offset);
+      if (page.items.length === 0) break;
+      all = all.concat(page.items);
+      more = page.hasMore;
+      offset += ITEMS_PAGE_SIZE;
+    }
+  }
+
+  return all;
+}
+
+export function useWorkItems(boardId?: string, serverParams?: Record<string, string>): WorkItemsResult {
+  const isTabVisible = useDocumentVisible();
+
+  // Track manual (user-initiated) refreshes separately from background polls
+  const isManualRefreshRef = React.useRef(false);
+  const [isManualRefreshing, setIsManualRefreshing] = React.useState(false);
+
+  // Suppress background polling while a board mutation (move/reorder) is
+  // in-flight.  The poll can fire right after a drop if its timer was already
+  // partway through, replacing the optimistic cache and causing a visible
+  // column stutter.  useIsMutating returns > 0 while any matching mutation
+  // is pending.
+  const activeBoardMutations = useIsMutating({
+    mutationKey: ['board-item-mutate', boardId],
+  });
+  const pollActive = isTabVisible && activeBoardMutations === 0;
+
+  const query = useQuery({
+    queryKey: boardKeys.items(boardId, serverParams),
+    queryFn: () => fetchAllWorkItems(boardId!, serverParams),
     enabled: Boolean(boardId),
     staleTime: 3_000,
+    refetchInterval: pollActive ? BACKGROUND_POLL_INTERVAL : false,
+    refetchIntervalInBackground: false,
+  });
+
+  // Clear manual refresh flag when fetch completes
+  React.useEffect(() => {
+    if (!query.isFetching && isManualRefreshRef.current) {
+      isManualRefreshRef.current = false;
+      setIsManualRefreshing(false);
+    }
+  }, [query.isFetching]);
+
+  // Derive lastSyncedAt from React Query's internal timestamp
+  const lastSyncedAt = React.useMemo(() => {
+    const ts = query.dataUpdatedAt;
+    return ts ? new Date(ts) : null;
+  }, [query.dataUpdatedAt]);
+
+  const refetch = React.useCallback(async () => {
+    isManualRefreshRef.current = true;
+    setIsManualRefreshing(true);
+    await query.refetch();
+  }, [query]);
+
+  return {
+    data: query.data ?? EMPTY_ITEMS,
+    isInitialLoading: query.isLoading && !query.data,
+    lastSyncedAt,
+    isRefreshing: isManualRefreshing,
+    error: query.error,
+    refetch,
+  };
+}
+
+/**
+ * Fetch all rollups for a board in a single request (no item_type filter),
+ * then derive per-type subsets client-side. This replaces two separate
+ * network calls (goals + features) with one.
+ */
+export function useBoardAllRollups(
+  boardId?: string,
+  options?: { includeIncompleteDescendants?: boolean }
+) {
+  const includeIncompleteDescendants = options?.includeIncompleteDescendants ?? false;
+
+  const query = useQuery({
+    queryKey: boardKeys.rollups(boardId, undefined, includeIncompleteDescendants),
+    queryFn: async (): Promise<WorkItemProgressRollup[]> => {
+      if (!boardId) return [];
+      const qs = new URLSearchParams();
+      if (includeIncompleteDescendants) qs.set('include_incomplete_descendants', 'true');
+      const suffix = qs.toString();
+      const response = await apiClient.get<{ rollups: WorkItemProgressRollup[] }>(
+        `/v1/boards/${boardId}/progress-rollups${suffix ? `?${suffix}` : ''}`
+      );
+      return response.rollups ?? [];
+    },
+    enabled: Boolean(boardId),
+    staleTime: 5_000,
+  });
+
+  return query;
+}
+
+/**
+ * Derive rollups for a specific item type from the combined query.
+ * Returns the same shape as the old per-type hook so callers don't change.
+ */
+export function useBoardProgressRollups(
+  boardId?: string,
+  options?: { itemType?: WorkItemType; includeIncompleteDescendants?: boolean }
+) {
+  const itemType = options?.itemType;
+  const includeIncompleteDescendants = options?.includeIncompleteDescendants ?? false;
+
+  const allRollups = useBoardAllRollups(boardId, { includeIncompleteDescendants });
+
+  const data = React.useMemo(() => {
+    if (!allRollups.data) return undefined;
+    if (!itemType) return allRollups.data;
+    return allRollups.data.filter((r) => r.item_type === itemType);
+  }, [allRollups.data, itemType]);
+
+  return {
+    ...allRollups,
+    data,
+  };
+}
+
+export function useWorkItemProgressRollup(
+  itemId?: string,
+  options?: { includeIncompleteDescendants?: boolean; enabled?: boolean }
+) {
+  const includeIncompleteDescendants = options?.includeIncompleteDescendants ?? false;
+  const enabled = options?.enabled ?? true;
+
+  return useQuery({
+    queryKey: boardKeys.rollup(itemId, includeIncompleteDescendants),
+    queryFn: async (): Promise<WorkItemProgressRollup | null> => {
+      if (!itemId) return null;
+      const qs = new URLSearchParams();
+      if (includeIncompleteDescendants) qs.set('include_incomplete_descendants', 'true');
+      const suffix = qs.toString();
+      const response = await apiClient.get<{ rollup: WorkItemProgressRollup }>(
+        `/v1/work-items/${itemId}/progress-rollup${suffix ? `?${suffix}` : ''}`
+      );
+      return response.rollup ?? null;
+    },
+    enabled: Boolean(itemId) && enabled,
+    staleTime: 2_000,
   });
 }
 
@@ -358,7 +673,7 @@ export function useCreateWorkItem() {
         parent_id: null,
         title: payload.title,
         description: payload.description ?? null,
-        status: payload.item_type === 'epic' ? 'draft' : payload.item_type === 'task' ? 'todo' : 'backlog',
+        status: 'backlog',
         priority: payload.priority ?? 'medium',
         position: 0,
         labels: [],
@@ -393,6 +708,7 @@ export function useMoveWorkItem(boardId?: string) {
   const queryClient = useQueryClient();
 
   return useMutation({
+    mutationKey: ['board-item-mutate', boardId],
     mutationFn: async (input: { itemId: string; move: MoveWorkItemRequest }): Promise<WorkItem> => {
       if (!boardId) throw new Error('boardId is required');
       const response = await apiClient.post<{ item: WorkItem }>(`/v1/work-items/${input.itemId}:move`, input.move);
@@ -406,14 +722,42 @@ export function useMoveWorkItem(boardId?: string) {
       const previous = queryClient.getQueryData<WorkItem[]>(boardKeys.items(boardId)) ?? [];
       const previousItem = queryClient.getQueryData<WorkItem | null>(boardKeys.item(input.itemId)) ?? null;
 
-      // Optimistically update the items list
+      // Optimistically update the items list — simulate the backend's
+      // remove-then-insert so positions are correct immediately.
       queryClient.setQueryData<WorkItem[]>(boardKeys.items(boardId), (current) => {
         const list = current ?? [];
-        return list.map((item) =>
-          item.item_id === input.itemId
-            ? { ...item, column_id: input.move.column_id, position: input.move.position }
-            : item
-        );
+        const targetCol = input.move.column_id;
+        const targetPos = input.move.position;
+        const movedId = input.itemId;
+
+        // Find the moved item's current state
+        const movedItem = list.find((i) => i.item_id === movedId);
+        const sourceCol = movedItem?.column_id;
+        const sourcePos = movedItem?.position ?? 0;
+        const sameColumn = sourceCol === targetCol;
+
+        return list.map((item) => {
+          if (item.item_id === movedId) {
+            return { ...item, column_id: targetCol, position: targetPos };
+          }
+
+          let pos = item.position ?? 0;
+
+          // Step 1: If same-column move, close the gap at the old position
+          if (sameColumn && item.column_id === sourceCol && pos > sourcePos) {
+            pos = pos - 1;
+          }
+
+          // Step 2: Open a gap at the target position
+          if (item.column_id === targetCol && pos >= targetPos) {
+            pos = pos + 1;
+          }
+
+          if (pos !== (item.position ?? 0)) {
+            return { ...item, position: pos };
+          }
+          return item;
+        });
       });
 
       // Optimistically update the individual item query (for the drawer)
@@ -441,13 +785,66 @@ export function useMoveWorkItem(boardId?: string) {
     },
     onSuccess: async (updated) => {
       if (!boardId) return;
-      // Update the items list with server response
+      // Only update the individual item query (for the drawer/detail view).
+      // Skip the full items-list setQueryData — the optimistic positions from
+      // onMutate are already correct and replacing the list creates a new array
+      // reference that causes every column to re-render (visible stutter).
+      // The background poll reconciles the list data shortly after.
+      queryClient.setQueryData<WorkItem>(boardKeys.item(updated.item_id), updated);
+    },
+  });
+}
+
+export interface ReorderWorkItemsInput {
+  columnId: string;
+  orderedItemIds: string[];
+}
+
+export function useReorderWorkItems(boardId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ['board-item-mutate', boardId],
+    mutationFn: async (input: ReorderWorkItemsInput): Promise<void> => {
+      if (!boardId) throw new Error('boardId is required');
+      await apiClient.post('/v1/work-items:reorder', {
+        column_id: input.columnId,
+        ordered_item_ids: input.orderedItemIds,
+      });
+    },
+    onMutate: async (input) => {
+      if (!boardId) return {};
+      await queryClient.cancelQueries({ queryKey: boardKeys.items(boardId) });
+
+      const previous = queryClient.getQueryData<WorkItem[]>(boardKeys.items(boardId)) ?? [];
+
+      // Optimistically assign 0-based positions matching the ordered list
+      const positionMap = new Map<string, number>();
+      input.orderedItemIds.forEach((id, idx) => positionMap.set(id, idx));
+
       queryClient.setQueryData<WorkItem[]>(boardKeys.items(boardId), (current) => {
         const list = current ?? [];
-        return list.map((item) => (item.item_id === updated.item_id ? updated : item));
+        return list.map((item) => {
+          const newPos = positionMap.get(item.item_id);
+          if (newPos !== undefined && item.position !== newPos) {
+            return { ...item, position: newPos };
+          }
+          return item;
+        });
       });
-      // Update the individual item query (for the drawer)
-      queryClient.setQueryData<WorkItem>(boardKeys.item(updated.item_id), updated);
+
+      return { previous };
+    },
+    onError: async (_error, _input, context) => {
+      if (!boardId) return;
+      const ctx = context as { previous?: WorkItem[] } | undefined;
+      queryClient.setQueryData(boardKeys.items(boardId), ctx?.previous ?? []);
+    },
+    onSuccess: async () => {
+      if (!boardId) return;
+      // Keep the optimistic order as source-of-truth for immediate UX smoothness.
+      // Background polling (useWorkItems) reconciles with server shortly after
+      // without triggering an immediate whole-column visual refresh.
     },
   });
 }
@@ -511,6 +908,84 @@ export function useUpdateWorkItem(boardId?: string) {
       await razeLog('INFO', 'Work item updated', {
         board_id: boardId ?? null,
         item_id: updated.item_id,
+      });
+    },
+  });
+}
+
+export function useDeleteWorkItem(boardId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: { itemId: string; cascade?: boolean }): Promise<DeleteResult> => {
+      const cascade = input.cascade !== false;
+      await razeLog('INFO', 'Work item delete requested', {
+        board_id: boardId ?? null,
+        item_id: input.itemId,
+        cascade,
+      });
+      const response = await apiClient.delete<DeleteResponse>(
+        `/v1/work-items/${input.itemId}?cascade=${cascade ? 'true' : 'false'}`
+      );
+      return response.result;
+    },
+    onMutate: async (input) => {
+      await queryClient.cancelQueries({ queryKey: boardKeys.item(input.itemId) });
+      if (boardId) {
+        await queryClient.cancelQueries({ queryKey: boardKeys.items(boardId) });
+      }
+
+      const previousItem = queryClient.getQueryData<WorkItem | null>(boardKeys.item(input.itemId)) ?? null;
+      const previousItems = boardId ? (queryClient.getQueryData<WorkItem[]>(boardKeys.items(boardId)) ?? []) : null;
+
+      const idsToRemove = new Set<string>([input.itemId]);
+      if (input.cascade !== false && previousItems) {
+        let added = true;
+        while (added) {
+          added = false;
+          previousItems.forEach((item) => {
+            if (item.parent_id && idsToRemove.has(item.parent_id) && !idsToRemove.has(item.item_id)) {
+              idsToRemove.add(item.item_id);
+              added = true;
+            }
+          });
+        }
+      }
+
+      queryClient.setQueryData<WorkItem | null>(boardKeys.item(input.itemId), null);
+      if (boardId && previousItems) {
+        queryClient.setQueryData<WorkItem[]>(boardKeys.items(boardId), (current) => {
+          const list = current ?? [];
+          return list.filter((item) => !idsToRemove.has(item.item_id));
+        });
+      }
+
+      return { previousItem, previousItems };
+    },
+    onError: async (error, input, context) => {
+      queryClient.setQueryData(
+        boardKeys.item(input.itemId),
+        (context as { previousItem?: WorkItem | null } | undefined)?.previousItem ?? null
+      );
+      if (boardId) {
+        queryClient.setQueryData(
+          boardKeys.items(boardId),
+          (context as { previousItems?: WorkItem[] } | undefined)?.previousItems ?? []
+        );
+      }
+      await razeLog('ERROR', 'Work item delete failed', {
+        board_id: boardId ?? null,
+        item_id: input.itemId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+    onSuccess: async (result) => {
+      queryClient.removeQueries({ queryKey: boardKeys.item(result.deleted_id), exact: true });
+      await razeLog('INFO', 'Work item deleted', {
+        board_id: boardId ?? null,
+        item_id: result.deleted_id,
+        deleted_type: result.deleted_type,
+        cascade_deleted_count: result.cascade_deleted?.length ?? 0,
       });
     },
   });
@@ -710,7 +1185,7 @@ export function usePostWorkItemComment(itemId?: string) {
 
       return { previous, optimisticId };
     },
-    onError: async (error, input, context) => {
+    onError: async (error, _input, context) => {
       if (!itemId) return;
       const previous = (context as { previous?: WorkItemComment[] } | undefined)?.previous ?? [];
       queryClient.setQueryData(boardKeys.comments(itemId), previous);
@@ -719,7 +1194,7 @@ export function usePostWorkItemComment(itemId?: string) {
         error: error instanceof Error ? error.message : String(error),
       });
     },
-    onSuccess: async (comment, input, context) => {
+    onSuccess: async (comment, _input, context) => {
       if (!itemId) return;
       const optimisticId = (context as { optimisticId?: string } | undefined)?.optimisticId ?? null;
       queryClient.setQueryData<WorkItemComment[]>(boardKeys.comments(itemId), (current) => {
@@ -731,6 +1206,50 @@ export function usePostWorkItemComment(itemId?: string) {
       await razeLog('INFO', 'Work item comment posted', {
         item_id: itemId,
         comment_id: comment.comment_id,
+      });
+    },
+  });
+}
+
+export interface CompleteWithDescendantsResponse {
+  updated_count: number;
+  updated_ids: string[];
+}
+
+export function useCompleteWithDescendants(boardId?: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (itemId: string): Promise<CompleteWithDescendantsResponse> => {
+      await razeLog('INFO', 'Complete with descendants requested', {
+        board_id: boardId ?? null,
+        item_id: itemId,
+      });
+      const response = await apiClient.post<CompleteWithDescendantsResponse>(
+        `/v1/work-items/${itemId}:complete-with-descendants`,
+        {}
+      );
+      return response;
+    },
+    onSuccess: async (result, itemId) => {
+      // Invalidate all affected items and rollups
+      await queryClient.invalidateQueries({ queryKey: boardKeys.item(itemId) });
+      if (boardId) {
+        await queryClient.invalidateQueries({ queryKey: boardKeys.items(boardId) });
+      }
+      // Invalidate rollups that might be affected
+      await queryClient.invalidateQueries({ queryKey: ['work-item-rollup'] });
+      await razeLog('INFO', 'Complete with descendants succeeded', {
+        board_id: boardId ?? null,
+        item_id: itemId,
+        updated_count: result.updated_count,
+      });
+    },
+    onError: async (error, itemId) => {
+      await razeLog('ERROR', 'Complete with descendants failed', {
+        board_id: boardId ?? null,
+        item_id: itemId,
+        error: error instanceof Error ? error.message : String(error),
       });
     },
   });

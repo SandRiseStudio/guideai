@@ -265,9 +265,13 @@ class ReflectionService:
         )
 
     def _emit_telemetry(self, response: ReflectResponse, metadata: Dict[str, Any]) -> None:
+        from .telemetry_events import TelemetryEventType
+
         try:
             self._telemetry.emit_event(
-                event_type="bci.reflection.generated",
+                event_type=TelemetryEventType.BCI_REFLECTION_GENERATED.value
+                if hasattr(TelemetryEventType, "BCI_REFLECTION_GENERATED")
+                else "bci.reflection.generated",
                 payload={
                     "run_id": response.run_id,
                     "candidate_count": len(response.candidates),

@@ -47,7 +47,7 @@ services:
 
   # PostgreSQL - Behavior Service Database (with pgvector extension)
   postgres-behavior:
-    image: pgvector/pgvector:pg16
+    image: timescale/timescaledb:latest-pg16
     hostname: postgres-behavior
     container_name: guideai-postgres-behavior
     ports:

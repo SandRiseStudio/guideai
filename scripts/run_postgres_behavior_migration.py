@@ -47,6 +47,15 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     dsn = discover_dsn(args.dsn, "GUIDEAI_BEHAVIOR_PG_DSN")
+
+    if not args.migration.exists():
+        print(f"⚠️ Behavior migration file not found: {args.migration}")
+        print(
+            "ℹ️ Skipping standalone behavior SQL bootstrap. "
+            "This is expected when schema is managed via consolidated Alembic migrations."
+        )
+        return 0
+
     migration_sql = load_migration(args.migration)
     statements = split_sql_statements(migration_sql)
 

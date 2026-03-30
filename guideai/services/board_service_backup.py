@@ -255,7 +255,6 @@ class BoardService:
                 if request.create_default_columns:
                     default_columns: List[Tuple[str, WorkItemStatus]] = [
                         ("Backlog", WorkItemStatus.BACKLOG),
-                        ("To Do", WorkItemStatus.TODO),
                         ("In Progress", WorkItemStatus.IN_PROGRESS),
                         ("In Review", WorkItemStatus.IN_REVIEW),
                         ("Done", WorkItemStatus.DONE),
@@ -997,7 +996,7 @@ class BoardService:
                         request.title,
                         request.description,
                         request.task_type.value,
-                        WorkItemStatus.TODO.value,
+                        WorkItemStatus.BACKLOG.value,
                         request.priority.value,
                         request.estimated_hours,
                         None,  # actual_hours
@@ -1423,7 +1422,7 @@ class BoardService:
         *,
         org_id: Optional[str] = None,
     ) -> DeleteResult:
-        """Delete a story. Soft-delete (status→cancelled) by default."""
+        """Delete a story. Soft-delete (status→done) by default."""
         story = self.get_story(story_id, org_id=org_id)
         timestamp = _now()
 
@@ -1435,7 +1434,7 @@ class BoardService:
                 else:
                     cur.execute(
                         "UPDATE stories SET status = %s, updated_at = %s WHERE story_id = %s",
-                        (WorkItemStatus.CANCELLED.value, timestamp, story_id),
+                        (WorkItemStatus.DONE.value, timestamp, story_id),
                     )
 
         self._pool.run_transaction(
@@ -1479,7 +1478,7 @@ class BoardService:
         *,
         org_id: Optional[str] = None,
     ) -> DeleteResult:
-        """Delete a task. Soft-delete (status→cancelled) by default."""
+        """Delete a task. Soft-delete (status→done) by default."""
         task = self.get_task(task_id, org_id=org_id)
         timestamp = _now()
 
@@ -1491,7 +1490,7 @@ class BoardService:
                 else:
                     cur.execute(
                         "UPDATE board_tasks SET status = %s, updated_at = %s WHERE task_id = %s",
-                        (WorkItemStatus.CANCELLED.value, timestamp, task_id),
+                        (WorkItemStatus.DONE.value, timestamp, task_id),
                     )
 
         self._pool.run_transaction(

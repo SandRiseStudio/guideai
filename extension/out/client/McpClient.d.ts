@@ -229,6 +229,38 @@ export interface ActionReplayStatusResult {
     completed_at?: string;
     error?: string;
 }
+export type WorkspaceProfile = 'solo-dev' | 'guideai-platform' | 'team-collab' | 'extension-dev' | 'api-backend' | 'compliance-sensitive';
+export interface BootstrapSignal {
+    signal_name: string;
+    detected: boolean;
+    confidence: number;
+    evidence: string;
+}
+export interface BootstrapDetectResult {
+    profile: WorkspaceProfile;
+    confidence: number;
+    is_ambiguous: boolean;
+    runner_up: WorkspaceProfile | null;
+    signals: BootstrapSignal[];
+}
+export interface BootstrapStatusResult {
+    is_bootstrapped: boolean;
+    profile: WorkspaceProfile | null;
+    pack_id: string | null;
+    pack_version: string | null;
+    agents_md_exists: boolean;
+    guideai_dir_exists: boolean;
+    last_updated: string | null;
+}
+export interface BootstrapInitResult {
+    success: boolean;
+    profile: WorkspaceProfile;
+    detection: BootstrapDetectResult;
+    pack_id: string;
+    pack_version: string;
+    files_written: string[];
+    notes: string[];
+}
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 export interface ConnectionStatus {
     state: ConnectionState;
@@ -367,6 +399,29 @@ export declare class McpClient extends EventEmitter {
         tags?: string[];
     }): Promise<unknown>;
     /**
+     * Full runtime injection: resolve context, retrieve behaviors, compose enriched prompt.
+     * E3 S3.3 (T3.3.2): Inject context blocks into extension chat.
+     */
+    bciInject(params: {
+        task: string;
+        surface?: string;
+        role?: string;
+        workspacePath?: string;
+        topK?: number;
+        strategy?: 'embedding' | 'keyword' | 'hybrid';
+        format?: 'list' | 'prose' | 'structured';
+        citationMode?: 'explicit' | 'implicit' | 'inline';
+        tags?: string[];
+        phase?: string;
+    }): Promise<{
+        composed_prompt: string;
+        behaviors_injected: string[];
+        overlays_included: string[];
+        context: Record<string, unknown>;
+        token_estimate: number;
+        latency_ms: number;
+    }>;
+    /**
      * Plan an amprealize environment from a blueprint
      */
     amprealizePlan(params: {
@@ -473,6 +528,19 @@ export declare class McpClient extends EventEmitter {
      * Get status of a replay job
      */
     actionReplayStatus(replayId: string): Promise<ActionReplayStatusResult>;
+    bootstrapDetect(params?: {
+        workspace_path?: string;
+    }): Promise<BootstrapDetectResult>;
+    bootstrapStatus(params?: {
+        workspace_path?: string;
+    }): Promise<BootstrapStatusResult>;
+    bootstrapInit(params: {
+        workspace_path?: string;
+        profile?: string;
+        skip_primer?: boolean;
+        skip_pack?: boolean;
+        force?: boolean;
+    }): Promise<BootstrapInitResult>;
     dispose(): void;
 }
 //# sourceMappingURL=McpClient.d.ts.map

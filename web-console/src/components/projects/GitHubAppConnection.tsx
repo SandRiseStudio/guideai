@@ -76,13 +76,16 @@ export function GitHubAppConnection({ projectId }: GitHubAppConnectionProps): Re
       </div>
 
       {/* Tab selector */}
-      <div className="github-app-tabs">
+      <div className="github-app-tabs" role="tablist" aria-label="GitHub connection methods">
         <button
           type="button"
           className={`github-app-tab ${effectiveTab === 'app' ? 'active' : ''} ${!appConfigured ? 'disabled' : ''}`}
           onClick={() => appConfigured && setActiveTab('app')}
           disabled={!appConfigured}
+          role="tab"
           aria-selected={effectiveTab === 'app'}
+          aria-controls="github-connection-tabpanel-app"
+          id="github-connection-tab-app"
         >
           <span className="tab-icon">🔐</span>
           <span className="tab-label">GitHub App</span>
@@ -92,7 +95,10 @@ export function GitHubAppConnection({ projectId }: GitHubAppConnectionProps): Re
           type="button"
           className={`github-app-tab ${effectiveTab === 'pat' ? 'active' : ''}`}
           onClick={() => setActiveTab('pat')}
+          role="tab"
           aria-selected={effectiveTab === 'pat'}
+          aria-controls="github-connection-tabpanel-pat"
+          id="github-connection-tab-pat"
         >
           <span className="tab-icon">🔑</span>
           <span className="tab-label">Personal Access Token</span>
@@ -102,20 +108,32 @@ export function GitHubAppConnection({ projectId }: GitHubAppConnectionProps): Re
       {/* Tab content */}
       <div className="github-app-tab-content">
         {effectiveTab === 'app' ? (
-          <GitHubAppTab
+          <div
+            role="tabpanel"
+            id="github-connection-tabpanel-app"
+            aria-labelledby="github-connection-tab-app"
+          >
+            <GitHubAppTab
             projectId={projectId}
             actorId={actor?.id}
             installation={appInstallation}
             isLoading={statusLoading || installationLoading || installationFetching}
             onRefreshInstallation={refetchInstallation}
-          />
+            />
+          </div>
         ) : (
-          <GitHubPATTab
+          <div
+            role="tabpanel"
+            id="github-connection-tabpanel-pat"
+            aria-labelledby="github-connection-tab-pat"
+          >
+            <GitHubPATTab
             projectId={projectId}
             actorId={actor?.id}
             credential={patCredential}
             isLoading={patLoading}
-          />
+            />
+          </div>
         )}
       </div>
     </div>
@@ -341,7 +359,7 @@ function GitHubAppTab({
         </div>
         {shouldShowInstall && (
           <div className="github-app-install-card">
-            <div className="install-card-title">Connect your GitHub</div>
+            <div className="install-card-title">Install the GuideAI GitHub App</div>
             <div className="install-card-subtitle">Install once, link instantly.</div>
             <button
               type="button"
@@ -436,7 +454,7 @@ function GitHubAppTab({
               onClick={() => void handleCheckInstallation()}
               data-haptic="light"
             >
-              I’ve installed it
+              Check again
             </button>
           )}
         </div>

@@ -796,6 +796,10 @@ class PodmanExecutor(ResourceCapableExecutor):
         if config.workdir:
             args.extend(["-w", config.workdir])
 
+        # Extra hosts (/etc/hosts entries)
+        for host_entry in config.extra_hosts:
+            args.extend(["--add-host", host_entry])
+
         # Image
         args.append(config.image)
 
@@ -2843,6 +2847,201 @@ class PodmanExecutor(ResourceCapableExecutor):
             pass  # Non-critical if estimation fails
 
         result.details = details
+        return result
+
+    def smart_cleanup(
+        self,
+        dry_run: bool = False,
+        remove_dead_containers: bool = True,
+        remove_anonymous_volumes: bool = True,
+        remove_unused_images: bool = False,
+        prune_build_cache: bool = False,
+        preserve_volume_patterns: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Intelligent cleanup that removes stale resources while preserving important data.
+
+        Unlike ``mitigate_resources`` which uses blanket prune commands, this method
+        specifically targets:
+        - Dead/exited containers (not running ones)
+        - Anonymous (hash-named) volumes not attached to running containers
+        - Images not referenced by any container
+        - Build cache
+
+        It explicitly preserves named DB volumes and volumes matching user-supplied
+        patterns.
+
+        Args:
+            dry_run: If True, report what would be cleaned without doing it.
+            remove_dead_containers: Remove exited/dead/created containers.
+            remove_anonymous_volumes: Remove hash-named volumes not in use.
+            remove_unused_images: Remove images not used by any container.
+            prune_build_cache: Clear Podman build cache.
+            preserve_volume_patterns: Additional volume name substrings to preserve
+                (e.g. ``["backup", "db-data"]``).  DB-related volumes are always
+                preserved regardless of this list.
+
+        Returns:
+            Dict with keys:
+              - dead_containers: list of removed container dicts (name, status)
+              - anonymous_volumes: list of removed volume names
+              - unused_images: list of removed image dicts (name, size)
+              - build_cache_cleared: bool
+              - preserved_volumes: list of volume names that were kept
+              - errors: list of error strings
+        """
+        import re as _re
+
+        # Default preserve patterns — always protect DB / data volumes
+        _default_preserve = [
+            "-db-data", "db-data", "postgres-", "pgadmin",
+            "telemetry-db", "timescale", "redis-data",
+            "backup",
+        ]
+        all_preserve = list(_default_preserve)
+        if preserve_volume_patterns:
+            all_preserve.extend(preserve_volume_patterns)
+
+        def _is_volume_preserved(name: str) -> bool:
+            for pat in all_preserve:
+                if pat in name:
+                    return True
+            return False
+
+        result: Dict[str, Any] = {
+            "dead_containers": [],
+            "anonymous_volumes": [],
+            "unused_images": [],
+            "build_cache_cleared": False,
+            "preserved_volumes": [],
+            "errors": [],
+        }
+
+        def run_podman(args: List[str]) -> str:
+            proc = self._run_podman(args, check=False)
+            return proc.stdout or ""
+
+        # -- 1. Dead / exited containers -----------------------------------
+        if remove_dead_containers:
+            try:
+                output = run_podman([
+                    "ps", "-a",
+                    "--filter", "status=exited",
+                    "--filter", "status=dead",
+                    "--filter", "status=created",
+                    "--format", "{{.ID}}|{{.Names}}|{{.Status}}",
+                ])
+                dead = []
+                for line in output.strip().split("\n"):
+                    if not line:
+                        continue
+                    parts = line.split("|", 2)
+                    if len(parts) >= 2:
+                        dead.append({"id": parts[0], "name": parts[1],
+                                     "status": parts[2] if len(parts) > 2 else ""})
+
+                for c in dead:
+                    if not dry_run:
+                        try:
+                            self._run_podman(["rm", "-f", c["id"]], check=False)
+                        except Exception as exc:
+                            result["errors"].append(f"Failed to remove container {c['name']}: {exc}")
+                            continue
+                    result["dead_containers"].append(c)
+            except Exception as exc:
+                result["errors"].append(f"Container discovery error: {exc}")
+
+        # -- 2. Anonymous (hash-named) volumes -----------------------------
+        if remove_anonymous_volumes:
+            try:
+                # Get volumes in use by running containers
+                in_use_output = run_podman(["ps", "--format", "{{.Mounts}}"])
+                volumes_in_use: set = set()
+                for line in in_use_output.strip().split("\n"):
+                    if line:
+                        volumes_in_use.update(v.strip() for v in line.split(",") if v.strip())
+
+                all_volumes_output = run_podman(["volume", "ls", "--format", "{{.Name}}"])
+                for vol_name in all_volumes_output.strip().split("\n"):
+                    vol_name = vol_name.strip()
+                    if not vol_name:
+                        continue
+
+                    # Only target anonymous volumes (64-char hex hash names)
+                    is_anonymous = bool(_re.fullmatch(r"[a-f0-9]{64}", vol_name))
+                    if not is_anonymous:
+                        # Also catch shorter hex-only names that aren't meaningful
+                        # but skip anything with a human-readable name
+                        if not _re.fullmatch(r"[a-f0-9]+", vol_name) or len(vol_name) < 32:
+                            # Named volume — check if it should be preserved
+                            if _is_volume_preserved(vol_name):
+                                result["preserved_volumes"].append(vol_name)
+                            continue
+
+                    if vol_name in volumes_in_use:
+                        continue
+
+                    if _is_volume_preserved(vol_name):
+                        result["preserved_volumes"].append(vol_name)
+                        continue
+
+                    if not dry_run:
+                        try:
+                            self._run_podman(["volume", "rm", vol_name], check=False)
+                        except Exception as exc:
+                            result["errors"].append(f"Failed to remove volume {vol_name[:16]}...: {exc}")
+                            continue
+                    result["anonymous_volumes"].append(vol_name)
+            except Exception as exc:
+                result["errors"].append(f"Volume discovery error: {exc}")
+
+        # -- 3. Unused images ----------------------------------------------
+        if remove_unused_images:
+            try:
+                # Images used by ANY container (running or stopped)
+                used_output = run_podman(["ps", "-a", "--format", "{{.Image}}"])
+                used_images = set(used_output.strip().split("\n")) if used_output.strip() else set()
+
+                all_images_output = run_podman([
+                    "images", "--format", "{{.ID}}|{{.Repository}}:{{.Tag}}|{{.Size}}",
+                ])
+                seen_ids: set = set()
+                for line in all_images_output.strip().split("\n"):
+                    if not line:
+                        continue
+                    parts = line.split("|", 2)
+                    if len(parts) < 2:
+                        continue
+                    img_id, img_ref = parts[0], parts[1]
+                    img_size = parts[2] if len(parts) > 2 else "unknown"
+
+                    if img_id in seen_ids:
+                        continue
+                    seen_ids.add(img_id)
+
+                    if img_ref in used_images:
+                        continue
+                    # Check by ID too — podman ps may return ID or ref
+                    if img_id in used_images:
+                        continue
+
+                    if not dry_run:
+                        try:
+                            self._run_podman(["rmi", img_id], check=False)
+                        except Exception:
+                            continue  # image may still be referenced
+                    result["unused_images"].append({"id": img_id, "name": img_ref, "size": img_size})
+            except Exception as exc:
+                result["errors"].append(f"Image discovery error: {exc}")
+
+        # -- 4. Build cache ------------------------------------------------
+        if prune_build_cache:
+            try:
+                if not dry_run:
+                    self._run_podman(["builder", "prune", "-f"], check=False)
+                result["build_cache_cleared"] = True
+            except Exception as exc:
+                result["errors"].append(f"Build cache prune error: {exc}")
+
         return result
 
     def _is_protected_image(self, image_ref: str) -> bool:

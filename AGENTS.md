@@ -352,6 +352,7 @@ Scan this table before starting any task. If keywords match, follow the linked b
 | quality gate, regression check, benchmark validation | `behavior_enforce_quality_gates` | 📖 Student |
 | pack bootstrap, workspace migration, pack rollback | `behavior_bootstrap_pack_migration` | 📖 Student |
 | auto-reflection, learning loop, reflection trigger | `behavior_run_auto_reflection` | 📖 Student |
+| work item naming, GWS, title convention, item standard | `behavior_standardize_work_items` | 📖 Student |
 | **pattern observed 3+ times, need new behavior** | `behaviors.propose` → propose new behavior | 🧠 Metacognitive Strategist |
 | **creating examples, documentation, tutorials** | Relevant domain behavior | 🎓 Teacher |
 | **code review, quality validation** | Relevant domain behavior | 🎓 Teacher |
@@ -832,6 +833,19 @@ Scan this table before starting any task. If keywords match, follow the linked b
   4. **Apply lifecycle policies**: Use `LifecyclePolicyService` to manage behavior promotion, deprecation, and archival.
   5. **Emit telemetry**: Fire events per TELEMETRY_SCHEMA for reflection triggers, queue operations, and policy applications.
   6. **Test with flag toggling**: Use `_build_loop_with_flag()` to test both enabled and disabled auto-reflection paths.
+
+### `behavior_standardize_work_items`
+- **When**: Creating work items via MCP, REST API, or agent planning prompts; reviewing work item titles for consistency.
+- **Role**: 📖 Student (follow established patterns)
+- **Reference**: `guideai/agents/work_item_planner/prompts.py` (single source of truth), `skills/work-item-planner/SKILL.md`
+- **Steps**:
+  1. **Follow GWS v1.0 naming**: Titles start uppercase, use imperative verb phrases, 5-120 characters.
+  2. **Use correct hierarchy**: goal → feature → task/bug. Set `parent_id` accordingly.
+  3. **Avoid anti-patterns**: No Phase/Sprint/Track numbering (use labels), no type-number prefixes, no manual numbering, no status prefixes, no coded-section prefixes (`A1:`, `S1.1—`), no bracket prefixes (`[Bug]`, `[Feature]`).
+  4. **Use labels for phasing**: Instead of "Phase 1: …" titles, add `labels: ["phase:1"]`.
+  5. **Use points**: Not `story_points`. Depth levels: `goal_only`, `goal_and_features`, `full`.
+  6. **Validate before creating**: MCP and REST API enforce GWS automatically; agent prompts include GWS summary.
+  7. **Use WorkItemPlanner**: For bulk planning, use `WorkItemPlanner.plan()` or the `work-item-planner` skill.
 
 ---
 

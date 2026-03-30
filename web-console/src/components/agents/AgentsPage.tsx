@@ -9,7 +9,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { ConsoleSidebar } from '../ConsoleSidebar';
-import { useOrganizations, useProjects, useAgents } from '../../api/dashboard';
+import { useOrganizations, useProjects } from '../../api/dashboard';
 import { useOrgContext } from '../../store/orgContextStore';
 import { useAuth } from '../../contexts/AuthContext';
 import {
@@ -19,11 +19,9 @@ import {
   useUpdateRegistryAgent,
   useCreateRegistryAgentVersion,
   usePublishRegistryAgent,
-  useAssignRegistryAgent,
-  useUnassignRegistryAgent,
-  usePersonalAgents,
-  useAssignRegistryAgentToPersonalProject,
-  useUnassignRegistryAgentFromPersonalProject,
+  useProjectAgents,
+  useAssignAgent,
+  useUnassignAgent,
   type AgentRegistryEntry,
   type AgentRegistryVersion,
   type AgentRegistryListItem,
@@ -33,6 +31,7 @@ import {
   type AgentStatus,
   type RoleAlignment,
 } from '../../api/agentRegistry';
+import { SCOPE_LABEL } from '../../copy/scopeLabels';
 import './AgentsPage.css';
 
 type PanelMode = 'detail' | 'create';
@@ -157,6 +156,45 @@ function formatRelativeTime(dateString?: string): string {
   return updated.toLocaleDateString();
 }
 
+function normalizeIdentity(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.toLowerCase();
+}
+
+function getAssignmentRegistryIdentity(agent: { config?: Record<string, unknown> }) {
+  const config = (agent.config ?? {}) as Record<string, unknown>;
+  const rawAgent = agent as { agent_id?: unknown; agent_slug?: unknown };
+
+  const configRegistryId = typeof config.registry_agent_id === 'string' ? config.registry_agent_id : null;
+  const configRegistrySlug = typeof config.registry_agent_slug === 'string' ? config.registry_agent_slug : null;
+
+  const topLevelRegistryId = typeof rawAgent.agent_id === 'string' ? rawAgent.agent_id : null;
+  const topLevelRegistrySlug = typeof rawAgent.agent_slug === 'string' ? rawAgent.agent_slug : null;
+
+  return {
+    registryId: normalizeIdentity(configRegistryId ?? topLevelRegistryId),
+    registrySlug: normalizeIdentity(configRegistrySlug ?? topLevelRegistrySlug),
+  };
+}
+
+function getIdentityCandidates(values: Array<string | null | undefined>): Set<string> {
+  const result = new Set<string>();
+  values.forEach((value) => {
+    const normalized = normalizeIdentity(value);
+    if (normalized) result.add(normalized);
+  });
+  return result;
+}
+
+function hasIntersection(left: Set<string>, right: Set<string>): boolean {
+  for (const value of left) {
+    if (right.has(value)) return true;
+  }
+  return false;
+}
+
 function pickActiveVersion(agentDetail: { versions: AgentRegistryVersion[] } | null, agent: AgentRegistryEntry | null) {
   if (!agentDetail || agentDetail.versions.length === 0) return null;
   if (agent?.latest_version) {
@@ -221,8 +259,6 @@ export function AgentsPage(): React.JSX.Element {
     orgScopeId: currentOrgId ?? null,
   });
   const [createSlugEdited, setCreateSlugEdited] = useState(false);
-  const [assignmentOrgId, setAssignmentOrgId] = useState<string | null>(currentOrgId ?? null);
-  const [assignmentScopeTouched, setAssignmentScopeTouched] = useState(false);
   const [projectQuery, setProjectQuery] = useState('');
   const [projectFilter, setProjectFilter] = useState<ProjectFilter>('all');
   const [bulkActionPending, setBulkActionPending] = useState(false);
@@ -231,10 +267,8 @@ export function AgentsPage(): React.JSX.Element {
   const updateMutation = useUpdateRegistryAgent();
   const versionMutation = useCreateRegistryAgentVersion();
   const publishMutation = usePublishRegistryAgent();
-  const assignMutation = useAssignRegistryAgent();
-  const unassignMutation = useUnassignRegistryAgent();
-  const assignPersonalMutation = useAssignRegistryAgentToPersonalProject();
-  const unassignPersonalMutation = useUnassignRegistryAgentFromPersonalProject();
+  const assignMutation = useAssignAgent();
+  const unassignMutation = useUnassignAgent();
 
   const filters = useMemo(
     () => ({
@@ -262,29 +296,35 @@ export function AgentsPage(): React.JSX.Element {
     [agentDetail, selectedAgent]
   );
 
-  const { data: assignmentProjects = [] } = useProjects(assignmentOrgId ?? undefined);
-  const { data: assignmentAgentsRaw = [] } = useAgents(assignmentOrgId ?? undefined, Boolean(assignmentOrgId));
-  const { data: personalAssignmentAgents = [] } = usePersonalAgents(!assignmentOrgId);
-  const assignmentAgents = useMemo(
-    () => (assignmentOrgId ? assignmentAgentsRaw : personalAssignmentAgents),
-    [assignmentAgentsRaw, assignmentOrgId, personalAssignmentAgents]
-  );
+  // Fetch ALL user projects for the assignment panel.
+  const { data: assignmentProjects = [] } = useProjects();
+  // Single source of truth: junction table assignments via /v1/projects/agents.
+  const { data: assignmentAgents = [] } = useProjectAgents();
 
   const assignmentIndex = useMemo(() => {
-    const map = new Map<string, { org: number; projects: number }>();
+    const map = new Map<string, { projects: number }>();
     assignmentAgents.forEach((agent) => {
-      const config = (agent.config ?? {}) as Record<string, unknown>;
-      const registryId = typeof config.registry_agent_id === 'string' ? config.registry_agent_id : null;
-      const registrySlug = typeof config.registry_agent_slug === 'string' ? config.registry_agent_slug : null;
-      const key = registryId ?? registrySlug;
-      if (!key) return;
-      const entry = map.get(key) ?? { org: 0, projects: 0 };
-      if (agent.project_id) {
-        entry.projects += 1;
-      } else {
-        entry.org += 1;
-      }
-      map.set(key, entry);
+      const rawAgent = agent as { agent_id?: unknown; agent_slug?: unknown; name?: unknown };
+      const { registryId, registrySlug } = getAssignmentRegistryIdentity(agent);
+      const keys = getIdentityCandidates([
+        registryId,
+        registrySlug,
+        typeof rawAgent.agent_id === 'string' ? rawAgent.agent_id : null,
+        typeof rawAgent.agent_slug === 'string' ? rawAgent.agent_slug : null,
+        typeof rawAgent.name === 'string' ? rawAgent.name : null,
+        typeof (rawAgent as any).agent_name === 'string' ? (rawAgent as any).agent_name : null,
+        typeof (rawAgent as any).id === 'string' ? (rawAgent as any).id : null,
+      ]);
+      if (keys.size === 0) return;
+      const projectKey = agent.project_id ?? (agent as { projectId?: string }).projectId;
+
+      keys.forEach((key) => {
+        const entry = map.get(key) ?? { projects: 0 };
+        if (projectKey) {
+          entry.projects += 1;
+        }
+        map.set(key, entry);
+      });
     });
     return map;
   }, [assignmentAgents]);
@@ -301,46 +341,40 @@ export function AgentsPage(): React.JSX.Element {
 
   const assignmentMatches = useMemo(() => {
     if (!selectedAgent) return [];
+    const selectedAgentCandidates = getIdentityCandidates([
+      selectedAgent.agent_id,
+      selectedAgent.slug,
+      selectedAgent.name,
+      (selectedAgent as any).id,
+    ]);
+    if (selectedAgentCandidates.size === 0) return [];
+
     return assignmentAgents.filter((agent) => {
-      const config = (agent.config ?? {}) as Record<string, unknown>;
-      const registryId = typeof config.registry_agent_id === 'string' ? config.registry_agent_id : null;
-      const registrySlug = typeof config.registry_agent_slug === 'string' ? config.registry_agent_slug : null;
-      return registryId === selectedAgent.agent_id || registrySlug === selectedAgent.slug;
+      const rawAgent = agent as { agent_id?: unknown; agent_slug?: unknown; name?: unknown };
+      const { registryId, registrySlug } = getAssignmentRegistryIdentity(agent);
+      const assignmentCandidates = getIdentityCandidates([
+        registryId,
+        registrySlug,
+        typeof rawAgent.agent_id === 'string' ? rawAgent.agent_id : null,
+        typeof rawAgent.agent_slug === 'string' ? rawAgent.agent_slug : null,
+        typeof rawAgent.name === 'string' ? rawAgent.name : null,
+        typeof (rawAgent as any).agent_name === 'string' ? (rawAgent as any).agent_name : null,
+        typeof (rawAgent as any).id === 'string' ? (rawAgent as any).id : null,
+      ]);
+      return hasIntersection(assignmentCandidates, selectedAgentCandidates);
     });
   }, [assignmentAgents, selectedAgent]);
-
-  const orgAssignment = useMemo(
-    () => (assignmentOrgId ? assignmentMatches.find((agent) => !agent.project_id) ?? null : null),
-    [assignmentMatches, assignmentOrgId]
-  );
 
   const projectAssignments = useMemo(() => {
     const mapping = new Map<string, string>();
     assignmentMatches.forEach((agent) => {
-      if (agent.project_id) {
-        mapping.set(agent.project_id, agent.id);
+      const projectKey = agent.project_id ?? (agent as { projectId?: string }).projectId;
+      if (projectKey) {
+        mapping.set(projectKey, agent.id);
       }
     });
     return mapping;
   }, [assignmentMatches]);
-
-  const projectFilterOptions = useMemo(() => {
-    if (orgAssignment) {
-      return [
-        { label: 'All', value: 'all' },
-        { label: 'Pinned', value: 'assigned' },
-        { label: 'Inherited', value: 'unassigned' },
-      ];
-    }
-    return PROJECT_FILTERS;
-  }, [orgAssignment]);
-
-  const hasOrganizations = organizations.length > 0;
-
-  const selectedOrganization = useMemo(
-    () => organizations.find((org) => org.id === assignmentOrgId) ?? null,
-    [assignmentOrgId, organizations]
-  );
 
   const visibilityLabel = selectedAgent
     ? VISIBILITY_LABELS[selectedAgent.visibility ?? 'PRIVATE']
@@ -356,42 +390,35 @@ export function AgentsPage(): React.JSX.Element {
       if (assignmentLocked) {
         return 'This private agent was assigned by its owner. Only the owner can change assignments.';
       }
-      return 'Private agents stay visible only to you until you assign them to an org or project. Once assigned, members can use them within that scope.';
+      return 'Private agents stay visible only to you until you assign them to a project.';
     }
     if (selectedAgent.visibility === 'ORGANIZATION') {
-      return 'Organization agents appear in the registry for org members and can still be scoped to specific projects.';
+      return 'Organization agents appear in the registry for org members and can be assigned to specific projects.';
     }
-    return 'Public agents are discoverable by everyone. Assignments let you pin usage to specific orgs or projects.';
+    return 'Public agents are discoverable by everyone. Assign them to projects for focused use.';
   }, [assignmentLocked, selectedAgent]);
 
   const filteredProjects = useMemo(() => {
     const normalizedQuery = projectQuery.trim().toLowerCase();
     return assignmentProjects
       .filter((project) => {
-        const pinned = projectAssignments.has(project.id);
-        const inherited = Boolean(orgAssignment) && !pinned;
-        if (projectFilter === 'assigned') {
-          if (orgAssignment) return pinned;
-          return pinned;
-        }
-        if (projectFilter === 'unassigned') {
-          if (orgAssignment) return inherited;
-          return !pinned;
-        }
+        const assigned = projectAssignments.has(project.id);
+        if (projectFilter === 'assigned') return assigned;
+        if (projectFilter === 'unassigned') return !assigned;
         if (!normalizedQuery) return true;
         const nameMatch = project.name.toLowerCase().includes(normalizedQuery);
         const slugMatch = (project.slug ?? '').toLowerCase().includes(normalizedQuery);
         return nameMatch || slugMatch;
       })
       .sort((left, right) => {
-        const leftPinned = projectAssignments.has(left.id);
-        const rightPinned = projectAssignments.has(right.id);
-        if (leftPinned !== rightPinned) {
-          return leftPinned ? -1 : 1;
+        const leftAssigned = projectAssignments.has(left.id);
+        const rightAssigned = projectAssignments.has(right.id);
+        if (leftAssigned !== rightAssigned) {
+          return leftAssigned ? -1 : 1;
         }
         return left.name.localeCompare(right.name);
       });
-  }, [assignmentProjects, orgAssignment, projectAssignments, projectFilter, projectQuery]);
+  }, [assignmentProjects, projectAssignments, projectFilter, projectQuery]);
 
   useEffect(() => {
     const isCreateRoute = location.pathname.endsWith('/new');
@@ -427,27 +454,16 @@ export function AgentsPage(): React.JSX.Element {
   }, [activeVersion, selectedAgent]);
 
   useEffect(() => {
-    if (assignmentScopeTouched) return;
-    if (currentOrgId && assignmentOrgId !== currentOrgId) {
-      setAssignmentOrgId(currentOrgId);
-      return;
-    }
-    if (!assignmentOrgId && organizations.length > 0) {
-      setAssignmentOrgId(organizations[0].id);
-    }
-  }, [assignmentOrgId, assignmentScopeTouched, currentOrgId, organizations]);
-
-  useEffect(() => {
     if (!createState.orgScopeId && currentOrgId) {
       setCreateState((prev) => ({ ...prev, orgScopeId: currentOrgId }));
     }
   }, [currentOrgId, createState.orgScopeId]);
 
   const handleSelectAgent = useCallback(
-    (agentId: string) => {
-      setSelectedAgentId(agentId);
+    (id: string) => {
+      setSelectedAgentId(id);
       setPanelMode('detail');
-      navigate(`/agents/${agentId}`, { replace: true });
+      navigate(`/agents/${id}`, { replace: true });
     },
     [navigate]
   );
@@ -501,10 +517,7 @@ export function AgentsPage(): React.JSX.Element {
     []
   );
 
-  const handleAssignmentOrgChange = useCallback((nextOrgId: string | null) => {
-    setAssignmentOrgId(nextOrgId);
-    setAssignmentScopeTouched(true);
-  }, []);
+
 
   const handleUpdateAgent = useCallback(async () => {
     if (!selectedAgent || !activeVersion) return;
@@ -656,31 +669,7 @@ export function AgentsPage(): React.JSX.Element {
     }
   }, [createMutation, createState, navigate, publishMutation]);
 
-  const handleAssignOrg = useCallback(async () => {
-    if (!selectedAgent || !assignmentOrgId) return;
-    try {
-      await assignMutation.mutateAsync({
-        orgId: assignmentOrgId,
-        agent: selectedAgent,
-        roleAlignment: activeVersion?.role_alignment,
-        capabilities: activeVersion?.capabilities ?? [],
-      });
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Failed to assign agent');
-    }
-  }, [activeVersion, assignMutation, assignmentOrgId, selectedAgent]);
 
-  const handleUnassignOrg = useCallback(async () => {
-    if (!assignmentOrgId || !orgAssignment) return;
-    try {
-      await unassignMutation.mutateAsync({
-        orgId: assignmentOrgId,
-        orgAgentId: orgAssignment.id,
-      });
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Failed to unassign agent');
-    }
-  }, [assignmentOrgId, orgAssignment, unassignMutation]);
 
   const handleAssignAllProjects = useCallback(async () => {
     if (!selectedAgent) return;
@@ -689,22 +678,12 @@ export function AgentsPage(): React.JSX.Element {
     try {
       for (const project of assignmentProjects) {
         if (!projectAssignments.has(project.id)) {
-          if (assignmentOrgId) {
-            await assignMutation.mutateAsync({
-              orgId: assignmentOrgId,
-              agent: selectedAgent,
-              projectId: project.id,
-              roleAlignment: activeVersion?.role_alignment,
-              capabilities: activeVersion?.capabilities ?? [],
-            });
-          } else {
-            await assignPersonalMutation.mutateAsync({
-              agent: selectedAgent,
-              projectId: project.id,
-              roleAlignment: activeVersion?.role_alignment,
-              capabilities: activeVersion?.capabilities ?? [],
-            });
-          }
+          await assignMutation.mutateAsync({
+            agent: selectedAgent,
+            projectId: project.id,
+            roleAlignment: activeVersion?.role_alignment,
+            capabilities: activeVersion?.capabilities ?? [],
+          });
         }
       }
     } catch (error) {
@@ -715,8 +694,6 @@ export function AgentsPage(): React.JSX.Element {
   }, [
     activeVersion,
     assignMutation,
-    assignPersonalMutation,
-    assignmentOrgId,
     assignmentProjects,
     projectAssignments,
     selectedAgent,
@@ -727,24 +704,15 @@ export function AgentsPage(): React.JSX.Element {
     setActionError(null);
     setBulkActionPending(true);
     try {
-      for (const orgAgentId of projectAssignments.values()) {
-        if (assignmentOrgId) {
-          await unassignMutation.mutateAsync({
-            orgId: assignmentOrgId,
-            orgAgentId,
-          });
-        } else {
-          await unassignPersonalMutation.mutateAsync({
-            orgAgentId,
-          });
-        }
+      for (const assignmentId of projectAssignments.values()) {
+        await unassignMutation.mutateAsync({ assignmentId });
       }
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Failed to clear project assignments');
     } finally {
       setBulkActionPending(false);
     }
-  }, [assignmentOrgId, projectAssignments, unassignMutation, unassignPersonalMutation]);
+  }, [projectAssignments, unassignMutation]);
 
   const handleToggleProjectAssignment = useCallback(
     async (projectId: string) => {
@@ -752,26 +720,9 @@ export function AgentsPage(): React.JSX.Element {
       const assignedId = projectAssignments.get(projectId);
       try {
         if (assignedId) {
-          if (assignmentOrgId) {
-            await unassignMutation.mutateAsync({
-              orgId: assignmentOrgId,
-              orgAgentId: assignedId,
-            });
-          } else {
-            await unassignPersonalMutation.mutateAsync({
-              orgAgentId: assignedId,
-            });
-          }
-        } else if (assignmentOrgId) {
-          await assignMutation.mutateAsync({
-            orgId: assignmentOrgId,
-            agent: selectedAgent,
-            projectId,
-            roleAlignment: activeVersion?.role_alignment,
-            capabilities: activeVersion?.capabilities ?? [],
-          });
+          await unassignMutation.mutateAsync({ assignmentId: assignedId });
         } else {
-          await assignPersonalMutation.mutateAsync({
+          await assignMutation.mutateAsync({
             agent: selectedAgent,
             projectId,
             roleAlignment: activeVersion?.role_alignment,
@@ -785,12 +736,9 @@ export function AgentsPage(): React.JSX.Element {
     [
       activeVersion,
       assignMutation,
-      assignPersonalMutation,
-      assignmentOrgId,
       projectAssignments,
       selectedAgent,
       unassignMutation,
-      unassignPersonalMutation,
     ]
   );
 
@@ -802,22 +750,12 @@ export function AgentsPage(): React.JSX.Element {
   const projectAssignmentCount = projectAssignments.size;
   const projectTotalCount = assignmentProjects.length;
   const assignmentSummary = projectTotalCount > 0
-    ? orgAssignment
-      ? 'All projects'
-      : `${projectAssignmentCount}/${projectTotalCount}`
+    ? `${projectAssignmentCount}/${projectTotalCount}`
     : 'No projects';
-  const pinSummary = orgAssignment ? `${projectAssignmentCount}` : null;
-  const assignmentScopeLabel = assignmentOrgId
-    ? selectedOrganization?.name ?? 'Organization'
-    : 'Personal workspace';
   const projectResultsLabel = projectTotalCount > 0
     ? `${filteredProjects.length} of ${projectTotalCount} projects`
-    : assignmentOrgId
-      ? 'No projects yet'
-      : 'No personal projects yet';
-  const mutationPending = assignmentOrgId
-    ? assignMutation.isPending || unassignMutation.isPending
-    : assignPersonalMutation.isPending || unassignPersonalMutation.isPending;
+    : 'No projects yet';
+  const mutationPending = assignMutation.isPending || unassignMutation.isPending;
   const bulkActionsDisabled = bulkActionPending || mutationPending || assignmentLocked;
 
   return (
@@ -830,7 +768,7 @@ export function AgentsPage(): React.JSX.Element {
           <div className="agents-header-left">
             <h1 className="agents-title animate-fade-in-up">Agent Registry</h1>
             <p className="agents-subtitle animate-fade-in-up">
-              Discover platform agents, publish your own, and assign them across organizations and projects.
+              Discover platform agents, publish your own, and assign them to your projects.
             </p>
           </div>
           <div className="agents-header-actions">
@@ -964,7 +902,7 @@ export function AgentsPage(): React.JSX.Element {
                 <div className="agents-empty animate-fade-in-up">
                   <h3 className="agents-empty-title">Registry offline</h3>
                   <p className="agents-empty-description">
-                    We couldn't load the agent registry. Retry to reconnect.
+                    We couldn't load the agent registry. Try again to reconnect.
                   </p>
                   <button
                     type="button"
@@ -979,7 +917,7 @@ export function AgentsPage(): React.JSX.Element {
                 <div className="agents-empty animate-fade-in-up">
                   <h3 className="agents-empty-title">No agents yet</h3>
                   <p className="agents-empty-description">
-                    Publish your first agent or bootstrap the platform defaults.
+                    Create your first agent to start assigning it across scopes and projects.
                   </p>
                   <button
                     type="button"
@@ -992,9 +930,8 @@ export function AgentsPage(): React.JSX.Element {
                 </div>
               ) : (
                 registryItems.map((item) => {
-                  const assignmentMeta = assignmentIndex.get(item.agent.agent_id)
-                    ?? assignmentIndex.get(item.agent.slug);
-                  const assignedToOrg = (assignmentMeta?.org ?? 0) > 0;
+                  const assignmentMeta = assignmentIndex.get(normalizeIdentity(item.agent.agent_id) ?? '')
+                    ?? assignmentIndex.get(normalizeIdentity(item.agent.slug) ?? '');
                   const assignedProjects = assignmentMeta?.projects ?? 0;
 
                   return (
@@ -1016,7 +953,7 @@ export function AgentsPage(): React.JSX.Element {
                       </div>
                       <p className="agents-list-description">{item.agent.description || 'No description yet.'}</p>
                       <div className="agents-list-tags">
-                        {(item.agent.tags ?? []).slice(0, 3).map((tag) => (
+                        {(item.agent.tags ?? []).slice(0, 2).map((tag) => (
                           <span key={tag} className="agents-pill">
                             {tag}
                           </span>
@@ -1025,9 +962,6 @@ export function AgentsPage(): React.JSX.Element {
                           <span className="agents-pill builtin">Built-in</span>
                         )}
                         <span className="agents-pill subtle">{VISIBILITY_LABELS[item.agent.visibility ?? 'PRIVATE']}</span>
-                        {assignedToOrg && (
-                          <span className="agents-pill assigned">Org access</span>
-                        )}
                         {assignedProjects > 0 && (
                           <span className="agents-pill assigned">{assignedProjects} projects</span>
                         )}
@@ -1085,7 +1019,7 @@ export function AgentsPage(): React.JSX.Element {
                   </label>
 
                   <label className="agents-field">
-                    <span className="agents-field-label">Workspace scope</span>
+                    <span className="agents-field-label">{SCOPE_LABEL}</span>
                     <select
                       className="agents-select"
                       value={createState.orgScopeId ?? ''}
@@ -1124,7 +1058,7 @@ export function AgentsPage(): React.JSX.Element {
                       value={createState.description}
                       onChange={(event) => handleCreateStateChange('description', event.target.value)}
                       placeholder="Short, human-readable summary."
-                      rows={3}
+                      rows={2}
                     />
                   </label>
 
@@ -1135,7 +1069,7 @@ export function AgentsPage(): React.JSX.Element {
                       value={createState.mission}
                       onChange={(event) => handleCreateStateChange('mission', event.target.value)}
                       placeholder="Describe the agent's mission, boundaries, and tone."
-                      rows={4}
+                      rows={2}
                     />
                   </label>
 
@@ -1192,7 +1126,7 @@ export function AgentsPage(): React.JSX.Element {
                       value={createState.playbookContent}
                       onChange={(event) => handleCreateStateChange('playbookContent', event.target.value)}
                       placeholder="Paste the full playbook content (markdown supported)."
-                      rows={6}
+                      rows={3}
                     />
                   </label>
                 </div>
@@ -1249,7 +1183,7 @@ export function AgentsPage(): React.JSX.Element {
                 )}
               </div>
             ) : (
-              <div className="agents-detail-card animate-fade-in-up">
+              <div key={selectedAgentId ?? 'empty'} className="agents-detail-card animate-fade-in-up">
                 {!selectedAgent ? (
                   <div className="agents-empty">
                     <h3 className="agents-empty-title">Select an agent</h3>
@@ -1266,7 +1200,7 @@ export function AgentsPage(): React.JSX.Element {
                   </div>
                 ) : (
                   <>
-                    <div className="agents-detail-header">
+                    <div className="agents-detail-header animate-reveal animate-reveal-d1">
                       <div>
                         <h2 className="agents-section-title">{selectedAgent.name}</h2>
                         <p className="agents-section-subtitle">{selectedAgent.slug}</p>
@@ -1296,7 +1230,7 @@ export function AgentsPage(): React.JSX.Element {
                       </div>
                     </div>
 
-                    <div className="agents-detail-meta">
+                    <div className="agents-detail-meta animate-reveal animate-reveal-d2">
                       <span className={`agents-badge status-${(selectedAgent.status ?? 'DRAFT').toLowerCase()}`}>
                         {STATUS_LABELS[selectedAgent.status ?? 'DRAFT']}
                       </span>
@@ -1314,7 +1248,7 @@ export function AgentsPage(): React.JSX.Element {
                       </div>
                     )}
 
-                    <div className="agents-form-grid">
+                    <div className="agents-form-grid animate-reveal animate-reveal-d3">
                       <label className="agents-field">
                         <span className="agents-field-label">Name</span>
                         <input
@@ -1347,7 +1281,7 @@ export function AgentsPage(): React.JSX.Element {
                           value={editState.description}
                           onChange={(event) => handleEditStateChange('description', event.target.value)}
                           disabled={!isEditing || isBuiltin}
-                          rows={3}
+                          rows={2}
                         />
                       </label>
                       <label className="agents-field full">
@@ -1357,7 +1291,7 @@ export function AgentsPage(): React.JSX.Element {
                           value={editState.mission}
                           onChange={(event) => handleEditStateChange('mission', event.target.value)}
                           disabled={!isEditing || isBuiltin}
-                          rows={4}
+                          rows={2}
                         />
                       </label>
                       <label className="agents-field">
@@ -1413,7 +1347,7 @@ export function AgentsPage(): React.JSX.Element {
                           value={editState.playbookContent}
                           onChange={(event) => handleEditStateChange('playbookContent', event.target.value)}
                           disabled={!isEditing || isBuiltin}
-                          rows={6}
+                          rows={3}
                         />
                       </label>
                     </div>
@@ -1435,7 +1369,7 @@ export function AgentsPage(): React.JSX.Element {
                       </div>
                     )}
 
-                    <div className="agents-assignments">
+                    <div className="agents-assignments animate-reveal animate-reveal-d4">
                       <div className="agents-assignments-header">
                         <div>
                           <h3 className="agents-section-title">Assignment studio</h3>
@@ -1445,13 +1379,7 @@ export function AgentsPage(): React.JSX.Element {
                         </div>
                         <div className="agents-assignment-summary">
                           <span className="agents-assignment-chip">Visibility: {visibilityLabel}</span>
-                          <span className="agents-assignment-chip">
-                            Workspace access: {orgAssignment ? 'Assigned' : 'Not assigned'}
-                          </span>
                           <span className="agents-assignment-chip">Projects: {assignmentSummary}</span>
-                          {pinSummary && (
-                            <span className="agents-assignment-chip">Pins: {pinSummary}</span>
-                          )}
                         </div>
                       </div>
 
@@ -1469,86 +1397,9 @@ export function AgentsPage(): React.JSX.Element {
                         <div className="agents-assignment-card">
                           <div className="agents-assignment-card-header">
                             <div>
-                              <h4 className="agents-assignment-title">Workspace access</h4>
+                              <h4 className="agents-assignment-title">Project assignments</h4>
                               <p className="agents-assignment-subtitle">
-                                {assignmentOrgId
-                                  ? 'Assigning to an org makes the agent available to every project. Pin or unpin per project below.'
-                                  : 'Personal workspaces skip org-wide access. Assign directly to projects.'}
-                              </p>
-                            </div>
-                            <span className="agents-pill subtle">Optional</span>
-                          </div>
-
-                          <label className="agents-field">
-                            <span className="agents-field-label">Workspace</span>
-                            <select
-                              className="agents-select"
-                              value={assignmentOrgId ?? ''}
-                              onChange={(event) =>
-                                handleAssignmentOrgChange(event.target.value || null)}
-                            >
-                              <option value="">Personal workspace</option>
-                              {organizations.map((org) => (
-                                <option key={org.id} value={org.id}>
-                                  {org.name}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
-
-                          {!hasOrganizations && (
-                            <div className="agents-assignment-empty">
-                              <p className="agents-empty-description">
-                                You do not have an org yet. Create one to share agents across projects.
-                              </p>
-                            </div>
-                          )}
-
-                          <div className="agents-assignment-row">
-                            <div>
-                              <span className="agents-assignment-label">Workspace access</span>
-                              <span className="agents-assignment-meta">
-                                {orgAssignment ? `Enabled for ${assignmentScopeLabel}` : 'Not assigned'}
-                              </span>
-                            </div>
-                            {orgAssignment ? (
-                              <button
-                                type="button"
-                                className="agents-secondary-button pressable"
-                                onClick={handleUnassignOrg}
-                                disabled={unassignMutation.isPending || !assignmentOrgId || assignmentLocked}
-                                data-haptic="light"
-                              >
-                                Remove from org
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                className="agents-primary-button pressable"
-                                onClick={handleAssignOrg}
-                                disabled={assignMutation.isPending || !assignmentOrgId || assignmentLocked}
-                                data-haptic="light"
-                              >
-                                Assign to org
-                              </button>
-                            )}
-                          </div>
-
-                          <div className="agents-assignment-hint">
-                            {assignmentOrgId
-                              ? 'Workspace access makes this agent available across every project in the org.'
-                              : 'Personal workspaces skip org-wide access. Assign directly to projects below.'}
-                          </div>
-                        </div>
-
-                        <div className="agents-assignment-card">
-                          <div className="agents-assignment-card-header">
-                            <div>
-                              <h4 className="agents-assignment-title">Project routing</h4>
-                              <p className="agents-assignment-subtitle">
-                                {orgAssignment
-                                  ? 'Projects inherit access by default. Pin to emphasize specific workspaces; agents can span many projects.'
-                                  : 'Assign the agent directly to projects for focused use. Agents can span many projects.'}
+                                Assign the agent directly to projects for focused use. Agents can span many projects.
                               </p>
                             </div>
                             <div className="agents-assignment-actions">
@@ -1559,7 +1410,7 @@ export function AgentsPage(): React.JSX.Element {
                                 disabled={bulkActionsDisabled || projectTotalCount === 0}
                                 data-haptic="light"
                               >
-                                {orgAssignment ? 'Pin all' : 'Assign all'}
+                                Assign all
                               </button>
                               <button
                                 type="button"
@@ -1568,7 +1419,7 @@ export function AgentsPage(): React.JSX.Element {
                                 disabled={bulkActionsDisabled || projectAssignments.size === 0}
                                 data-haptic="light"
                               >
-                                {orgAssignment ? 'Clear pins' : 'Clear all'}
+                                Clear all
                               </button>
                             </div>
                           </div>
@@ -1586,7 +1437,7 @@ export function AgentsPage(): React.JSX.Element {
                             <div className="agents-filter-group">
                               <span className="agents-filter-label">Filter</span>
                               <div className="agents-filter-pills">
-                                {projectFilterOptions.map((filter) => (
+                                {PROJECT_FILTERS.map((filter) => (
                                   <button
                                     type="button"
                                     key={filter.value}
@@ -1602,50 +1453,28 @@ export function AgentsPage(): React.JSX.Element {
 
                           <div className="agents-project-stats">
                             <span>{projectResultsLabel}</span>
-                            <span>{assignmentScopeLabel}</span>
                           </div>
 
                           <div className="agents-project-assignments">
                             {projectTotalCount === 0 ? (
                               <div className="agents-empty compact">
                                 <p className="agents-empty-description">
-                                  {assignmentOrgId
-                                    ? 'This organization has no projects yet.'
-                                    : 'You do not have personal projects yet.'}
+                                  You do not have projects yet. Create one to start routing agent access.
                                 </p>
                               </div>
                             ) : filteredProjects.length === 0 ? (
                               <div className="agents-empty compact">
                                 <p className="agents-empty-description">
-                                  No projects match this filter.
+                                  No projects match this search or filter.
                                 </p>
                               </div>
                             ) : (
                               filteredProjects.map((project) => {
                                 const assignedId = projectAssignments.get(project.id);
                                 const pinned = Boolean(assignedId);
-                                const inherited = Boolean(orgAssignment) && !pinned;
-                                const statusLabel = orgAssignment
-                                  ? pinned
-                                    ? 'Pinned'
-                                    : 'Inherited'
-                                  : pinned
-                                    ? 'Assigned'
-                                    : 'Not assigned';
-                                const statusClass = orgAssignment
-                                  ? pinned
-                                    ? 'status-pinned'
-                                    : 'status-inherited'
-                                  : pinned
-                                    ? 'status-assigned'
-                                    : 'status-unassigned';
-                                const actionLabel = orgAssignment
-                                  ? pinned
-                                    ? 'Unpin'
-                                    : 'Pin'
-                                  : pinned
-                                    ? 'Unassign'
-                                    : 'Assign';
+                                const statusLabel = pinned ? 'Assigned' : 'Not assigned';
+                                const statusClass = pinned ? 'status-assigned' : 'status-unassigned';
+                                const actionLabel = pinned ? 'Unassign' : 'Assign';
                                 return (
                                   <div key={project.id} className="agents-project-row">
                                     <div>

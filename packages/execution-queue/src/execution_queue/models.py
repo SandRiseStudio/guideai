@@ -57,7 +57,7 @@ class ExecutionJob:
         agent_id: The agent to execute
         priority: Queue priority (affects latency)
         user_id: User who initiated the execution
-        org_id: Organization context (None for personal projects)
+        org_id: Organization context (None for user-owned projects)
         project_id: Project containing the work item
         model_override: Optional model to use instead of agent default
         timeout_seconds: Max execution time before termination

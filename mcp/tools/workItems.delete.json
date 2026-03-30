@@ -1,13 +1,13 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "workItems.delete",
-  "description": "Delete a work item. If the item has children (e.g., an epic with stories), they will also be deleted (cascade).",
+  "description": "Delete a work item. If the item has children (e.g., a goal with features), they will also be deleted (cascade).",
   "inputSchema": {
     "type": "object",
     "properties": {
       "item_id": {
         "type": "string",
-        "description": "Work item ID to delete (required)"
+        "description": "Work item ID or display ID (e.g. 'myproject-42') to delete (required)"
       },
       "user_id": {
         "type": "string",

@@ -433,11 +433,14 @@ class CollaborationService:
         session_id = str(uuid.uuid4())
 
         self._active_sessions[session_id] = {
+            "session_id": session_id,
             "document_id": document_id,
             "user_id": user_id,
             "started_at": datetime.utcnow(),
             "last_activity": datetime.utcnow(),
             "cursor_position": 0,
+            "selection_end": None,
+            "status": "active",
             "is_active": True
         }
 
@@ -447,8 +450,32 @@ class CollaborationService:
         """End a collaboration session."""
         if session_id in self._active_sessions:
             self._active_sessions[session_id]["is_active"] = False
+            self._active_sessions[session_id]["status"] = "disconnected"
+            self._active_sessions[session_id]["last_activity"] = datetime.utcnow()
             return True
         return False
+
+    def touch_collaboration_session(
+        self,
+        session_id: str,
+        *,
+        cursor_position: Optional[int] = None,
+        selection_end: Optional[int] = None,
+        status: Optional[str] = None,
+    ) -> bool:
+        """Update activity metadata for a live collaboration session."""
+        session = self._active_sessions.get(session_id)
+        if session is None:
+            return False
+
+        session["last_activity"] = datetime.utcnow()
+        if cursor_position is not None:
+            session["cursor_position"] = cursor_position
+        if selection_end is not None:
+            session["selection_end"] = selection_end
+        if status is not None:
+            session["status"] = status
+        return True
 
     def get_active_collaborators(self, document_id: str) -> List[Dict[str, Any]]:
         """Get currently active collaborators on a document."""
@@ -460,6 +487,8 @@ class CollaborationService:
                 active_users.append({
                     "user_id": session["user_id"],
                     "cursor_position": session["cursor_position"],
+                    "selection_end": session.get("selection_end"),
+                    "status": session.get("status", "active"),
                     "session_id": session.get("session_id", ""),
                     "last_activity": session["last_activity"].isoformat()
                 })

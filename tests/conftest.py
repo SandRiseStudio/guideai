@@ -38,6 +38,16 @@ from guideai.storage.redis_cache import get_cache
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# Exclude interactive/manual scripts that have no pytest test functions
+# and execute module-level code on import (blocking pytest collection)
+collect_ignore = [
+    "test_github_device_flow.py",
+    "test_task_integration.py",
+    "test_all_service_parity.py",
+    "test_kafka_consume.py",
+    "test_e2e_device_flow.py",
+]
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Register custom CLI flags used across the test suite."""
@@ -404,6 +414,12 @@ def initialize_test_schemas(request):
     # Skip for smoke/load tests - they have minimal infrastructure requirements
     if _is_minimal_infrastructure_run(request):
         return
+
+    # In Amprealize mode, the test runner already provisions infra and applies
+    # migrations before pytest starts. Avoid duplicate bootstrap here.
+    if os.getenv("GUIDEAI_TEST_INFRA_MODE", "legacy") == "amprealize":
+        return
+
     import subprocess
 
     migrations = [
@@ -446,8 +462,13 @@ def initialize_test_schemas(request):
                 env=env,
             )
         except subprocess.CalledProcessError as e:
-            # Only fail if it's not an "already exists" error
-            if "already exists" not in e.stderr.lower():
+            stderr = (e.stderr or "").lower()
+            # In consolidated schema mode, legacy standalone SQL files may no longer exist.
+            # Treat that condition as non-fatal and continue with the rest of bootstrap.
+            if "migration file not found" in stderr:
+                continue
+            # Only fail if it's not an idempotent "already exists" case.
+            if "already exists" not in stderr:
                 pytest.exit(
                     f"Failed to initialize {service_name} schema:\n{e.stderr}",
                     returncode=1

@@ -8,7 +8,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { apiClient, ApiError } from './client';
+import { apiClient } from './client';
 
 // ---------------------------------------------------------------------------
 // Types (aligned with backend llm_credential_repository.py)

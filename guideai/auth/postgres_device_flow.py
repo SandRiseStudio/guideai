@@ -263,6 +263,10 @@ class PostgresDeviceFlowStore:
         """Get session by access token from PostgreSQL."""
         return self._get_session("access_token", access_token)
 
+    def get_by_refresh_token(self, refresh_token: str) -> Optional[DeviceSession]:
+        """Get session by refresh token from PostgreSQL."""
+        return self._get_session("refresh_token", refresh_token)
+
     def _get_session(self, field: str, value: str) -> Optional[DeviceSession]:
         """Generic session lookup by field."""
         import json
@@ -379,7 +383,9 @@ class PostgresDeviceFlowStore:
                         access_token = %s,
                         refresh_token = %s,
                         access_token_expires_at = %s,
-                        refresh_token_expires_at = %s
+                        refresh_token_expires_at = %s,
+                        oauth_email = COALESCE(oauth_email, %s),
+                        oauth_user_id = COALESCE(oauth_user_id, %s)
                     WHERE device_code = %s AND status = 'PENDING'
                     """,
                     (
@@ -390,6 +396,8 @@ class PostgresDeviceFlowStore:
                         refresh_token,
                         access_expires,
                         refresh_expires,
+                        approver,
+                        approver,
                         device_code,
                     ),
                 )
@@ -412,6 +420,10 @@ class PostgresDeviceFlowStore:
         session.refresh_token = refresh_token
         session.access_token_expires_at = access_expires
         session.refresh_token_expires_at = refresh_expires
+        if not session.oauth_email:
+            session.oauth_email = approver
+        if not session.oauth_user_id:
+            session.oauth_user_id = approver
 
         logger.info(f"Approved device session: user_code={session.user_code}, approver={approver}")
         return session
@@ -503,6 +515,77 @@ class PostgresDeviceFlowStore:
             reason=reason,
         )
 
+    def update_oauth_identity(
+        self,
+        device_code: str,
+        *,
+        oauth_user_id: Optional[str] = None,
+        oauth_username: Optional[str] = None,
+        oauth_email: Optional[str] = None,
+        oauth_display_name: Optional[str] = None,
+        oauth_avatar_url: Optional[str] = None,
+        oauth_provider: Optional[str] = None,
+    ) -> Optional[DeviceSession]:
+        """Update OAuth identity fields on an approved session.
+
+        Used to populate user identity after approval, e.g. for service
+        principals or when the approver's identity is resolved from
+        auth.users.
+        """
+        session = self.get_by_device_code(device_code)
+        if not session:
+            return None
+
+        def _execute(conn) -> None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE auth.device_sessions
+                    SET oauth_user_id = COALESCE(%s, oauth_user_id),
+                        oauth_username = COALESCE(%s, oauth_username),
+                        oauth_email = COALESCE(%s, oauth_email),
+                        oauth_display_name = COALESCE(%s, oauth_display_name),
+                        oauth_avatar_url = COALESCE(%s, oauth_avatar_url),
+                        oauth_provider = COALESCE(%s, oauth_provider)
+                    WHERE device_code = %s
+                    """,
+                    (
+                        oauth_user_id,
+                        oauth_username,
+                        oauth_email,
+                        oauth_display_name,
+                        oauth_avatar_url,
+                        oauth_provider,
+                        device_code,
+                    ),
+                )
+
+        self._pool.run_transaction(
+            operation="device_session.update_oauth_identity",
+            service_prefix="auth",
+            actor=oauth_user_id,
+            metadata={"device_code": device_code},
+            executor=_execute,
+            telemetry=None,
+        )
+
+        # Update session object
+        if oauth_user_id:
+            session.oauth_user_id = oauth_user_id
+        if oauth_username:
+            session.oauth_username = oauth_username
+        if oauth_email:
+            session.oauth_email = oauth_email
+        if oauth_display_name:
+            session.oauth_display_name = oauth_display_name
+        if oauth_avatar_url:
+            session.oauth_avatar_url = oauth_avatar_url
+        if oauth_provider:
+            session.oauth_provider = oauth_provider
+
+        logger.info(f"Updated OAuth identity for device session: device_code={device_code}, oauth_user_id={oauth_user_id}")
+        return session
+
     def cleanup_expired(self) -> int:
         """Remove expired sessions. Returns count of removed sessions."""
         count = 0
@@ -534,6 +617,73 @@ class PostgresDeviceFlowStore:
             logger.info(f"Cleaned up {count} expired device sessions")
 
         return count
+
+    def refresh_access_token(
+        self,
+        refresh_token: str,
+        *,
+        access_token_ttl: int = 3600,
+    ) -> Optional[DeviceSession]:
+        """Refresh an access token using a valid refresh token.
+
+        Generates a new access token while keeping the same refresh token.
+        Returns the updated session with new tokens, or None if refresh token
+        is invalid or expired.
+
+        Args:
+            refresh_token: The refresh token to use
+            access_token_ttl: TTL for the new access token in seconds (default: 1 hour)
+
+        Returns:
+            Updated DeviceSession with new access token, or None if invalid/expired
+        """
+        session = self.get_by_refresh_token(refresh_token)
+        if not session:
+            logger.warning(f"Refresh token not found in database")
+            return None
+
+        if session.status != "APPROVED":
+            logger.warning(f"Cannot refresh token for session in status {session.status}")
+            return None
+
+        now = datetime.now(timezone.utc)
+
+        # Check refresh token expiry
+        if session.refresh_token_expires_at and now > session.refresh_token_expires_at:
+            logger.warning(f"Refresh token expired")
+            return None
+
+        # Generate new access token
+        new_access_token = self._generate_token("ga_")
+        new_access_expires = now + timedelta(seconds=access_token_ttl)
+
+        def _execute(conn) -> None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE auth.device_sessions
+                    SET access_token = %s,
+                        access_token_expires_at = %s
+                    WHERE refresh_token = %s AND status = 'APPROVED'
+                    """,
+                    (new_access_token, new_access_expires, refresh_token),
+                )
+
+        self._pool.run_transaction(
+            operation="device_session.refresh",
+            service_prefix="auth",
+            actor=session.oauth_user_id or session.approver,
+            metadata={"device_code": session.device_code},
+            executor=_execute,
+            telemetry=None,
+        )
+
+        # Update session object
+        session.access_token = new_access_token
+        session.access_token_expires_at = new_access_expires
+
+        logger.info(f"Refreshed access token for session: device_code={session.device_code}")
+        return session
 
     def get_user_info_from_access_token(self, access_token: str) -> Optional[Dict[str, Any]]:
         """Get user info from a valid access token.

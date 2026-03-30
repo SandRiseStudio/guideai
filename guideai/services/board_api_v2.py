@@ -1,6 +1,6 @@
 """FastAPI router for Unified Agile Board management.
 
-Uses a single WorkItem model for epics, stories, and tasks.
+Uses a single WorkItem model for goals, features, and tasks.
 Hierarchy is managed via item_type and parent_id.
 
 Endpoints:
@@ -17,13 +17,15 @@ Endpoints:
     PATCH  /v1/columns/{column_id}              - Update column
     DELETE /v1/columns/{column_id}              - Delete column
 
-    # Work Items (unified epic/story/task)
+    # Work Items (unified goal/feature/task)
     POST   /v1/work-items                       - Create work item
     GET    /v1/work-items                       - List work items (with filters)
     GET    /v1/work-items/{item_id}             - Get work item details
     GET    /v1/work-items/{item_id}/children    - Get child items
     PATCH  /v1/work-items/{item_id}             - Update work item
     DELETE /v1/work-items/{item_id}             - Delete work item (cascade optional)
+    POST   /v1/work-items/{item_id}:complete-with-descendants
+                                                - Complete item and all descendants
 
     # Assignment
     POST   /v1/work-items/{item_id}:assign      - Assign to user/agent
@@ -68,6 +70,7 @@ from guideai.multi_tenant.board_contracts import (
     UpdateColumnRequest,
     # Work item models
     WorkItem,
+    WorkItemProgressRollup,
     WorkItemType,
     WorkItemStatus,
     WorkItemPriority,
@@ -100,6 +103,7 @@ from guideai.services.board_service import (
     ColumnNotFoundError,
     WorkItemNotFoundError,
     WorkItemTransitionError,
+    WorkItemValidationError,
     AssigneeNotFoundError,
     AuthorNotFoundError,
     Actor,
@@ -210,6 +214,23 @@ class CreateWorkItemCommentRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkItemProgressRollupResponse(BaseModel):
+    """Response for single work item progress rollup."""
+    rollup: WorkItemProgressRollup
+
+
+class WorkItemProgressRollupListResponse(BaseModel):
+    """Response for board-level progress rollup list."""
+    rollups: List[WorkItemProgressRollup]
+    total: int
+
+
+class CompleteWithDescendantsResponse(BaseModel):
+    """Response for completing a work item with all descendants."""
+    updated_count: int
+    updated_ids: List[str]
+
+
 # =============================================================================
 # Router Factory
 # =============================================================================
@@ -242,6 +263,14 @@ def create_board_routes(
     def _get_org_id(request: Request) -> Optional[str]:
         """Extract org_id from request state."""
         return getattr(request.state, "org_id", None)
+
+    def _resolve_item_id(item_id: str, request: Request) -> str:
+        """Resolve a work item identifier (UUID, short ID, or display ID like 'myproject-42')."""
+        org_id = _get_org_id(request)
+        project_id = getattr(request.state, "project_id", None)
+        return board_service.resolve_work_item_id(
+            item_id, org_id=org_id, project_id=project_id,
+        )
 
     def _post_comment_with_author_type(
         *,
@@ -483,7 +512,7 @@ def create_board_routes(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
     # =========================================================================
-    # Work Item CRUD (unified epic/story/task)
+    # Work Item CRUD (unified goal/feature/task)
     # =========================================================================
 
     @router.post(
@@ -491,7 +520,7 @@ def create_board_routes(
         response_model=WorkItemResponse,
         status_code=status.HTTP_201_CREATED,
         summary="Create work item",
-        description="Create a work item (epic, story, or task). Use item_type to specify.",
+        description="Create a work item (goal, feature, task, or bug). Use item_type to specify.",
     )
     async def create_work_item(
         request: Request,
@@ -500,6 +529,7 @@ def create_board_routes(
         actor = _get_actor(request)
         org_id = _get_org_id(request)
 
+        # GWS title validation is enforced by BoardService.create_work_item()
         try:
             item = board_service.create_work_item(body, actor, org_id=org_id)
             return WorkItemResponse(item=item)
@@ -514,18 +544,25 @@ def create_board_routes(
         "/v1/work-items",
         response_model=WorkItemListResponse,
         summary="List work items",
-        description="List work items with optional filters for type, status, parent, assignee, labels, sprint.",
+        description="List work items with optional filters for type, status, parent, assignee, priority, labels, sprint, text search, due-date range, and custom sorting.",
     )
     async def list_work_items(
         request: Request,
         project_id: Optional[str] = Query(None, description="Filter by project"),
         board_id: Optional[str] = Query(None, description="Filter by board"),
-        item_type: Optional[WorkItemType] = Query(None, description="Filter by type (epic/story/task)"),
+        item_type: Optional[WorkItemType] = Query(None, description="Filter by type (goal/feature/task/bug)"),
         parent_id: Optional[str] = Query(None, description="Filter by parent item"),
         status_filter: Optional[WorkItemStatus] = Query(None, alias="status", description="Filter by status"),
+        priority: Optional[WorkItemPriority] = Query(None, description="Filter by priority"),
         assignee_id: Optional[str] = Query(None, description="Filter by assignee"),
+        assignee_type: Optional[str] = Query(None, description="Filter by assignee type (user/agent)"),
         sprint_id: Optional[str] = Query(None, description="Filter by sprint"),
         labels: Optional[List[str]] = Query(None, description="Filter by labels (any match)"),
+        title_search: Optional[str] = Query(None, description="Case-insensitive substring search on title"),
+        due_before: Optional[str] = Query(None, description="Items due on or before this ISO date"),
+        due_after: Optional[str] = Query(None, description="Items due on or after this ISO date"),
+        sort_by: Optional[str] = Query(None, description="Sort field: position, priority, created_at, updated_at, due_date, title, points"),
+        order: Optional[str] = Query(None, description="Sort order: asc or desc (default asc)"),
         limit: int = Query(50, ge=1, le=100, description="Max items to return"),
         offset: int = Query(0, ge=0, description="Items to skip"),
     ) -> WorkItemListResponse:
@@ -537,9 +574,16 @@ def create_board_routes(
             item_type=item_type,
             parent_id=parent_id,
             status=status_filter,
+            priority=priority,
             assignee_id=assignee_id,
+            assignee_type=assignee_type,
             sprint_id=sprint_id,
             labels=labels,
+            title_search=title_search,
+            due_before=due_before,
+            due_after=due_after,
+            sort_by=sort_by,
+            order=order,
             org_id=org_id,
             limit=limit,
             offset=offset,
@@ -564,6 +608,7 @@ def create_board_routes(
         item_id: str,
     ) -> WorkItemResponse:
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             item = board_service.get_work_item(item_id, org_id=org_id)
@@ -575,7 +620,7 @@ def create_board_routes(
         "/v1/work-items/{item_id}/children",
         response_model=WorkItemListResponse,
         summary="Get child items",
-        description="Get all child work items (stories under epic, tasks under story).",
+        description="Get all child work items (features under goal, tasks under feature).",
     )
     async def get_children(
         request: Request,
@@ -584,6 +629,7 @@ def create_board_routes(
         offset: int = Query(0, ge=0),
     ) -> WorkItemListResponse:
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             # Verify parent exists
@@ -605,6 +651,65 @@ def create_board_routes(
         except WorkItemNotFoundError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
+    @router.get(
+        "/v1/work-items/{item_id}/progress-rollup",
+        response_model=WorkItemProgressRollupResponse,
+        summary="Get work item progress rollup",
+        description="Get status bucket and remaining-work rollup for a work item subtree.",
+    )
+    async def get_work_item_progress_rollup(
+        request: Request,
+        item_id: str,
+        include_incomplete_descendants: bool = Query(
+            False,
+            description="Include incomplete descendant rows for drill-down UIs",
+        ),
+    ) -> WorkItemProgressRollupResponse:
+        org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
+
+        try:
+            rollup = board_service.get_work_item_progress_rollup(
+                item_id,
+                include_incomplete_descendants=include_incomplete_descendants,
+                org_id=org_id,
+            )
+            return WorkItemProgressRollupResponse(rollup=rollup)
+        except WorkItemNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        except BoardServiceError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    @router.get(
+        "/v1/boards/{board_id}/progress-rollups",
+        response_model=WorkItemProgressRollupListResponse,
+        summary="List board progress rollups",
+        description="List top-level rollups (goals/features/tasks) for a board.",
+    )
+    async def list_board_progress_rollups(
+        request: Request,
+        board_id: str,
+        item_type: Optional[WorkItemType] = Query(None, description="Filter root rollups by item type"),
+        include_incomplete_descendants: bool = Query(
+            False,
+            description="Include incomplete descendant rows for drill-down UIs",
+        ),
+    ) -> WorkItemProgressRollupListResponse:
+        org_id = _get_org_id(request)
+
+        try:
+            rollups = board_service.list_board_progress_rollups(
+                board_id,
+                item_type=item_type,
+                include_incomplete_descendants=include_incomplete_descendants,
+                org_id=org_id,
+            )
+            return WorkItemProgressRollupListResponse(rollups=rollups, total=len(rollups))
+        except BoardNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        except BoardServiceError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
     @router.patch(
         "/v1/work-items/{item_id}",
         response_model=WorkItemResponse,
@@ -618,7 +723,9 @@ def create_board_routes(
     ) -> WorkItemResponse:
         actor = _get_actor(request)
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
+        # GWS title validation is enforced by BoardService.update_work_item()
         try:
             item = board_service.update_work_item(item_id, body, actor, org_id=org_id)
             return WorkItemResponse(item=item)
@@ -626,6 +733,31 @@ def create_board_routes(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
         except WorkItemTransitionError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        except BoardServiceError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    @router.post(
+        "/v1/work-items/{item_id}:complete-with-descendants",
+        response_model=CompleteWithDescendantsResponse,
+        summary="Complete work item with descendants",
+        description="Set status to 'done' for a work item and all its incomplete descendants. Use when marking a parent done and cascading to children.",
+    )
+    async def complete_with_descendants(
+        request: Request,
+        item_id: str,
+    ) -> CompleteWithDescendantsResponse:
+        actor = _get_actor(request)
+        org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
+
+        try:
+            result = board_service.complete_with_descendants(item_id, actor, org_id=org_id)
+            return CompleteWithDescendantsResponse(
+                updated_count=result["updated_count"],
+                updated_ids=result["updated_ids"],
+            )
+        except WorkItemNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
         except BoardServiceError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -646,6 +778,7 @@ def create_board_routes(
     ) -> WorkItemResponse:
         actor = _get_actor(request)
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             item = board_service.move_work_item(item_id, body, actor, org_id=org_id)
@@ -719,6 +852,7 @@ def create_board_routes(
     ) -> DeleteResponse:
         actor = _get_actor(request)
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             result = board_service.delete_work_item(item_id, actor, org_id=org_id, cascade=cascade)
@@ -743,6 +877,7 @@ def create_board_routes(
     ) -> AssignmentResponse:
         actor = _get_actor(request)
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             item = board_service.assign_work_item(item_id, body, actor, org_id=org_id)
@@ -774,6 +909,7 @@ def create_board_routes(
     ) -> AssignmentResponse:
         actor = _get_actor(request)
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             item = board_service.unassign_work_item(item_id, actor, reason=reason, org_id=org_id)
@@ -800,6 +936,7 @@ def create_board_routes(
         offset: int = Query(0, ge=0, description="Comments to skip"),
     ) -> WorkItemCommentListResponse:
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             comments = board_service.list_comments(
@@ -826,6 +963,7 @@ def create_board_routes(
     ) -> WorkItemCommentResponse:
         actor = _get_actor(request)
         org_id = _get_org_id(request)
+        item_id = _resolve_item_id(item_id, request)
 
         try:
             comment = _post_comment_with_author_type(

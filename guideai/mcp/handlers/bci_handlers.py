@@ -28,7 +28,7 @@ from ...bci_contracts import (
     TraceInput,
     ValidateCitationsRequest,
 )
-from ...llm_provider import LLMConfig, ProviderType
+from ...llm import LLMConfig, ProviderType
 
 
 def _parse_retrieval_strategy(value: Optional[str], *, default: RetrievalStrategy = RetrievalStrategy.HYBRID) -> RetrievalStrategy:
@@ -638,10 +638,7 @@ def _parse_provider_type(value: Optional[str]) -> ProviderType:
         "togetherai": ProviderType.TOGETHER,
         "groq": ProviderType.GROQ,
         "fireworks": ProviderType.FIREWORKS,
-        "google": ProviderType.GOOGLE,
-        "cohere": ProviderType.COHERE,
-        "azure": ProviderType.AZURE_OPENAI,
-        "azure_openai": ProviderType.AZURE_OPENAI,
+        # google, cohere, azure_openai not currently supported as providers
     }
     if normalized in alias_map:
         return alias_map[normalized]
@@ -661,7 +658,7 @@ def _build_llm_config(arguments: Dict[str, Any]) -> LLMConfig:
     config = LLMConfig.from_env()
     config.provider = provider
     if model:
-        config.model_name = model
+        config.model = model
     if temperature is not None:
         config.temperature = float(temperature)
 
@@ -768,4 +765,94 @@ def bci_improve(arguments: Dict[str, Any]) -> Dict[str, Any]:
             for b in result.behaviors_extracted
         ],
         "latency_ms": result.latency_ms,
+    }
+
+
+def bci_inject(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full runtime injection: resolve context, retrieve behaviors, and compose enriched prompt.
+
+    E3 Runtime Injection (GUIDEAI-277 / T3.3.3).
+
+    This is the primary interface for behavior-conditioned prompt generation with
+    full runtime context awareness (pack, profile, surface, overlays, primer).
+
+    Args:
+        task (str): The task or prompt description
+        surface (str, optional): Invoking surface ("vscode", "cli", "mcp", "web", "api")
+        role (str, optional): Agent role ("Student", "Teacher", "Strategist")
+        workspace_path (str, optional): Local workspace path for profile detection
+        org_id (str, optional): Organization ID from session
+        project_id (str, optional): Project ID from session
+        user_id (str, optional): User ID from session
+        active_pack_id (str, optional): Explicit pack override
+        active_pack_version (str, optional): Explicit pack version
+        editor_context (dict, optional): Rich context from editor (file, lang, selection)
+        top_k (int, optional): Number of behaviors to retrieve (default 5)
+        strategy (str, optional): Retrieval strategy ("hybrid", "embedding", "keyword")
+        format (str, optional): Prompt format ("list", "prose", "structured")
+        citation_mode (str, optional): Citation mode ("explicit", "implicit", "inline")
+        tags (list, optional): Filter behaviors by tags
+
+    Returns:
+        Dict with:
+          - composed_prompt: The enriched prompt ready for an LLM
+          - behaviors_injected: List of behavior names used
+          - overlays_included: List of overlay IDs applied
+          - context: The resolved RuntimeContext (workspace_profile, pack, etc.)
+          - token_estimate: Rough token count
+          - latency_ms: Processing time in ms
+    """
+    # Lazy import to avoid circular dependencies during module load
+    from ...runtime_injector import RuntimeInjector
+    from ...telemetry import TelemetryClient, create_sink_from_env
+
+    telemetry = TelemetryClient(
+        sink=create_sink_from_env(),
+        default_actor={"id": arguments.get("user_id", "system"), "role": "SYSTEM", "surface": arguments.get("surface", "mcp")},
+    )
+
+    # TODO: Wire real services from MCPServiceProvider in a future pass.
+    # For now, instantiate injector with lazy service creation.
+    injector = RuntimeInjector(telemetry=telemetry)
+
+    result = injector.inject(
+        task_description=arguments["task"],
+        surface=arguments.get("surface", "mcp"),
+        role=arguments.get("role"),
+        workspace_path=arguments.get("workspace_path"),
+        org_id=arguments.get("org_id"),
+        project_id=arguments.get("project_id"),
+        user_id=arguments.get("user_id"),
+        active_pack_id=arguments.get("active_pack_id"),
+        active_pack_version=arguments.get("active_pack_version"),
+        editor_context=arguments.get("editor_context"),
+        top_k=arguments.get("top_k", 5),
+        strategy=_parse_retrieval_strategy(arguments.get("strategy")),
+        prompt_format=_parse_prompt_format(arguments.get("format")),
+        citation_mode=_parse_citation_mode(arguments.get("citation_mode")),
+        tags=arguments.get("tags"),
+        phase=arguments.get("phase"),
+    )
+
+    # Serialize RuntimeContext to dict for JSON response
+    context_dict = {
+        "workspace_profile": result.context.workspace_profile,
+        "active_pack_id": result.context.active_pack_id,
+        "active_pack_version": result.context.active_pack_version,
+        "role": result.context.role,
+        "surface": result.context.surface,
+        "task_type": result.context.task_type,
+        "org_id": result.context.org_id,
+        "project_id": result.context.project_id,
+        "user_id": result.context.user_id,
+    }
+
+    return {
+        "composed_prompt": result.composed_prompt,
+        "behaviors_injected": result.behaviors_injected,
+        "overlays_included": result.overlays_included,
+        "context": context_dict,
+        "token_estimate": result.token_estimate,
+        "latency_ms": result.metadata.get("latency_ms", 0.0),
     }

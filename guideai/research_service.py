@@ -34,8 +34,10 @@ if TYPE_CHECKING:
     from guideai.multi_tenant.board_contracts import CreateWorkItemRequest
 
 from guideai.research_contracts import (
+    AdoptionStrategy,
     AffectedComponent,
     ClaimedResult,
+    CompetitiveLandscapeItem,
     Complexity,
     ComprehensionResult,
     ConflictItem,
@@ -49,6 +51,8 @@ from guideai.research_contracts import (
     IngestPaperResponse,
     PaperSummary,
     Priority,
+    StructuredCon,
+    ValueProposition,
     Recommendation,
     SearchPapersRequest,
     SearchPapersResponse,
@@ -56,6 +60,7 @@ from guideai.research_contracts import (
     Verdict,
     calculate_verdict,
 )
+from guideai.storage.research_storage_postgres import ResearchStoragePostgres
 from guideai.research.prompts import (
     COMPREHENSION_SYSTEM_PROMPT,
     COMPREHENSION_USER_PROMPT,
@@ -216,6 +221,7 @@ class ResearchService:
         context_dir: Optional[str] = None,
         board_service: Optional["BoardService"] = None,
         project_id: Optional[str] = None,
+        pool: Optional[Any] = None,
     ):
         """Initialize ResearchService.
 
@@ -227,12 +233,17 @@ class ResearchService:
                          Defaults to current working directory.
             board_service: Optional BoardService for creating work items on ADOPT/ADAPT verdicts.
             project_id: Project ID for work item creation. Required if board_service provided.
+            pool: Optional PostgresPool for multi-tenant storage. When provided,
+                  uses ResearchStoragePostgres instead of SQLite.
         """
-        self.db_path = db_path or str(
-            Path.home() / ".guideai" / "research.db"
+        self.db_path = db_path or (
+            str(Path.home() / ".guideai" / "research.db") if not pool else None
         )
         self.llm_model = llm_model or os.environ.get("ANTHROPIC_MODEL", self.DEFAULT_MODEL)
         self.context_dir = Path(context_dir) if context_dir else Path.cwd()
+
+        # PostgreSQL multi-tenant storage pool
+        self._pool = pool
 
         # Initialize ingesters
         self._ingesters: List[BaseIngester] = [
@@ -252,28 +263,31 @@ class ResearchService:
         self._project_id = project_id
 
         # Lazy-load storage and LLM
-        self._storage: Optional[ResearchStorage] = None
+        self._storage = None
         self._llm_provider = None
 
     @property
-    def storage(self) -> "ResearchStorage":
+    def storage(self):
         """Access the storage layer (lazy-loaded)."""
         return self._get_storage()
 
-    def _get_storage(self) -> "ResearchStorage":
-        """Lazy-load storage layer."""
+    def _get_storage(self):
+        """Lazy-load storage layer.
+
+        Returns ResearchStoragePostgres when a pool is configured,
+        otherwise falls back to the SQLite ResearchStorage.
+        """
         if self._storage is None:
-            self._storage = ResearchStorage(self.db_path)
+            if self._pool is not None:
+                self._storage = ResearchStoragePostgres(self._pool)
+            else:
+                self._storage = ResearchStorage(self.db_path)
         return self._storage
 
     def _get_llm_provider(self):
-        """Lazy-load LLM provider."""
+        """Lazy-load LLM client."""
         if self._llm_provider is None:
-            from guideai.llm_provider import (
-                LLMConfig,
-                ProviderType,
-                get_provider,
-            )
+            from guideai.llm import LLMClient, LLMConfig, ProviderType
 
             # Determine provider from model name
             if "claude" in self.llm_model.lower():
@@ -288,9 +302,9 @@ class ResearchService:
                 model=self.llm_model,
                 api_key=api_key,
                 max_tokens=4096,
-                temperature=0.3,  # Lower temperature for structured analysis
+                temperature=0.3,
             )
-            self._llm_provider = get_provider(config)
+            self._llm_provider = LLMClient(config)
 
         return self._llm_provider
 
@@ -378,12 +392,10 @@ class ResearchService:
         """
         logger.info(f"Comprehending paper: {paper.metadata.title}")
 
-        from guideai.llm_provider import LLMRequest, LLMMessage
-
-        provider = self._get_llm_provider()
+        client = self._get_llm_provider()
 
         # Load agent playbook for expertise context
-        agent_playbook = self._load_context_doc("agents/AGENT_AI_RESEARCH.md", max_chars=3000)
+        agent_playbook = self._load_context_doc("guideai/agents/playbooks/AGENT_AI_RESEARCH.md", max_chars=3000)
         if agent_playbook and "[not found]" not in agent_playbook.lower():
             agent_playbook_section = f"\n**Agent Playbook (your operational guidelines):**\n{agent_playbook}"
         else:
@@ -396,17 +408,12 @@ class ResearchService:
         user_prompt = format_comprehension_prompt(paper.raw_text)
 
         # Call LLM
-        request = LLMRequest(
-            messages=[
-                LLMMessage(role="system", content=system_prompt),
-                LLMMessage(role="user", content=user_prompt),
-            ],
-            model=llm_model or self.llm_model,
-            max_tokens=4096,
-            temperature=0.3,
-        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        response = provider.generate(request)
+        response = client.call(messages, model=llm_model or self.llm_model, max_tokens=4096, temperature=0.3)
 
         # Parse JSON response
         try:
@@ -471,12 +478,10 @@ class ResearchService:
         """
         logger.info("Evaluating paper fit for GuideAI")
 
-        from guideai.llm_provider import LLMRequest, LLMMessage
-
-        provider = self._get_llm_provider()
+        client = self._get_llm_provider()
 
         # Load context documents
-        architecture_context = self._load_context_doc("MCP_SERVER_DESIGN.md")
+        architecture_context = self._load_context_doc("docs/contracts/MCP_SERVER_DESIGN.md")
         behaviors_context = self._load_context_doc("AGENTS.md")
         product_context = self._load_context_doc("PRD.md")
 
@@ -484,7 +489,7 @@ class ResearchService:
         codebase_context = self._get_codebase_context()
 
         # Load agent playbook for expertise context
-        agent_playbook = self._load_context_doc("agents/AGENT_AI_RESEARCH.md", max_chars=5000)
+        agent_playbook = self._load_context_doc("guideai/agents/playbooks/AGENT_AI_RESEARCH.md", max_chars=5000)
         if agent_playbook:
             agent_playbook_section = f"\n**Agent Playbook (your operational guidelines):**\n{agent_playbook}"
         else:
@@ -496,6 +501,20 @@ class ResearchService:
             codebase_context=codebase_context,
         )
 
+        # Brutal honesty directive appended to every evaluation
+        system_prompt += (
+            "\n\n## CRITICAL: Brutal Honesty Requirement\n"
+            "You MUST be ruthlessly honest in this evaluation. Do NOT sugarcoat. "
+            "If an existing library already solves this problem, say so and name it. "
+            "If the research is repackaging old ideas, call it out. "
+            "If simpler approaches achieve 80% of the gains at 20% of the complexity, flag that. "
+            "If the right answer is 'just pip install X,' say that. "
+            "If this is academic vaporware that won't survive production, say that. "
+            "Include an 'honest_assessment' field in your JSON: 2-3 sentences of plain-language, "
+            "no-hedging gut check -- what you'd tell a colleague over coffee. "
+            "The team prefers an honest REJECT now over discovering problems after weeks of work."
+        )
+
         # Format prompt
         user_prompt = format_evaluation_prompt(
             comprehension_summary=comprehension.to_json(),
@@ -505,17 +524,12 @@ class ResearchService:
         )
 
         # Call LLM
-        request = LLMRequest(
-            messages=[
-                LLMMessage(role="system", content=system_prompt),
-                LLMMessage(role="user", content=user_prompt),
-            ],
-            model=llm_model or self.llm_model,
-            max_tokens=4096,
-            temperature=0.3,
-        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        response = provider.generate(request)
+        response = client.call(messages, model=llm_model or self.llm_model, max_tokens=4096, temperature=0.3)
 
         # Parse JSON response
         try:
@@ -533,6 +547,43 @@ class ResearchService:
             for c in data.get("conflicts_with_existing", [])
         ]
 
+        # Build competitive landscape
+        competitive_landscape = [
+            CompetitiveLandscapeItem(
+                name=item.get("name", ""),
+                category=item.get("category", "tool"),
+                url=item.get("url"),
+                description=item.get("description", ""),
+                maturity=item.get("maturity", "unknown"),
+                overlap_description=item.get("overlap_description", ""),
+                differentiators=item.get("differentiators", []),
+            )
+            for item in data.get("competitive_landscape", [])
+        ]
+
+        # Build structured cons
+        structured_cons = [
+            StructuredCon(
+                description=con.get("description", ""),
+                severity=con.get("severity", "medium"),
+                likelihood=con.get("likelihood", "medium"),
+                mitigation=con.get("mitigation", ""),
+                category=con.get("category", ""),
+            )
+            for con in data.get("structured_cons", [])
+        ]
+
+        # Build value proposition
+        vp_data = data.get("value_proposition")
+        value_proposition = None
+        if vp_data and isinstance(vp_data, dict):
+            value_proposition = ValueProposition(
+                effectiveness_summary=vp_data.get("effectiveness_summary", ""),
+                key_benefits=vp_data.get("key_benefits", []),
+                measurable_outcomes=vp_data.get("measurable_outcomes", []),
+                value_to_guideai=vp_data.get("value_to_guideai", ""),
+            )
+
         # Build EvaluationResult
         result = EvaluationResult(
             relevance_score=float(data.get("relevance_score", 5.0)),
@@ -545,6 +596,7 @@ class ResearchService:
             roi_rationale=data.get("roi_rationale", ""),
             safety_score=float(data.get("safety_score", 8.0)),
             safety_rationale=data.get("safety_rationale", ""),
+            honest_assessment=data.get("honest_assessment", ""),
             conflicts_with_existing=conflicts,
             implementation_complexity=Complexity(
                 data.get("implementation_complexity", "MEDIUM")
@@ -558,7 +610,10 @@ class ResearchService:
             estimated_effort=data.get("estimated_effort", "M - Moderate effort"),
             concerns=data.get("concerns", []),
             risks=data.get("risks", []),
+            structured_cons=structured_cons,
             potential_benefits=data.get("potential_benefits", []),
+            competitive_landscape=competitive_landscape,
+            value_proposition=value_proposition,
             llm_model=llm_model or self.llm_model,
         )
 
@@ -595,15 +650,13 @@ class ResearchService:
         """
         logger.info("Generating recommendation")
 
-        from guideai.llm_provider import LLMRequest, LLMMessage
-
-        provider = self._get_llm_provider()
+        client = self._get_llm_provider()
 
         # Get dynamic codebase context for accurate roadmap generation
         codebase_context = self._get_codebase_context()
 
         # Load agent playbook for expertise context
-        agent_playbook = self._load_context_doc("agents/AGENT_AI_RESEARCH.md", max_chars=3000)
+        agent_playbook = self._load_context_doc("guideai/agents/playbooks/AGENT_AI_RESEARCH.md", max_chars=3000)
         if agent_playbook and "[not found]" not in agent_playbook.lower():
             agent_playbook_section = f"\n**Agent Playbook (your operational guidelines):**\n{agent_playbook}"
         else:
@@ -613,6 +666,16 @@ class ResearchService:
         system_prompt = RECOMMENDATION_SYSTEM_PROMPT.format(
             agent_playbook=agent_playbook_section,
             codebase_context=codebase_context,
+        )
+
+        # Brutal honesty directive appended to every recommendation
+        system_prompt += (
+            "\n\n## CRITICAL: Brutal Honesty Requirement\n"
+            "Be ruthlessly honest in this recommendation. "
+            "Default to 'use_directly' when an existing tool/library already solves the problem well. "
+            "The burden of proof is on 'build_custom' to justify why existing solutions won't work. "
+            "If the honest recommendation is REJECT, say so without hedging. "
+            "Include an unvarnished executive_summary that tells the truth plainly."
         )
 
         # Format conflicts for prompt
@@ -641,17 +704,12 @@ class ResearchService:
         )
 
         # Call LLM
-        request = LLMRequest(
-            messages=[
-                LLMMessage(role="system", content=system_prompt),
-                LLMMessage(role="user", content=user_prompt),
-            ],
-            model=llm_model or self.llm_model,
-            max_tokens=4096,
-            temperature=0.3,
-        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
-        response = provider.generate(request)
+        response = client.call(messages, model=llm_model or self.llm_model, max_tokens=4096, temperature=0.3)
 
         # Parse JSON response
         try:
@@ -691,13 +749,29 @@ class ResearchService:
                 adaptations_needed=rm_data.get("adaptations_needed", []),
             )
 
+        # Build adoption strategy if present
+        adoption_strategy = None
+        as_data = data.get("adoption_strategy")
+        if as_data and isinstance(as_data, dict):
+            adoption_strategy = AdoptionStrategy(
+                approach=as_data.get("approach", "build_custom"),
+                rationale=as_data.get("rationale", ""),
+                direct_use_candidates=as_data.get("direct_use_candidates", []),
+                concepts_to_extract=as_data.get("concepts_to_extract", []),
+                integration_points=as_data.get("integration_points", []),
+                estimated_time_saved=as_data.get("estimated_time_saved", ""),
+            )
+
         result = Recommendation(
             verdict=verdict,
             verdict_rationale=data.get("verdict_rationale", ""),
+            executive_summary=data.get("executive_summary", ""),
             implementation_roadmap=roadmap,
+            adoption_strategy=adoption_strategy,
             next_agent=data.get("next_agent"),
             priority=Priority(data.get("priority", "P3")),
             blocking_dependencies=data.get("blocking_dependencies", []),
+            handoff_context=data.get("handoff_context", {}),
         )
 
         logger.info(f"Recommendation: {result.verdict.value}")
@@ -712,6 +786,10 @@ class ResearchService:
         self,
         request: EvaluatePaperRequest,
         progress_callback: ProgressCallback = None,
+        *,
+        owner_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> EvaluatePaperResponse:
         """Run full evaluation pipeline on a paper.
 
@@ -828,18 +906,26 @@ class ResearchService:
         if request.save_to_db:
             progress("Save", "💾 Persisting to database & saving report...", 0.95)
             storage = self._get_storage()
-            storage.save_evaluation(paper, comprehension, evaluation, recommendation)
 
-            # Also save the full report for other agents to access
-            user_path, project_path = storage.save_report(paper.id, report, title=paper.metadata.title)
-
-            # Update the research index for prioritization
-            storage.update_research_index()
-
-            if project_path:
-                progress("Save", f"✓ Saved: {paper.id[:12]}... → agents/research_reports/", 0.98)
+            if isinstance(storage, ResearchStoragePostgres):
+                storage.save_evaluation(
+                    paper, comprehension, evaluation, recommendation,
+                    owner_id=owner_id,
+                    org_id=org_id,
+                    project_id=project_id,
+                )
+                report_id = storage.save_report(
+                    paper.id, report, title=paper.metadata.title,
+                    owner_id=owner_id,
+                    org_id=org_id,
+                )
+                user_path = f"report:{report_id}"
             else:
-                progress("Save", f"✓ Saved: {paper.id[:12]}... → {user_path}", 0.98)
+                storage.save_evaluation(paper, comprehension, evaluation, recommendation)
+                user_path = storage.save_report(paper.id, report, title=paper.metadata.title)
+                storage.update_research_index()
+
+            progress("Save", f"✓ Saved: {paper.id[:12]}... → {user_path}", 0.98)
 
         # Create handoff work item for actionable verdicts (ADOPT/ADAPT)
         work_item_id = None
@@ -895,14 +981,113 @@ class ResearchService:
     def search_papers(
         self,
         request: SearchPapersRequest,
+        *,
+        owner_id: Optional[str] = None,
+        org_id: Optional[str] = None,
     ) -> SearchPapersResponse:
         """Search evaluated papers."""
         storage = self._get_storage()
+        if isinstance(storage, ResearchStoragePostgres):
+            raw = storage.search_papers(
+                query=getattr(request, 'query', None),
+                verdict=request.verdict.value if request.verdict else None,
+                min_score=request.min_score,
+                max_score=getattr(request, 'max_score', None),
+                source_type=request.source_type.value if request.source_type else None,
+                limit=request.limit,
+                offset=request.offset,
+                owner_id=owner_id,
+                org_id=org_id,
+            )
+            papers = [
+                PaperSummary(
+                    paper_id=p["paper_id"],
+                    title=p["title"],
+                    source_type=SourceType(p["source_type"]) if p.get("source_type") else SourceType.URL,
+                    overall_score=p.get("overall_score", 0),
+                    verdict=Verdict(p["verdict"]) if p.get("verdict") else Verdict.DEFER,
+                    core_idea=p.get("core_idea", ""),
+                    created_at=datetime.fromisoformat(p["created_at"]) if p.get("created_at") else datetime.now(),
+                )
+                for p in raw.get("papers", [])
+            ]
+            return SearchPapersResponse(
+                papers=papers,
+                total_count=raw.get("total_count", len(papers)),
+                has_more=raw.get("has_more", False),
+            )
         return storage.search_papers(request)
 
-    def get_paper(self, paper_id: str) -> Optional[EvaluatePaperResponse]:
+    def get_paper(
+        self,
+        paper_id: str,
+        *,
+        owner_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+    ) -> Optional[EvaluatePaperResponse]:
         """Get full evaluation for a paper by ID."""
         storage = self._get_storage()
+        if isinstance(storage, ResearchStoragePostgres):
+            raw = storage.get_paper(
+                paper_id,
+                owner_id=owner_id,
+                org_id=org_id,
+            )
+            if raw is None:
+                return None
+
+            # Build lightweight contract objects from the flat row data
+            recommendation = None
+            if raw.get("verdict"):
+                roadmap_data = json.loads(raw["implementation_roadmap"]) if raw.get("implementation_roadmap") else None
+                roadmap = None
+                if roadmap_data:
+                    roadmap = ImplementationRoadmap(
+                        affected_components=roadmap_data.get("affected_components", []),
+                        proposed_steps=roadmap_data.get("proposed_steps", []),
+                        success_criteria=roadmap_data.get("success_criteria", []),
+                        estimated_effort=roadmap_data.get("estimated_effort", ""),
+                    )
+                recommendation = Recommendation(
+                    verdict=Verdict(raw["verdict"]),
+                    verdict_rationale=raw.get("verdict_rationale", ""),
+                    implementation_roadmap=roadmap,
+                    next_agent=raw.get("next_agent"),
+                    priority=Priority(raw["priority"]) if raw.get("priority") else Priority.P3,
+                    blocking_dependencies=json.loads(raw["blocking_dependencies"]) if raw.get("blocking_dependencies") else [],
+                )
+
+            evaluation_obj = None
+            if raw.get("overall_score") is not None:
+                evaluation_obj = EvaluationResult(
+                    relevance_score=raw.get("relevance_score", 0),
+                    relevance_rationale="",
+                    feasibility_score=raw.get("feasibility_score", 0),
+                    feasibility_rationale="",
+                    novelty_score=raw.get("novelty_score", 0),
+                    novelty_rationale="",
+                    roi_score=raw.get("roi_score", 0),
+                    roi_rationale="",
+                    safety_score=raw.get("safety_score", 0),
+                    safety_rationale="",
+                    overall_score=raw.get("overall_score", 0),
+                    conflicts_with_existing=[],
+                    implementation_complexity=Complexity(raw["implementation_complexity"]) if raw.get("implementation_complexity") else Complexity.MEDIUM,
+                    maintenance_burden=Complexity(raw["maintenance_burden"]) if raw.get("maintenance_burden") else Complexity.MEDIUM,
+                    expertise_gap=Complexity.MEDIUM,
+                    estimated_effort=raw.get("estimated_effort", ""),
+                    concerns=json.loads(raw["concerns"]) if raw.get("concerns") else [],
+                    risks=json.loads(raw["risks"]) if raw.get("risks") else [],
+                    potential_benefits=json.loads(raw["potential_benefits"]) if raw.get("potential_benefits") else [],
+                )
+
+            return EvaluatePaperResponse(
+                paper_id=raw["paper_id"],
+                paper_title=raw.get("title", ""),
+                recommendation=recommendation,
+                evaluation=evaluation_obj,
+                markdown_report=raw.get("markdown_report", ""),
+            )
         return storage.get_paper(paper_id)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -923,8 +1108,14 @@ class ResearchService:
         locations = [
             self.context_dir / filename,
             self.context_dir / "docs" / filename,
+            self.context_dir / "docs" / "contracts" / filename,
+            self.context_dir / "docs" / "agents" / filename,
+            self.context_dir / "guideai" / "agents" / "playbooks" / filename,
             Path.cwd() / filename,
             Path.cwd() / "docs" / filename,
+            Path.cwd() / "docs" / "contracts" / filename,
+            Path.cwd() / "docs" / "agents" / filename,
+            Path.cwd() / "guideai" / "agents" / "playbooks" / filename,
         ]
 
         for path in locations:
@@ -1065,7 +1256,13 @@ class ResearchService:
 **Paper:** {paper_title}
 **Paper ID:** {paper_id}
 **Overall Score:** {evaluation.overall_score:.1f}/10
+"""
 
+            # Add executive summary if available
+            if recommendation.executive_summary:
+                description += f"\n### Executive Summary\n{recommendation.executive_summary}\n"
+
+            description += f"""
 ### Evaluation Summary
 - Relevance: {evaluation.relevance_score:.1f}/10
 - Feasibility: {evaluation.feasibility_score:.1f}/10
@@ -1075,13 +1272,63 @@ class ResearchService:
 
 ### Verdict Rationale
 {recommendation.verdict_rationale}
-
-### Next Steps
-Review the full research report at `agents/research_reports/{paper_id}.md` and produce:
-1. Architecture Decision Record (ADR)
-2. Implementation work items
-3. Affected component analysis
 """
+
+            # Add honest assessment if available (the unvarnished gut-check)
+            if evaluation.honest_assessment:
+                description += f"\n### Honest Assessment\n> {evaluation.honest_assessment}\n"
+
+            # Add value proposition if available
+            if evaluation.value_proposition:
+                vp = evaluation.value_proposition
+                description += "\n### Effectiveness & Value\n"
+                description += f"**Effectiveness:** {vp.effectiveness_summary}\n\n"
+                if vp.key_benefits:
+                    description += "**Key Benefits:**\n"
+                    for b in vp.key_benefits:
+                        description += f"- {b}\n"
+                if vp.measurable_outcomes:
+                    description += "\n**Measurable Outcomes:**\n"
+                    for m in vp.measurable_outcomes:
+                        description += f"- {m}\n"
+                if vp.value_to_guideai:
+                    description += f"\n**Value to GuideAI:** {vp.value_to_guideai}\n"
+
+            # Add competitive landscape if available
+            if evaluation.competitive_landscape:
+                description += "\n### Competitive Landscape\n"
+                description += "| Name | Type | Maturity | Overlap | Differentiators |\n"
+                description += "| --- | --- | --- | --- | --- |\n"
+                for item in evaluation.competitive_landscape:
+                    name_col = f"[{item.name}]({item.url})" if item.url else item.name
+                    diffs = "; ".join(item.differentiators) if item.differentiators else "—"
+                    description += f"| {name_col} | {item.category} | {item.maturity} | {item.overlap_description} | {diffs} |\n"
+
+            # Add structured cons if available
+            if evaluation.structured_cons:
+                description += "\n### Potential Cons\n"
+                for con in evaluation.structured_cons:
+                    description += f"- **{con.description}** (severity: {con.severity}, likelihood: {con.likelihood})"
+                    if con.category:
+                        description += f" [{con.category}]"
+                    if con.mitigation:
+                        description += f"\n  Mitigation: {con.mitigation}"
+                    description += "\n"
+
+            # Add adoption strategy if available
+            if recommendation.adoption_strategy:
+                strat = recommendation.adoption_strategy
+                description += f"\n### Adoption Strategy\n"
+                description += f"**Approach:** {strat.approach}\n"
+                description += f"**Rationale:** {strat.rationale}\n"
+                if strat.direct_use_candidates:
+                    description += "**Direct-use candidates:** " + ", ".join(strat.direct_use_candidates) + "\n"
+                if strat.concepts_to_extract:
+                    description += "**Concepts to extract:** " + ", ".join(strat.concepts_to_extract) + "\n"
+                if strat.integration_points:
+                    description += "**Integration points:** " + ", ".join(strat.integration_points) + "\n"
+                if strat.estimated_time_saved:
+                    description += f"**Estimated time saved:** {strat.estimated_time_saved}\n"
 
             # Add roadmap if available
             if recommendation.implementation_roadmap:
@@ -1091,6 +1338,27 @@ Review the full research report at `agents/research_reports/{paper_id}.md` and p
                     for step in roadmap.proposed_steps:
                         description += f"{step.order}. {step.description} ({step.effort})\n"
 
+            description += """
+### Next Steps
+Review the full research report and produce:
+1. Architecture Decision Record (ADR)
+2. Implementation work items
+3. Affected component analysis
+"""
+
+            # Build metadata with enriched context
+            work_item_metadata = {
+                "paper_id": paper_id,
+                "research_verdict": recommendation.verdict.value,
+                "overall_score": evaluation.overall_score,
+                "next_agent": next_agent,
+                "source": "research_service",
+            }
+            if recommendation.adoption_strategy:
+                work_item_metadata["adoption_approach"] = recommendation.adoption_strategy.approach
+            if recommendation.handoff_context:
+                work_item_metadata["handoff_context"] = recommendation.handoff_context
+
             # Create the work item request
             request = CreateWorkItemRequest(
                 item_type=WorkItemType.STORY,
@@ -1099,13 +1367,7 @@ Review the full research report at `agents/research_reports/{paper_id}.md` and p
                 description=description,
                 priority=priority,
                 labels=["research-handoff", next_agent, recommendation.verdict.value.lower()],
-                metadata={
-                    "paper_id": paper_id,
-                    "research_verdict": recommendation.verdict.value,
-                    "overall_score": evaluation.overall_score,
-                    "next_agent": next_agent,
-                    "source": "research_service",
-                },
+                metadata=work_item_metadata,
             )
 
             # Create actor for the research agent
@@ -1120,7 +1382,7 @@ Review the full research report at `agents/research_reports/{paper_id}.md` and p
             # Use the first/default board
             request.board_id = boards[0].board_id
 
-            # Get first column (usually "Backlog" or "To Do")
+            # Get first column for new work items
             columns = self._board_service.list_columns(boards[0].board_id)
             if columns:
                 request.column_id = columns[0].column_id
@@ -1212,6 +1474,7 @@ class ResearchStorage:
                     safety_score REAL,
                     safety_rationale TEXT,
                     overall_score REAL,
+                    honest_assessment TEXT,
                     conflicts TEXT,
                     implementation_complexity TEXT,
                     maintenance_burden TEXT,
@@ -1220,6 +1483,9 @@ class ResearchStorage:
                     concerns TEXT,
                     risks TEXT,
                     potential_benefits TEXT,
+                    structured_cons TEXT,
+                    competitive_landscape TEXT,
+                    value_proposition TEXT,
                     llm_model TEXT,
                     created_at TEXT NOT NULL
                 );
@@ -1230,10 +1496,13 @@ class ResearchStorage:
                     evaluation_id TEXT NOT NULL REFERENCES evaluations(id),
                     verdict TEXT NOT NULL,
                     verdict_rationale TEXT,
+                    executive_summary TEXT,
                     implementation_roadmap TEXT,
+                    adoption_strategy TEXT,
                     next_agent TEXT,
                     priority TEXT,
                     blocking_dependencies TEXT,
+                    handoff_context TEXT,
                     created_at TEXT NOT NULL,
                     created_by TEXT
                 );
@@ -1334,9 +1603,12 @@ class ResearchStorage:
                 (id, paper_id, comprehension_id, relevance_score, relevance_rationale,
                  feasibility_score, feasibility_rationale, novelty_score, novelty_rationale,
                  roi_score, roi_rationale, safety_score, safety_rationale, overall_score,
+                 honest_assessment,
                  conflicts, implementation_complexity, maintenance_burden, expertise_gap,
-                 estimated_effort, concerns, risks, potential_benefits, llm_model, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 estimated_effort, concerns, risks, potential_benefits,
+                 structured_cons, competitive_landscape, value_proposition,
+                 llm_model, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     eval_id,
@@ -1353,6 +1625,7 @@ class ResearchStorage:
                     evaluation.safety_score,
                     evaluation.safety_rationale,
                     evaluation.overall_score,
+                    evaluation.honest_assessment,
                     json.dumps([c.to_dict() for c in evaluation.conflicts_with_existing]),
                     evaluation.implementation_complexity.value,
                     evaluation.maintenance_burden.value,
@@ -1361,6 +1634,10 @@ class ResearchStorage:
                     json.dumps(evaluation.concerns),
                     json.dumps(evaluation.risks),
                     json.dumps(evaluation.potential_benefits),
+                    json.dumps([sc.to_dict() for sc in evaluation.structured_cons]),
+                    json.dumps([cl.to_dict() for cl in evaluation.competitive_landscape]),
+                    json.dumps(evaluation.value_proposition.to_dict())
+                        if evaluation.value_proposition else None,
                     evaluation.llm_model,
                     now,
                 ),
@@ -1371,9 +1648,10 @@ class ResearchStorage:
             conn.execute(
                 """
                 INSERT INTO recommendations
-                (id, paper_id, evaluation_id, verdict, verdict_rationale,
-                 implementation_roadmap, next_agent, priority, blocking_dependencies, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, paper_id, evaluation_id, verdict, verdict_rationale, executive_summary,
+                 implementation_roadmap, adoption_strategy, next_agent, priority,
+                 blocking_dependencies, handoff_context, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rec_id,
@@ -1381,11 +1659,16 @@ class ResearchStorage:
                     eval_id,
                     recommendation.verdict.value,
                     recommendation.verdict_rationale,
+                    recommendation.executive_summary,
                     json.dumps(recommendation.implementation_roadmap.to_dict())
                         if recommendation.implementation_roadmap else None,
+                    json.dumps(recommendation.adoption_strategy.to_dict())
+                        if recommendation.adoption_strategy else None,
                     recommendation.next_agent,
                     recommendation.priority.value,
                     json.dumps(recommendation.blocking_dependencies),
+                    json.dumps(recommendation.handoff_context)
+                        if recommendation.handoff_context else None,
                     now,
                 ),
             )
@@ -1401,13 +1684,13 @@ class ResearchStorage:
         paper_id: str,
         report_markdown: str,
         title: Optional[str] = None,
-    ) -> tuple[str, str]:
+    ) -> str:
         """Save the full markdown report to database and file system.
 
         This makes the report accessible to other agents for retrieval.
-        Reports are saved to TWO locations:
+        Reports are saved to:
         1. ~/.guideai/research/reports/ (user data directory)
-        2. guideai/agents/research_reports/ (project directory for agent access)
+        2. SQLite research_reports table (source of truth)
 
         Args:
             paper_id: ID of the paper this report is for
@@ -1415,7 +1698,7 @@ class ResearchStorage:
             title: Optional title for the report filename
 
         Returns:
-            Tuple of (user_report_path, project_report_path)
+            Path to the saved report file.
         """
         import sqlite3
         import re
@@ -1437,23 +1720,6 @@ class ResearchStorage:
         user_reports_dir.mkdir(parents=True, exist_ok=True)
         user_report_path = user_reports_dir / safe_filename
         user_report_path.write_text(report_markdown, encoding="utf-8")
-
-        # 2. Save to project directory (guideai/agents/research_reports/)
-        # Find the guideai project root by looking for AGENTS.md
-        project_report_path = None
-        try:
-            # Try to find project root from current working directory
-            cwd = Path.cwd()
-            for parent in [cwd] + list(cwd.parents):
-                if (parent / "AGENTS.md").exists() and (parent / "guideai").is_dir():
-                    project_reports_dir = parent / "agents" / "research_reports"
-                    project_reports_dir.mkdir(parents=True, exist_ok=True)
-                    project_report_path = project_reports_dir / safe_filename
-                    project_report_path.write_text(report_markdown, encoding="utf-8")
-                    logger.info(f"Saved report to project: {project_report_path}")
-                    break
-        except Exception as e:
-            logger.warning(f"Could not save to project directory: {e}")
 
         # Save to database
         conn = sqlite3.connect(self.db_path)
@@ -1483,7 +1749,7 @@ class ResearchStorage:
         finally:
             conn.close()
 
-        return str(user_report_path), str(project_report_path) if project_report_path else None
+        return str(user_report_path)
 
     def get_report(self, paper_id: str) -> Optional[str]:
         """Retrieve the full markdown report for a paper.
@@ -1726,17 +1992,15 @@ class ResearchStorage:
 
         index_content = "\n".join(lines)
 
-        # Save to project directory
+        # Save to user data directory
         try:
-            cwd = Path.cwd()
-            for parent in [cwd] + list(cwd.parents):
-                if (parent / "AGENTS.md").exists() and (parent / "guideai").is_dir():
-                    project_reports_dir = parent / "agents" / "research_reports"
-                    project_reports_dir.mkdir(parents=True, exist_ok=True)
-                    index_path = project_reports_dir / "RESEARCH_INDEX.md"
-                    index_path.write_text(index_content, encoding="utf-8")
-                    logger.info(f"Updated research index: {index_path}")
-                    return str(index_path)
+            from pathlib import Path
+            reports_dir = Path(self.db_path).parent / "research" / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            index_path = reports_dir / "RESEARCH_INDEX.md"
+            index_path.write_text(index_content, encoding="utf-8")
+            logger.info(f"Updated research index: {index_path}")
+            return str(index_path)
         except Exception as e:
             logger.warning(f"Could not update research index: {e}")
 
@@ -1852,8 +2116,10 @@ class ResearchStorage:
 
             # Reconstruct objects
             from guideai.research_contracts import (
+                AdoptionStrategy,
                 IngestedPaper, PaperMetadata, ParsedSection,
                 ComprehensionResult, ClaimedResult,
+                CompetitiveLandscapeItem, StructuredCon, ValueProposition,
                 EvaluationResult, ConflictItem, Complexity,
                 Recommendation, ImplementationRoadmap, SourceType, Verdict, Priority,
                 EvaluatePaperResponse,
@@ -1930,6 +2196,63 @@ class ResearchStorage:
                 for c in conflicts_data
             ]
 
+            # Reconstruct structured_cons from stored JSON (column may not exist in older DBs)
+            stored_structured_cons = []
+            try:
+                sc_data = json.loads(eval_row["structured_cons"]) if eval_row["structured_cons"] else []
+                stored_structured_cons = [
+                    StructuredCon(
+                        description=sc.get("description", ""),
+                        severity=sc.get("severity", "medium"),
+                        likelihood=sc.get("likelihood", "medium"),
+                        mitigation=sc.get("mitigation", ""),
+                        category=sc.get("category", ""),
+                    )
+                    for sc in sc_data
+                ]
+            except (KeyError, IndexError):
+                pass
+
+            # Reconstruct competitive_landscape from stored JSON
+            stored_landscape = []
+            try:
+                cl_data = json.loads(eval_row["competitive_landscape"]) if eval_row["competitive_landscape"] else []
+                stored_landscape = [
+                    CompetitiveLandscapeItem(
+                        name=item.get("name", ""),
+                        category=item.get("category", "tool"),
+                        url=item.get("url"),
+                        description=item.get("description", ""),
+                        maturity=item.get("maturity", "unknown"),
+                        overlap_description=item.get("overlap_description", ""),
+                        differentiators=item.get("differentiators", []),
+                    )
+                    for item in cl_data
+                ]
+            except (KeyError, IndexError):
+                pass
+
+            # Reconstruct value_proposition from stored JSON
+            stored_vp = None
+            try:
+                vp_data = json.loads(eval_row["value_proposition"]) if eval_row["value_proposition"] else None
+                if vp_data and isinstance(vp_data, dict):
+                    stored_vp = ValueProposition(
+                        effectiveness_summary=vp_data.get("effectiveness_summary", ""),
+                        key_benefits=vp_data.get("key_benefits", []),
+                        measurable_outcomes=vp_data.get("measurable_outcomes", []),
+                        value_to_guideai=vp_data.get("value_to_guideai", ""),
+                    )
+            except (KeyError, IndexError):
+                pass
+
+            # Reconstruct honest_assessment (column may not exist in older DBs)
+            stored_honest_assessment = ""
+            try:
+                stored_honest_assessment = eval_row["honest_assessment"] or ""
+            except (KeyError, IndexError):
+                pass
+
             # Build EvaluationResult
             evaluation = EvaluationResult(
                 relevance_score=eval_row["relevance_score"],
@@ -1943,6 +2266,7 @@ class ResearchStorage:
                 safety_score=eval_row["safety_score"],
                 safety_rationale=eval_row["safety_rationale"],
                 overall_score=eval_row["overall_score"],
+                honest_assessment=stored_honest_assessment,
                 conflicts_with_existing=conflicts,
                 implementation_complexity=Complexity(eval_row["implementation_complexity"]),
                 maintenance_burden=Complexity(eval_row["maintenance_burden"]),
@@ -1950,7 +2274,10 @@ class ResearchStorage:
                 estimated_effort=eval_row["estimated_effort"],
                 concerns=json.loads(eval_row["concerns"]) if eval_row["concerns"] else [],
                 risks=json.loads(eval_row["risks"]) if eval_row["risks"] else [],
+                structured_cons=stored_structured_cons,
                 potential_benefits=json.loads(eval_row["potential_benefits"]) if eval_row["potential_benefits"] else [],
+                competitive_landscape=stored_landscape,
+                value_proposition=stored_vp,
                 llm_model=eval_row["llm_model"],
             )
 
@@ -1965,14 +2292,47 @@ class ResearchStorage:
                     estimated_effort=roadmap_data.get("estimated_effort", ""),
                 )
 
+            # Reconstruct adoption_strategy from stored JSON
+            stored_adoption = None
+            try:
+                as_data = json.loads(rec_row["adoption_strategy"]) if rec_row["adoption_strategy"] else None
+                if as_data and isinstance(as_data, dict):
+                    stored_adoption = AdoptionStrategy(
+                        approach=as_data.get("approach", "build_custom"),
+                        rationale=as_data.get("rationale", ""),
+                        direct_use_candidates=as_data.get("direct_use_candidates", []),
+                        concepts_to_extract=as_data.get("concepts_to_extract", []),
+                        integration_points=as_data.get("integration_points", []),
+                        estimated_time_saved=as_data.get("estimated_time_saved", ""),
+                    )
+            except (KeyError, IndexError):
+                pass
+
+            # Reconstruct handoff_context from stored JSON
+            stored_handoff_ctx: Dict[str, Any] = {}
+            try:
+                stored_handoff_ctx = json.loads(rec_row["handoff_context"]) if rec_row["handoff_context"] else {}
+            except (KeyError, IndexError):
+                pass
+
+            # Reconstruct executive_summary
+            stored_exec_summary = ""
+            try:
+                stored_exec_summary = rec_row["executive_summary"] or ""
+            except (KeyError, IndexError):
+                pass
+
             # Build Recommendation
             recommendation = Recommendation(
                 verdict=Verdict(rec_row["verdict"]),
                 verdict_rationale=rec_row["verdict_rationale"],
+                executive_summary=stored_exec_summary,
                 implementation_roadmap=roadmap,
+                adoption_strategy=stored_adoption,
                 next_agent=rec_row["next_agent"],
                 priority=Priority(rec_row["priority"]) if rec_row["priority"] else Priority.P3,
                 blocking_dependencies=json.loads(rec_row["blocking_dependencies"]) if rec_row["blocking_dependencies"] else [],
+                handoff_context=stored_handoff_ctx,
             )
 
             # Build final response

@@ -11,6 +11,7 @@ import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { ConsoleSidebar } from '../ConsoleSidebar';
 import { useOrganizations } from '../../api/dashboard';
 import { useCreateOrganization } from '../../api/organizations';
+import { PERSONAL_SCOPE_DESCRIPTION, PERSONAL_SCOPE_LABEL } from '../../copy/scopeLabels';
 import { orgContextStore } from '../../store/orgContextStore';
 import './OrganizationsPage.css';
 
@@ -116,7 +117,7 @@ export function OrganizationsPage(): React.JSX.Element {
     [navigate]
   );
 
-  const handleOpenPersonalProjects = useCallback(() => {
+  const handleOpenMyProjects = useCallback(() => {
     orgContextStore.setCurrentOrgId(null);
     navigate('/projects');
   }, [navigate]);
@@ -136,7 +137,7 @@ export function OrganizationsPage(): React.JSX.Element {
           <div className="orgs-header-left">
             <h1 className="orgs-title animate-fade-in-up">Organizations</h1>
             <p className="orgs-subtitle animate-fade-in-up">
-              Keep personal projects separate, or group work under an organization to collaborate at scale.
+              Keep your own projects separate, or group work under an organization to collaborate at scale.
             </p>
           </div>
           <div className="orgs-header-right">
@@ -157,7 +158,7 @@ export function OrganizationsPage(): React.JSX.Element {
             <div>
               <h2 className="orgs-section-title">Start a new organization</h2>
               <p className="orgs-section-subtitle">
-                Organize teams, projects, and agents with a shared workspace and membership controls.
+                Organize teams, projects, and agents with shared membership controls and project access.
               </p>
             </div>
             <div className="orgs-create-fields">
@@ -191,10 +192,10 @@ export function OrganizationsPage(): React.JSX.Element {
               <button
                 type="button"
                 className="orgs-secondary-button pressable"
-                onClick={handleOpenPersonalProjects}
+                onClick={handleOpenMyProjects}
                 data-haptic="light"
               >
-                Go to personal projects
+                Open my projects
               </button>
             </div>
           </div>
@@ -202,17 +203,17 @@ export function OrganizationsPage(): React.JSX.Element {
 
         <section className="orgs-grid" aria-label="Organization list">
           <OrganizationCard
-            title="Personal workspace"
-            subtitle="Projects you own outside of any organization."
-            meta="Personal"
-            onOpen={handleOpenPersonalProjects}
+            title={PERSONAL_SCOPE_LABEL}
+            subtitle={PERSONAL_SCOPE_DESCRIPTION}
+            meta={PERSONAL_SCOPE_LABEL}
+            onOpen={handleOpenMyProjects}
             isPersonal
           />
           {sortedOrganizations.length === 0 ? (
             <div className="orgs-empty animate-fade-in-up">
               <h2 className="orgs-empty-title">No organizations yet</h2>
               <p className="orgs-empty-description">
-                Create an organization to invite teammates and share projects.
+                Create an organization to invite teammates, share projects, and manage access in one place.
               </p>
             </div>
           ) : (
@@ -260,8 +261,14 @@ function OrganizationCard({
         <p className="org-card-subtitle">{subtitle}</p>
         <p className="org-card-meta">{meta}</p>
       </div>
-      <button type="button" className="org-card-action pressable" onClick={onOpen} data-haptic="light">
-        View projects
+      <button
+        type="button"
+        className="org-card-action pressable"
+        onClick={onOpen}
+        data-haptic="light"
+        aria-label={`Open projects for ${title}`}
+      >
+        Open projects
       </button>
     </div>
   );

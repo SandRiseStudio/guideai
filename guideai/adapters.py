@@ -824,6 +824,39 @@ class MCPBehaviorServiceAdapter(BehaviorAdapterBase):
     def get(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._behavior_detail(payload["behavior_id"], payload.get("version"))
 
+    def get_for_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Get relevant behaviors for a task before execution."""
+        from .behavior_service import RoleContext
+
+        actor = self._build_actor(payload.get("actor", {}))
+        role = payload.get("role", "Student")
+        task_description = payload["task_description"]
+        limit = min(int(payload.get("limit", 5)), 20)
+
+        role_context = None
+        if payload.get("role_context"):
+            rc = payload["role_context"]
+            role_context = RoleContext(
+                role=rc.get("role", role),
+                rationale=rc.get("rationale", ""),
+                behaviors_cited=rc.get("behaviors_cited", []),
+            )
+
+        result = self._service.get_relevant_behaviors_for_task(
+            task_description=task_description,
+            role=role,
+            limit=limit,
+            actor=actor,
+            role_context=role_context,
+        )
+
+        return {
+            "role": result["role"],
+            "task_description": result["task_description"],
+            "role_advisory": result["role_advisory"],
+            "recommended_behaviors": result["recommended_behaviors"],
+        }
+
 
 class BaseTaskAdapter:
     """Common adapter utilities for task assignments."""
@@ -1983,7 +2016,7 @@ class RestBCIAdapter(BaseBCIAdapter):
 
     def generate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Generate a behavior-conditioned LLM response."""
-        from .llm_provider import LLMConfig, ProviderType
+        from .llm import LLMConfig, ProviderType
 
         # Parse provider type (enum values are lowercase)
         provider_str = payload.get("provider", "openai")
@@ -1995,7 +2028,7 @@ class RestBCIAdapter(BaseBCIAdapter):
         # Build LLM config - pass provider_type so API key resolution uses correct provider
         llm_config = LLMConfig.from_env(provider=provider_type)
         if payload.get("model"):
-            llm_config.model_name = payload["model"]
+            llm_config.model = payload["model"]
         if payload.get("temperature") is not None:
             llm_config.temperature = float(payload["temperature"])
 
@@ -2027,7 +2060,7 @@ class RestBCIAdapter(BaseBCIAdapter):
 
     def improve(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Analyze a failed run and generate improvement suggestions."""
-        from .llm_provider import LLMConfig, ProviderType
+        from .llm import LLMConfig, ProviderType
 
         # Parse provider type (enum values are lowercase)
         provider_str = payload.get("provider", "openai")
@@ -2039,7 +2072,7 @@ class RestBCIAdapter(BaseBCIAdapter):
         # Build LLM config - pass provider_type so API key resolution uses correct provider
         llm_config = LLMConfig.from_env(provider=provider_type)
         if payload.get("model"):
-            llm_config.model_name = payload["model"]
+            llm_config.model = payload["model"]
 
         result = self._service.improve_run(
             run_id=payload["run_id"],
@@ -2124,6 +2157,37 @@ class RestReflectionAdapter(BaseReflectionAdapter):
     def extract(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         request = self._parse(payload)
         return self._service.reflect(request).to_dict()
+
+    def list_candidates(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """List behavior candidates for review.
+
+        Query params are passed as payload dict:
+            status?: str - Filter by status (proposed, approved, rejected, merged)
+            role?: str - Filter by role
+            min_confidence?: float - Filter by minimum confidence
+            limit?: int - Max results (default 50)
+            offset?: int - Pagination offset (default 0)
+        """
+        # Check if service supports list_candidates (PostgresReflectionService)
+        if not hasattr(self._service, "list_candidates"):
+            return {
+                "candidates": [],
+                "total": 0,
+                "message": "Candidate listing requires PostgreSQL storage (set GUIDEAI_POSTGRES_DSN)",
+            }
+
+        candidates = self._service.list_candidates(
+            status=payload.get("status"),
+            role=payload.get("role"),
+            min_confidence=payload.get("min_confidence"),
+            limit=payload.get("limit", 50),
+            offset=payload.get("offset", 0),
+        )
+
+        return {
+            "candidates": [c.to_dict() if hasattr(c, "to_dict") else c for c in candidates],
+            "total": len(candidates),
+        }
 
     def approve_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Approve a behavior candidate and add it to the handbook.
@@ -2220,6 +2284,153 @@ class CLIReflectionAdapter(BaseReflectionAdapter):
             preferred_tags=preferred_tags,
         )
         return self._service.reflect(request).to_dict()
+
+    def list_candidates(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """List behavior candidates for review.
+
+        payload:
+            status?: str - Filter by status (proposed, approved, rejected, merged)
+            role?: str - Filter by role
+            min_confidence?: float - Filter by minimum confidence
+            limit?: int - Max results (default 50)
+            offset?: int - Pagination offset (default 0)
+        """
+        # Check if service supports list_candidates (PostgresReflectionService)
+        if not hasattr(self._service, "list_candidates"):
+            return {
+                "candidates": [],
+                "total": 0,
+                "message": "Candidate listing requires PostgreSQL storage (set GUIDEAI_POSTGRES_DSN)",
+            }
+
+        candidates = self._service.list_candidates(
+            status=payload.get("status"),
+            role=payload.get("role"),
+            min_confidence=payload.get("min_confidence"),
+            limit=payload.get("limit", 50),
+            offset=payload.get("offset", 0),
+        )
+
+        return {
+            "candidates": [c.to_dict() if hasattr(c, "to_dict") else c for c in candidates],
+            "total": len(candidates),
+        }
+
+    def approve_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Approve a behavior candidate.
+
+        payload:
+            candidate_id: str - ID of the candidate to approve
+            reviewed_by: str - Reviewer identifier
+            merge_to_handbook?: bool - Immediately merge to behavior handbook
+            behavior_name?: str - Override behavior name when merging
+        """
+        candidate_id = payload.get("candidate_id")
+        if not candidate_id:
+            return {"success": False, "message": "candidate_id is required"}
+
+        # Check if service supports approve_candidate
+        if not hasattr(self._service, "approve_candidate"):
+            return {
+                "success": False,
+                "message": "Candidate approval requires PostgreSQL storage (set GUIDEAI_POSTGRES_DSN)",
+            }
+
+        reviewed_by = payload.get("reviewed_by", "cli-user")
+
+        try:
+            result = self._service.approve_candidate(
+                candidate_id=candidate_id,
+                reviewed_by=reviewed_by,
+            )
+
+            response: Dict[str, Any] = {
+                "success": True,
+                "candidate_id": candidate_id,
+                "status": "approved",
+            }
+
+            # Check for auto-approval (confidence >= 0.8)
+            if hasattr(result, "confidence") and result.confidence >= 0.8:
+                response["auto_approved"] = True
+
+            # Handle merge to handbook if requested
+            if payload.get("merge_to_handbook"):
+                response["merge_requested"] = True
+                behavior_id = self._promote_candidate_cli(result, reviewed_by)
+                if behavior_id:
+                    response["merged_behavior_id"] = behavior_id
+
+            return response
+
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def _promote_candidate_cli(self, candidate: Any, reviewed_by: str) -> Optional[str]:
+        """Promote an approved candidate to a behavior via BehaviorService (CLI surface)."""
+        try:
+            import os as _os
+            from .behavior_service import BehaviorService
+            from .action_contracts import Actor
+
+            dsn = _os.environ.get("GUIDEAI_BEHAVIOR_PG_DSN")
+            if not dsn:
+                return None
+
+            behavior_service = BehaviorService(dsn=dsn)
+            actor = Actor(id=reviewed_by, type="user")
+            result = behavior_service.promote_candidate_to_behavior(
+                candidate_name=getattr(candidate, "name", "unknown"),
+                candidate_summary=getattr(candidate, "summary", ""),
+                candidate_triggers=getattr(candidate, "triggers", []) or [],
+                candidate_steps=getattr(candidate, "steps", []) or [],
+                candidate_keywords=getattr(candidate, "keywords", []) or [],
+                candidate_confidence=getattr(candidate, "confidence", 0.0),
+                candidate_role=getattr(candidate, "role", "Student") or "Student",
+                actor=actor,
+            )
+            return result.get("behavior_id")
+        except Exception:
+            return None
+
+    def reject_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Reject a behavior candidate.
+
+        payload:
+            candidate_id: str - ID of the candidate to reject
+            reviewed_by: str - Reviewer identifier
+            reason?: str - Reason for rejection
+        """
+        candidate_id = payload.get("candidate_id")
+        if not candidate_id:
+            return {"success": False, "message": "candidate_id is required"}
+
+        # Check if service supports reject_candidate
+        if not hasattr(self._service, "reject_candidate"):
+            return {
+                "success": False,
+                "message": "Candidate rejection requires PostgreSQL storage (set GUIDEAI_POSTGRES_DSN)",
+            }
+
+        reviewed_by = payload.get("reviewed_by", "cli-user")
+        reason = payload.get("reason")
+
+        try:
+            self._service.reject_candidate(
+                candidate_id=candidate_id,
+                reviewed_by=reviewed_by,
+                reason=reason,
+            )
+
+            return {
+                "success": True,
+                "candidate_id": candidate_id,
+                "status": "rejected",
+                "reason": reason,
+            }
+
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
 
 class MCPReflectionAdapter(BaseReflectionAdapter):
@@ -3573,157 +3784,9 @@ class MCPAgentAuthServiceAdapter(BaseAgentAuthServiceAdapter):
         return result
 
 
-class BaseDeviceFlowAdapter:
-    """Surface-specific wrapper around DeviceFlowManager."""
-
-    def __init__(self, manager: DeviceFlowManager, surface: str) -> None:
-        self._manager = manager
-        self.surface = surface
-
-    @staticmethod
-    def _normalize_user_code(user_code: str) -> str:
-        stripped = "".join(ch for ch in user_code if ch.isalnum())
-        if not stripped:
-            raise ValueError("user_code must contain letters or numbers")
-        upper = stripped.upper()
-        if len(upper) >= 8:
-            midpoint = len(upper) // 2
-            return f"{upper[:midpoint]}-{upper[midpoint:]}"
-        return upper
-
-    @staticmethod
-    def _format_session(session: DeviceAuthorizationSession) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "device_code": session.device_code,
-            "user_code": session.user_code,
-            "client_id": session.client_id,
-            "scopes": list(session.scopes),
-            "surface": session.surface,
-            "status": session.status.value,
-            "verification_uri": session.verification_uri,
-            "verification_uri_complete": session.verification_uri_complete,
-            "created_at": session.created_at.isoformat(),
-            "expires_at": session.expires_at.isoformat(),
-            "poll_interval": session.poll_interval,
-        }
-        if session.approved_at:
-            payload["approved_at"] = session.approved_at.isoformat()
-        if session.denied_at:
-            payload["denied_at"] = session.denied_at.isoformat()
-        if session.denied_reason:
-            payload["denied_reason"] = session.denied_reason
-        return payload
-
-    @staticmethod
-    def _format_poll_result(result: DevicePollResult) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "status": result.status.value,
-            "retry_after": result.retry_after,
-            "expires_in": result.expires_in,
-            "client_id": result.client_id,
-            "scopes": list(result.scopes or []),
-        }
-        if result.denied_reason:
-            payload["denied_reason"] = result.denied_reason
-        if result.tokens:
-            payload.update(
-                {
-                    "access_token": result.tokens.access_token,
-                    "refresh_token": result.tokens.refresh_token,
-                    "token_type": result.tokens.token_type,
-                    "access_token_expires_at": result.tokens.access_token_expires_at.isoformat(),
-                    "refresh_token_expires_at": result.tokens.refresh_token_expires_at.isoformat(),
-                }
-            )
-        return payload
-
-    def start_authorization(
-        self,
-        *,
-        client_id: str,
-        scopes: List[str],
-        metadata: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        session = self._manager.start_authorization(
-            client_id=client_id,
-            scopes=scopes,
-            surface=self.surface,
-            metadata=metadata,
-        )
-        return self._format_session(session)
-
-    def lookup_user_code(self, user_code: str) -> Dict[str, Any]:
-        normalized = self._normalize_user_code(user_code)
-        session = self._manager.describe_user_code(normalized)
-        return self._format_session(session)
-
-    def poll(self, device_code: str) -> Dict[str, Any]:
-        result = self._manager.poll_device_code(device_code)
-        return self._format_poll_result(result)
-
-    def refresh(self, refresh_token: str) -> Dict[str, Any]:
-        session = self._manager.refresh_access_token(refresh_token)
-        tokens = session.tokens
-        assert tokens is not None, "refreshed session must include tokens"
-        return {
-            "access_token": tokens.access_token,
-            "refresh_token": tokens.refresh_token,
-            "token_type": tokens.token_type,
-            "access_token_expires_at": tokens.access_token_expires_at.isoformat(),
-            "refresh_token_expires_at": tokens.refresh_token_expires_at.isoformat(),
-            "access_expires_in": tokens.access_expires_in(),
-            "refresh_expires_in": tokens.refresh_expires_in(),
-            "client_id": session.client_id,
-            "scopes": list(session.scopes),
-        }
-
-    def approve(
-        self,
-        user_code: str,
-        *,
-        approver: str,
-        roles: Optional[List[str]] = None,
-        mfa_verified: bool = False,
-    ) -> Dict[str, Any]:
-        normalized = self._normalize_user_code(user_code)
-        session = self._manager.approve_user_code(
-            normalized,
-            approver,
-            approver_surface=self.surface,
-            roles=roles,
-            mfa_verified=mfa_verified,
-        )
-        return self._format_session(session)
-
-    def deny(
-        self,
-        user_code: str,
-        *,
-        approver: str,
-        reason: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        normalized = self._normalize_user_code(user_code)
-        session = self._manager.deny_user_code(
-            normalized,
-            approver,
-            approver_surface=self.surface,
-            reason=reason,
-        )
-        return self._format_session(session)
-
-
-class CLIDeviceFlowAdapter(BaseDeviceFlowAdapter):
-    """Device flow adapter scoped to CLI surface."""
-
-    def __init__(self, manager: DeviceFlowManager) -> None:
-        super().__init__(manager, surface="cli")
-
-
-class MCPDeviceFlowAdapter(BaseDeviceFlowAdapter):
-    """Device flow adapter scoped to MCP surface."""
-
-    def __init__(self, manager: DeviceFlowManager) -> None:
-        super().__init__(manager, surface="mcp")
+# Device flow adapters extracted to device_flow_adapters.py for lightweight imports.
+# Re-exported here for backwards compatibility.
+from .device_flow_adapters import BaseDeviceFlowAdapter, CLIDeviceFlowAdapter, MCPDeviceFlowAdapter  # noqa: F401
 
 
 class BaseTraceAnalysisAdapter:
@@ -3915,6 +3978,172 @@ class MCPReflectionServiceAdapter:
             ],
             "summary": response.summary,
             "metadata": response.metadata,
+        }
+
+    def list_candidates(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tool: reflection.listCandidates - List behavior candidates with filtering."""
+        from .reflection_service_postgres import PostgresReflectionService
+
+        # Check if service supports candidate listing (PostgreSQL backend)
+        if not hasattr(self._service, "list_candidates"):
+            return {
+                "candidates": [],
+                "total": 0,
+                "error": "Candidate listing requires PostgreSQL backend (set GUIDEAI_REFLECTION_PG_DSN)",
+            }
+
+        candidates = self._service.list_candidates(
+            status=payload.get("status"),
+            role=payload.get("role"),
+            min_confidence=payload.get("min_confidence", 0.0),
+            limit=payload.get("limit", 50),
+            offset=payload.get("offset", 0),
+        )
+
+        return {
+            "candidates": [
+                {
+                    "candidate_id": c.candidate_id,
+                    "name": c.name,
+                    "summary": c.summary,
+                    "triggers": c.triggers,
+                    "steps": c.steps,
+                    "confidence": c.confidence,
+                    "status": c.status,
+                    "role": c.role,
+                    "keywords": c.keywords,
+                    "reviewed_by": c.reviewed_by,
+                    "reviewed_at": c.reviewed_at.isoformat() if c.reviewed_at else None,
+                    "merged_behavior_id": c.merged_behavior_id,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                    "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                }
+                for c in candidates
+            ],
+            "total": len(candidates),
+        }
+
+    def approve_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tool: reflection.approveCandidate - Approve a behavior candidate."""
+        from .telemetry_events import ReflectionCandidateApprovedPayload, TelemetryEventType
+
+        if not hasattr(self._service, "approve_candidate"):
+            return {
+                "success": False,
+                "error": "Candidate approval requires PostgreSQL backend",
+            }
+
+        candidate_id = payload.get("candidate_id")
+        reviewed_by = payload.get("reviewed_by", "mcp_user")
+        merge_to_handbook = payload.get("merge_to_handbook", False)
+
+        if not candidate_id:
+            return {"success": False, "error": "candidate_id is required"}
+
+        # Get candidate for auto-approval check
+        candidate = self._service.get_candidate(candidate_id)
+        if not candidate:
+            return {"success": False, "error": f"Candidate not found: {candidate_id}"}
+
+        # Auto-approval: confidence >= 0.8 triggers automatic approval
+        auto_approved = candidate.confidence >= 0.8
+        merged_behavior_id = None
+
+        if merge_to_handbook:
+            # Promote candidate to a real behavior via BehaviorService
+            merged_behavior_id = self._promote_candidate(candidate, reviewed_by)
+
+        updated = self._service.approve_candidate(
+            candidate_id=candidate_id,
+            reviewed_by=reviewed_by,
+            merged_behavior_id=merged_behavior_id,
+        )
+
+        # Emit telemetry
+        try:
+            from .telemetry import TelemetryClient, create_sink_from_env
+
+            telemetry = TelemetryClient(sink=create_sink_from_env())
+            telemetry.emit_event(
+                event_type=TelemetryEventType.REFLECTION_CANDIDATE_APPROVED.value,
+                payload=ReflectionCandidateApprovedPayload(
+                    candidate_id=candidate_id,
+                    behavior_id=merged_behavior_id,
+                    reviewer_role="teacher" if not auto_approved else "auto",
+                    auto_approved=auto_approved,
+                ).to_dict(),
+            )
+        except Exception:
+            pass  # Telemetry should not block approval
+
+        return {
+            "success": True,
+            "candidate_id": updated.candidate_id,
+            "status": updated.status,
+            "behavior_id": merged_behavior_id,
+            "auto_approved": auto_approved,
+            "message": f"Candidate {candidate_id} approved" + (" and merged to handbook" if merge_to_handbook else ""),
+        }
+
+    def _promote_candidate(self, candidate: Any, reviewed_by: str) -> Optional[str]:
+        """Promote an approved candidate to a behavior via BehaviorService.
+
+        Returns the created behavior_id, or None if BehaviorService is unavailable.
+        """
+        try:
+            import os as _os
+            from .behavior_service import BehaviorService
+            from .action_contracts import Actor
+
+            behavior_service = getattr(self._service, "_behavior_service", None)
+            if behavior_service is None:
+                # Try constructing from environment
+                dsn = _os.environ.get("GUIDEAI_BEHAVIOR_PG_DSN")
+                if not dsn:
+                    return None
+                behavior_service = BehaviorService(dsn=dsn)
+
+            actor = Actor(id=reviewed_by, type="user")
+            result = behavior_service.promote_candidate_to_behavior(
+                candidate_name=candidate.name,
+                candidate_summary=candidate.summary,
+                candidate_triggers=candidate.triggers if candidate.triggers else [],
+                candidate_steps=candidate.steps if candidate.steps else [],
+                candidate_keywords=candidate.keywords if candidate.keywords else [],
+                candidate_confidence=candidate.confidence,
+                candidate_role=candidate.role or "Student",
+                actor=actor,
+            )
+            return result.get("behavior_id")
+        except Exception:
+            return None
+
+    def reject_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """MCP tool: reflection.rejectCandidate - Reject a behavior candidate."""
+        if not hasattr(self._service, "reject_candidate"):
+            return {
+                "success": False,
+                "error": "Candidate rejection requires PostgreSQL backend",
+            }
+
+        candidate_id = payload.get("candidate_id")
+        reviewed_by = payload.get("reviewed_by", "mcp_user")
+        reason = payload.get("reason")
+
+        if not candidate_id:
+            return {"success": False, "error": "candidate_id is required"}
+
+        updated = self._service.reject_candidate(
+            candidate_id=candidate_id,
+            reviewed_by=reviewed_by,
+            reason=reason,
+        )
+
+        return {
+            "success": True,
+            "candidate_id": updated.candidate_id,
+            "status": updated.status,
+            "message": f"Candidate {candidate_id} rejected" + (f": {reason}" if reason else ""),
         }
 
 
@@ -4311,7 +4540,7 @@ class RestAmprealizeAdapter:
 
 
 # ============================================================================
-# AuditLogService Adapters (per AUDIT_LOG_STORAGE.md)
+# AuditLogService Adapters (per docs/contracts/AUDIT_LOG_STORAGE.md)
 # ============================================================================
 
 
@@ -4491,7 +4720,7 @@ class CLIAuditServiceAdapter(BaseAuditServiceAdapter):
 class MCPAuditServiceAdapter(BaseAuditServiceAdapter):
     """MCP adapter for AuditLogService.
 
-    Provides audit.* MCP tools per AUDIT_LOG_STORAGE.md:
+    Provides audit.* MCP tools per docs/contracts/AUDIT_LOG_STORAGE.md:
     - audit.query: Query audit events with filters
     - audit.archive: Trigger batch archival
     - audit.verify: Verify integrity (hash chain + Object Lock)

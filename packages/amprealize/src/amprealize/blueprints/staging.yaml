@@ -118,10 +118,7 @@ services:
       - "log_line_prefix=%m [%p] %q%u@%d "
     volumes:
       - staging-telemetry-data:/var/lib/postgresql/data
-      - ./schema/migrations/001_create_telemetry_warehouse.sql:/docker-entrypoint-initdb.d/001_create_telemetry_warehouse.sql:ro
-      - ./schema/migrations/012_create_metrics_service.sql:/docker-entrypoint-initdb.d/012_create_metrics_service.sql:ro
-      - ./schema/migrations/013_create_trace_analysis.sql:/docker-entrypoint-initdb.d/013_create_trace_analysis.sql:ro
-      - ./schema/migrations/014_create_telemetry_warehouse_timescale.sql:/docker-entrypoint-initdb.d/014_create_telemetry_warehouse_timescale.sql:ro
+      # Schema managed by Alembic (alembic.telemetry.ini → migrations_telemetry/)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guideai_telemetry -d guideai_telemetry"]
       interval: 10s
@@ -133,7 +130,7 @@ services:
     restart: unless-stopped
 
   postgres-behavior:
-    image: pgvector/pgvector:pg16
+    image: timescale/timescaledb:latest-pg16
     module: core
     hostname: postgres-behavior
     container_name: guideai-staging-behavior
@@ -154,9 +151,7 @@ services:
       - "log_line_prefix=%m [%p] %q%u@%d "
     volumes:
       - staging-behavior-data:/var/lib/postgresql/data
-      - ./schema/migrations/002_create_behavior_service.sql:/docker-entrypoint-initdb.d/002_create_behavior_service.sql:ro
-      - ./schema/migrations/008_optimize_behavior_indexes.sql:/docker-entrypoint-initdb.d/008_optimize_behavior_indexes.sql:ro
-      - ./schema/migrations/010_create_behavior_embeddings.sql:/docker-entrypoint-initdb.d/010_create_behavior_embeddings.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guideai_behavior -d guideai_behavior"]
       interval: 10s
@@ -187,8 +182,7 @@ services:
       - "log_min_duration_statement=500"
     volumes:
       - staging-workflow-data:/var/lib/postgresql/data
-      - ./schema/migrations/003_create_workflow_service.sql:/docker-entrypoint-initdb.d/003_create_workflow_service.sql:ro
-      - ./schema/migrations/009_refactor_workflow_schema.sql:/docker-entrypoint-initdb.d/009_refactor_workflow_schema.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guideai_workflow -d guideai_workflow"]
       interval: 10s
@@ -219,8 +213,7 @@ services:
       - "log_min_duration_statement=500"
     volumes:
       - staging-action-data:/var/lib/postgresql/data
-      - ./schema/migrations/004_create_action_service.sql:/docker-entrypoint-initdb.d/004_create_action_service.sql:ro
-      - ./schema/migrations/007_extend_replays_metadata.sql:/docker-entrypoint-initdb.d/007_extend_replays_metadata.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guideai_action -d guideai_action"]
       interval: 10s
@@ -251,7 +244,7 @@ services:
       - "log_min_duration_statement=500"
     volumes:
       - staging-run-data:/var/lib/postgresql/data
-      - ./schema/migrations/005_create_run_service.sql:/docker-entrypoint-initdb.d/005_create_run_service.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guideai_run -d guideai_run"]
       interval: 10s
@@ -282,7 +275,7 @@ services:
       - "log_min_duration_statement=500"
     volumes:
       - staging-compliance-data:/var/lib/postgresql/data
-      - ./schema/migrations/006_create_compliance_service.sql:/docker-entrypoint-initdb.d/006_create_compliance_service.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guideai_compliance -d guideai_compliance"]
       interval: 10s
@@ -313,7 +306,7 @@ services:
       - "log_min_duration_statement=500"
     volumes:
       - staging-agent-orchestrator-data:/var/lib/postgresql/data
-      - ./schema/migrations/011_create_agent_orchestrator.sql:/docker-entrypoint-initdb.d/011_create_agent_orchestrator.sql:ro
+      # Schema managed by Alembic (alembic.ini → migrations/)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guideai_agent_orchestrator -d guideai_agent_orchestrator"]
       interval: 10s

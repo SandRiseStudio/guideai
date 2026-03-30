@@ -30,4 +30,4 @@ services:
       - "timescaledb.max_background_workers=8"
     volumes:
       - timescaledb-metrics-data:/var/lib/postgresql/data
-      - ./schema/migrations/012_create_metrics_service.sql:/docker-entrypoint-initdb.d/012_create_metrics_service.sql:ro
+      # Schema managed by Alembic (alembic.telemetry.ini → migrations_telemetry/)

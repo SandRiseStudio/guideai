@@ -1584,6 +1584,18 @@ def stop(
     with open(env_path) as f:
         run_data = json.load(f)
 
+    # Build podman command with connection info from runtime
+    runtime = run_data.get("runtime", {})
+    executor = PodmanExecutor(connection=runtime.get("podman_connection"))
+    if not executor.connection:
+        machine_name = runtime.get("podman_machine")
+        if machine_name:
+            executor.connection = executor.resolve_connection_for_machine(machine_name)
+
+    podman_cmd = ["podman"]
+    if executor.connection:
+        podman_cmd.extend(["--connection", executor.connection])
+
     outputs = run_data.get("environment_outputs", {})
     if not outputs:
         console.print(f"[yellow]No services found in environment {target_run_id}[/yellow]")
@@ -2228,12 +2240,17 @@ def cleanup(
     aggressive: bool = typer.Option(
         False,
         "--aggressive", "-a",
-        help="Use aggressive cleanup (images, build cache, dangling volumes)",
+        help="Remove unused images and build cache in addition to containers/volumes",
     ),
     include_volumes: bool = typer.Option(
+        True,
+        "--include-volumes/--no-volumes",
+        help="Remove anonymous (hash-named) volumes not attached to running containers (default: on)",
+    ),
+    include_images: bool = typer.Option(
         False,
-        "--include-volumes",
-        help="Include ALL volumes (WARNING: may lose data)",
+        "--include-images", "-i",
+        help="Remove images not referenced by any container",
     ),
     include_stale_state: bool = typer.Option(
         False,
@@ -2260,6 +2277,11 @@ def cleanup(
         "--preserve-env", "-e",
         help="Environment run IDs to preserve (can specify multiple times, partial IDs work)",
     ),
+    preserve_volumes: Optional[List[str]] = typer.Option(
+        None,
+        "--preserve-volume",
+        help="Additional volume name patterns to preserve (can specify multiple times)",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run", "-n",
@@ -2276,28 +2298,49 @@ def cleanup(
         help="Minimal output",
     ),
 ) -> None:
-    """Clean up container resources to free disk space.
+    """Clean up stale container resources to free disk space.
 
-    By default, performs standard cleanup (stopped containers, unused networks).
-    Use --aggressive for deeper cleanup including images and cache.
-    Use --include-stale-state to remove orphaned state files for environments
-    that are no longer running (preserves the most recent running environment).
-    Use --scaledown-machines as a last resort to stop unused Podman machines.
+    This is the safe middle-ground between doing nothing and 'amprealize nuke'.
+    By default it removes dead/exited containers and anonymous (hash-named)
+    volumes while preserving all named database volumes, pip/node caches,
+    and anything attached to running containers.
+
+    Use --aggressive to also remove unused images and build cache.
+    Use --include-stale-state to remove orphaned state files.
+
+    Database and backup volumes are ALWAYS preserved, even with --aggressive.
 
     Examples:
-        amprealize cleanup                    # Standard cleanup
-        amprealize cleanup --aggressive       # Include images and cache
+        amprealize cleanup                    # Remove dead containers + anonymous volumes
+        amprealize cleanup --dry-run          # Preview what would be cleaned
+        amprealize cleanup --aggressive       # Also remove unused images + build cache
         amprealize cleanup -a -s              # Aggressive + clean stale state
+        amprealize cleanup --no-volumes       # Only clean dead containers
+        amprealize cleanup --include-images   # Also remove unused images
+        amprealize cleanup --preserve-volume mydata  # Extra volume pattern to protect
         amprealize cleanup -s --preserve-env amp-abc123  # Clean state but keep specific env
         amprealize cleanup --scaledown-machines --preserve-machine default
-        amprealize cleanup --dry-run          # Preview cleanup
     """
     import subprocess
     import re
 
     executor = PodmanExecutor()
 
-    # Discover stale state files if requested
+    # Aggressive enables images + build cache
+    if aggressive:
+        include_images = True
+
+    # --- Phase 1: Smart cleanup via executor (containers, volumes, images, cache) ---
+    smart_result = executor.smart_cleanup(
+        dry_run=dry_run,
+        remove_dead_containers=True,
+        remove_anonymous_volumes=include_volumes,
+        remove_unused_images=include_images,
+        prune_build_cache=aggressive,
+        preserve_volume_patterns=preserve_volumes,
+    )
+
+    # --- Phase 2: Stale state files (same logic as before) ---
     stale_state_to_remove: Dict[str, List[Path]] = {
         "environments": [],
         "manifests": [],
@@ -2307,7 +2350,6 @@ def cleanup(
     most_recent_env_id: Optional[str] = None
 
     if include_stale_state:
-        # First, discover which environments are actually running via containers
         try:
             result = subprocess.run(
                 ["podman", "ps", "--format", "{{.Names}}"],
@@ -2315,228 +2357,217 @@ def cleanup(
                 text=True,
                 timeout=30,
             )
-            # Extract run IDs from container names like "amp-5d13e62f-840a-4672-ae03-24e18d05022a-guideai-db"
             for line in result.stdout.strip().split("\n"):
                 if line.startswith("amp-"):
-                    # Extract the UUID part (amp-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX)
                     match = re.match(r"(amp-[a-f0-9-]{36})", line)
                     if match:
                         running_env_ids.add(match.group(1))
         except Exception:
             pass
 
-        # Add explicitly preserved environments
         if preserve_environments:
             for env_id in preserve_environments:
-                # Support partial matching
                 running_env_ids.add(env_id)
 
-        # Discover state files
         state_dir = Path.home() / ".guideai" / "amprealize"
         if state_dir.exists():
-            # Find the most recent environment state file (by modified time)
             env_files = list((state_dir / "environments").glob("*.json")) if (state_dir / "environments").exists() else []
             if env_files:
                 most_recent_file = max(env_files, key=lambda f: f.stat().st_mtime)
                 most_recent_env_id = most_recent_file.stem
 
-            # Categorize state files
             for category in ["environments", "manifests", "snapshots"]:
                 category_dir = state_dir / category
                 if category_dir.exists():
                     for f in category_dir.glob("*"):
                         if f.is_file():
                             file_id = f.stem
-                            # Check if this file belongs to a running or preserved environment
                             is_preserved = False
-
-                            # Check running environments
                             for running_id in running_env_ids:
                                 if running_id in file_id or file_id in running_id:
                                     is_preserved = True
                                     break
-
-                            # Also preserve the most recent environment state
                             if most_recent_env_id and (most_recent_env_id in file_id or file_id in most_recent_env_id):
                                 is_preserved = True
-
                             if not is_preserved:
                                 stale_state_to_remove[category].append(f)
 
     total_stale_files = sum(len(files) for files in stale_state_to_remove.values())
 
+    # --- Dry run output ---
     if dry_run:
-        # Show current resource usage and what could be cleaned
-        console.print("[yellow]Dry run mode - no changes will be made[/yellow]")
+        if json_output:
+            output = {
+                "dry_run": True,
+                **smart_result,
+                "stale_state": {k: [str(f) for f in v] for k, v in stale_state_to_remove.items()},
+            }
+            console.print(json.dumps(output, indent=2, default=str))
+            return
+
+        console.print("[yellow]Dry run — no changes will be made[/yellow]")
         console.print()
 
-        try:
-            resource_data = executor.get_resource_insights(verbose=True)
-            if resource_data.get("summary"):
-                console.print(Panel(
-                    resource_data["summary"],
-                    title="Current Resource Status",
-                    expand=False,
-                ))
-        except Exception:
-            pass
+        # Dead containers
+        if smart_result["dead_containers"]:
+            table = Table(title="Dead Containers to Remove")
+            table.add_column("Name", style="cyan")
+            table.add_column("Status", style="dim")
+            for c in smart_result["dead_containers"]:
+                table.add_row(c["name"], c.get("status", "")[:40])
+            console.print(table)
+        else:
+            console.print("[green]No dead containers found[/green]")
 
         console.print()
-        console.print("[cyan]Cleanup actions that would be performed:[/cyan]")
-        console.print("  • Remove stopped containers")
-        console.print("  • Remove unused networks")
+
+        # Anonymous volumes
+        anon_count = len(smart_result["anonymous_volumes"])
+        if anon_count:
+            console.print(f"[cyan]Anonymous volumes to remove:[/cyan] {anon_count}")
+            # Show first few
+            for vol in smart_result["anonymous_volumes"][:5]:
+                console.print(f"  • {vol[:16]}...")
+            if anon_count > 5:
+                console.print(f"  [dim]... and {anon_count - 5} more[/dim]")
+        else:
+            console.print("[green]No anonymous volumes to clean[/green]")
+
+        # Preserved volumes
+        if smart_result["preserved_volumes"]:
+            console.print()
+            console.print(f"[green]Preserved volumes ({len(smart_result['preserved_volumes'])}):[/green]")
+            for vol in smart_result["preserved_volumes"]:
+                console.print(f"  [green]✓[/green] {vol}")
+
+        # Unused images
+        if smart_result["unused_images"]:
+            console.print()
+            table = Table(title="Unused Images to Remove")
+            table.add_column("Image", style="cyan")
+            table.add_column("Size", style="dim", justify="right")
+            for img in smart_result["unused_images"]:
+                table.add_row(img["name"], img.get("size", ""))
+            console.print(table)
+
         if aggressive:
-            console.print("  • Remove unused images")
-            console.print("  • Remove build cache")
-            console.print("  • Remove dangling volumes")
-        if include_volumes:
-            console.print("  • [red]Remove ALL volumes (data loss possible)[/red]")
+            console.print()
+            console.print("[cyan]Build cache will be pruned[/cyan]")
+
+        # Stale state
         if include_stale_state:
-            console.print(f"  • Remove stale state files ({total_stale_files} files)")
+            console.print()
+            if total_stale_files:
+                console.print(f"[cyan]Stale state files to remove:[/cyan] {total_stale_files}")
+                for category, files in stale_state_to_remove.items():
+                    if files:
+                        console.print(f"  • {category}: {len(files)} file(s)")
+            else:
+                console.print("[green]No stale state files[/green]")
             if running_env_ids:
-                console.print(f"    [green]Preserving running environments: {', '.join(sorted(running_env_ids)[:3])}{'...' if len(running_env_ids) > 3 else ''}[/green]")
-            if most_recent_env_id and most_recent_env_id not in running_env_ids:
-                console.print(f"    [green]Preserving most recent: {most_recent_env_id}[/green]")
-            for category, files in stale_state_to_remove.items():
-                if files:
-                    console.print(f"    • {category}: {len(files)} file(s) to remove")
+                console.print(f"  [green]Preserving running environments: {', '.join(sorted(running_env_ids)[:3])}{'...' if len(running_env_ids) > 3 else ''}[/green]")
+
+        # Machine
         if scaledown_machines:
-            console.print("  • Stop unused Podman machines")
+            console.print()
+            console.print("[cyan]Unused Podman machines would be stopped[/cyan]")
             if remove_machines:
-                console.print("  • [red]Remove unused machines (rebuild required)[/red]")
+                console.print("[red]Unused machines would be removed (rebuild required)[/red]")
             if preserve_machines:
-                console.print(f"  • Preserving machines: {', '.join(preserve_machines)}")
+                console.print(f"  Preserving machines: {', '.join(preserve_machines)}")
+
         return
 
-    # Track stale state removal results
-    stale_state_removed = {
-        "environments": 0,
-        "manifests": 0,
-        "snapshots": 0,
-    }
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=not quiet,
-    ) as progress:
-        task = progress.add_task("Cleaning up resources...", total=None)
-
-        try:
-            # Perform standard or aggressive cleanup
-            result = executor.mitigate_resources(
-                aggressive=aggressive,
-                prune_volumes=include_volumes,
-            )
-
-            # Clean stale state files
-            if include_stale_state and total_stale_files > 0:
-                progress.update(task, description="Removing stale state files...")
-                for category, files in stale_state_to_remove.items():
-                    for f in files:
-                        try:
-                            f.unlink()
-                            stale_state_removed[category] += 1
-                        except Exception:
-                            pass  # Non-critical, continue
-
-            # Optionally stop/remove machines
-            machine_result = None
-            if scaledown_machines and hasattr(executor, 'stop_unused_machines'):
-                progress.update(task, description="Scaling down machines...")
-                machine_result = executor.stop_unused_machines(
-                    preserve=preserve_machines or []
-                )
-
-                # Optionally remove machines
-                if remove_machines and machine_result and machine_result.machines_stopped > 0:
-                    progress.update(task, description="Removing machines...")
-                    # The stopped machines are tracked in machine_result
-                    # We could iterate over them to remove, but for safety
-                    # we'll just note this in the result
+    # --- Execute (non-dry-run already happened in smart_cleanup) ---
+    # Phase 2 execution: stale state files
+    stale_state_removed = {"environments": 0, "manifests": 0, "snapshots": 0}
+    if include_stale_state and total_stale_files > 0:
+        for category, files in stale_state_to_remove.items():
+            for f in files:
+                try:
+                    f.unlink()
+                    stale_state_removed[category] += 1
+                except Exception:
                     pass
-
-        except Exception as e:
-            console.print(f"[red]Cleanup failed: {e}[/red]")
-            raise typer.Exit(1)
 
     total_state_removed = sum(stale_state_removed.values())
 
+    # Phase 3: Machine scaledown
+    machine_result = None
+    if scaledown_machines and hasattr(executor, 'stop_unused_machines'):
+        machine_result = executor.stop_unused_machines(
+            preserve=preserve_machines or []
+        )
+
+    # --- Output ---
     if json_output:
-        output = result.to_dict() if hasattr(result, 'to_dict') else {}
+        output = {
+            **{k: v for k, v in smart_result.items() if k != "errors"},
+            "dead_containers_removed": len(smart_result["dead_containers"]),
+            "anonymous_volumes_removed": len(smart_result["anonymous_volumes"]),
+            "unused_images_removed": len(smart_result["unused_images"]),
+            "build_cache_cleared": smart_result["build_cache_cleared"],
+            "stale_state_removed": stale_state_removed,
+            "errors": smart_result["errors"],
+        }
         if machine_result:
             output["machines_stopped"] = machine_result.machines_stopped
-            output["machines_removed"] = machine_result.machines_removed
-        if include_stale_state:
-            output["stale_state_removed"] = stale_state_removed
-            output["stale_state_total"] = total_state_removed
-        console.print(json.dumps(output, indent=2))
+        console.print(json.dumps(output, indent=2, default=str))
         return
 
     if quiet:
-        items = result.items_cleaned if hasattr(result, 'items_cleaned') else 0
+        items = (
+            len(smart_result["dead_containers"])
+            + len(smart_result["anonymous_volumes"])
+            + len(smart_result["unused_images"])
+            + total_state_removed
+        )
         if machine_result:
             items += machine_result.machines_stopped
-        items += total_state_removed
         console.print(f"{items}")
         return
 
-    # Display results
+    # Summary table
     table = Table(title="Cleanup Results")
     table.add_column("Resource", style="cyan")
     table.add_column("Cleaned", style="green")
 
-    table.add_row("Containers", str(result.containers_removed))
-    table.add_row("Images", str(result.images_removed))
-    table.add_row("Volumes", str(result.volumes_removed))
-    table.add_row("Networks", str(result.networks_removed))
-    if hasattr(result, 'cache_cleared') and result.cache_cleared:
-        table.add_row("Build Cache", "Yes")
+    table.add_row("Dead Containers", str(len(smart_result["dead_containers"])))
+    table.add_row("Anonymous Volumes", str(len(smart_result["anonymous_volumes"])))
+
+    if include_images:
+        table.add_row("Unused Images", str(len(smart_result["unused_images"])))
+    if aggressive and smart_result["build_cache_cleared"]:
+        table.add_row("Build Cache", "Pruned")
 
     if include_stale_state and total_state_removed > 0:
         table.add_row("Stale State Files", str(total_state_removed))
-        # Show breakdown
         for category, count in stale_state_removed.items():
             if count > 0:
                 table.add_row(f"  └─ {category.capitalize()}", str(count))
 
     if machine_result:
         table.add_row("Machines Stopped", str(machine_result.machines_stopped))
-        table.add_row("Machines Removed", str(machine_result.machines_removed))
 
     console.print(table)
 
-    # Show preserved environments if stale state was cleaned
-    if include_stale_state and running_env_ids:
+    # Show preserved volumes
+    if smart_result["preserved_volumes"]:
         console.print()
-        preserved_ids = list(running_env_ids)
-        if most_recent_env_id and most_recent_env_id not in running_env_ids:
-            preserved_ids.append(most_recent_env_id)
-        console.print(f"[green]Preserved environments: {', '.join(preserved_ids[:5])}{'...' if len(preserved_ids) > 5 else ''}[/green]")
+        console.print(f"[green]Preserved {len(smart_result['preserved_volumes'])} named volume(s):[/green]")
+        for vol in smart_result["preserved_volumes"][:8]:
+            console.print(f"  [green]✓[/green] {vol}")
+        if len(smart_result["preserved_volumes"]) > 8:
+            console.print(f"  [dim]... and {len(smart_result['preserved_volumes']) - 8} more[/dim]")
 
-    # Show space reclaimed
-    space_mb = result.space_reclaimed_mb
-    if machine_result:
-        space_mb += machine_result.space_reclaimed_mb
-    if space_mb > 0:
-        if space_mb > 1024:
-            console.print(f"\n[green]Space reclaimed: {space_mb / 1024:.2f} GB[/green]")
-        else:
-            console.print(f"\n[green]Space reclaimed: {space_mb:.0f} MB[/green]")
+    # Errors
+    if smart_result["errors"]:
+        console.print()
+        for err in smart_result["errors"]:
+            console.print(f"  [yellow]⚠[/yellow] {err}")
 
-    # Show post-cleanup resource status
-    try:
-        resource_data = executor.get_resource_insights()
-        if resource_data.get("summary"):
-            console.print()
-            console.print(Panel(
-                resource_data["summary"],
-                title="Post-Cleanup Resource Status",
-                expand=False,
-            ))
-    except Exception:
-        pass
+    console.print()
+    console.print("[green]✓ Cleanup complete[/green]")
 
 
 # =============================================================================
@@ -2997,6 +3028,11 @@ def nuke(
         "--quiet", "-q",
         help="Minimal output",
     ),
+    skip_backup: bool = typer.Option(
+        False,
+        "--skip-backup",
+        help="Skip automatic database backup before nuking",
+    ),
 ) -> None:
     """Remove ALL guideai/amprealize containers, volumes, networks, state, and processes.
 
@@ -3008,6 +3044,9 @@ def nuke(
     - Stops the Podman machine to release ports (gvproxy)
     - Optionally: volumes, state files, and destroy (not just stop) the Podman machine
 
+    Before any destruction, databases are automatically backed up to
+    ~/.guideai/backups/ unless --skip-backup is passed.
+
     Use --dry-run to preview what would be removed before actually doing it.
 
     Examples:
@@ -3018,6 +3057,7 @@ def nuke(
         amprealize nuke -m                 # Also destroy the Podman machine (not just stop)
         amprealize nuke --no-stop-machine  # Keep machine running (ports may remain bound)
         amprealize nuke --no-processes     # Skip killing processes
+        amprealize nuke --skip-backup      # Skip pre-nuke database backup
         amprealize nuke --no-networks      # Skip removing networks
         amprealize nuke --json             # Output results as JSON
     """
@@ -3449,6 +3489,26 @@ def nuke(
             console.print("[dim]Aborted[/dim]")
             raise typer.Exit(0)
 
+    # Auto-backup databases before destruction
+    if not skip_backup and not dry_run:
+        from .backup import backup_databases, rotate_backups
+
+        if not quiet:
+            console.print("[bold cyan]Auto-backing up databases before nuke...[/bold cyan]")
+
+        backup_result = backup_databases(tag="pre-nuke", quiet=quiet)
+        if backup_result["databases"]:
+            if not quiet:
+                for db in backup_result["databases"]:
+                    console.print(f"  [green]✓[/green] {db}")
+                console.print(f"  [dim]Saved to: {backup_result['path']}[/dim]")
+                console.print()
+            rotate_backups(tag="pre-nuke")
+        elif not quiet:
+            if backup_result["skipped"]:
+                console.print("  [dim]No running databases to back up[/dim]")
+                console.print()
+
     # Execute removal
     removed = {
         "containers": [],
@@ -3724,12 +3784,20 @@ def fresh(
         "--quiet", "-q",
         help="Minimal output",
     ),
+    skip_backup: bool = typer.Option(
+        False,
+        "--skip-backup",
+        help="Skip automatic database backup before nuking",
+    ),
 ) -> None:
     """Nuke everything and bring up a fresh environment.
 
     This is the nuclear rebuild option - it combines:
     1. amprealize nuke (stop/remove containers, networks, processes)
     2. amprealize up (plan + apply a fresh environment)
+
+    Before destruction, databases are automatically backed up to
+    ~/.guideai/backups/ unless --skip-backup is passed.
 
     Use this when you want a completely clean slate.
 
@@ -3741,6 +3809,7 @@ def fresh(
         amprealize fresh --skip-machine-stop     # Faster, but may have port conflicts
         amprealize fresh --skip-resource-check   # Ignore disk/memory warnings
         amprealize fresh --auto-cleanup          # Auto-cleanup if resources low
+        amprealize fresh --skip-backup           # Skip pre-nuke database backup
     """
     import subprocess
     import time
@@ -3783,6 +3852,7 @@ def fresh(
             force=True,  # Already confirmed above
             json_output=False,
             quiet=quiet,
+            skip_backup=skip_backup,
         )
     except typer.Exit as e:
         if e.exit_code != 0:
@@ -3875,6 +3945,209 @@ def fresh(
 
     console.print()
     console.print("[bold green]✓ Fresh environment ready![/bold green]")
+
+
+# =============================================================================
+# Backup Command
+# =============================================================================
+
+@app.command()
+def backup(
+    tag: str = typer.Option(
+        "manual",
+        "--tag", "-t",
+        help="Label for this backup (e.g., 'pre-migration', 'manual')",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet", "-q",
+        help="Minimal output",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+) -> None:
+    """Backup all PostgreSQL databases to ~/.guideai/backups/.
+
+    Runs pg_dump inside each running database container and saves
+    compressed SQL dumps.
+
+    Examples:
+        amprealize backup                        # Quick backup with 'manual' tag
+        amprealize backup -t pre-migration       # Tagged backup
+        amprealize backup --json                 # JSON output for scripting
+    """
+    from .backup import backup_databases, rotate_backups
+
+    if not quiet and not json_output:
+        console.print("[bold cyan]Backing up databases...[/bold cyan]")
+
+    result = backup_databases(tag=tag, quiet=quiet)
+
+    if json_output:
+        console.print(json.dumps(result, indent=2))
+        return
+
+    if result["databases"]:
+        for db in result["databases"]:
+            console.print(f"  [green]✓[/green] {db}")
+    if result["skipped"]:
+        for s in result["skipped"]:
+            console.print(f"  [dim]⊘ {s}[/dim]")
+    if result["errors"]:
+        for e in result["errors"]:
+            console.print(f"  [red]✗ {e}[/red]")
+
+    if result["databases"]:
+        console.print(f"\n[bold green]✓ Backup saved to:[/bold green] {result['path']}")
+    elif not result["errors"]:
+        console.print("[yellow]No databases found to back up[/yellow]")
+    else:
+        console.print("[red]Backup failed[/red]")
+        raise typer.Exit(1)
+
+
+# =============================================================================
+# Restore Command
+# =============================================================================
+
+@app.command()
+def restore(
+    backup_name: Optional[str] = typer.Argument(
+        None,
+        help="Backup directory name (e.g., '2025-07-15T10-30-00_manual'). Uses latest if omitted.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force", "-f",
+        help="Skip confirmation prompt",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet", "-q",
+        help="Minimal output",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+) -> None:
+    """Restore PostgreSQL databases from a backup.
+
+    By default restores the most recent backup. Specify a backup name
+    to restore a specific one (see ``amprealize backups`` for available backups).
+
+    This overwrites existing data in the target databases.
+
+    Examples:
+        amprealize restore                       # Restore latest backup
+        amprealize restore 2025-07-15T10-30-00_manual
+        amprealize restore --force               # Skip confirmation
+    """
+    from pathlib import Path as _P
+    from .backup import restore_databases, list_backups, BACKUP_ROOT
+
+    available = list_backups()
+    if not available:
+        console.print("[yellow]No backups found in ~/.guideai/backups/[/yellow]")
+        raise typer.Exit(1)
+
+    if backup_name:
+        target = BACKUP_ROOT / backup_name
+        if not target.is_dir():
+            console.print(f"[red]Backup not found:[/red] {backup_name}")
+            console.print("[dim]Run 'amprealize backups' to see available backups[/dim]")
+            raise typer.Exit(1)
+    else:
+        target = _P(available[0]["path"])
+        if not quiet and not json_output:
+            console.print(f"[dim]Using latest backup: {available[0]['name']}[/dim]")
+
+    if not force:
+        console.print(f"\n[yellow]⚠ This will overwrite data in running databases from:[/yellow]")
+        console.print(f"  {target}")
+        dumps = list(target.glob("*.sql.gz"))
+        for d in dumps:
+            console.print(f"  • {d.stem.replace('.sql', '')}")
+        console.print()
+        if not Confirm.ask("[yellow]Continue?[/yellow]"):
+            raise typer.Exit(0)
+
+    if not quiet and not json_output:
+        console.print("[bold cyan]Restoring databases...[/bold cyan]")
+
+    result = restore_databases(backup_path=target)
+
+    if json_output:
+        console.print(json.dumps(result, indent=2))
+        return
+
+    if result["restored"]:
+        for db in result["restored"]:
+            console.print(f"  [green]✓[/green] {db}")
+    if result["skipped"]:
+        for s in result["skipped"]:
+            console.print(f"  [dim]⊘ {s}[/dim]")
+    if result["errors"]:
+        for e in result["errors"]:
+            console.print(f"  [red]✗ {e}[/red]")
+
+    if result["restored"]:
+        console.print("\n[bold green]✓ Restore complete[/bold green]")
+    else:
+        console.print("[red]Restore failed[/red]")
+        raise typer.Exit(1)
+
+
+# =============================================================================
+# Backups Command (list)
+# =============================================================================
+
+@app.command()
+def backups(
+    json_output: bool = typer.Option(
+        False,
+        "--json", "-j",
+        help="Output as JSON",
+    ),
+) -> None:
+    """List available database backups.
+
+    Examples:
+        amprealize backups
+        amprealize backups --json
+    """
+    from .backup import list_backups
+
+    available = list_backups()
+
+    if json_output:
+        console.print(json.dumps(available, indent=2))
+        return
+
+    if not available:
+        console.print("[dim]No backups found in ~/.guideai/backups/[/dim]")
+        return
+
+    table = Table(title="Database Backups")
+    table.add_column("Name", style="cyan")
+    table.add_column("Tag", style="yellow")
+    table.add_column("Databases", style="green")
+    table.add_column("Size", style="dim", justify="right")
+
+    for b in available:
+        table.add_row(
+            b["created"],
+            b["tag"],
+            ", ".join(b["databases"]),
+            f"{b['size_kb']:.1f} KB",
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Location: ~/.guideai/backups/[/dim]")
 
 
 # =============================================================================

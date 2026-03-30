@@ -12,6 +12,7 @@
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { GuideAIClient, ComplianceChecklist, ComplianceStep, ComplianceComment } from '../client/GuideAIClient';
+import { buildActorAvatarHtml, createActorViewModel } from '../utils/actorAvatar';
 
 export class ComplianceReviewPanel {
 	public static currentPanel: ComplianceReviewPanel | undefined;
@@ -221,6 +222,16 @@ export class ComplianceReviewPanel {
 		const completedSteps = checklist.steps?.filter(step => step.status === 'COMPLETED')?.length || 0;
 		const totalSteps = checklist.steps?.length || 0;
 		const progressPercentage = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
+		const actorAvatarHtml = buildActorAvatarHtml(
+			createActorViewModel({
+				id: checklist.actor.id,
+				kind: checklist.actor.role === 'STUDENT' || checklist.actor.role === 'TEACHER' || checklist.actor.role === 'STRATEGIST' ? 'human' : 'agent',
+				displayName: checklist.actor.id,
+				subtitle: checklist.actor.role,
+				presenceState: checklist.status === 'APPROVED' ? 'finished_recently' : checklist.status === 'REJECTED' ? 'paused' : 'working',
+			}),
+			44,
+		);
 
 		return `<!DOCTYPE html>
 <html lang="en">
@@ -235,10 +246,15 @@ export class ComplianceReviewPanel {
 	<div class="container">
 		<header class="compliance-header">
 			<div class="compliance-title">
-				<h1>${checklist.title}</h1>
-				<div class="checklist-meta">
-					<span class="category-badge">${checklist.compliance_category?.join(', ') || 'General'}</span>
-					<span class="checklist-id">ID: ${checklist.checklist_id}</span>
+				<div style="display:flex;align-items:center;gap:12px;">
+					${actorAvatarHtml}
+					<div>
+						<h1>${checklist.title}</h1>
+						<div class="checklist-meta">
+							<span class="category-badge">${checklist.compliance_category?.join(', ') || 'General'}</span>
+							<span class="checklist-id">ID: ${checklist.checklist_id}</span>
+						</div>
+					</div>
 				</div>
 			</div>
 			<div class="compliance-status">

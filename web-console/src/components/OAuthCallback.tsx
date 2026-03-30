@@ -9,15 +9,21 @@
  * - behavior_lock_down_security_surface (Student)
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import {
+  AlertCircle,
+  ArrowLeft,
+  CheckCircle2,
+  LoaderCircle,
+} from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { AuthStage } from './auth/AuthStage';
+import { parseOAuthState } from './auth/oauthState';
 import './OAuthCallback.css';
 
 type CallbackStatus = 'processing' | 'success' | 'error';
 
-// Module-level state to handle React StrictMode double-execution
-// This survives component remounts within the same page load
 let processingPromise: Promise<void> | null = null;
 let processingCode: string | null = null;
 
@@ -29,46 +35,56 @@ export function OAuthCallback() {
   const [status, setStatus] = useState<CallbackStatus>('processing');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const parsedState = useMemo(() => parseOAuthState(searchParams.get('state')), [searchParams]);
 
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
 
   useEffect(() => {
     async function handleCallback() {
       const code = searchParams.get('code');
-      const state = searchParams.get('state');
+      const rawState = searchParams.get('state');
       const error = searchParams.get('error');
       const errorDescription = searchParams.get('error_description');
+      const returnTo = parsedState?.returnTo ?? '/';
+      const isPopup = Boolean(parsedState?.popup && window.opener && !window.opener.closed);
 
-      // Check for OAuth error from provider
       if (error) {
         setStatus('error');
         setErrorMessage(errorDescription ?? `OAuth error: ${error}`);
         return;
       }
 
-      // Validate required parameters
       if (!code) {
         if (isAuthenticated) {
-          navigate('/', { replace: true });
+          navigate(returnTo, { replace: true });
           return;
         }
+
         setStatus('error');
         setErrorMessage('Missing authorization code');
         return;
       }
 
-      // If we're already processing THIS code, wait for that result
       if (processingCode === code && processingPromise) {
-        // StrictMode double-execution detected—silently wait for the first attempt
         try {
           await processingPromise;
-          if (mountedRef.current) {
-            setStatus('success');
-            setTimeout(() => navigate('/', { replace: true }), 1500);
+          if (!mountedRef.current) {
+            return;
           }
+          setStatus('success');
+          window.setTimeout(() => {
+            if (isPopup && window.opener && !window.opener.closed) {
+              window.opener.postMessage({ type: 'guideai:oauth-complete', provider: parsedState?.provider ?? 'oauth' }, window.location.origin);
+              window.close();
+              return;
+            }
+            navigate(returnTo, { replace: true });
+          }, isPopup ? 650 : 850);
         } catch (err) {
           if (mountedRef.current) {
             setStatus('error');
@@ -78,79 +94,125 @@ export function OAuthCallback() {
         return;
       }
 
-      // Start processing this code
       processingCode = code;
 
       const doExchange = async () => {
-        // Clear any stale auth state before attempting OAuth
         try {
           await logout();
         } catch {
           // Ignore logout errors
         }
 
-        // Exchange code for tokens
-        await completeOAuthLogin(code, state ?? undefined);
+        await completeOAuthLogin(code, rawState ?? undefined);
       };
 
       processingPromise = doExchange();
 
       try {
         await processingPromise;
-        if (mountedRef.current) {
-          setStatus('success');
-          setTimeout(() => navigate('/', { replace: true }), 1500);
+        if (!mountedRef.current) {
+          return;
         }
+        setStatus('success');
+        window.setTimeout(() => {
+          if (isPopup && window.opener && !window.opener.closed) {
+            window.opener.postMessage({ type: 'guideai:oauth-complete', provider: parsedState?.provider ?? 'oauth' }, window.location.origin);
+            window.close();
+            return;
+          }
+          navigate(returnTo, { replace: true });
+        }, isPopup ? 650 : 850);
       } catch (err) {
         if (mountedRef.current) {
           setStatus('error');
           setErrorMessage(err instanceof Error ? err.message : 'Failed to complete authentication');
         }
-        throw err; // Re-throw so waiting promises also get the error
+        throw err;
       } finally {
         processingPromise = null;
         processingCode = null;
       }
     }
 
-    handleCallback();
-  }, [searchParams, completeOAuthLogin, navigate, isAuthenticated, logout]);
+    handleCallback().catch(() => {
+      // The component state already captures the error path.
+    });
+  }, [searchParams, completeOAuthLogin, navigate, isAuthenticated, logout, parsedState]);
 
   return (
-    <div className="oauth-callback-page">
-      <div className="oauth-callback-container">
-        {status === 'processing' && (
-          <div className="oauth-callback-processing">
-            <div className="oauth-callback-spinner" aria-hidden="true" />
-            <h2>Completing sign in...</h2>
-            <p>Please wait while we verify your credentials.</p>
+    <AuthStage
+      panelEyebrow={
+        status === 'processing'
+          ? 'Completing sign in'
+          : status === 'success'
+            ? 'Success'
+            : 'Authentication issue'
+      }
+      panelTitle={
+        status === 'processing'
+          ? 'Securing your session'
+          : status === 'success'
+            ? 'You are signed in'
+            : 'We could not finish sign in'
+      }
+      panelSubtitle={
+        status === 'processing'
+          ? 'Hold tight while GuideAI validates your identity and prepares the web console.'
+          : status === 'success'
+            ? parsedState?.popup
+              ? 'This sign-in window will close automatically.'
+              : 'Taking you to your destination now.'
+            : 'You can return to the login screen and try again. The rest of the console remains unchanged.'
+      }
+    >
+      {status === 'processing' && (
+        <div className="oauth-callback-state oauth-callback-state-processing" aria-live="polite">
+          <div className="oauth-callback-icon-shell" aria-hidden="true">
+            <LoaderCircle className="oauth-callback-spinner" size={28} strokeWidth={2} />
           </div>
-        )}
-
-        {status === 'success' && (
-          <div className="oauth-callback-success">
-            <span className="oauth-callback-icon" aria-hidden="true">✓</span>
-            <h2>Sign in successful!</h2>
-            <p>Redirecting to your dashboard...</p>
+          <div className="oauth-callback-copy">
+            <h2>Verifying your credentials</h2>
+            <p>We are finishing the provider handoff and preparing your GuideAI session.</p>
           </div>
-        )}
+        </div>
+      )}
 
-        {status === 'error' && (
-          <div className="oauth-callback-error">
-            <span className="oauth-callback-icon error" aria-hidden="true">✕</span>
-            <h2>Sign in failed</h2>
+      {status === 'success' && (
+        <div className="oauth-callback-state oauth-callback-state-success" aria-live="polite">
+          <div className="oauth-callback-icon-shell oauth-callback-icon-shell-success" aria-hidden="true">
+            <CheckCircle2 size={28} strokeWidth={2} />
+          </div>
+          <div className="oauth-callback-copy">
+            <h2>Sign-in successful</h2>
+            <p>
+              {parsedState?.popup
+                ? 'You can return to the main GuideAI window. This popup will close in a moment.'
+                : 'GuideAI confirmed your account and will continue in just a moment.'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {status === 'error' && (
+        <div className="oauth-callback-state oauth-callback-state-error" role="alert">
+          <div className="oauth-callback-icon-shell oauth-callback-icon-shell-error" aria-hidden="true">
+            <AlertCircle size={28} strokeWidth={2} />
+          </div>
+          <div className="oauth-callback-copy">
+            <h2>Authentication did not complete</h2>
             <p>{errorMessage}</p>
-            <button
-              type="button"
-              className="oauth-callback-retry"
-              onClick={() => navigate('/login', { replace: true })}
-            >
-              Return to sign in
-            </button>
           </div>
-        )}
-      </div>
-    </div>
+          <button
+            type="button"
+            className="oauth-callback-retry"
+            onClick={() => navigate('/login', { replace: true })}
+          >
+            <ArrowLeft size={16} strokeWidth={2} aria-hidden="true" />
+            <span>Return to sign in</span>
+          </button>
+        </div>
+      )}
+    </AuthStage>
   );
 }
 

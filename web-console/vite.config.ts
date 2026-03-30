@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { existsSync } from 'node:fs';
@@ -7,7 +8,8 @@ import { resolve } from 'node:path';
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: (() => {
+    alias: ((): Record<string, string> => {
+      const localFallback = resolve(__dirname, 'src/vendor/collab-client-dist/index.js');
       const candidates = [
         process.env.GUIDEAI_REPO_ROOT,
         resolve(__dirname, '..'),
@@ -25,8 +27,15 @@ export default defineConfig({
         }
       }
 
+      if (existsSync(localFallback)) {
+        return { '@guideai/collab-client': localFallback };
+      }
+
       return {};
     })(),
+    // Ensure collab-client's optional peer dep on react resolves to
+    // the web-console copy rather than a Vite optional-peer-dep stub.
+    dedupe: ['react', 'react-dom'],
   },
   server: {
     fs: {
@@ -36,5 +45,11 @@ export default defineConfig({
         resolve(__dirname),
       ],
     },
+  },
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.ts',
+    include: ['src/**/*.test.{ts,tsx}'],
   },
 });

@@ -15,15 +15,12 @@ from typing import Any, Dict, Iterable, List, Optional
 from .behavior_retriever import BehaviorRetriever
 from .behavior_service import BehaviorService, SearchBehaviorsRequest
 from .telemetry import TelemetryClient
-from .llm_provider import (
+from .llm import (
+    LLMClient,
     LLMConfig,
-    LLMMessage,
-    LLMProvider,
-    LLMRequest,
     LLMResponse,
-    LLMProviderError,
-    TokenBudgetExceededError,
-    get_provider,
+    LLMError,
+    TokenBudgetError,
 )
 from .bci_contracts import (
     BatchComposePromptRequest,
@@ -197,7 +194,28 @@ class BCIService:
     def compose_prompt(self, request: ComposePromptRequest) -> ComposePromptResponse:
         behaviors = self._trim_behaviors(request.behaviors, request.max_behaviors)
         instruction = request.citation_instruction or _DEFAULT_PROMPT_INSTRUCTION
-        prompt = self._render_prompt(request.query, behaviors, request.format, instruction)
+
+        # E3 Runtime Injection: compose enriched prompt when context is available
+        if request.runtime_context or request.overlay_instructions or request.primer_text:
+            prompt = self._render_enriched_prompt(
+                query=request.query,
+                behaviors=behaviors,
+                prompt_format=request.format,
+                instruction=instruction,
+                runtime_context=request.runtime_context,
+                overlay_instructions=request.overlay_instructions,
+                primer_text=request.primer_text,
+                runtime_constraints=request.runtime_constraints,
+            )
+            overlays_included = (
+                request.runtime_context.get("recommended_overlays", [])
+                if request.runtime_context
+                else []
+            )
+        else:
+            prompt = self._render_prompt(request.query, behaviors, request.format, instruction)
+            overlays_included = []
+
         metadata = {
             "citation_mode": request.citation_mode.value,
             "format": request.format.value,
@@ -209,9 +227,16 @@ class BCIService:
                 "behaviors": len(behaviors),
                 "format": request.format.value,
                 "citation_mode": request.citation_mode.value,
+                "has_runtime_context": request.runtime_context is not None,
+                "overlays_count": len(overlays_included),
             },
         )
-        return ComposePromptResponse(prompt=prompt, behaviors=behaviors, metadata=metadata)
+        return ComposePromptResponse(
+            prompt=prompt,
+            behaviors=behaviors,
+            metadata=metadata,
+            overlays_included=overlays_included,
+        )
 
     def compose_prompts_batch(self, request: BatchComposePromptRequest) -> BatchComposePromptResponse:
         items: List[BatchComposeResult] = []
@@ -262,6 +287,70 @@ class BCIService:
             "task": query,
         }
         return json.dumps(payload, indent=2)
+
+    @staticmethod
+    def _render_enriched_prompt(
+        *,
+        query: str,
+        behaviors: List[BehaviorSnippet],
+        prompt_format: PromptFormat,
+        instruction: str,
+        runtime_context: Optional[Dict[str, Any]] = None,
+        overlay_instructions: Optional[List[str]] = None,
+        primer_text: Optional[str] = None,
+        runtime_constraints: Optional[List[str]] = None,
+    ) -> str:
+        """Render a prompt enriched with runtime context, overlays, and primer.
+
+        E3 Runtime Injection (GUIDEAI-289 / T3.3.1).
+        Falls back to LIST format structure when enriched context is present,
+        since the richer block benefits from structured sections.
+        """
+        sections: List[str] = []
+
+        # 1. Runtime context header
+        if runtime_context:
+            ctx_parts = ["## GuideAI Runtime Context"]
+            profile = runtime_context.get("workspace_profile", "unknown")
+            surface = runtime_context.get("surface", "unknown")
+            role = runtime_context.get("role", "unspecified")
+            ctx_parts.append(f"**Workspace**: {profile} | **Surface**: {surface} | **Role**: {role}")
+            pack_id = runtime_context.get("active_pack_id")
+            pack_ver = runtime_context.get("active_pack_version")
+            if pack_id:
+                pack_label = f"{pack_id}@{pack_ver}" if pack_ver else pack_id
+                ctx_parts.append(f"**Active Pack**: {pack_label}")
+            sections.append("\n".join(ctx_parts))
+
+        # 2. Behaviors
+        if behaviors:
+            lines = ["## Relevant Behaviors"]
+            for snippet in behaviors:
+                label = snippet.citation_label or snippet.name
+                lines.append(f"- {label}: {snippet.instruction}")
+            sections.append("\n".join(lines))
+
+        # 3. Primer / operational guidance
+        guidance_parts: List[str] = []
+        if primer_text:
+            guidance_parts.append(primer_text)
+        if overlay_instructions:
+            guidance_parts.extend(overlay_instructions)
+        if guidance_parts:
+            sections.append("## Operational Guidance\n" + "\n\n".join(guidance_parts))
+
+        # 4. Constraints
+        if runtime_constraints:
+            constraint_lines = ["## Constraints"]
+            for c in runtime_constraints:
+                constraint_lines.append(f"- {c}")
+            sections.append("\n".join(constraint_lines))
+
+        # 5. Instruction + task
+        sections.append(instruction)
+        sections.append(f"Task:\n{query}")
+
+        return "\n\n".join(sections)
 
     # ------------------------------------------------------------------
     # Citation parsing & validation
@@ -555,20 +644,19 @@ class BCIService:
         )
         compose_resp = self.compose_prompt(compose_req)
 
-        # Get LLM provider
-        provider: LLMProvider = get_provider(llm_config)
+        # Get LLM client
+        client = LLMClient(llm_config)
 
         # Build messages
         messages = [
-            LLMMessage(role="system", content=compose_resp.prompt),
-            LLMMessage(role="user", content=query),
+            {"role": "system", "content": compose_resp.prompt},
+            {"role": "user", "content": query},
         ]
 
-        # Generate response (may raise TokenBudgetExceededError)
-        llm_req = LLMRequest(messages=messages)
+        # Generate response (may raise TokenBudgetError)
         try:
-            llm_resp: LLMResponse = provider.generate(llm_req)
-        except TokenBudgetExceededError as exc:
+            llm_resp: LLMResponse = client.call(messages)
+        except TokenBudgetError as exc:
             # Log the budget violation and re-raise with context
             self._telemetry.emit_event(
                 event_type="bci.generate_response.budget_exceeded",
@@ -577,11 +665,11 @@ class BCIService:
                     "behaviors_count": len(behavior_snippets),
                     "budget": exc.budget,
                     "estimated_tokens": exc.estimated_tokens,
-                    "provider": exc.provider.value if exc.provider else "unknown",
+                    "provider": str(exc.provider) if exc.provider else "unknown",
                 },
             )
             raise
-        except LLMProviderError as exc:
+        except LLMError as exc:
             # Log provider errors for debugging
             self._telemetry.emit_event(
                 event_type="bci.generate_response.error",
@@ -589,7 +677,7 @@ class BCIService:
                     "query_length": len(query),
                     "behaviors_count": len(behavior_snippets),
                     "error_type": type(exc).__name__,
-                    "provider": exc.provider.value if exc.provider else "unknown",
+                    "provider": str(exc.provider) if exc.provider else "unknown",
                 },
             )
             raise
@@ -609,23 +697,17 @@ class BCIService:
             "query_length": len(query),
             "behaviors_count": len(behavior_snippets),
             "behaviors": behavior_names,
-            "provider": llm_resp.provider.value,
+            "provider": str(llm_resp.provider),
             "model": llm_resp.model,
             "input_tokens": llm_resp.input_tokens,
             "output_tokens": llm_resp.output_tokens,
-            "total_tokens": llm_resp.total_tokens,
+            "total_tokens": llm_resp.input_tokens + llm_resp.output_tokens,
             "token_savings_input": input_saved,
             "latency_ms": latency_ms,
             "llm_latency_ms": llm_resp.latency_ms,
             "finish_reason": llm_resp.finish_reason,
-            # Token budget tracking
-            "token_budget_used": llm_resp.token_budget_used,
-            "token_budget_remaining": llm_resp.token_budget_remaining,
-            "token_budget_warning": llm_resp.token_budget_warning,
             # Cost estimation (USD)
-            "estimated_cost_usd": llm_resp.estimated_cost_usd,
-            "input_cost_usd": llm_resp.input_cost_usd,
-            "output_cost_usd": llm_resp.output_cost_usd,
+            "estimated_cost_usd": llm_resp.cost_usd,
         }
         self._telemetry.emit_event(event_type="bci.generate_response", payload=telemetry_payload)
 
@@ -637,15 +719,8 @@ class BCIService:
                 "output_saved": 0,  # Hard to estimate without baseline
                 "total_saved": input_saved,
             },
-            "token_budget": {
-                "used": llm_resp.token_budget_used,
-                "remaining": llm_resp.token_budget_remaining,
-                "warning": llm_resp.token_budget_warning,
-            },
             "cost": {
-                "input_usd": llm_resp.input_cost_usd,
-                "output_usd": llm_resp.output_cost_usd,
-                "total_usd": llm_resp.estimated_cost_usd,
+                "total_usd": llm_resp.cost_usd,
             },
             "latency_ms": latency_ms,
         }

@@ -34,6 +34,8 @@ class ToolGroupId(str, Enum):
     GITHUB = "github"
     INFRASTRUCTURE = "infrastructure"
     BILLING = "billing"
+    KNOWLEDGE_PACKS = "knowledge_packs"
+    RESEARCH = "research"
 
 
 @dataclass
@@ -67,6 +69,11 @@ CORE_TOOLS: Set[str] = {
     "behaviors.list",
     "behaviors.create",
     "behaviors.search",
+    "behaviors.update",
+    "behaviors.submit",
+    "behaviors.approve",
+    "behaviors.deprecate",
+    "behaviors.deleteDraft",
 
     # Project/Org basics
     "projects.list",
@@ -79,7 +86,13 @@ CORE_TOOLS: Set[str] = {
     "workItems.list",
     "workItems.get",
     "workItems.create",
+    "workItems.update",
+    "workItems.delete",
     "workItems.execute",
+
+    # Board basics (discover boards for work item placement)
+    "boards.list",
+    "boards.get",
 
     # Runs basics
     "runs.list",
@@ -90,6 +103,12 @@ CORE_TOOLS: Set[str] = {
     "context.getContext",
     "context.setOrg",
     "context.setProject",
+
+    # Research tools
+    "research.evaluate",
+    "research.get",
+    "research.search",
+    "research.list",
 
     # Tool group activation (meta-tools)
     "tools.listGroups",
@@ -105,8 +124,8 @@ TOOL_GROUPS: Dict[ToolGroupId, ToolGroup] = {
         id=ToolGroupId.CORE,
         name="Core",
         description="Essential GuideAI tools always available",
-        tool_prefixes=["auth.", "behaviors.", "projects.", "orgs.", "workItems.", "runs.", "context."],
-        max_tools=35,
+        tool_prefixes=["auth.", "behaviors.", "projects.", "orgs.", "workItems.", "runs.", "context.", "boards."],
+        max_tools=42,
         priority=0,  # Highest priority
         requires_auth=False,  # Auth tools don't require auth
         activation_keywords=["start", "login", "behavior", "project", "work"],
@@ -220,6 +239,26 @@ TOOL_GROUPS: Dict[ToolGroupId, ToolGroup] = {
         max_tools=10,
         priority=85,
         activation_keywords=["billing", "subscription", "invoice", "payment", "plan"],
+    ),
+
+    ToolGroupId.KNOWLEDGE_PACKS: ToolGroup(
+        id=ToolGroupId.KNOWLEDGE_PACKS,
+        name="Knowledge Packs",
+        description="Build, validate, inspect, and manage knowledge packs for context injection",
+        tool_prefixes=["knowledgePacks."],
+        max_tools=10,
+        priority=42,
+        activation_keywords=["knowledge pack", "pack", "overlay", "primer", "context injection"],
+    ),
+
+    ToolGroupId.RESEARCH: ToolGroup(
+        id=ToolGroupId.RESEARCH,
+        name="AI Research",
+        description="Evaluate research papers/articles through 4-phase pipeline, search and retrieve past evaluations",
+        tool_prefixes=["research."],
+        max_tools=10,
+        priority=38,
+        activation_keywords=["research", "paper", "evaluate", "arxiv", "article", "study"],
     ),
 }
 

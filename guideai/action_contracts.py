@@ -1,6 +1,6 @@
 """Data contracts for the ActionService stub.
 
-These structures align with the schemas defined in `ACTION_SERVICE_CONTRACT.md`.
+These structures align with the schemas defined in `docs/contracts/ACTION_SERVICE_CONTRACT.md`.
 """
 
 from __future__ import annotations

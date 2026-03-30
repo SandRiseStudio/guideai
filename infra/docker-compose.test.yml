@@ -12,7 +12,7 @@ services:
 
   postgres-behavior-test:
     container_name: guideai-postgres-behavior-test
-    image: pgvector/pgvector:pg16
+    image: timescale/timescaledb:latest-pg16
     environment:
       POSTGRES_USER: guideai_behavior
       POSTGRES_PASSWORD: behavior_test_pass

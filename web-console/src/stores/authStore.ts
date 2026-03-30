@@ -68,10 +68,19 @@ type Listener = () => void;
 class AuthStore implements AuthActions {
   private state: AuthState;
   private listeners: Set<Listener> = new Set();
+  private readonly handleStorageEvent = (event: StorageEvent): void => {
+    if (event.key !== STORAGE_KEY) {
+      return;
+    }
+    this.loadFromStorage();
+  };
 
   constructor() {
     this.state = { ...initialState };
     this.loadFromStorage();
+    if (typeof window !== 'undefined') {
+      window.addEventListener('storage', this.handleStorageEvent);
+    }
   }
 
   // ---------------------------------------------------------------------------

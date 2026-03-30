@@ -1,32 +1,12 @@
 {
   "servers": {
     "guideai": {
-      "command": "/Users/nick/guideai/.venv/bin/python",
-      "args": ["-m", "guideai.mcp_server"],
+      "type": "stdio",
+      "command": "python3",
+      "args": ["scripts/start_guideai_mcp.py"],
       "cwd": "/Users/nick/guideai",
       "env": {
-        "PYTHONUNBUFFERED": "1",
-
-        "GUIDEAI_DEV_ADMIN_USERS": "dev-user,admin,dev-admin",
-
-        "GUIDEAI_AUTH_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_BOARD_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_ACTION_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_RUN_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_WORKFLOW_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_BEHAVIOR_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_COMPLIANCE_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_REFLECTION_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_COLLABORATION_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_AGENT_ORCHESTRATOR_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_AGENT_REGISTRY_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_METRICS_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_AUDIT_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_AGENTAUTH_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai",
-        "GUIDEAI_ORG_PG_DSN": "postgresql://guideai:guideai_dev@localhost:5432/guideai?options=-csearch_path%3Dauth",
-
-        "GUIDEAI_TELEMETRY_PG_DSN": "postgresql://telemetry:telemetry_dev@localhost:5433/telemetry",
-        "GUIDEAI_TASK_PG_DSN": "postgresql://telemetry:telemetry_dev@localhost:5433/telemetry"
+        "PYTHONUNBUFFERED": "1"
       }
     }
   }

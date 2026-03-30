@@ -58,7 +58,7 @@ def _is_admin_from_session(arguments: Dict[str, Any]) -> bool:
     return session.get("is_admin", False)
 
 
-def _check_org_access(
+async def _check_org_access(
     org_service: OrganizationService,
     org_id: str,
     user_id: str,
@@ -76,7 +76,7 @@ def _check_org_access(
     if arguments and _is_admin_from_session(arguments):
         return True, None, MemberRole.OWNER
 
-    membership = org_service.get_membership(org_id=org_id, user_id=user_id)
+    membership = await org_service.get_membership(org_id=org_id, user_id=user_id)
     if not membership:
         return False, "Access denied or organization not found", None
 
@@ -86,7 +86,7 @@ def _check_org_access(
     return True, None, membership.role
 
 
-def _check_project_access(
+async def _check_project_access(
     project_service: OrganizationService,
     org_service: OrganizationService,
     project_id: str,
@@ -98,30 +98,30 @@ def _check_project_access(
     Check if user has access to the project.
 
     Admin users (from session) bypass all access checks.
-    Personal projects (no org_id) are accessible if owned by user.
+    User-owned projects (no org_id) are accessible if owned by user.
 
     Returns: (has_access, error_message, project)
     """
     # Admin users have full access
     if arguments and _is_admin_from_session(arguments):
-        project = project_service.get_project(project_id)
+        project = await project_service.get_project(project_id)
         if not project:
             return False, f"Project {project_id} not found", None
         return True, None, project
 
-    project = project_service.get_project(project_id)
+    project = await project_service.get_project(project_id)
     if not project:
         return False, f"Project {project_id} not found", None
 
-    # Personal project - check ownership
+    # User-owned project - check ownership
     if project.org_id is None:
         owner_id = getattr(project, 'owner_id', None) or getattr(project, 'created_by', None)
         if owner_id == user_id:
             return True, None, project
-        return False, "Access denied. You are not the owner of this personal project.", None
+        return False, "Access denied. You are not the owner of this project.", None
 
     # Org project - check org membership
-    has_access, error, role = _check_org_access(
+    has_access, error, role = await _check_org_access(
         org_service,
         project.org_id,
         user_id,
@@ -140,14 +140,14 @@ def _check_project_access(
 # ==============================================================================
 
 
-def handle_create_project(
+async def handle_create_project(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
     Create a new project. If org_id is provided, creates an organization project.
-    If org_id is omitted, creates a personal project owned by the user.
+    If org_id is omitted, creates a user-owned project.
 
     MCP Tool: projects.create
     """
@@ -159,7 +159,7 @@ def handle_create_project(
             "hint": "Use the auth.deviceLogin tool to authenticate before creating projects.",
         }
 
-    org_id = arguments.get("org_id")  # Optional - None for personal projects
+    org_id = arguments.get("org_id")  # Optional - None for user-owned projects
     name = arguments["name"]
     description = arguments.get("description")
     visibility = arguments.get("visibility", "private")
@@ -174,29 +174,20 @@ def handle_create_project(
 
     if org_id:
         # Org project: check user has admin access to org
-        has_access, error, _ = _check_org_access(
+        has_access, error, _ = await _check_org_access(
             org_service, org_id, user_id, require_admin=True
         )
         if not has_access:
             return {"success": False, "error": error}
 
-        project = project_service.create_project(
-            org_id=org_id,
-            name=name,
-            owner_id=user_id,
-            description=description,
-            visibility=visibility_enum,
-            settings=settings,
-        )
-    else:
-        # Personal project: create without org
-        project = project_service.create_personal_project(
-            owner_id=user_id,
-            name=name,
-            description=description,
-            visibility=visibility_enum,
-            settings=settings,
-        )
+    project = await project_service.create_project(
+        name=name,
+        owner_id=user_id,
+        org_id=org_id,
+        description=description,
+        visibility=visibility_enum,
+        settings=settings,
+    )
 
     return {
         "success": True,
@@ -205,7 +196,7 @@ def handle_create_project(
     }
 
 
-def handle_get_project(
+async def handle_get_project(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -218,7 +209,7 @@ def handle_get_project(
     user_id = arguments["user_id"]
     project_id = arguments["project_id"]
 
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
@@ -230,7 +221,7 @@ def handle_get_project(
     }
 
 
-def handle_list_projects(
+async def handle_list_projects(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -238,7 +229,7 @@ def handle_list_projects(
     """
     List projects. If org_id is provided, lists projects in that org.
     If org_id is not provided, lists all projects the user has access to
-    (personal projects + projects from orgs they belong to).
+    (user-owned projects + projects from orgs they belong to).
 
     MCP Tool: projects.list
 
@@ -262,40 +253,17 @@ def handle_list_projects(
 
     if org_id:
         # List projects in specific org
-        has_access, error, _ = _check_org_access(org_service, org_id, user_id, arguments=arguments)
+        has_access, error, _ = await _check_org_access(org_service, org_id, user_id, arguments=arguments)
         if not has_access:
             return {"success": False, "error": error}
 
-        all_projects = project_service.list_projects(org_id=org_id)
+        all_projects = await project_service.list_projects(org_id=org_id)
     elif is_admin:
-        # Admin: list ALL projects across all orgs
-        try:
-            # Get all orgs
-            all_orgs = org_service.list_organizations()
-            for org in all_orgs:
-                org_projects = project_service.list_projects(org_id=org.id)
-                all_projects.extend(org_projects)
-            # Also get personal projects - for admin, list all
-            all_personal = project_service.list_all_personal_projects()
-            all_projects.extend(all_personal)
-        except Exception:
-            # Fallback to normal user flow if list_all methods don't exist
-            pass
+        # Admin: list ALL projects across all orgs and personal
+        all_projects = await project_service.list_projects()
     else:
-        # List all projects user has access to:
-        # 1. Personal projects (no org, owned by user)
-        try:
-            personal_projects = project_service.list_personal_projects(owner_id=user_id)
-            all_projects.extend(personal_projects)
-        except Exception:
-            # Schema may not support personal projects yet
-            pass
-
-        # 2. Projects from orgs user belongs to
-        user_orgs = org_service.list_user_organizations(user_id=user_id)
-        for org in user_orgs:
-            org_projects = project_service.list_projects(org_id=org.id)
-            all_projects.extend(org_projects)
+        # List all projects user has access to (personal + org memberships)
+        all_projects = await project_service.list_projects(owner_id=user_id)
 
     # Apply pagination
     total = len(all_projects)
@@ -311,7 +279,7 @@ def handle_list_projects(
     }
 
 
-def handle_update_project(
+async def handle_update_project(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -325,7 +293,7 @@ def handle_update_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
@@ -339,7 +307,7 @@ def handle_update_project(
         metadata=arguments.get("metadata"),
     )
 
-    updated_project = project_service.update_project(project_id, update_request)
+    updated_project = await project_service.update_project(project_id, update_request)
     if not updated_project:
         return {
             "success": False,
@@ -353,7 +321,7 @@ def handle_update_project(
     }
 
 
-def handle_delete_project(
+async def handle_delete_project(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -367,13 +335,13 @@ def handle_delete_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
         return {"success": False, "error": error}
 
-    success = project_service.delete_project(project_id)
+    success = await project_service.delete_project(project_id)
     if not success:
         return {
             "success": False,
@@ -387,7 +355,7 @@ def handle_delete_project(
     }
 
 
-def handle_archive_project(
+async def handle_archive_project(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -401,7 +369,7 @@ def handle_archive_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
@@ -413,7 +381,7 @@ def handle_archive_project(
     current_settings["archived_at"] = datetime.utcnow().isoformat()
 
     update_request = UpdateProjectRequest(settings=current_settings)
-    updated_project = project_service.update_project(project_id, update_request)
+    updated_project = await project_service.update_project(project_id, update_request)
 
     if not updated_project:
         return {
@@ -428,7 +396,7 @@ def handle_archive_project(
     }
 
 
-def handle_restore_project(
+async def handle_restore_project(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -442,7 +410,7 @@ def handle_restore_project(
     project_id = arguments["project_id"]
 
     # Check user has write access
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
@@ -454,7 +422,7 @@ def handle_restore_project(
     current_settings["archived_at"] = None
 
     update_request = UpdateProjectRequest(settings=current_settings)
-    updated_project = project_service.update_project(project_id, update_request)
+    updated_project = await project_service.update_project(project_id, update_request)
 
     if not updated_project:
         return {
@@ -474,7 +442,7 @@ def handle_restore_project(
 # ==============================================================================
 
 
-def handle_get_settings(
+async def handle_get_settings(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -487,7 +455,7 @@ def handle_get_settings(
     user_id = arguments["user_id"]
     project_id = arguments["project_id"]
 
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
@@ -500,7 +468,7 @@ def handle_get_settings(
     }
 
 
-def handle_update_settings(
+async def handle_update_settings(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -516,7 +484,7 @@ def handle_update_settings(
     merge = arguments.get("merge", True)
 
     # Check user has write access
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id, require_write=True
     )
     if not has_access:
@@ -529,7 +497,7 @@ def handle_update_settings(
         new_settings = settings
 
     update_request = UpdateProjectRequest(settings=new_settings)
-    updated_project = project_service.update_project(project_id, update_request)
+    updated_project = await project_service.update_project(project_id, update_request)
 
     if not updated_project:
         return {
@@ -550,7 +518,7 @@ def handle_update_settings(
 # ==============================================================================
 
 
-def handle_get_stats(
+async def handle_get_stats(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -563,7 +531,7 @@ def handle_get_stats(
     user_id = arguments["user_id"]
     project_id = arguments["project_id"]
 
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
@@ -572,7 +540,7 @@ def handle_get_stats(
     # Get stats if method exists
     stats = {}
     if hasattr(project_service, 'get_project_stats'):
-        stats = project_service.get_project_stats(project_id)
+        stats = await project_service.get_project_stats(project_id)
 
     return {
         "success": True,
@@ -581,7 +549,7 @@ def handle_get_stats(
     }
 
 
-def handle_get_usage(
+async def handle_get_usage(
     project_service: OrganizationService,
     org_service: OrganizationService,
     arguments: Dict[str, Any],
@@ -595,7 +563,7 @@ def handle_get_usage(
     project_id = arguments["project_id"]
     period = arguments.get("period", "30d")
 
-    has_access, error, project = _check_project_access(
+    has_access, error, project = await _check_project_access(
         project_service, org_service, project_id, user_id
     )
     if not has_access:
@@ -604,7 +572,7 @@ def handle_get_usage(
     # Get usage if method exists
     usage = {}
     if hasattr(project_service, 'get_project_usage'):
-        usage = project_service.get_project_usage(project_id, period=period)
+        usage = await project_service.get_project_usage(project_id, period=period)
 
     return {
         "success": True,

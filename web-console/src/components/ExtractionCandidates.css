@@ -1,7 +1,7 @@
 .extraction-panel {
-  background: var(--card-bg, #ffffff);
-  border: 1px solid var(--border-color, #e5e7eb);
-  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid var(--color-border-default, #e5e7eb);
+  border-radius: 16px;
   padding: 24px;
 }
 
@@ -14,9 +14,10 @@
 
 .extraction-panel .panel-header h2 {
   margin: 0;
-  font-size: 1.25rem;
+  font-size: 1.35rem;
   font-weight: 600;
-  color: var(--text-primary, #1f2937);
+  color: var(--color-text-primary, #1f2937);
+  letter-spacing: -0.03em;
 }
 
 .threshold-badge {
@@ -40,7 +41,7 @@
   display: block;
   font-size: 0.85rem;
   font-weight: 500;
-  color: var(--text-secondary, #374151);
+  color: var(--color-text-secondary, #374151);
   margin-bottom: 6px;
 }
 
@@ -49,18 +50,18 @@
   padding: 12px 16px;
   font-size: 0.9rem;
   font-family: 'SF Mono', 'Menlo', monospace;
-  border: 1px solid var(--border-color, #d1d5db);
+  border: 1px solid var(--color-border-default, #d1d5db);
   border-radius: 8px;
-  background: var(--input-bg, #ffffff);
-  color: var(--text-primary, #1f2937);
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--color-text-primary, #1f2937);
   resize: vertical;
   min-height: 150px;
 }
 
 .extraction-form textarea:focus {
   outline: none;
-  border-color: #667eea;
-  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+  border-color: var(--color-accent, #2276d2);
+  background: rgba(255, 255, 255, 0.96);
 }
 
 .form-options {
@@ -79,9 +80,9 @@
   width: 100%;
   padding: 10px 12px;
   font-size: 0.9rem;
-  border: 1px solid var(--border-color, #d1d5db);
+  border: 1px solid var(--color-border-default, #d1d5db);
   border-radius: 6px;
-  background: var(--input-bg, #ffffff);
+  background: rgba(255, 255, 255, 0.88);
 }
 
 .extract-btn {
@@ -90,17 +91,17 @@
   font-size: 1rem;
   font-weight: 600;
   color: white;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: var(--color-accent, #2276d2);
   border: none;
   border-radius: 8px;
   cursor: pointer;
-  transition: transform 0.15s, box-shadow 0.15s;
+  transition: transform 0.15s, background-color 0.15s;
   margin-top: 16px;
 }
 
 .extract-btn:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+  background: var(--color-accent-hover, #1a63b5);
 }
 
 .extract-btn:disabled {
@@ -123,7 +124,7 @@
 }
 
 .results-summary {
-  background: var(--summary-bg, #f9fafb);
+  background: rgba(247, 250, 252, 0.88);
   border-radius: 8px;
   padding: 16px;
   margin-bottom: 20px;
@@ -132,13 +133,13 @@
 .results-summary h3 {
   margin: 0 0 8px 0;
   font-size: 1rem;
-  color: var(--text-primary, #1f2937);
+  color: var(--color-text-primary, #1f2937);
 }
 
 .results-summary p {
   margin: 0 0 12px 0;
   font-size: 0.9rem;
-  color: var(--text-secondary, #6b7280);
+  color: var(--color-text-secondary, #6b7280);
 }
 
 .summary-stats {
@@ -149,15 +150,15 @@
 
 .summary-stats .stat {
   font-size: 0.85rem;
-  color: var(--text-secondary, #6b7280);
-  background: var(--stat-bg, #ffffff);
+  color: var(--color-text-secondary, #6b7280);
+  background: rgba(255, 255, 255, 0.92);
   padding: 6px 12px;
   border-radius: 6px;
   border: 1px solid var(--border-color, #e5e7eb);
 }
 
 .summary-stats .stat strong {
-  color: var(--text-primary, #1f2937);
+  color: var(--color-text-primary, #1f2937);
 }
 
 .summary-stats .stat.auto {
@@ -181,10 +182,10 @@
 
 .candidate-section h4 {
   font-size: 0.95rem;
-  color: var(--text-primary, #374151);
+  color: var(--color-text-primary, #374151);
   margin: 0 0 12px 0;
   padding-bottom: 8px;
-  border-bottom: 1px solid var(--border-color, #e5e7eb);
+  border-bottom: 1px solid var(--color-border-default, #e5e7eb);
 }
 
 .candidate-section.auto-approved h4 {
@@ -206,8 +207,8 @@
 }
 
 .candidate-card {
-  background: var(--card-inner-bg, #ffffff);
-  border: 1px solid var(--border-color, #e5e7eb);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--color-border-default, #e5e7eb);
   border-radius: 8px;
   padding: 16px;
 }
@@ -237,7 +238,7 @@
 .candidate-name {
   font-weight: 600;
   font-size: 1rem;
-  color: var(--text-primary, #1f2937);
+  color: var(--color-text-primary, #1f2937);
 }
 
 .candidate-badges {
@@ -286,22 +287,22 @@
 
 .candidate-slug code {
   font-size: 0.8rem;
-  background: var(--code-bg, #f3f4f6);
+  background: rgba(226, 232, 240, 0.9);
   padding: 2px 8px;
   border-radius: 4px;
-  color: #667eea;
+  color: var(--color-accent, #2276d2);
 }
 
 .candidate-instruction {
   font-size: 0.9rem;
-  color: var(--text-primary, #374151);
+  color: var(--color-text-primary, #374151);
   line-height: 1.6;
   margin-bottom: 12px;
 }
 
 .candidate-summary {
   font-size: 0.85rem;
-  color: var(--text-secondary, #6b7280);
+  color: var(--color-text-secondary, #6b7280);
   margin-bottom: 12px;
 }
 
@@ -314,7 +315,7 @@
 
 .quality-scores .score {
   font-size: 0.8rem;
-  color: var(--text-secondary, #6b7280);
+  color: var(--color-text-secondary, #6b7280);
   cursor: help;
 }
 
@@ -327,8 +328,8 @@
 
 .candidate-tags .tag {
   font-size: 0.75rem;
-  color: var(--text-secondary, #6b7280);
-  background: var(--tag-bg, #e5e7eb);
+  color: var(--color-text-secondary, #6b7280);
+  background: rgba(226, 232, 240, 0.9);
   padding: 4px 8px;
   border-radius: 4px;
 }
@@ -339,7 +340,7 @@
 
 .candidate-examples summary {
   font-size: 0.85rem;
-  color: #667eea;
+  color: var(--color-accent, #2276d2);
   cursor: pointer;
   font-weight: 500;
 }
@@ -347,7 +348,7 @@
 .examples-list {
   margin-top: 8px;
   padding-left: 16px;
-  border-left: 2px solid var(--border-color, #e5e7eb);
+  border-left: 2px solid var(--color-border-default, #e5e7eb);
 }
 
 .example {
@@ -356,26 +357,26 @@
 
 .example strong {
   font-size: 0.8rem;
-  color: var(--text-secondary, #6b7280);
+  color: var(--color-text-secondary, #6b7280);
 }
 
 .example p {
   font-size: 0.85rem;
-  color: var(--text-primary, #374151);
+  color: var(--color-text-primary, #374151);
   margin: 4px 0 0 0;
 }
 
 .candidate-actions {
   margin-top: 16px;
   padding-top: 12px;
-  border-top: 1px solid var(--border-color, #e5e7eb);
+  border-top: 1px solid var(--color-border-default, #e5e7eb);
 }
 
 .notes-input {
   width: 100%;
   padding: 10px 12px;
   font-size: 0.9rem;
-  border: 1px solid var(--border-color, #d1d5db);
+  border: 1px solid var(--color-border-default, #d1d5db);
   border-radius: 6px;
   margin-bottom: 12px;
 }

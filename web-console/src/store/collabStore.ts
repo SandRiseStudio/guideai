@@ -13,7 +13,7 @@ import type {
   WorkspaceId,
   UserPresence,
   UserId,
-} from '@guideai/collab-client';
+} from '../lib/collab-client';
 
 // ---------------------------------------------------------------------------
 // Store Types
@@ -47,6 +47,8 @@ type CollabActions = {
   addDocument: (document: Document) => void;
   updateDocument: (document: Document) => void;
   setPresence: (userId: UserId, presence: UserPresence | null) => void;
+  replacePresence: (presence: Iterable<UserPresence>) => void;
+  clearPresence: () => void;
   setConnectionState: (state: CollabState['connectionState']) => void;
   toggleSidebar: () => void;
   toggleCommandPalette: () => void;
@@ -116,6 +118,16 @@ export const collabStore: CollabActions = {
     }
     setState({ presence: next });
   },
+
+  replacePresence: (presence) => {
+    const next = new Map<UserId, UserPresence>();
+    for (const item of presence) {
+      next.set(item.user_id, item);
+    }
+    setState({ presence: next });
+  },
+
+  clearPresence: () => setState({ presence: new Map() }),
 
   setConnectionState: (connectionState) => setState({ connectionState }),
 

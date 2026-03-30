@@ -10,7 +10,7 @@ Replaces the in-memory AgentAuthClient stub with a production-ready service that
 References:
 - docs/AGENT_AUTH_ARCHITECTURE.md: Service contract, policy engine, token vault
 - SECRETS_MANAGEMENT_PLAN.md: Rotation runbooks, OS keychain integration
-- MCP_SERVER_DESIGN.md: Tool surface parity expectations
+- docs/contracts/MCP_SERVER_DESIGN.md: Tool surface parity expectations
 - AGENTS.md: behavior_lock_down_security_surface compliance
 """
 

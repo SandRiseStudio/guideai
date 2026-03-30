@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 # Default agents directory relative to project root
-DEFAULT_AGENTS_DIR = "agents"
+DEFAULT_AGENTS_DIR = "guideai/agents/playbooks"
 
 
 @dataclass

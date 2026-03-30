@@ -26,8 +26,8 @@
       },
       "item_type": {
         "type": "string",
-        "enum": ["epic", "story", "task"],
-        "description": "Filter by work item type"
+        "enum": ["goal", "feature", "task", "bug", "epic", "story"],
+        "description": "Filter by work item type. Use goal/feature/task/bug. Legacy values epic/story are accepted"
       },
       "status": {
         "type": "string",
@@ -80,7 +80,7 @@
             },
             "item_type": {
               "type": "string",
-              "enum": ["epic", "story", "task"],
+              "enum": ["epic", "story", "task", "bug"],
               "description": "Type of work item"
             },
             "status": {

@@ -1,7 +1,7 @@
 .token-savings-chart {
-  background: var(--card-bg, #ffffff);
-  border: 1px solid var(--border-color, #e5e7eb);
-  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid var(--color-border-default, #e5e7eb);
+  border-radius: 16px;
   padding: 20px;
   margin: 16px 0;
 }
@@ -17,7 +17,8 @@
   margin: 0;
   font-size: 1.1rem;
   font-weight: 600;
-  color: var(--text-primary, #1f2937);
+  color: var(--color-text-primary, #1f2937);
+  letter-spacing: -0.02em;
 }
 
 .savings-badge {
@@ -55,7 +56,7 @@
 .bar-label {
   width: 80px;
   font-size: 0.85rem;
-  color: var(--text-secondary, #6b7280);
+  color: var(--color-text-secondary, #6b7280);
   font-weight: 500;
 }
 
@@ -63,7 +64,7 @@
   flex: 1;
   display: flex;
   height: 32px;
-  background: var(--bar-bg, #f3f4f6);
+  background: rgba(226, 232, 240, 0.9);
   border-radius: 6px;
   overflow: hidden;
 }
@@ -78,41 +79,32 @@
 }
 
 .bar-original {
-  background: linear-gradient(90deg, #6366f1 0%, #8b5cf6 100%);
+  background: rgba(34, 118, 210, 0.78);
 }
 
 .bar-optimized {
-  background: linear-gradient(90deg, #10b981 0%, #34d399 100%);
+  background: rgba(22, 131, 79, 0.78);
 }
 
 .bar-savings {
-  background: repeating-linear-gradient(
-    45deg,
-    #fca5a5,
-    #fca5a5 4px,
-    #fecaca 4px,
-    #fecaca 8px
-  );
-  opacity: 0.7;
+  background: rgba(215, 75, 69, 0.24);
 }
 
 .bar-value {
   font-size: 0.8rem;
   font-weight: 600;
   color: white;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
 }
 
 .bar-savings .bar-value {
   color: #991b1b;
-  text-shadow: none;
 }
 
 .chart-stats {
   display: flex;
   gap: 24px;
   padding-top: 16px;
-  border-top: 1px solid var(--border-color, #e5e7eb);
+  border-top: 1px solid var(--color-border-default, #e5e7eb);
 }
 
 .stat {
@@ -124,12 +116,12 @@
 .stat-value {
   font-size: 1.25rem;
   font-weight: 700;
-  color: var(--text-primary, #1f2937);
+  color: var(--color-text-primary, #1f2937);
 }
 
 .stat-label {
   font-size: 0.75rem;
-  color: var(--text-secondary, #6b7280);
+  color: var(--color-text-secondary, #6b7280);
   text-transform: uppercase;
   letter-spacing: 0.5px;
   margin-top: 4px;

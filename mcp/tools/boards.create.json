@@ -28,7 +28,13 @@
       "create_default_columns": {
         "type": "boolean",
         "default": true,
-        "description": "Whether to create default columns (Backlog, To Do, In Progress, In Review, Done)"
+        "description": "Whether to create default columns based on the chosen template"
+      },
+      "template": {
+        "type": "string",
+        "enum": ["minimal", "standard", "full"],
+        "default": "minimal",
+        "description": "Column template: 'minimal' (To Do, In Progress, Done), 'standard' (adds Backlog + In Review), 'full' (all statuses). Default is minimal for progressive disclosure."
       },
       "user_id": {
         "type": "string",

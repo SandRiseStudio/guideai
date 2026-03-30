@@ -1,13 +1,13 @@
 """
 Board Contracts v2 - Unified WorkItem Model
 
-Treats epics, stories, and tasks as the same entity type (WorkItem)
+Treats goals, features, and tasks as the same entity type (WorkItem)
 with a discriminator field and parent_id for hierarchy.
 
 Hierarchy:
-  - Epic (type=epic, parent_id=None)
-    - Story (type=story, parent_id=epic_id)
-      - Task (type=task, parent_id=story_id)
+  - Goal (type=goal, parent_id=None)
+    - Feature (type=feature, parent_id=goal_id)
+      - Task (type=task, parent_id=feature_id)
 
 Feature: 13.4.5 (Agent assignment) + 13.5.x (Agile Board System)
 """
@@ -19,7 +19,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # =============================================================================
@@ -28,9 +28,30 @@ from pydantic import BaseModel, Field, model_validator
 
 class WorkItemType(str, Enum):
     """Type of work item in the hierarchy."""
-    EPIC = "epic"      # Top-level grouping
-    STORY = "story"    # User stories under epics
-    TASK = "task"      # Subtasks under stories
+    GOAL = "goal"          # Top-level grouping (formerly 'epic')
+    FEATURE = "feature"    # Features under goals (formerly 'story')
+    TASK = "task"          # Subtasks under features
+    BUG = "bug"            # Defects / issues to fix
+
+    # Backward-compat aliases (1 release cycle)
+    EPIC = "goal"          # Deprecated: use GOAL
+    STORY = "feature"      # Deprecated: use FEATURE
+
+
+# Backward-compat mapping: old item_type values → new values
+_ITEM_TYPE_ALIASES: dict[str, str] = {
+    "epic": "goal",
+    "story": "feature",
+}
+
+
+def normalize_item_type(value: str) -> str:
+    """Map legacy item_type strings to current values.
+
+    Accepts 'epic' → 'goal', 'story' → 'feature'.
+    Passes through 'goal', 'feature', 'task', 'bug' unchanged.
+    """
+    return _ITEM_TYPE_ALIASES.get(value, value)
 
 
 class AssigneeType(str, Enum):
@@ -41,18 +62,14 @@ class AssigneeType(str, Enum):
 
 class WorkItemStatus(str, Enum):
     """Unified status for all work items."""
-    DRAFT = "draft"          # Planning phase (especially for epics)
     BACKLOG = "backlog"
-    TODO = "todo"
     IN_PROGRESS = "in_progress"
     IN_REVIEW = "in_review"
     DONE = "done"
-    CANCELLED = "cancelled"
 
 
 class EpicStatus(str, Enum):
     """Legacy epic status enum used by older APIs/tests."""
-    DRAFT = "draft"
     ACTIVE = "active"
     COMPLETED = "completed"
 
@@ -97,6 +114,18 @@ class BoardVisibility(str, Enum):
     PUBLIC = "public"
 
 
+class BoardTemplate(str, Enum):
+    """Board column template — progressive disclosure.
+
+    minimal:  Backlog, In Progress, Done  (solo / small teams)
+    standard: Backlog, In Progress, In Review, Done  (typical team)
+    full:     Backlog, In Progress, In Review, Done  (same as standard)
+    """
+    MINIMAL = "minimal"
+    STANDARD = "standard"
+    FULL = "full"
+
+
 class LabelColor(str, Enum):
     """
     Predefined color palette for labels.
@@ -121,13 +150,10 @@ class LabelColor(str, Enum):
 # =============================================================================
 
 VALID_STATUS_TRANSITIONS: dict[WorkItemStatus, list[WorkItemStatus]] = {
-    WorkItemStatus.DRAFT: [WorkItemStatus.BACKLOG, WorkItemStatus.TODO, WorkItemStatus.IN_PROGRESS, WorkItemStatus.CANCELLED],
-    WorkItemStatus.BACKLOG: [WorkItemStatus.TODO, WorkItemStatus.IN_PROGRESS, WorkItemStatus.CANCELLED],
-    WorkItemStatus.TODO: [WorkItemStatus.IN_PROGRESS, WorkItemStatus.BACKLOG, WorkItemStatus.CANCELLED],
-    WorkItemStatus.IN_PROGRESS: [WorkItemStatus.IN_REVIEW, WorkItemStatus.DONE, WorkItemStatus.TODO, WorkItemStatus.CANCELLED],
-    WorkItemStatus.IN_REVIEW: [WorkItemStatus.DONE, WorkItemStatus.IN_PROGRESS, WorkItemStatus.CANCELLED],
-    WorkItemStatus.DONE: [WorkItemStatus.TODO],  # Reopen
-    WorkItemStatus.CANCELLED: [WorkItemStatus.BACKLOG, WorkItemStatus.DRAFT],  # Restore
+    WorkItemStatus.BACKLOG: [WorkItemStatus.IN_PROGRESS, WorkItemStatus.IN_REVIEW, WorkItemStatus.DONE],
+    WorkItemStatus.IN_PROGRESS: [WorkItemStatus.IN_REVIEW, WorkItemStatus.DONE, WorkItemStatus.BACKLOG],
+    WorkItemStatus.IN_REVIEW: [WorkItemStatus.DONE, WorkItemStatus.IN_PROGRESS, WorkItemStatus.BACKLOG],
+    WorkItemStatus.DONE: [WorkItemStatus.BACKLOG],  # Reopen
 }
 
 
@@ -148,7 +174,7 @@ class BoardSettings(BaseModel):
     """Board configuration settings."""
     default_column_id: str | None = None
     auto_archive_after_days: int | None = None
-    show_story_points: bool = True
+    show_points: bool = True  # Formerly show_story_points
     show_due_dates: bool = True
     allow_subtasks: bool = True
     visibility: BoardVisibility = BoardVisibility.INHERIT
@@ -200,6 +226,7 @@ class Board(BaseModel):
     created_by: str | None = None  # Nullable in database schema
     is_default: bool = False
     org_id: str | None = None
+    display_number: int | None = None  # Project-scoped sequential ID (e.g., 1, 2, 3)
 
 
 class BoardColumn(BaseModel):
@@ -227,15 +254,17 @@ class BoardWithColumns(Board):
 
 class WorkItem(BaseModel):
     """
-    Unified work item - can be epic, story, or task.
+    Unified work item - can be goal, feature, task, or bug.
 
     Hierarchy via parent_id:
-      - Epic: parent_id=None
-      - Story: parent_id=epic_id (optional, can be standalone)
-      - Task: parent_id=story_id (optional, can be standalone)
+      - Goal: parent_id=None
+      - Feature: parent_id=goal_id (optional, can be standalone)
+      - Task: parent_id=feature_id (optional, can be standalone)
     """
+    model_config = ConfigDict(populate_by_name=True)
+
     # Accept both old short-id format and UUIDs from database
-    item_id: str = Field(..., pattern=r"^((epic|story|task)-[a-f0-9]{12}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$")
+    item_id: str = Field(..., pattern=r"^((goal|feature|epic|story|task|bug)-[a-f0-9]{12}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$")
     item_type: WorkItemType
     project_id: str | None = None  # Nullable in database schema
     board_id: str | None = None
@@ -250,7 +279,7 @@ class WorkItem(BaseModel):
     position: int = 0
 
     # Estimation
-    story_points: int | None = Field(None, ge=0)  # For stories/epics
+    points: int | None = Field(None, ge=0, alias="story_points")  # Formerly story_points; alias kept for backward compat
     estimated_hours: Decimal | None = Field(None, ge=0)  # For tasks
     actual_hours: Decimal | None = Field(None, ge=0)  # For tasks
 
@@ -288,6 +317,8 @@ class WorkItem(BaseModel):
     org_id: str | None = None
 
     # Computed fields (populated by service)
+    display_number: int | None = None  # Project-scoped sequential ID (e.g., 1, 2, 3)
+    display_id: str | None = None  # Human-friendly ID: "{project_slug}-{display_number}"
     child_count: int | None = None
     completed_child_count: int | None = None
     progress_percent: float | None = None
@@ -305,6 +336,50 @@ class WorkItemWithChildren(WorkItem):
     children: list["WorkItem"] = Field(default_factory=list)
 
 
+class ProgressBucketCounts(BaseModel):
+    """Normalized status buckets for progress displays."""
+    not_started: int = 0
+    in_progress: int = 0
+    completed: int = 0
+    total: int = 0
+
+
+class RemainingWorkSummary(BaseModel):
+    """Remaining work metrics for PM-style rollups."""
+    items_remaining: int = 0
+    estimated_hours_remaining: float | None = None
+    points_remaining: int | None = None  # Formerly story_points_remaining
+    estimate_coverage_ratio: float | None = None
+
+
+class IncompleteWorkItemSummary(BaseModel):
+    """Compact descendant row for incomplete-work drilldowns."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    item_id: str
+    item_type: WorkItemType
+    title: str
+    status: WorkItemStatus
+    parent_id: str | None = None
+    assignee_id: str | None = None
+    assignee_type: AssigneeType | None = None
+    points: int | None = Field(None, alias="story_points")  # Formerly story_points
+    estimated_hours: float | None = None
+    actual_hours: float | None = None
+
+
+class WorkItemProgressRollup(BaseModel):
+    """Canonical rollup payload for epic/story/task progress UX."""
+    item_id: str
+    item_type: WorkItemType
+    title: str
+    status: WorkItemStatus
+    buckets: ProgressBucketCounts
+    remaining: RemainingWorkSummary
+    completion_percent: float = 0.0
+    incomplete_items: list[IncompleteWorkItemSummary] = Field(default_factory=list)
+
+
 # =============================================================================
 # Request Models
 # =============================================================================
@@ -317,6 +392,7 @@ class CreateBoardRequest(BaseModel):
     settings: BoardSettings | None = None
     is_default: bool = False
     create_default_columns: bool = True
+    template: BoardTemplate = BoardTemplate.MINIMAL
 
 
 class UpdateBoardRequest(BaseModel):
@@ -347,22 +423,25 @@ class UpdateColumnRequest(BaseModel):
 
 class CreateWorkItemRequest(BaseModel):
     """
-    Unified request to create any work item (epic/story/task).
+    Unified request to create any work item (goal/feature/task/bug).
 
     The item_type determines the ID prefix and valid parent relationships.
+    Accepts legacy values 'epic' and 'story' which are normalized automatically.
     """
+    model_config = ConfigDict(populate_by_name=True)
+
     item_type: WorkItemType
     project_id: str | None = None  # Optional - board_id determines project context
     board_id: str | None = None
     column_id: str | None = None
-    parent_id: str | None = None  # epic_id for stories, story_id for tasks
+    parent_id: str | None = None  # goal_id for features, feature_id for tasks
 
     title: str = Field(..., min_length=1, max_length=500)
     description: str | None = None
     priority: WorkItemPriority = WorkItemPriority.MEDIUM
 
     # Optional fields
-    story_points: int | None = Field(None, ge=0)
+    points: int | None = Field(None, ge=0, alias="story_points")  # Formerly story_points
     estimated_hours: Decimal | None = Field(None, ge=0)
     start_date: date | None = None
     target_date: date | None = None
@@ -374,16 +453,28 @@ class CreateWorkItemRequest(BaseModel):
     behavior_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_fields(cls, data: Any) -> Any:
+        """Accept legacy item_type values ('epic'/'story') and 'story_points' field."""
+        if isinstance(data, dict):
+            if "item_type" in data and isinstance(data["item_type"], str):
+                data["item_type"] = normalize_item_type(data["item_type"])
+        return data
+
     @model_validator(mode="after")
     def validate_hierarchy(self) -> "CreateWorkItemRequest":
         """Validate parent relationship based on item type."""
-        if self.item_type == WorkItemType.EPIC and self.parent_id:
-            raise ValueError("Epics cannot have a parent_id")
+        if self.item_type == WorkItemType.GOAL and self.parent_id:
+            raise ValueError("Goals cannot have a parent_id")
         return self
 
 
 class UpdateWorkItemRequest(BaseModel):
     """Unified request to update any work item."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    item_type: WorkItemType | None = None
     title: str | None = Field(None, min_length=1, max_length=500)
     description: str | None = None
     status: WorkItemStatus | None = None
@@ -394,7 +485,7 @@ class UpdateWorkItemRequest(BaseModel):
     parent_id: str | None = None
     position: int | None = None
 
-    story_points: int | None = Field(None, ge=0)
+    points: int | None = Field(None, ge=0, alias="story_points")  # Formerly story_points
     estimated_hours: Decimal | None = Field(None, ge=0)
     actual_hours: Decimal | None = Field(None, ge=0)
 
@@ -414,6 +505,8 @@ class UpdateWorkItemRequest(BaseModel):
 
 # =============================================================================
 # Legacy request/response models (compat for older API/tests)
+# DEPRECATED: Prefer CreateWorkItemRequest / UpdateWorkItemRequest with
+#   item_type='goal'/'feature'. These will be removed after 1 release cycle.
 # =============================================================================
 
 
@@ -761,12 +854,14 @@ class BoardEvent(BaseModel):
 
 class AgentWorkload(BaseModel):
     """Agent workload metrics for capacity planning."""
+    model_config = ConfigDict(populate_by_name=True)
+
     agent_id: str
     agent_name: str
-    active_items: int = 0  # Stories + tasks in progress
+    active_items: int = 0  # Features + tasks in progress
     in_progress_count: int = 0
     completed_count: int = 0
-    total_story_points: int = 0
+    total_points: int = Field(default=0, alias="total_story_points")  # Formerly total_story_points
     allowed_behaviors: list[str] = Field(default_factory=list)
 
     # Capacity metrics
@@ -775,9 +870,9 @@ class AgentWorkload(BaseModel):
 
 
 class SuggestAgentRequest(BaseModel):
-    """Request to suggest best agent for a story/task."""
+    """Request to suggest best agent for a feature/task."""
     assignable_id: str
-    assignable_type: Literal["story", "task"]
+    assignable_type: Literal["feature", "task", "story"]  # 'story' accepted for backward compat
     required_behaviors: list[str] = Field(default_factory=list)  # Filter by allowed_behaviors
     max_suggestions: int = Field(3, ge=1, le=10)
     exclude_agent_ids: list[str] = Field(default_factory=list)
@@ -799,7 +894,7 @@ class SuggestAgentResponse(BaseModel):
     """Response with agent suggestions."""
     suggestions: list[AgentSuggestion]
     assignable_id: str
-    assignable_type: Literal["story", "task"]
+    assignable_type: Literal["feature", "task", "story"]  # 'story' for backward compat
     required_behaviors: list[str]
     total_eligible_agents: int
 

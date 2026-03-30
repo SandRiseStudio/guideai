@@ -307,6 +307,27 @@ class AmprealizeService:
         """Register an environment definition."""
         self.environments[env_def.name] = env_def
 
+    def _infer_repo_root(self) -> Path:
+        """Infer the repository root directory.
+
+        Uses GUIDEAI_REPO_ROOT env var if set, otherwise infers from
+        the environment manifest path. When the manifest lives inside a
+        ``config/amprealize/`` subdirectory, walks up to the true repo root
+        rather than returning the manifest's immediate parent.
+        """
+        env_val = os.environ.get("GUIDEAI_REPO_ROOT")
+        if env_val:
+            return Path(env_val)
+
+        if self.environment_manifest_path:
+            manifest_dir = self.environment_manifest_path.parent
+            # config/amprealize/environments.yaml → repo root is 2 levels up
+            if manifest_dir.name == "amprealize" and manifest_dir.parent.name == "config":
+                return manifest_dir.parent.parent
+            return manifest_dir
+
+        return Path.cwd()
+
     def _resolve_environment_file(self) -> Optional[Path]:
         """Resolve the environment configuration file path."""
         override = os.environ.get("GUIDEAI_ENV_FILE") or os.environ.get("AMPREALIZE_ENV_FILE")
@@ -1306,10 +1327,7 @@ class AmprealizeService:
         merged_variables = env_def.variables.copy()
         merged_variables.update(request.variables)
         if "GUIDEAI_REPO_ROOT" not in merged_variables:
-            if self.environment_manifest_path:
-                merged_variables["GUIDEAI_REPO_ROOT"] = str(self.environment_manifest_path.parent)
-            else:
-                merged_variables["GUIDEAI_REPO_ROOT"] = str(Path.cwd())
+            merged_variables["GUIDEAI_REPO_ROOT"] = str(self._infer_repo_root())
 
         # Apply defaults
         lifetime = request.lifetime or env_def.default_lifetime
@@ -1324,9 +1342,16 @@ class AmprealizeService:
 
         blueprint = self._resolve_blueprint(blueprint_id, variables=merged_variables)
 
-        # Filter services by module only when explicitly requested.
-        # Environment-level active_modules is treated as informational by default
-        # to avoid silently stripping services from planned manifests.
+        # Auto-derive active_modules from blueprint module definitions
+        # when the caller didn't explicitly specify them.
+        if request.active_modules is None and blueprint.modules:
+            request.active_modules = [
+                mod_name for mod_name, mod_spec in blueprint.modules.items()
+                if mod_spec.enabled
+            ]
+
+        # Filter services by module when active_modules is set
+        # (either explicitly by the caller or auto-derived from blueprint).
         if request.active_modules is not None:
             active_modules = request.active_modules
             filtered_services = {}
@@ -1458,7 +1483,7 @@ class AmprealizeService:
             env_def = self.environments[request.environment]
             blueprint_id = blueprint_id or env_def.infrastructure.blueprint_id
             merged_variables = env_def.variables.copy()
-            merged_variables.setdefault("GUIDEAI_REPO_ROOT", str(Path.cwd()))
+            merged_variables.setdefault("GUIDEAI_REPO_ROOT", str(self._infer_repo_root()))
 
         if not blueprint_id:
             raise ValueError(
@@ -2157,6 +2182,7 @@ class AmprealizeService:
                     network=network_name,
                     network_aliases=[name] if network_name else [],
                     privileged=bool(spec.get("privileged", False)),
+                    extra_hosts=spec.get("extra_hosts", []),
                 )
 
                 container_id = self.executor.run_container(config)
@@ -2712,7 +2738,7 @@ class AmprealizeService:
       provider: podman
       auto_start: true
     infrastructure:
-      blueprint_id: postgres-dev
+            blueprint_id: local-test-suite
       teardown_on_exit: true
 
   staging:

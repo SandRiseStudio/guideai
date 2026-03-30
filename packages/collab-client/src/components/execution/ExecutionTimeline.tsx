@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { ExecutionStep } from '../../types.js';
 import { ensureExecutionStyles } from './executionStyles.js';
 import { formatDuration, formatPhaseLabel, formatTimestamp } from './executionUtils.js';
@@ -24,6 +26,20 @@ const STEP_LABELS: Record<string, string> = {
 function formatStepLabel(stepType: string): string {
   if (!stepType) return 'Step';
   return STEP_LABELS[stepType] ?? stepType.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * Detect whether text contains markdown formatting worth rendering.
+ * Checks for markdown headers, tables, or a density of markdown syntax.
+ */
+function isMarkdownContent(text: string): boolean {
+  // Quick checks for common markdown indicators
+  const hasHeaders = /^#{1,3}\s/m.test(text);
+  const hasTables = /\|.+\|.+\|/m.test(text);
+  const hasBold = /\*\*.+\*\*/m.test(text);
+  const hasLists = /^[-*]\s/m.test(text);
+  const indicators = [hasHeaders, hasTables, hasBold, hasLists].filter(Boolean).length;
+  return indicators >= 2 || hasHeaders;
 }
 
 interface ParsedStepContent {
@@ -237,13 +253,19 @@ export function ExecutionTimeline({
                         {/* Show full detail when expanded */}
                         {isExpanded && parsedContent && (
                           <div className="ga-exec-step-detail" style={{ marginTop: '8px', fontSize: '13px' }}>
-                            {/* LLM Response text */}
+                            {/* LLM Response text / Research report */}
                             {parsedContent.text && (
                               <div style={{ marginBottom: '8px' }}>
                                 <strong>Agent Response:</strong>
-                                <pre style={{ whiteSpace: 'pre-wrap', background: 'var(--vscode-editor-background, #1e1e1e)', padding: '8px', borderRadius: '4px', maxHeight: '300px', overflow: 'auto', marginTop: '4px' }}>
-                                  {parsedContent.text}
-                                </pre>
+                                {isMarkdownContent(parsedContent.text) ? (
+                                  <div style={{ background: 'var(--vscode-editor-background, #1e1e1e)', padding: '8px', borderRadius: '4px', maxHeight: '400px', overflow: 'auto', marginTop: '4px', lineHeight: 1.5 }} className="ga-exec-markdown">
+                                    <Markdown remarkPlugins={[remarkGfm]}>{parsedContent.text}</Markdown>
+                                  </div>
+                                ) : (
+                                  <pre style={{ whiteSpace: 'pre-wrap', background: 'var(--vscode-editor-background, #1e1e1e)', padding: '8px', borderRadius: '4px', maxHeight: '300px', overflow: 'auto', marginTop: '4px' }}>
+                                    {parsedContent.text}
+                                  </pre>
+                                )}
                               </div>
                             )}
 

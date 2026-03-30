@@ -26,6 +26,7 @@ import { ActionTimelinePanel } from './panels/ActionTimelinePanel';
 import { BehaviorAccuracyPanel } from './panels/BehaviorAccuracyPanel';
 import { GuideAIChatPanel } from './panels/GuideAIChatPanel';
 import { McpStatusBarProvider } from './providers/McpStatusBarProvider';
+import { OnboardingPanel } from './panels/OnboardingPanel';
 
 export function activate(context: vscode.ExtensionContext) {
 	console.log('GuideAI extension is now active');
@@ -117,6 +118,11 @@ export function activate(context: vscode.ExtensionContext) {
 		// Amprealize Orchestrator Commands (Epic 9.5)
 		vscode.commands.registerCommand('guideai.openAmprealize', () => {
 			AmprealizePanel.createOrShow(context.extensionUri, client, mcpClient);
+		}),
+
+		// Onboarding / Bootstrap Commands (GUIDEAI-276 E2)
+		vscode.commands.registerCommand('guideai.openOnboarding', () => {
+			OnboardingPanel.createOrShow(context.extensionUri, mcpClient);
 		}),
 
 		// Compliance Tracker Commands (Epic 5.5)

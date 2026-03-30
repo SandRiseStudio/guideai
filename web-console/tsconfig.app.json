@@ -10,11 +10,15 @@
 
     /* Bundler mode */
     "moduleResolution": "bundler",
+    "baseUrl": ".",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
     "noEmit": true,
     "jsx": "react-jsx",
+    "paths": {
+      "@guideai/collab-client": ["./src/vendor/collab-client-dist/index.d.ts"]
+    },
 
     /* Linting */
     "strict": true,

@@ -162,6 +162,15 @@ class RetrieveRequest(SerializableDataclass):
     trace_context: Optional[Dict[str, Any]] = None
     user_id: Optional[str] = None  # Phase 2: For gradual rollout A/B cohort routing
     namespace: Optional[str] = "core"
+    # E3 Runtime Injection — context-aware retrieval signals
+    workspace_profile: Optional[str] = None
+    active_pack_id: Optional[str] = None
+    surface: Optional[str] = None
+    task_type: Optional[str] = None
+    pack_behavior_refs: Optional[List[str]] = None
+    runtime_constraints: Optional[List[str]] = None
+    # E3 S3.9 — phase-aware retrieval
+    phase: Optional[str] = None
 
 
 @dataclass
@@ -204,6 +213,11 @@ class ComposePromptRequest(SerializableDataclass):
     format: PromptFormat = PromptFormat.LIST
     citation_instruction: Optional[str] = None
     max_behaviors: Optional[int] = None
+    # E3 Runtime Injection — overlay/primer enrichment
+    runtime_context: Optional[Dict[str, Any]] = None
+    overlay_instructions: Optional[List[str]] = None
+    primer_text: Optional[str] = None
+    runtime_constraints: Optional[List[str]] = None
 
 
 @dataclass
@@ -211,6 +225,7 @@ class ComposePromptResponse(SerializableDataclass):
     prompt: str
     behaviors: List[BehaviorSnippet]
     metadata: Optional[Dict[str, Any]] = None
+    overlays_included: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -264,6 +279,9 @@ class ParseCitationsRequest(SerializableDataclass):
 @dataclass
 class ParseCitationsResponse(SerializableDataclass):
     citations: List[Citation]
+    # E3 Runtime Injection — overlay/role adherence
+    overlays_cited: List[str] = field(default_factory=list)
+    role_declared: Optional[str] = None
 
 
 @dataclass
@@ -290,6 +308,10 @@ class ValidateCitationsResponse(SerializableDataclass):
     is_compliant: bool
     missing_behaviors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # E3 Runtime Injection — overlay compliance
+    overlay_compliance_rate: float = 0.0
+    missing_overlays: List[str] = field(default_factory=list)
+    role_declared: bool = False
 
 
 @dataclass
@@ -395,6 +417,88 @@ class ScoreReusabilityResponse(SerializableDataclass):
     dimensions: List[ScoreDimension]
 
 
+# ===========================================================================
+# E3 S3.9 — Phase-Specific Behavior Boosts & Adherence Tracking
+# ===========================================================================
+
+
+# Phase boost configuration: maps GEP phases to tag boosts and query hints.
+# Tags matching a phase's boost_tags receive the specified multiplier.
+# The query_hint is prepended to the embedding query for better retrieval.
+PHASE_BOOST_CONFIG: Dict[str, Dict[str, Any]] = {
+    "planning": {
+        "boost_tags": ["architecture", "planning", "design", "requirements", "estimation"],
+        "boost_factor": 1.5,
+        "query_hint": "planning and architecture decisions",
+    },
+    "clarifying": {
+        "boost_tags": ["requirements", "clarification", "scope", "stakeholder", "acceptance"],
+        "boost_factor": 1.4,
+        "query_hint": "requirements clarification and scope definition",
+    },
+    "architecting": {
+        "boost_tags": ["architecture", "design", "patterns", "contracts", "api"],
+        "boost_factor": 1.5,
+        "query_hint": "software architecture and design patterns",
+    },
+    "executing": {
+        "boost_tags": ["implementation", "coding", "refactoring", "logging", "security"],
+        "boost_factor": 1.3,
+        "query_hint": "code implementation best practices",
+    },
+    "testing": {
+        "boost_tags": ["testing", "test", "coverage", "quality", "validation"],
+        "boost_factor": 1.5,
+        "query_hint": "testing strategy and test patterns",
+    },
+    "fixing": {
+        "boost_tags": ["debugging", "fix", "error", "incident", "root-cause"],
+        "boost_factor": 1.4,
+        "query_hint": "debugging and fixing issues",
+    },
+    "verifying": {
+        "boost_tags": ["verification", "review", "compliance", "audit", "quality"],
+        "boost_factor": 1.4,
+        "query_hint": "verification and quality review",
+    },
+    "completing": {
+        "boost_tags": ["documentation", "deployment", "release", "changelog"],
+        "boost_factor": 1.3,
+        "query_hint": "documentation and release completion",
+    },
+}
+
+
+@dataclass
+class PhaseAdherenceRecord(SerializableDataclass):
+    """Records adherence for a single GEP phase execution."""
+
+    phase: str
+    behaviors_injected: List[str] = field(default_factory=list)
+    behaviors_cited: List[str] = field(default_factory=list)
+    behaviors_missed: List[str] = field(default_factory=list)
+    overlays_injected: List[str] = field(default_factory=list)
+    overlays_cited: List[str] = field(default_factory=list)
+    overlays_missed: List[str] = field(default_factory=list)
+    role_declared: bool = False
+    adherence_score: float = 0.0
+    violation_count: int = 0
+    timestamp: Optional[str] = None
+
+
+@dataclass
+class AdherenceResult(SerializableDataclass):
+    """Aggregate adherence result across all phases of a run."""
+
+    run_id: str
+    phase_records: List[PhaseAdherenceRecord] = field(default_factory=list)
+    overall_adherence_score: float = 0.0
+    total_behaviors_injected: int = 0
+    total_behaviors_cited: int = 0
+    total_violations: int = 0
+    is_compliant: bool = True
+
+
 __all__ = [
     "RetrievalStrategy",
     "RoleFocus",
@@ -432,4 +536,7 @@ __all__ = [
     "ScoreDimension",
     "ScoreReusabilityRequest",
     "ScoreReusabilityResponse",
+    "PHASE_BOOST_CONFIG",
+    "PhaseAdherenceRecord",
+    "AdherenceResult",
 ]

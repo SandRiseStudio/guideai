@@ -10,6 +10,7 @@
  */
 import * as vscode from 'vscode';
 import { GuideAIClient, ProjectSettings as ClientProjectSettings, LLMCredential as ClientLLMCredential } from '../client/GuideAIClient';
+import { McpClient } from '../client/McpClient';
 export type ExecutionMode = 'local' | 'github_pr' | 'local_and_pr';
 export interface ProjectSettings extends ClientProjectSettings {
     project_id?: string;
@@ -31,9 +32,11 @@ export declare class ProjectSettingsPanel {
     private readonly _panel;
     private readonly _extensionUri;
     private readonly _client;
+    private readonly _mcpClient;
     private _disposables;
     private _projectId;
     private _settings;
+    private _bootstrapStatus;
     private _validatedGithub;
     private _credentials;
     private _githubLink;
@@ -41,9 +44,10 @@ export declare class ProjectSettingsPanel {
     private _myGitHubCredentials;
     private _myGitHubAppInstallations;
     private constructor();
-    static createOrShow(extensionUri: vscode.Uri, client: GuideAIClient, projectId: string, projectName?: string): void;
-    static revive(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, client: GuideAIClient, projectId: string): void;
+    static createOrShow(extensionUri: vscode.Uri, client: GuideAIClient, projectId: string, projectName?: string, mcpClient?: McpClient): void;
+    static revive(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, client: GuideAIClient, projectId: string, mcpClient?: McpClient): void;
     private _loadSettings;
+    private _loadBootstrapStatus;
     private _detectWorkspace;
     private _validateGithub;
     private _saveSettings;
@@ -54,6 +58,7 @@ export declare class ProjectSettingsPanel {
     private _linkGitHubApp;
     private _unlinkGitHub;
     private _update;
+    private _renderBootstrapSection;
     private _renderGitHubResolutionStatus;
     private _renderGitHubLinkSection;
     private _getHtmlForWebview;

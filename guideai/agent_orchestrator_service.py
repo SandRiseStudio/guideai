@@ -18,7 +18,7 @@ _DEFAULT_PERSONA_DEFS = [
             "behavior_unify_execution_records",
             "behavior_wire_cli_to_orchestrator",
         ],
-        "playbook_refs": ["AGENT_ENGINEERING.md"],
+        "playbook_refs": ["guideai/agents/playbooks/AGENT_ENGINEERING.md"],
         "capabilities": ["runtime_orchestration", "telemetry"],
     },
     {
@@ -29,7 +29,7 @@ _DEFAULT_PERSONA_DEFS = [
             "behavior_update_docs_after_changes",
             "behavior_instrument_metrics_pipeline",
         ],
-        "playbook_refs": ["AGENT_PRODUCT.md"],
+        "playbook_refs": ["guideai/agents/playbooks/AGENT_PRODUCT.md"],
         "capabilities": ["roadmap", "metrics"],
     },
     {
@@ -39,7 +39,7 @@ _DEFAULT_PERSONA_DEFS = [
         "default_behaviors": [
             "behavior_validate_financial_impact",
         ],
-        "playbook_refs": ["AGENT_FINANCE.md"],
+        "playbook_refs": ["guideai/agents/playbooks/AGENT_FINANCE.md"],
         "capabilities": ["budget", "forecasting"],
     },
     {
@@ -50,7 +50,7 @@ _DEFAULT_PERSONA_DEFS = [
             "behavior_handbook_compliance_prompt",
             "behavior_update_docs_after_changes",
         ],
-        "playbook_refs": ["AGENT_COMPLIANCE.md"],
+        "playbook_refs": ["guideai/agents/playbooks/AGENT_COMPLIANCE.md"],
         "capabilities": ["audit", "checklist"],
     },
     {
@@ -61,7 +61,7 @@ _DEFAULT_PERSONA_DEFS = [
             "behavior_lock_down_security_surface",
             "behavior_prevent_secret_leaks",
         ],
-        "playbook_refs": ["AGENT_SECURITY.md"],
+        "playbook_refs": ["guideai/agents/playbooks/AGENT_SECURITY.md"],
         "capabilities": ["auth", "threat_model"],
     },
 ]

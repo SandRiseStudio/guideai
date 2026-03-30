@@ -49,6 +49,24 @@ class BuildSpec(BaseModel):
     build_args: Dict[str, Any] = Field(default_factory=dict, description="Build-time args")
 
 
+class PostStartCommand(BaseModel):
+    """A command to execute inside a container after it starts and passes healthchecks."""
+
+    command: List[str] = Field(description="Command and arguments to exec in the container")
+    description: str = Field("", description="Human-readable description of the command")
+    timeout_s: int = Field(300, description="Timeout in seconds for command execution")
+
+
+class HealthcheckSpec(BaseModel):
+    """Container healthcheck specification (matches Docker/Podman healthcheck format)."""
+
+    test: List[str] = Field(description="Healthcheck command (e.g., ['CMD-SHELL', 'curl -f ...'])")
+    interval: str = Field("10s", description="Time between checks")
+    timeout: str = Field("5s", description="Timeout per check")
+    retries: int = Field(3, description="Consecutive failures before unhealthy")
+    start_period: Optional[str] = Field(None, description="Grace period before checks count")
+
+
 class ServiceSpec(BaseModel):
     """Specification for a single service within a blueprint.
 
@@ -64,6 +82,11 @@ class ServiceSpec(BaseModel):
         module: Module grouping (e.g., "datastores", "observability")
         build: Optional local build spec (context/dockerfile/rebuild)
         depends_on: Optional dependency list (best-effort ordering)
+        healthcheck: Container healthcheck configuration
+        healthcheck_timeout_s: Overall timeout waiting for healthcheck to pass
+        post_start_commands: Commands to exec after container is healthy
+        extra_hosts: Extra /etc/hosts entries (e.g., "host.containers.internal:host-gateway")
+        privileged: Run container in privileged mode
     """
 
     image: str
@@ -80,6 +103,20 @@ class ServiceSpec(BaseModel):
     )
     build: Optional[BuildSpec] = None
     depends_on: List[str] = Field(default_factory=list)
+    healthcheck: Optional[HealthcheckSpec] = Field(None, description="Container healthcheck config")
+    healthcheck_timeout_s: Optional[int] = Field(None, description="Overall healthcheck wait timeout in seconds")
+    post_start_commands: List[PostStartCommand] = Field(
+        default_factory=list, description="Commands to exec after container is healthy"
+    )
+    extra_hosts: List[str] = Field(default_factory=list, description="Extra /etc/hosts entries")
+    privileged: bool = Field(False, description="Run container in privileged mode")
+
+
+class ModuleSpec(BaseModel):
+    """Specification for a blueprint module (group of services)."""
+
+    description: str = Field("", description="Human-readable module description")
+    enabled: bool = Field(True, description="Whether this module's services should be provisioned")
 
 
 class Blueprint(BaseModel):
@@ -92,6 +129,7 @@ class Blueprint(BaseModel):
         name: Blueprint identifier
         version: Blueprint version
         services: Map of service name to specification
+        modules: Map of module name to module spec (controls enabled/disabled)
 
     Example:
         blueprint = Blueprint(
@@ -109,6 +147,7 @@ class Blueprint(BaseModel):
     name: str
     version: str
     services: Dict[str, ServiceSpec]
+    modules: Dict[str, ModuleSpec] = Field(default_factory=dict)
 
     def validate_topology(self) -> List[str]:
         """Validate the blueprint topology.

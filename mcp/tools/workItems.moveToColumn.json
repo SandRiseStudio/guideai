@@ -7,7 +7,7 @@
     "properties": {
       "work_item_id": {
         "type": "string",
-        "description": "ID of the work item to move (required)"
+        "description": "ID or display ID (e.g. 'myproject-42') of the work item to move (required)"
       },
       "column_id": {
         "type": "string",
@@ -15,7 +15,7 @@
       },
       "status_mapping": {
         "type": "string",
-        "enum": ["todo", "in_progress", "in_review", "blocked", "done", "cancelled"],
+        "enum": ["backlog", "in_progress", "in_review", "done"],
         "description": "Target status - finds column with matching status_mapping. Either column_id or status_mapping must be provided."
       },
       "position": {

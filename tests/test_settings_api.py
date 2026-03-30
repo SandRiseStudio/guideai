@@ -17,8 +17,13 @@ from __future__ import annotations
 
 import pytest
 
-# Mark all tests in this module as unit tests (no infrastructure required)
-pytestmark = pytest.mark.unit
+from guideai.multi_tenant.settings import SettingsService
+
+# Mark all tests as unit; skip if enterprise not installed
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skipif(SettingsService is None, reason="SettingsService requires guideai-enterprise"),
+]
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from typing import Dict, Any

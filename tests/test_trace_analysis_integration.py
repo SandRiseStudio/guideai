@@ -4,7 +4,7 @@ Validates parity across:
 - CLI: guideai patterns detect/score
 - MCP: patterns.detectPatterns / patterns.scoreReusability
 
-Per ACTION_SERVICE_CONTRACT.md parity requirements and behavior_wire_cli_to_orchestrator.
+Per docs/contracts/ACTION_SERVICE_CONTRACT.md parity requirements and behavior_wire_cli_to_orchestrator.
 """
 
 import json

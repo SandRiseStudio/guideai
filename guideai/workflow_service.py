@@ -6,7 +6,7 @@ enabling runtime template execution that injects retrieved behaviors into prompt
 Aligns with:
 - PRD.md: Milestone 1 Workflow Engine Foundation
 - AGENTS.md: Strategist/Teacher/Student role definitions
-- MCP_SERVER_DESIGN.md: Control-plane orchestration patterns
+- docs/contracts/MCP_SERVER_DESIGN.md: Control-plane orchestration patterns
 """
 
 from __future__ import annotations

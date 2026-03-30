@@ -31,7 +31,7 @@ export function BCIResponsePanel({ onBehaviorSelect }: BCIResponsePanelProps) {
   return (
     <div className="bci-panel">
       <div className="panel-header">
-        <h2>Behavior-Conditioned Inference</h2>
+        <h2>Behavior Search</h2>
         {status && (
           <div className="status-badge">
             <span className={`status-dot ${status.index_built ? 'active' : 'inactive'}`} />

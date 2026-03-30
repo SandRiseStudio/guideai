@@ -45,7 +45,6 @@ declare class AgentTreeItem extends vscode.TreeItem {
     constructor(agent: Agent, collapsibleState: vscode.TreeItemCollapsibleState);
     private buildTooltip;
     private getContextValue;
-    private getIconName;
 }
 declare class MessageTreeItem extends vscode.TreeItem {
     constructor(label: string, tooltip?: string);

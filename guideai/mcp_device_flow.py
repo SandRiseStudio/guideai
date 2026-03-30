@@ -45,7 +45,7 @@ import os
 import time
 import platform
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from pathlib import Path
 
@@ -61,7 +61,6 @@ from .auth_tokens import (
     TokenStoreError,
     get_default_token_store,
 )
-from .adapters import MCPDeviceFlowAdapter
 from .telemetry import TelemetryClient
 from .services.agent_auth_service import (
     AgentAuthService,
@@ -112,6 +111,8 @@ class MCPDeviceFlowService:
         self._telemetry = telemetry
         self._agent_auth_service = agent_auth_service
         self._postgres_store = postgres_store
+        # Import from lightweight device_flow_adapters (not heavy adapters.py)
+        from .device_flow_adapters import MCPDeviceFlowAdapter
         self._adapter = MCPDeviceFlowAdapter(self._manager)
 
     def _get_token_store(self) -> TokenStore:
@@ -119,6 +120,22 @@ class MCPDeviceFlowService:
         if self._token_store is None:
             self._token_store = get_default_token_store()
         return self._token_store
+
+    @staticmethod
+    def _db_call_timeout_seconds() -> float:
+        """Timeout for blocking database-backed device-flow calls."""
+        try:
+            return float(os.environ.get("MCP_DB_CALL_TIMEOUT_SECONDS", "5"))
+        except ValueError:
+            return 5.0
+
+    @staticmethod
+    def _token_store_timeout_seconds() -> float:
+        """Timeout for token store operations that may block on keychain backends."""
+        try:
+            return float(os.environ.get("MCP_AUTH_STORE_TIMEOUT_SECONDS", "3"))
+        except ValueError:
+            return 3.0
 
     async def device_init(
         self,
@@ -151,23 +168,64 @@ class MCPDeviceFlowService:
 
         # Use PostgreSQL store for shared state if available
         if self._postgres_store:
-            # Wrap synchronous database call in asyncio.to_thread to avoid blocking event loop
-            session = await asyncio.to_thread(
-                self._postgres_store.create_session,
-                client_id=client_id,
-                scopes=scopes,
-                surface="mcp",
-                metadata=metadata,
-            )
-            verification_uri = os.getenv("GUIDEAI_DEVICE_VERIFICATION_URI", "https://device.guideai.dev/activate")
-            return {
-                "device_code": session.device_code,
-                "user_code": session.user_code,
-                "verification_uri": verification_uri,
-                "verification_uri_complete": f"{verification_uri}?user_code={session.user_code}",
-                "expires_in": int((session.expires_at - session.created_at).total_seconds()),
-                "interval": session.poll_interval,
-            }
+            try:
+                # Wrap synchronous database call in asyncio.to_thread to avoid blocking event loop
+                # and enforce timeout so auth.deviceInit cannot hang indefinitely.
+                session = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._postgres_store.create_session,
+                        client_id=client_id,
+                        scopes=scopes,
+                        surface="mcp",
+                        metadata=metadata,
+                    ),
+                    timeout=self._db_call_timeout_seconds(),
+                )
+
+                # Auto-approve in dev mode (no real OAuth provider to redirect to).
+                # Controlled by MCP_AUTO_APPROVE_DEVICE_FLOW env var (default: true).
+                auto_approve = os.getenv("MCP_AUTO_APPROVE_DEVICE_FLOW", "true").lower() in ("1", "true", "yes")
+                if auto_approve:
+                    approver = os.getenv("GUIDEAI_DEFAULT_APPROVER", "auto-approve@local")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._postgres_store.approve,
+                                session.device_code,
+                                approver=approver,
+                                approver_surface="mcp-auto",
+                            ),
+                            timeout=self._db_call_timeout_seconds(),
+                        )
+                    except Exception as exc:
+                        # Non-fatal — poll can still work if approved manually later
+                        if self._telemetry:
+                            self._telemetry.emit_event(
+                                event_type="device_flow.mcp.auto_approve_failed",
+                                payload={"error": str(exc), "device_code": session.device_code},
+                            )
+
+                verification_uri = os.getenv("GUIDEAI_DEVICE_VERIFICATION_URI", "https://device.guideai.dev/activate")
+                return {
+                    "device_code": session.device_code,
+                    "user_code": session.user_code,
+                    "verification_uri": verification_uri,
+                    "verification_uri_complete": f"{verification_uri}?user_code={session.user_code}",
+                    "expires_in": int((session.expires_at - session.created_at).total_seconds()),
+                    "interval": session.poll_interval,
+                }
+            except asyncio.TimeoutError:
+                if self._telemetry:
+                    self._telemetry.emit_event(
+                        event_type="device_flow.mcp.db_timeout",
+                        payload={"operation": "device_init", "client_id": client_id},
+                    )
+            except Exception as exc:
+                if self._telemetry:
+                    self._telemetry.emit_event(
+                        event_type="device_flow.mcp.db_fallback",
+                        payload={"operation": "device_init", "client_id": client_id, "error": str(exc)},
+                    )
 
         # Fallback to in-memory manager
         session_data = self._adapter.start_authorization(
@@ -175,6 +233,15 @@ class MCPDeviceFlowService:
             scopes=scopes,
             metadata=metadata,
         )
+
+        # Auto-approve in-memory session too
+        auto_approve = os.getenv("MCP_AUTO_APPROVE_DEVICE_FLOW", "true").lower() in ("1", "true", "yes")
+        if auto_approve and session_data.get("user_code"):
+            approver = os.getenv("GUIDEAI_DEFAULT_APPROVER", "auto-approve@local")
+            try:
+                self._adapter.approve(session_data["user_code"], approver=approver)
+            except Exception:
+                pass  # Non-fatal
 
         return {
             "device_code": session_data["device_code"],
@@ -200,8 +267,11 @@ class MCPDeviceFlowService:
             # Use PostgreSQL store for shared state if available
             if self._postgres_store:
                 # Wrap synchronous database call in asyncio.to_thread to avoid blocking event loop
-                session = await asyncio.to_thread(
-                    self._postgres_store.get_by_device_code, device_code
+                session = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._postgres_store.get_by_device_code, device_code
+                    ),
+                    timeout=self._db_call_timeout_seconds(),
                 )
                 if session is None:
                     return {
@@ -242,6 +312,8 @@ class MCPDeviceFlowService:
                         "token_type": "Bearer",
                         "scopes": session.scopes or [],
                         "expires_in": max(0, access_expires_in),
+                        "user_id": session.oauth_user_id or session.oauth_email or session.approver,
+                        "email": session.oauth_email or session.approver,
                     })
 
                     if store_tokens:
@@ -257,8 +329,11 @@ class MCPDeviceFlowService:
                                 expires_at=session.access_token_expires_at or datetime.now(timezone.utc),
                                 refresh_expires_at=session.refresh_token_expires_at,
                             )
-                            store.save(bundle)
-                        except TokenStoreError as exc:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(store.save, bundle),
+                                timeout=self._token_store_timeout_seconds(),
+                            )
+                        except (TokenStoreError, asyncio.TimeoutError, Exception) as exc:
                             result["error"] = "storage_failed"
                             result["error_description"] = str(exc)
 
@@ -307,8 +382,11 @@ class MCPDeviceFlowService:
                             expires_at=datetime.fromisoformat(poll_result["access_token_expires_at"]),
                             refresh_expires_at=datetime.fromisoformat(poll_result["refresh_token_expires_at"]),
                         )
-                        store.save(bundle)
-                    except TokenStoreError as exc:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(store.save, bundle),
+                            timeout=self._token_store_timeout_seconds(),
+                        )
+                    except (TokenStoreError, asyncio.TimeoutError, Exception) as exc:
                         result["error"] = "storage_failed"
                         result["error_description"] = str(exc)
 
@@ -336,6 +414,7 @@ class MCPDeviceFlowService:
         poll_interval: int = 5,
         timeout: int = 300,
         store_tokens: bool = True,
+        wait_for_authorization: bool = False,
     ) -> Dict[str, Any]:
         """
         Initiate device authorization flow and poll until completion.
@@ -353,6 +432,9 @@ class MCPDeviceFlowService:
             poll_interval: Polling interval in seconds (server may override)
             timeout: Maximum wait time in seconds before giving up
             store_tokens: Whether to persist tokens in keychain/file storage
+            wait_for_authorization: If True, block and poll until authorized/denied/expired/timeout.
+                If False (recommended for MCP agents), return pending status immediately and
+                use auth.devicePoll with returned device_code.
 
         Returns:
             Dictionary with status, tokens, and metadata per auth.deviceLogin.json schema
@@ -379,125 +461,103 @@ class MCPDeviceFlowService:
             )
 
         try:
-            # Start authorization and get device/user codes
-            session_data = self._adapter.start_authorization(
+            # Start authorization and get device/user codes.
+            # IMPORTANT: use device_init so auth.deviceLogin shares the same backing store
+            # (PostgreSQL when configured), matching auth.devicePoll semantics.
+            init_result = await self.device_init(
                 client_id=client_id,
                 scopes=scopes,
-                metadata=metadata,
+                poll_interval=poll_interval,
             )
 
-            # Build initial response with verification instructions
             result: Dict[str, Any] = {
                 "status": "pending",
-                "device_code": session_data["device_code"],
-                "user_code": session_data["user_code"],
-                "verification_uri": session_data["verification_uri"],
-                "verification_uri_complete": session_data.get("verification_uri_complete"),
-                "expires_in": session_data.get("poll_interval", poll_interval) * (timeout // poll_interval),
-                "interval": session_data.get("poll_interval", poll_interval),
+                "device_code": init_result["device_code"],
+                "user_code": init_result["user_code"],
+                "verification_uri": init_result["verification_uri"],
+                "verification_uri_complete": init_result.get("verification_uri_complete"),
+                "expires_in": init_result.get("expires_in", timeout),
+                "interval": init_result.get("interval", poll_interval),
             }
 
-            # Poll until authorization completes or times out
+            # Best practice for MCP agents: return immediately and let the client poll.
+            if not wait_for_authorization:
+                return result
+
+            # Optional legacy/blocking behavior: poll until authorization completes.
             deadline = time.monotonic() + timeout
-            device_code = session_data["device_code"]
-            retry_after = session_data.get("poll_interval", poll_interval)
+            retry_after = int(result["interval"])
 
             while time.monotonic() < deadline:
                 await asyncio.sleep(retry_after)
 
-                poll_result = self._adapter.poll(device_code)
-                status_value = poll_result["status"]
+                poll_result = await self.device_poll(
+                    device_code=result["device_code"],
+                    client_id=client_id,
+                    store_tokens=store_tokens,
+                )
+                status = str(poll_result.get("status", "error")).lower()
 
-                if status_value.upper() == "PENDING":
-                    retry_after = poll_result.get("retry_after", poll_interval)
+                if status == "pending":
                     continue
 
-                # Update result with final status (normalize APPROVED→authorized, DENIED→denied, etc.)
-                status_normalized = {
-                    "APPROVED": "authorized",
-                    "DENIED": "denied",
-                    "EXPIRED": "expired",
-                    "PENDING": "pending",
-                }.get(status_value.upper(), status_value.lower())
-                result["status"] = status_normalized
+                result["status"] = status
 
-                if status_value.upper() == "APPROVED":
-                    # Extract tokens from poll result
-                    result.update({
-                        "access_token": poll_result["access_token"],
-                        "refresh_token": poll_result["refresh_token"],
-                        "token_type": poll_result.get("token_type", "Bearer"),
-                        "scopes": poll_result["scopes"],
-                        "expires_at": poll_result["access_token_expires_at"],
-                        "refresh_expires_at": poll_result["refresh_token_expires_at"],
-                    })
+                # Merge non-status fields from poll response.
+                for key, value in poll_result.items():
+                    if key != "status":
+                        result[key] = value
 
-                    # Persist tokens if requested
+                if status == "authorized":
                     if store_tokens:
-                        try:
-                            store = self._get_token_store()
-                            bundle = AuthTokenBundle(
-                                access_token=poll_result["access_token"],
-                                refresh_token=poll_result["refresh_token"],
-                                token_type=poll_result.get("token_type", "Bearer"),
-                                scopes=poll_result["scopes"],
-                                client_id=poll_result.get("client_id", client_id),
-                                issued_at=datetime.now(timezone.utc),
-                                expires_at=datetime.fromisoformat(poll_result["access_token_expires_at"]),
-                                refresh_expires_at=datetime.fromisoformat(poll_result["refresh_token_expires_at"]),
-                            )
-                            store.save(bundle)
-                            result["token_storage_path"] = self._get_storage_path_description(store)
+                        store = self._get_token_store()
+                        result["token_storage_path"] = self._get_storage_path_description(store)
 
-                            if self._telemetry:
-                                self._telemetry.emit_event(
-                                    event_type="device_flow.mcp.tokens_stored",
-                                    payload={
-                                        "client_id": client_id,
-                                        "storage_type": type(store).__name__,
-                                    },
-                                )
-                        except TokenStoreError as exc:
-                            result["error"] = "storage_failed"
-                            result["error_description"] = f"Failed to persist tokens: {exc}"
+                        if self._telemetry:
+                            storage_type = type(store).__name__
+                            self._telemetry.emit_event(
+                                event_type="device_flow.mcp.tokens_stored",
+                                payload={
+                                    "client_id": client_id,
+                                    "storage_type": storage_type,
+                                },
+                            )
 
                     if self._telemetry:
                         self._telemetry.emit_event(
                             event_type="device_flow.mcp.login_success",
                             payload={
                                 "client_id": client_id,
-                                "scopes": poll_result["scopes"],
+                                "scopes": result.get("scopes", []),
                                 "tokens_stored": store_tokens and "error" not in result,
                             },
                         )
 
                     return result
 
-                elif status_value.upper() == "DENIED":
-                    result["error"] = "access_denied"
-                    result["error_description"] = poll_result.get("denied_reason", "User denied authorization")
-
+                if status == "denied":
                     if self._telemetry:
                         self._telemetry.emit_event(
                             event_type="device_flow.mcp.login_denied",
-                            payload={"client_id": client_id, "reason": result["error_description"]},
+                            payload={
+                                "client_id": client_id,
+                                "reason": result.get("error_description", "User denied authorization"),
+                            },
                         )
-
                     return result
 
-                elif status_value.upper() == "EXPIRED":
-                    result["error"] = "expired_token"
-                    result["error_description"] = "Device code expired before user authorization"
-
+                if status == "expired":
                     if self._telemetry:
                         self._telemetry.emit_event(
                             event_type="device_flow.mcp.login_expired",
                             payload={"client_id": client_id},
                         )
-
                     return result
 
-            # Timeout reached
+                # Unknown or explicit error status - return as-is.
+                return result
+
+            # Timeout reached while still pending.
             result["status"] = "error"
             result["error"] = "authorization_pending"
             result["error_description"] = f"Timed out after {timeout}s waiting for user authorization"
@@ -546,7 +606,10 @@ class MCPDeviceFlowService:
         """
         try:
             store = self._get_token_store()
-            bundle = store.load()
+            bundle = await asyncio.wait_for(
+                asyncio.to_thread(store.load),
+                timeout=self._token_store_timeout_seconds(),
+            )
 
             if bundle is None or bundle.client_id != client_id:
                 return {
@@ -598,6 +661,15 @@ class MCPDeviceFlowService:
                 "needs_login": True,
                 "error_description": str(exc),
             }
+        except asyncio.TimeoutError:
+            return {
+                "is_authenticated": False,
+                "access_token_valid": False,
+                "refresh_token_valid": False,
+                "client_id": client_id,
+                "needs_login": True,
+                "error_description": "Token store operation timed out",
+            }
 
     async def refresh_token(
         self,
@@ -609,8 +681,8 @@ class MCPDeviceFlowService:
         Refresh an expired access token using stored refresh token.
 
         Implements auth.refreshToken MCP tool by reading refresh token from
-        KeychainTokenStore, calling DeviceFlowManager.refresh_access_token,
-        and persisting new tokens.
+        KeychainTokenStore, and refreshing via PostgresDeviceFlowStore (if available)
+        or DeviceFlowManager (fallback).
 
         Args:
             client_id: OAuth client identifier to refresh tokens for
@@ -621,7 +693,10 @@ class MCPDeviceFlowService:
         """
         try:
             store = self._get_token_store()
-            bundle = store.load()
+            bundle = await asyncio.wait_for(
+                asyncio.to_thread(store.load),
+                timeout=self._token_store_timeout_seconds(),
+            )
 
             if bundle is None or bundle.client_id != client_id:
                 return {
@@ -637,8 +712,56 @@ class MCPDeviceFlowService:
                     "error_description": "Refresh token has expired",
                 }
 
-            # Refresh tokens via DeviceFlowManager
-            refresh_data = self._adapter.refresh(bundle.refresh_token)
+            refresh_data: Optional[Dict[str, Any]] = None
+
+            # Try PostgreSQL store first (tokens were likely issued there)
+            if self._postgres_store:
+                try:
+                    session = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._postgres_store.refresh_access_token,
+                            bundle.refresh_token,
+                        ),
+                        timeout=self._db_call_timeout_seconds(),
+                    )
+                    if session and session.access_token:
+                        refresh_data = {
+                            "access_token": session.access_token,
+                            "refresh_token": session.refresh_token,
+                            "token_type": "Bearer",
+                            "scopes": list(session.scopes),
+                            "client_id": session.client_id,
+                            "access_token_expires_at": session.access_token_expires_at.isoformat() if session.access_token_expires_at else None,
+                            "refresh_token_expires_at": session.refresh_token_expires_at.isoformat() if session.refresh_token_expires_at else None,
+                            "access_expires_in": int((session.access_token_expires_at - now).total_seconds()) if session.access_token_expires_at else 3600,
+                            "refresh_expires_in": int((session.refresh_token_expires_at - now).total_seconds()) if session.refresh_token_expires_at else 604800,
+                            # Include user info for session context population
+                            "user_id": session.oauth_user_id or session.approver,
+                            "email": session.oauth_email or session.approver,
+                        }
+                except asyncio.TimeoutError:
+                    if self._telemetry:
+                        self._telemetry.emit_event(
+                            event_type="device_flow.mcp.db_timeout",
+                            payload={"operation": "refresh_token", "client_id": client_id},
+                        )
+                except Exception as exc:
+                    if self._telemetry:
+                        self._telemetry.emit_event(
+                            event_type="device_flow.mcp.db_fallback",
+                            payload={"operation": "refresh_token", "client_id": client_id, "error": str(exc)},
+                        )
+
+            # Fallback to in-memory manager if postgres didn't work
+            if refresh_data is None:
+                try:
+                    refresh_data = self._adapter.refresh(bundle.refresh_token)
+                except Exception as fallback_exc:
+                    return {
+                        "status": "error",
+                        "error": "invalid_request",
+                        "error_description": str(fallback_exc),
+                    }
 
             result: Dict[str, Any] = {
                 "status": "refreshed",
@@ -661,10 +784,13 @@ class MCPDeviceFlowService:
                         scopes=refresh_data["scopes"],
                         client_id=refresh_data.get("client_id", client_id),
                         issued_at=datetime.now(timezone.utc),
-                        expires_at=datetime.fromisoformat(refresh_data["access_token_expires_at"]),
-                        refresh_expires_at=datetime.fromisoformat(refresh_data["refresh_token_expires_at"]),
+                        expires_at=datetime.fromisoformat(refresh_data["access_token_expires_at"]) if refresh_data.get("access_token_expires_at") else now + timedelta(hours=1),
+                        refresh_expires_at=datetime.fromisoformat(refresh_data["refresh_token_expires_at"]) if refresh_data.get("refresh_token_expires_at") else bundle.refresh_expires_at,
                     )
-                    store.save(new_bundle)
+                    await asyncio.wait_for(
+                        asyncio.to_thread(store.save, new_bundle),
+                        timeout=self._token_store_timeout_seconds(),
+                    )
                     result["token_storage_path"] = self._get_storage_path_description(store)
 
                     if self._telemetry:
@@ -718,7 +844,10 @@ class MCPDeviceFlowService:
         """
         try:
             store = self._get_token_store()
-            bundle = store.load()
+            bundle = await asyncio.wait_for(
+                asyncio.to_thread(store.load),
+                timeout=self._token_store_timeout_seconds(),
+            )
 
             warnings: List[str] = []
             access_revoked = False
@@ -883,6 +1012,7 @@ class MCPDeviceFlowHandler:
                 poll_interval=params.get("poll_interval", 5),
                 timeout=params.get("timeout", 300),
                 store_tokens=params.get("store_tokens", True),
+                wait_for_authorization=params.get("wait_for_authorization", False),
             )
 
         elif tool_name == "auth.deviceInit":

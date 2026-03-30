@@ -83,6 +83,9 @@ def _score_agent_for_work_item(agent: Agent, work_item: WorkItem) -> Tuple[float
     if work_item.item_type == WorkItemType.TASK:
         if "engineering" in agent_caps or "engineer" in agent_name_lower:
             score += 1.0
+    elif work_item.item_type == WorkItemType.BUG:
+        if "engineering" in agent_caps or "engineer" in agent_name_lower:
+            score += 1.0
     elif work_item.item_type == WorkItemType.STORY:
         if "product" in agent_caps or "product" in agent_name_lower:
             score += 0.5

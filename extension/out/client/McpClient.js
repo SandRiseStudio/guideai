@@ -620,6 +620,24 @@ class McpClient extends events_1.EventEmitter {
             tags: params.tags
         });
     }
+    /**
+     * Full runtime injection: resolve context, retrieve behaviors, compose enriched prompt.
+     * E3 S3.3 (T3.3.2): Inject context blocks into extension chat.
+     */
+    async bciInject(params) {
+        return this.callTool('bci.inject', {
+            task: params.task,
+            surface: params.surface || 'vscode',
+            role: params.role,
+            workspace_path: params.workspacePath,
+            top_k: params.topK || 5,
+            strategy: params.strategy || 'hybrid',
+            format: params.format || 'list',
+            citation_mode: params.citationMode || 'explicit',
+            tags: params.tags,
+            phase: params.phase
+        });
+    }
     // ============================================
     // Amprealize Environment Orchestration
     // ============================================
@@ -793,6 +811,18 @@ class McpClient extends events_1.EventEmitter {
                 surface: 'MCP'
             }
         });
+    }
+    // ============================================
+    // Bootstrap Tools (GUIDEAI-276)
+    // ============================================
+    async bootstrapDetect(params) {
+        return this.callTool('bootstrap.detect', params || {});
+    }
+    async bootstrapStatus(params) {
+        return this.callTool('bootstrap.status', params || {});
+    }
+    async bootstrapInit(params) {
+        return this.callTool('bootstrap.init', params);
     }
     // ============================================
     // Lifecycle

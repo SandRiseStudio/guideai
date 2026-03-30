@@ -1,7 +1,7 @@
 """Run service data contracts.
 
 These dataclasses are shared across CLI, REST, and MCP surfaces. They align with the
-contracts described in `MCP_SERVER_DESIGN.md` and planned RunService schemas.
+contracts described in `docs/contracts/MCP_SERVER_DESIGN.md` and planned RunService schemas.
 """
 
 from __future__ import annotations

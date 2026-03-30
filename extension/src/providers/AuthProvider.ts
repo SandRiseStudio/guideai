@@ -13,7 +13,7 @@
 
 import * as vscode from 'vscode';
 import { GuideAIClient } from '../client/GuideAIClient';
-import { McpClient, DeviceInitResult, DevicePollResult } from '../client/McpClient';
+import { McpClient, DeviceInitResult, DevicePollResult, WorkspaceProfile } from '../client/McpClient';
 
 export interface AuthToken {
     access_token: string;
@@ -463,6 +463,7 @@ export class AuthProvider implements vscode.AuthenticationProvider {
                         <li>Authorize the application</li>
                         <li>Click "I've completed authentication" below</li>
                     </ol>
+                    ${deviceCodeResponse.scopes ? `<p class="scope-hint">Requested scopes: <code>${deviceCodeResponse.scopes.join(', ')}</code></p>` : ''}
                 </div>
 
                 <div class="auth-actions">
@@ -531,6 +532,37 @@ export class AuthProvider implements vscode.AuthenticationProvider {
     isAuthenticated(): boolean {
         const session = this.getCurrentSession();
         return session !== null && (!session.expiresAt || session.expiresAt > new Date());
+    }
+
+    /**
+     * Suggest auth scopes based on the detected workspace profile.
+     * Returns base scopes plus profile-specific additions with rationale.
+     */
+    static getScopeGuidance(profile?: WorkspaceProfile): { scopes: string[]; rationale: string } {
+        const base = ['behaviors:read', 'runs:write', 'projects:read'];
+
+        switch (profile) {
+            case 'compliance-sensitive':
+                return {
+                    scopes: [...base, 'compliance:read', 'compliance:write', 'audit:read'],
+                    rationale: 'Compliance-sensitive workspaces need audit and compliance scopes for policy enforcement.'
+                };
+            case 'team-collab':
+                return {
+                    scopes: [...base, 'projects:write', 'boards:read', 'boards:write'],
+                    rationale: 'Team collaboration requires project write access and board management scopes.'
+                };
+            case 'guideai-platform':
+                return {
+                    scopes: [...base, 'behaviors:write', 'compliance:read', 'projects:write', 'admin:read'],
+                    rationale: 'Platform development benefits from behavior write access and admin visibility.'
+                };
+            default:
+                return {
+                    scopes: base,
+                    rationale: 'Standard scopes for workspace interaction.'
+                };
+        }
     }
 
     /**

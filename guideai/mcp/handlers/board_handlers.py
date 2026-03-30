@@ -9,9 +9,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from ...services.board_service import BoardService, Actor, BoardNotFoundError, WorkItemNotFoundError, ColumnNotFoundError, AuthorNotFoundError
+from ...services.board_service import BoardService, Actor, BoardNotFoundError, WorkItemNotFoundError, WorkItemValidationError, ColumnNotFoundError, AuthorNotFoundError
 from ...multi_tenant.board_contracts import (
     Board,
+    BoardTemplate,
     BoardWithColumns,
     BoardColumn,
     WorkItem,
@@ -19,10 +20,12 @@ from ...multi_tenant.board_contracts import (
     WorkItemStatus,
     WorkItemPriority,
     CreateBoardRequest,
+    CreateColumnRequest,
     UpdateBoardRequest,
     CreateWorkItemRequest,
     UpdateWorkItemRequest,
     MoveWorkItemRequest,
+    normalize_item_type,
 )
 
 
@@ -74,6 +77,19 @@ def _get_actor(arguments: Dict[str, Any]) -> Actor:
     role = arguments.get("actor_role", "user")
     surface = arguments.get("actor_surface", "mcp")
     return Actor(id=user_id, role=role, surface=surface)
+
+
+def _resolve_id(
+    service: BoardService,
+    identifier: str,
+    arguments: Dict[str, Any],
+) -> str:
+    """Resolve a display ID (e.g. 'myproject-42') or pass through a UUID/short-ID."""
+    org_id = arguments.get("org_id")
+    project_id = arguments.get("project_id")
+    return service.resolve_work_item_id(
+        identifier, org_id=org_id, project_id=project_id,
+    )
 
 
 # ==============================================================================
@@ -144,6 +160,7 @@ def handle_create_board(
         description=arguments.get("description"),
         is_default=arguments.get("is_default", False),
         create_default_columns=arguments.get("create_default_columns", True),
+        template=arguments.get("template", "minimal"),
     )
 
     board = service.create_board(request, actor, org_id=org_id)
@@ -295,11 +312,14 @@ def handle_list_work_items(
         except ValueError:
             pass
 
+    parent_id = arguments.get("parent_id")
+
     items = service.list_work_items(
         project_id=project_id,
         board_id=board_id,
         item_type=item_type,
         status=status,
+        parent_id=parent_id,
         org_id=org_id,
         limit=limit,
         offset=offset,
@@ -319,7 +339,7 @@ def handle_create_work_item(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Create a new work item (epic, story, or task).
+    Create a new work item (goal, feature, task, or bug).
 
     MCP Tool: workItems.create
     """
@@ -329,7 +349,7 @@ def handle_create_work_item(
     org_id = arguments.get("org_id")
 
     if not item_type:
-        return {"success": False, "error": "item_type is required (epic, story, or task)"}
+        return {"success": False, "error": "item_type is required (goal, feature, task, or bug)"}
     if not project_id:
         return {"success": False, "error": "project_id is required"}
     if not title:
@@ -337,11 +357,13 @@ def handle_create_work_item(
 
     actor = _get_actor(arguments)
 
-    # Parse item_type enum
+    # Parse item_type enum — accept legacy 'epic'/'story' via normalize
     try:
-        item_type_enum = WorkItemType(item_type)
+        item_type_enum = WorkItemType(normalize_item_type(item_type))
     except ValueError:
-        return {"success": False, "error": f"Invalid item_type: {item_type}. Must be epic, story, or task."}
+        return {"success": False, "error": f"Invalid item_type: {item_type}. Must be goal, feature, task, or bug."}
+
+    # GWS title validation is enforced by BoardService.create_work_item()
 
     # Parse priority
     priority = WorkItemPriority.MEDIUM
@@ -361,7 +383,7 @@ def handle_create_work_item(
         description=arguments.get("description"),
         priority=priority,
         labels=arguments.get("labels", []),
-        story_points=arguments.get("story_points"),
+        story_points=arguments.get("points") or arguments.get("story_points"),
         estimated_hours=arguments.get("estimated_hours"),
         start_date=arguments.get("start_date"),
         target_date=arguments.get("target_date"),
@@ -389,13 +411,14 @@ def handle_get_work_item(
 
     MCP Tool: workItems.get
     """
-    item_id = arguments.get("item_id")
+    raw_id = arguments.get("item_id")
     org_id = arguments.get("org_id")
 
-    if not item_id:
+    if not raw_id:
         return {"success": False, "error": "item_id is required"}
 
     try:
+        item_id = _resolve_id(service, raw_id, arguments)
         item = service.get_work_item(item_id, org_id=org_id)
         return {
             "success": True,
@@ -404,8 +427,39 @@ def handle_get_work_item(
     except WorkItemNotFoundError:
         return {
             "success": False,
-            "error": f"Work item {item_id} not found",
+            "error": f"Work item {raw_id} not found",
         }
+
+
+def handle_get_work_items_batch(
+    service: BoardService,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Get multiple work items by IDs in a single call.
+
+    MCP Tool: workItems.getBatch
+    """
+    raw_ids = arguments.get("item_ids", [])
+    org_id = arguments.get("org_id")
+
+    if not raw_ids:
+        return {"success": False, "error": "item_ids is required and must be non-empty"}
+
+    if len(raw_ids) > 100:
+        return {"success": False, "error": "Maximum 100 item_ids per batch request"}
+
+    item_ids = [_resolve_id(service, rid, arguments) for rid in raw_ids]
+    items = service.get_work_items_batch(item_ids, org_id=org_id)
+    found_ids = {i.item_id for i in items}
+    missing_ids = [iid for iid in item_ids if iid not in found_ids]
+
+    return {
+        "success": True,
+        "items": [_work_item_to_dict(i) for i in items],
+        "total": len(items),
+        "missing_ids": missing_ids,
+    }
 
 
 def handle_update_work_item(
@@ -417,12 +471,13 @@ def handle_update_work_item(
 
     MCP Tool: workItems.update
     """
-    item_id = arguments.get("item_id")
+    raw_id = arguments.get("item_id")
     org_id = arguments.get("org_id")
 
-    if not item_id:
+    if not raw_id:
         return {"success": False, "error": "item_id is required"}
 
+    item_id = _resolve_id(service, raw_id, arguments)
     actor = _get_actor(arguments)
 
     # Parse optional status
@@ -441,13 +496,27 @@ def handle_update_work_item(
         except ValueError:
             pass
 
+    # Check for cascade_to_children flag (only applies when status=done)
+    cascade_to_children = arguments.get("cascade_to_children", False)
+
+    # Parse optional item_type
+    item_type_enum = None
+    if arguments.get("item_type"):
+        try:
+            item_type_enum = WorkItemType(normalize_item_type(arguments["item_type"]))
+        except ValueError:
+            return {"success": False, "error": f"Invalid item_type: {arguments['item_type']}. Must be goal, feature, task, or bug."}
+
+    # GWS title validation is enforced by BoardService.update_work_item()
+
     request = UpdateWorkItemRequest(
+        item_type=item_type_enum,
         title=arguments.get("title"),
         description=arguments.get("description"),
         status=status,
         priority=priority,
         labels=arguments.get("labels"),
-        story_points=arguments.get("story_points"),
+        story_points=arguments.get("points") or arguments.get("story_points"),
         estimated_hours=arguments.get("estimated_hours"),
         actual_hours=arguments.get("actual_hours"),
         start_date=arguments.get("start_date"),
@@ -456,19 +525,28 @@ def handle_update_work_item(
         behavior_id=arguments.get("behavior_id"),
         run_id=arguments.get("run_id"),
         metadata=arguments.get("metadata"),
+        parent_id=arguments.get("parent_id"),
     )
 
     try:
+        # If cascade_to_children is true and status is "done", use complete_with_descendants
+        cascade_result = None
+        if cascade_to_children and status == WorkItemStatus.DONE:
+            cascade_result = service.complete_with_descendants(item_id, actor, org_id=org_id)
+
         item = service.update_work_item(item_id, request, actor, org_id=org_id)
-        return {
+        response = {
             "success": True,
             "item": _work_item_to_dict(item),
             "message": "Work item updated successfully",
         }
+        if cascade_result:
+            response["cascade_result"] = cascade_result
+        return response
     except WorkItemNotFoundError:
         return {
             "success": False,
-            "error": f"Work item {item_id} not found",
+            "error": f"Work item {raw_id} not found",
         }
 
 
@@ -477,35 +555,19 @@ def handle_move_work_item(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Move a work item between columns or change position.
+    DEPRECATED: Adapter that delegates to handle_move_to_column.
 
-    MCP Tool: workItems.move
+    MCP Tool: workItems.move → workItems.moveToColumn
+
+    Maps the legacy ``item_id`` parameter to ``work_item_id`` and forwards
+    to the canonical handler.  Kept for backwards compatibility during the
+    deprecation period.
     """
-    item_id = arguments.get("item_id")
-    org_id = arguments.get("org_id")
-
-    if not item_id:
-        return {"success": False, "error": "item_id is required"}
-
-    actor = _get_actor(arguments)
-
-    request = MoveWorkItemRequest(
-        column_id=arguments.get("column_id"),
-        position=arguments.get("position", 0),
-    )
-
-    try:
-        item = service.move_work_item(item_id, request, actor, org_id=org_id)
-        return {
-            "success": True,
-            "item": _work_item_to_dict(item),
-            "message": "Work item moved successfully",
-        }
-    except WorkItemNotFoundError:
-        return {
-            "success": False,
-            "error": f"Work item {item_id} not found",
-        }
+    # Adapt legacy param name: item_id → work_item_id
+    adapted = dict(arguments)
+    if "item_id" in adapted and "work_item_id" not in adapted:
+        adapted["work_item_id"] = adapted.pop("item_id")
+    return handle_move_to_column(service, adapted)
 
 
 def handle_delete_work_item(
@@ -517,12 +579,13 @@ def handle_delete_work_item(
 
     MCP Tool: workItems.delete
     """
-    item_id = arguments.get("item_id")
+    raw_id = arguments.get("item_id")
     org_id = arguments.get("org_id")
 
-    if not item_id:
+    if not raw_id:
         return {"success": False, "error": "item_id is required"}
 
+    item_id = _resolve_id(service, raw_id, arguments)
     actor = _get_actor(arguments)
 
     try:
@@ -537,7 +600,7 @@ def handle_delete_work_item(
     except WorkItemNotFoundError:
         return {
             "success": False,
-            "error": f"Work item {item_id} not found",
+            "error": f"Work item {raw_id} not found",
         }
 
 
@@ -564,7 +627,7 @@ def handle_post_comment(
         metadata: Optional JSON metadata
         org_id: Organization context
     """
-    work_item_id = arguments.get("work_item_id")
+    raw_id = arguments.get("work_item_id")
     body = arguments.get("body")
     author_id = arguments.get("author_id")
     author_type = arguments.get("author_type", "user")
@@ -573,7 +636,7 @@ def handle_post_comment(
     org_id = arguments.get("org_id")
 
     # Validate required fields
-    if not work_item_id:
+    if not raw_id:
         return {"success": False, "error": "work_item_id is required"}
     if not body:
         return {"success": False, "error": "body is required"}
@@ -582,6 +645,7 @@ def handle_post_comment(
     if author_type not in ("user", "agent"):
         return {"success": False, "error": "author_type must be 'user' or 'agent'"}
 
+    work_item_id = _resolve_id(service, raw_id, arguments)
     actor = _get_actor(arguments)
 
     try:
@@ -603,7 +667,7 @@ def handle_post_comment(
     except WorkItemNotFoundError:
         return {
             "success": False,
-            "error": f"Work item {work_item_id} not found",
+            "error": f"Work item {raw_id} not found",
         }
     except AuthorNotFoundError as e:
         return {
@@ -627,13 +691,15 @@ def handle_list_comments(
         offset: Number of comments to skip (default: 0)
         org_id: Organization context
     """
-    work_item_id = arguments.get("work_item_id")
+    raw_id = arguments.get("work_item_id")
     limit = arguments.get("limit", 50)
     offset = arguments.get("offset", 0)
     org_id = arguments.get("org_id")
 
-    if not work_item_id:
+    if not raw_id:
         return {"success": False, "error": "work_item_id is required"}
+
+    work_item_id = _resolve_id(service, raw_id, arguments)
 
     try:
         comments = service.list_comments(
@@ -650,7 +716,7 @@ def handle_list_comments(
     except WorkItemNotFoundError:
         return {
             "success": False,
-            "error": f"Work item {work_item_id} not found",
+            "error": f"Work item {raw_id} not found",
         }
 
 
@@ -666,7 +732,7 @@ def handle_move_to_column(
     Arguments:
         work_item_id: ID of the work item to move
         column_id: Target column ID (optional if status_mapping provided)
-        status_mapping: Target status (e.g., "todo", "in_progress", "done") -
+        status_mapping: Target status (e.g., "backlog", "in_progress", "done") -
                        will find column with matching status_mapping
         position: Position in the target column (default: 0, top of column)
         org_id: Organization context
@@ -674,17 +740,18 @@ def handle_move_to_column(
     Either column_id or status_mapping must be provided.
     If both provided, column_id takes precedence.
     """
-    work_item_id = arguments.get("work_item_id")
+    raw_id = arguments.get("work_item_id")
     column_id = arguments.get("column_id")
     status_mapping = arguments.get("status_mapping")
     position = arguments.get("position", 0)
     org_id = arguments.get("org_id")
 
-    if not work_item_id:
+    if not raw_id:
         return {"success": False, "error": "work_item_id is required"}
     if not column_id and not status_mapping:
         return {"success": False, "error": "Either column_id or status_mapping is required"}
 
+    work_item_id = _resolve_id(service, raw_id, arguments)
     actor = _get_actor(arguments)
 
     try:
@@ -695,7 +762,7 @@ def handle_move_to_column(
             if not item.board_id:
                 return {
                     "success": False,
-                    "error": f"Work item {work_item_id} has no board_id",
+                    "error": f"Work item {raw_id} has no board_id",
                 }
 
             # Parse status_mapping to WorkItemStatus enum
@@ -735,13 +802,138 @@ def handle_move_to_column(
     except WorkItemNotFoundError:
         return {
             "success": False,
-            "error": f"Work item {work_item_id} not found",
+            "error": f"Work item {raw_id} not found",
         }
     except ColumnNotFoundError as e:
         return {
             "success": False,
             "error": str(e),
         }
+
+
+# ==============================================================================
+# Column Handlers (progressive disclosure)
+# ==============================================================================
+
+
+def _column_to_dict(col: BoardColumn) -> Dict[str, Any]:
+    """Convert BoardColumn Pydantic model to dict with serialized timestamps."""
+    result = col.model_dump()
+    return {k: _serialize_value(v) for k, v in result.items()}
+
+
+def handle_create_column(
+    service: BoardService,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Add a column to an existing board (progressive disclosure).
+
+    MCP Tool: columns.create
+    """
+    board_id = arguments.get("board_id")
+    name = arguments.get("name")
+    org_id = arguments.get("org_id")
+
+    if not board_id:
+        return {"success": False, "error": "board_id is required"}
+    if not name:
+        return {"success": False, "error": "name is required"}
+
+    status_mapping = arguments.get("status_mapping")
+    if not status_mapping:
+        return {"success": False, "error": "status_mapping is required"}
+
+    try:
+        status_enum = WorkItemStatus(status_mapping)
+    except ValueError:
+        valid = [s.value for s in WorkItemStatus]
+        return {"success": False, "error": f"Invalid status_mapping '{status_mapping}'. Valid: {valid}"}
+
+    actor = _get_actor(arguments)
+
+    request = CreateColumnRequest(
+        board_id=board_id,
+        name=name,
+        position=arguments.get("position", 0),
+        status_mapping=status_enum,
+        wip_limit=arguments.get("wip_limit"),
+    )
+
+    column = service.create_column(request, actor, org_id=org_id)
+
+    return {
+        "success": True,
+        "column": _column_to_dict(column),
+        "message": f"Column '{name}' added to board",
+    }
+
+
+def handle_list_columns(
+    service: BoardService,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    List columns on a board.
+
+    MCP Tool: columns.list
+    """
+    board_id = arguments.get("board_id")
+    org_id = arguments.get("org_id")
+
+    if not board_id:
+        return {"success": False, "error": "board_id is required"}
+
+    columns = service.list_columns(board_id, org_id=org_id)
+
+    return {
+        "success": True,
+        "columns": [_column_to_dict(c) for c in columns],
+        "total": len(columns),
+    }
+
+
+def handle_available_columns(
+    service: BoardService,
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Show which columns/statuses can still be added to a board.
+
+    MCP Tool: columns.available
+    """
+    board_id = arguments.get("board_id")
+    org_id = arguments.get("org_id")
+
+    if not board_id:
+        return {"success": False, "error": "board_id is required"}
+
+    columns = service.list_columns(board_id, org_id=org_id)
+    existing_statuses = {c.status_mapping for c in columns if c.status_mapping}
+
+    # All possible columns with suggested names and colors
+    all_columns = {
+        WorkItemStatus.BACKLOG: ("Backlog", "#6B7280"),
+        WorkItemStatus.IN_PROGRESS: ("In Progress", "#F59E0B"),
+        WorkItemStatus.IN_REVIEW: ("In Review", "#8B5CF6"),
+        WorkItemStatus.DONE: ("Done", "#10B981"),
+    }
+
+    available = []
+    for status, (name, color) in all_columns.items():
+        if status not in existing_statuses:
+            available.append({
+                "status_mapping": status.value,
+                "suggested_name": name,
+                "suggested_color": color,
+            })
+
+    return {
+        "success": True,
+        "existing_columns": [_column_to_dict(c) for c in columns],
+        "available_columns": available,
+        "message": f"{len(available)} column(s) available to add" if available else "All columns already present",
+    }
 
 
 # ==============================================================================
@@ -757,10 +949,17 @@ BOARD_HANDLERS = {
     "boards.delete": handle_delete_board,
 }
 
+COLUMN_HANDLERS = {
+    "columns.create": handle_create_column,
+    "columns.list": handle_list_columns,
+    "columns.available": handle_available_columns,
+}
+
 WORK_ITEM_HANDLERS = {
     "workItems.list": handle_list_work_items,
     "workItems.create": handle_create_work_item,
     "workItems.get": handle_get_work_item,
+    "workItems.getBatch": handle_get_work_items_batch,
     "workItems.update": handle_update_work_item,
     "workItems.move": handle_move_work_item,
     "workItems.delete": handle_delete_work_item,

@@ -11,7 +11,14 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { ConsoleSidebar } from '../ConsoleSidebar';
 import { useProjects, type Project } from '../../api/dashboard';
+import { CREATE_PROJECT_CTA, NEW_PROJECT_CTA, SCOPE_LABEL } from '../../copy/scopeLabels';
 import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
+import {
+  loadProjectSortPreference,
+  saveProjectSortPreference,
+  sortProjects,
+  type ProjectSortMode,
+} from '../../utils/projectSort';
 import './ProjectsPage.css';
 
 function getRelativeTime(dateString?: string): string {
@@ -56,6 +63,11 @@ export function ProjectsPage(): React.JSX.Element {
   } = useProjects(currentOrgId ?? undefined);
 
   const [query, setQuery] = useState('');
+  const [projectSortMode, setProjectSortMode] = useState<ProjectSortMode>(() => loadProjectSortPreference());
+
+  useEffect(() => {
+    saveProjectSortPreference(projectSortMode);
+  }, [projectSortMode]);
 
   useEffect(() => {
     if (!orgFromQuery) return;
@@ -84,8 +96,8 @@ export function ProjectsPage(): React.JSX.Element {
 
 
   const filteredProjects = useMemo(
-    () => scopedProjects.filter((p) => matchesQuery(p, query)),
-    [query, scopedProjects]
+    () => sortProjects(scopedProjects.filter((p) => matchesQuery(p, query)), projectSortMode),
+    [projectSortMode, query, scopedProjects]
   );
 
   const handleNewProject = useCallback(() => {
@@ -110,13 +122,13 @@ export function ProjectsPage(): React.JSX.Element {
           <div className="projects-header-left">
             <h1 className="projects-title animate-fade-in-up">Projects</h1>
             <p className="projects-subtitle animate-fade-in-up">
-              Create a workspace where humans and agents collaborate in real time.
+              Create projects within the right {SCOPE_LABEL.toLowerCase()} and collaborate in real time.
             </p>
           </div>
 
           <div className="projects-header-right">
             <button type="button" className="projects-new-button pressable" onClick={handleNewProject} data-haptic="light">
-              New Project
+              {NEW_PROJECT_CTA}
             </button>
           </div>
         </header>
@@ -131,6 +143,19 @@ export function ProjectsPage(): React.JSX.Element {
               placeholder="Filter by name, slug, description…"
               autoComplete="off"
             />
+          </label>
+          <label className="projects-sort-control">
+            <span className="projects-search-label">Sort</span>
+            <select
+              className="projects-sort-select"
+              value={projectSortMode}
+              onChange={(event) => setProjectSortMode(event.target.value as ProjectSortMode)}
+              aria-label="Sort projects"
+            >
+              <option value="activity">Activity</option>
+              <option value="updated">Last updated</option>
+              <option value="name">Name</option>
+            </select>
           </label>
         </section>
 
@@ -190,8 +215,8 @@ export function ProjectsPage(): React.JSX.Element {
                       navigate(`/projects/${project.id}/settings`);
                     }}
                     data-haptic="light"
-                    aria-label={`Settings for ${project.name}`}
-                    title="Project Settings"
+                    aria-label={`Open settings for ${project.name}`}
+                    title="Open project settings"
                   >
                     ⚙️
                   </button>
@@ -203,7 +228,7 @@ export function ProjectsPage(): React.JSX.Element {
               <h2 className="projects-empty-title">No projects yet</h2>
               <p className="projects-empty-description">Create your first project to get started.</p>
               <button type="button" className="projects-new-button pressable" onClick={handleNewProject} data-haptic="light">
-                Create Project
+                {CREATE_PROJECT_CTA}
               </button>
             </div>
           )}

@@ -66,6 +66,10 @@ environments:
     variables:
       GUIDEAI_ENV: "development"
 
+      # MCP server (guideai-mcp service in local-test-suite blueprint)
+      GUIDEAI_MCP_PORT: "3000"
+      MCP_TRANSPORT: "stdio"
+
       # Database connections (customize ports/credentials)
       DATABASE_HOST: "localhost"
       DATABASE_PORT: "5432"

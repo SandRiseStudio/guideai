@@ -97,7 +97,7 @@ export function ExtractionCandidates({
   return (
     <div className="extraction-panel">
       <div className="panel-header">
-        <h2>Behavior Extraction Pipeline</h2>
+        <h2>Behavior Extraction</h2>
         <span className="threshold-badge">
           Auto-accept threshold: {AUTO_ACCEPT_THRESHOLD * 100}%
         </span>

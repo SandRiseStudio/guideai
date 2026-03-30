@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "auth.deviceLogin",
-  "description": "Initiate OAuth 2.0 device authorization flow (RFC 8628) for CLI/IDE authentication. Returns device code and user code for browser-based consent, then polls until user approves or denies access.",
+  "description": "Initiate OAuth 2.0 device authorization flow (RFC 8628) for CLI/IDE authentication. Best practice for MCP agents: set wait_for_authorization=false (default) and then call auth.devicePoll after browser consent.",
   "inputSchema": {
     "type": "object",
     "properties": {
@@ -25,10 +25,15 @@
       },
       "timeout": {
         "type": "integer",
-        "description": "Maximum time in seconds to wait for user authorization before giving up.",
+        "description": "Maximum time in seconds to wait for user authorization before giving up (used when wait_for_authorization=true).",
         "minimum": 60,
         "maximum": 900,
         "default": 300
+      },
+      "wait_for_authorization": {
+        "type": "boolean",
+        "description": "When true, block and poll until authorization completes. When false (default), return immediately with device_code/user_code and use auth.devicePoll.",
+        "default": false
       },
       "store_tokens": {
         "type": "boolean",

@@ -1,7 +1,7 @@
 """Action capturability validation service.
 
 Ensures all platform actions can be recorded and tracked for reproducibility.
-Implements the capturability requirements from ACTION_REGISTRY_SPEC.md.
+Implements the capturability requirements from docs/contracts/ACTION_REGISTRY_SPEC.md.
 """
 
 from __future__ import annotations

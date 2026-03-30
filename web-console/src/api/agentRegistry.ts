@@ -6,10 +6,10 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { apiClient, ApiError, API_ORIGIN } from './client';
+import { apiClient, ApiError } from './client';
 import { apiClient as clientInstance } from './client';
 import { razeLog } from '../telemetry/raze';
-import { dashboardKeys, type Agent as OrgAgent } from './dashboard';
+import { dashboardKeys, type Agent, type AgentStatus as DashboardAgentStatus } from './dashboard';
 
 export type AgentVisibility = 'PRIVATE' | 'ORGANIZATION' | 'PUBLIC';
 export type AgentStatus = 'DRAFT' | 'ACTIVE' | 'DEPRECATED';
@@ -136,14 +136,6 @@ export interface PublishAgentInput {
 }
 
 export interface AgentAssignmentInput {
-  orgId: string;
-  agent: AgentRegistryEntry;
-  projectId?: string | null;
-  roleAlignment?: RoleAlignment;
-  capabilities?: string[];
-}
-
-export interface PersonalAgentAssignmentInput {
   agent: AgentRegistryEntry;
   projectId: string;
   roleAlignment?: RoleAlignment;
@@ -154,26 +146,8 @@ export const agentRegistryKeys = {
   all: ['agentRegistry'] as const,
   list: (filters: AgentRegistryQuery) => [...agentRegistryKeys.all, 'list', filters] as const,
   detail: (agentId?: string | null) => [...agentRegistryKeys.all, 'detail', agentId] as const,
-  personalAgents: () => [...agentRegistryKeys.all, 'personalAgents'] as const,
+  projectAgents: () => [...agentRegistryKeys.all, 'projectAgents'] as const,
 };
-
-const openApiKeys = {
-  paths: () => ['openapi', 'paths'] as const,
-};
-
-async function fetchOpenApiPaths(): Promise<string[]> {
-  const response = await fetch(`${API_ORIGIN}/openapi.json`, {
-    method: 'GET',
-    headers: { Accept: 'application/json' },
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch OpenAPI spec (${response.status})`);
-  }
-
-  const json = (await response.json()) as { paths?: Record<string, unknown> };
-  return Object.keys(json.paths ?? {});
-}
 
 function normalizeApiError(error: unknown, fallback: string): string {
   if (error instanceof ApiError) return error.message;
@@ -192,27 +166,76 @@ function normalizeListResponse(response: unknown): RawAgentListItem[] {
   return [];
 }
 
-function normalizeAssignmentList(response: unknown): OrgAgent[] {
+function isProjectAgentAssignmentPayload(item: unknown): item is Record<string, unknown> {
+  if (typeof item !== 'object' || item === null) return false;
+  const o = item as Record<string, unknown>;
+  return typeof o.agent_id === 'string' && typeof o.project_id === 'string' && !('agent_type' in o);
+}
+
+function mapProjectAgentAssignmentToAgent(o: Record<string, unknown>): Agent {
+  const agentId = o.agent_id as string;
+  const assignmentId = typeof o.id === 'string' ? o.id : `pa-${agentId}`;
+  const name =
+    (typeof o.name === 'string' && o.name)
+      ? o.name
+      : (typeof o.agent_name === 'string' && o.agent_name)
+        ? o.agent_name
+        : '';
+  const role = typeof o.role === 'string' ? o.role : 'PRIMARY';
+  const agentType = role.toLowerCase().replace(/_/g, ' ');
+  const st = typeof o.status === 'string' ? o.status.toLowerCase() : 'active';
+  let status: DashboardAgentStatus = 'active';
+  if (st === 'inactive') status = 'idle';
+  else if (st === 'removed') status = 'archived';
+  else if (st === 'active') status = 'active';
+  const baseConfig =
+    typeof o.config === 'object' && o.config !== null && !Array.isArray(o.config)
+      ? (o.config as Record<string, unknown>)
+      : {};
+  const config = { ...baseConfig, registry_agent_id: agentId };
+  const assignedAt =
+    typeof o.assigned_at === 'string' ? o.assigned_at : new Date().toISOString();
+  const projectId = o.project_id as string;
+  return {
+    id: assignmentId,
+    name: name || `Agent ${agentId.length > 8 ? agentId.slice(0, 8) : agentId}`,
+    agent_type: agentType,
+    status,
+    config,
+    project_id: projectId,
+    created_at: assignedAt,
+    updated_at: assignedAt,
+  };
+}
+
+function mapAssignmentsToAgents(items: unknown[]): Agent[] {
+  return items.map((item) => {
+    if (isProjectAgentAssignmentPayload(item)) {
+      return mapProjectAgentAssignmentToAgent(item);
+    }
+    return item as Agent;
+  });
+}
+
+function normalizeAssignmentList(response: unknown): Agent[] {
   if (!response) return [];
-  if (Array.isArray(response)) return response as OrgAgent[];
+  if (Array.isArray(response)) return mapAssignmentsToAgents(response);
   if (typeof response === 'object') {
-    const payload = response as { agents?: OrgAgent[]; items?: OrgAgent[] };
-    if (Array.isArray(payload.agents)) return payload.agents;
-    if (Array.isArray(payload.items)) return payload.items;
+    const payload = response as { agents?: unknown[]; items?: unknown[] };
+    if (Array.isArray(payload.agents)) return mapAssignmentsToAgents(payload.agents);
+    if (Array.isArray(payload.items)) return mapAssignmentsToAgents(payload.items);
   }
   return [];
 }
 
-async function listPersonalAgents(): Promise<OrgAgent[]> {
+async function listProjectAgents(): Promise<Agent[]> {
   try {
-    const response = await apiClient.get<OrgAgent[] | { agents?: OrgAgent[]; items?: OrgAgent[] }>(
+    const response = await apiClient.get<Agent[] | { agents?: Agent[]; items?: Agent[] }>(
       '/v1/projects/agents'
     );
     return normalizeAssignmentList(response);
   } catch (error) {
-    // In some deployments this endpoint may be unavailable for "personal" context.
-    // Treat a 404 as "no assignments" to avoid noisy console errors.
-    if (error instanceof ApiError && error.status === 404) {
+    if (error instanceof ApiError && error.status < 500) {
       return [];
     }
     throw error;
@@ -288,29 +311,19 @@ export function useAgentRegistryDetail(agentId?: string | null) {
   });
 }
 
-export function usePersonalAgents(enabled = true) {
-  // Skip entirely if user isn't authenticated—this endpoint returns 404 without a valid token
-  // (security measure to hide endpoint existence from unauthenticated requests).
+export function useProjectAgents(enabled = true) {
   const hasToken = clientInstance.hasToken();
 
-  const { data: openApiPaths } = useQuery({
-    queryKey: openApiKeys.paths(),
-    queryFn: fetchOpenApiPaths,
-    staleTime: Infinity,
-    gcTime: Infinity,
-    enabled: enabled && hasToken,
-    retry: false,
-  });
-
-  // Our API client calls `/v1/...` under `${API_BASE}` which already includes `/api`.
-  // Therefore `/v1/projects/agents` maps to the OpenAPI path `/api/v1/projects/agents`.
-  const supportsPersonalAgents = openApiPaths?.includes('/api/v1/projects/agents') ?? false;
-
   return useQuery({
-    queryKey: agentRegistryKeys.personalAgents(),
-    queryFn: listPersonalAgents,
+    queryKey: agentRegistryKeys.projectAgents(),
+    queryFn: listProjectAgents,
     staleTime: 30_000,
-    enabled: enabled && hasToken && supportsPersonalAgents,
+    enabled: enabled && hasToken,
+    retry: (failureCount, error) => {
+      if (error instanceof ApiError && error.status < 500) return false;
+      return failureCount < 2;
+    },
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 }
 
@@ -397,46 +410,9 @@ export async function publishRegistryAgent(agentId: string, payload: PublishAgen
   }
 }
 
-export async function assignRegistryAgentToOrg(payload: AgentAssignmentInput): Promise<OrgAgent> {
-  await razeLog('INFO', 'Agent assignment requested', {
-    agent_id: payload.agent.agent_id,
-    org_id: payload.orgId,
-    project_id: payload.projectId ?? null,
-  });
-  const body = {
-    name: payload.agent.name,
-    project_id: payload.projectId ?? undefined,
-    agent_type: 'custom',
-    capabilities: payload.capabilities ?? payload.agent.tags ?? [],
-    config: {
-      registry_agent_id: payload.agent.agent_id,
-      registry_agent_slug: payload.agent.slug,
-      registry_agent_version: payload.agent.latest_version,
-      registry_visibility: payload.agent.visibility,
-      registry_role_alignment: payload.roleAlignment ?? null,
-    },
-  };
-  try {
-    const assigned = await apiClient.post<OrgAgent>(`/v1/orgs/${payload.orgId}/agents`, body);
-    await razeLog('INFO', 'Agent assigned to org/project', {
-      agent_id: payload.agent.agent_id,
-      org_id: payload.orgId,
-      assigned_id: assigned.id,
-    });
-    return assigned;
-  } catch (error) {
-    await razeLog('ERROR', 'Agent assignment failed', {
-      agent_id: payload.agent.agent_id,
-      org_id: payload.orgId,
-      error: normalizeApiError(error, 'Failed to assign agent'),
-    });
-    throw error;
-  }
-}
-
-export async function assignRegistryAgentToPersonalProject(
-  payload: PersonalAgentAssignmentInput
-): Promise<OrgAgent> {
+export async function assignRegistryAgentToProject(
+  payload: AgentAssignmentInput
+): Promise<Agent> {
   await razeLog('INFO', 'Agent assignment requested', {
     agent_id: payload.agent.agent_id,
     org_id: null,
@@ -456,8 +432,8 @@ export async function assignRegistryAgentToPersonalProject(
     },
   };
   try {
-    const assigned = await apiClient.post<OrgAgent>('/v1/projects/agents', body);
-    await razeLog('INFO', 'Agent assigned to personal project', {
+    const assigned = await apiClient.post<Agent>('/v1/projects/agents', body);
+    await razeLog('INFO', 'Agent assigned to project', {
       agent_id: payload.agent.agent_id,
       assigned_id: assigned.id,
       project_id: payload.projectId,
@@ -472,42 +448,18 @@ export async function assignRegistryAgentToPersonalProject(
   }
 }
 
-export async function unassignRegistryAgentFromOrg(orgId: string, orgAgentId: string): Promise<void> {
+export async function unassignAgentFromProject(assignmentId: string): Promise<void> {
   await razeLog('INFO', 'Agent unassign requested', {
-    org_id: orgId,
-    org_agent_id: orgAgentId,
+    assignment_id: assignmentId,
   });
   try {
-    await apiClient.delete<void>(`/v1/orgs/${orgId}/agents/${orgAgentId}`);
+    await apiClient.delete<void>(`/v1/projects/agents/${assignmentId}`);
     await razeLog('INFO', 'Agent unassigned', {
-      org_id: orgId,
-      org_agent_id: orgAgentId,
+      assignment_id: assignmentId,
     });
   } catch (error) {
     await razeLog('ERROR', 'Agent unassign failed', {
-      org_id: orgId,
-      org_agent_id: orgAgentId,
-      error: normalizeApiError(error, 'Failed to unassign agent'),
-    });
-    throw error;
-  }
-}
-
-export async function unassignRegistryAgentFromPersonalProject(orgAgentId: string): Promise<void> {
-  await razeLog('INFO', 'Agent unassign requested', {
-    org_id: null,
-    org_agent_id: orgAgentId,
-  });
-  try {
-    await apiClient.delete<void>(`/v1/projects/agents/${orgAgentId}`);
-    await razeLog('INFO', 'Agent unassigned', {
-      org_id: null,
-      org_agent_id: orgAgentId,
-    });
-  } catch (error) {
-    await razeLog('ERROR', 'Agent unassign failed', {
-      org_id: null,
-      org_agent_id: orgAgentId,
+      assignment_id: assignmentId,
       error: normalizeApiError(error, 'Failed to unassign agent'),
     });
     throw error;
@@ -562,44 +514,25 @@ export function usePublishRegistryAgent() {
   });
 }
 
-export function useAssignRegistryAgent() {
+export function useAssignAgent() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: assignRegistryAgentToOrg,
-    onSuccess: async (_data, variables) => {
-      await queryClient.invalidateQueries({ queryKey: dashboardKeys.agents(variables.orgId) });
-    },
-  });
-}
-
-export function useAssignRegistryAgentToPersonalProject() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: assignRegistryAgentToPersonalProject,
+    mutationFn: assignRegistryAgentToProject,
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: agentRegistryKeys.personalAgents() });
+      await queryClient.invalidateQueries({ queryKey: agentRegistryKeys.projectAgents() });
+      await queryClient.invalidateQueries({ queryKey: dashboardKeys.agents() });
     },
   });
 }
 
-export function useUnassignRegistryAgent() {
+export function useUnassignAgent() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ orgId, orgAgentId }: { orgId: string; orgAgentId: string }) =>
-      unassignRegistryAgentFromOrg(orgId, orgAgentId),
-    onSuccess: async (_data, variables) => {
-      await queryClient.invalidateQueries({ queryKey: dashboardKeys.agents(variables.orgId) });
-    },
-  });
-}
-
-export function useUnassignRegistryAgentFromPersonalProject() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ orgAgentId }: { orgAgentId: string }) =>
-      unassignRegistryAgentFromPersonalProject(orgAgentId),
+    mutationFn: ({ assignmentId }: { assignmentId: string }) =>
+      unassignAgentFromProject(assignmentId),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: agentRegistryKeys.personalAgents() });
+      await queryClient.invalidateQueries({ queryKey: agentRegistryKeys.projectAgents() });
+      await queryClient.invalidateQueries({ queryKey: dashboardKeys.agents() });
     },
   });
 }

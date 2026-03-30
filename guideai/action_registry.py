@@ -1,6 +1,6 @@
 """Multi-tier action registry for local, team, and platform action storage.
 
-Implements the multi-tier architecture described in ACTION_REGISTRY_SPEC.md:
+Implements the multi-tier architecture described in docs/contracts/ACTION_REGISTRY_SPEC.md:
 - Local tier: JSON storage in ~/.guideai/actions/ for developer-specific actions
 - Team tier: Shared storage (filesystem/cloud) for team-wide actions
 - Platform tier: PostgreSQL for platform-wide, WORM-compliant actions

@@ -373,6 +373,12 @@ class BehaviorRetriever:
         - Lazily loaded model (no per-query loading overhead after first use)
         - Cache key includes query hash + strategy + filters
 
+        E3 Runtime Injection enhancements:
+        - Pack-scoped boosting: behaviors in active pack's behavior_refs get 2× score
+        - Profile-enriched query: workspace_profile + task_type prepended to embedding query
+        - Surface weighting: behaviors tagged with matching surface get 1.1× boost
+        - Deterministic fallback: rule-based results when embedding scores are low
+
         Phase 2 Gradual Rollout:
         - Determines model cohort based on user_id hashing (A/B testing)
         - Routes to all-MiniLM-L6-v2 or BGE-M3 based on EMBEDDING_ROLLOUT_PERCENTAGE
@@ -405,6 +411,12 @@ class BehaviorRetriever:
                 "role_focus": request.role_focus.value if request.role_focus else None,
                 "include_metadata": request.include_metadata,
                 "namespace": request.namespace,
+                # E3: include context signals in cache key
+                "workspace_profile": request.workspace_profile,
+                "active_pack_id": request.active_pack_id,
+                "surface": request.surface,
+                "task_type": request.task_type,
+                "phase": request.phase,
             }
             cache_key = cache._make_key("retriever", "query", cache_params)
 
@@ -450,6 +462,8 @@ class BehaviorRetriever:
             embedding_matches = self._embedding_retrieve(request, cohort_model)
             if request.strategy == RetrievalStrategy.EMBEDDING:
                 matches = embedding_matches[: request.top_k]
+                matches = self._apply_context_boosts(matches, request)
+                matches = self._apply_fallback_rules(request, matches)
                 self._emit_retrieval_event(request, matches, "semantic")
                 self._cache_matches(cache_key, matches)
                 record_retrieval_latency(request.strategy.value, time.time() - retrieval_start, cohort_model)
@@ -459,6 +473,8 @@ class BehaviorRetriever:
             keyword_matches = self._keyword_retrieve(request, limit=max(request.top_k * 3, 15))
             if request.strategy == RetrievalStrategy.KEYWORD:
                 matches = keyword_matches[: request.top_k]
+                matches = self._apply_context_boosts(matches, request)
+                matches = self._apply_fallback_rules(request, matches)
                 self._emit_retrieval_event(request, matches, "keyword")
                 self._cache_matches(cache_key, matches)
                 record_retrieval_latency(request.strategy.value, time.time() - retrieval_start, cohort_model)
@@ -466,6 +482,9 @@ class BehaviorRetriever:
                 return matches
 
             matches = self._merge_hybrid(embedding_matches, keyword_matches, request)
+            # E3: apply context-aware boosts and fallback rules
+            matches = self._apply_context_boosts(matches, request)
+            matches = self._apply_fallback_rules(request, matches)
             self._emit_retrieval_event(request, matches, "hybrid")
             self._cache_matches(cache_key, matches)
             record_retrieval_latency(request.strategy.value, time.time() - retrieval_start, cohort_model)
@@ -603,6 +622,174 @@ class BehaviorRetriever:
         result.setdefault("status", "ready" if result.get("mode") == "semantic" else "degraded")
         result["timestamp"] = datetime.now(UTC).isoformat()
         return result
+
+    # ------------------------------------------------------------------
+    # E3 Runtime Injection — context-aware boosts & fallbacks
+    # ------------------------------------------------------------------
+
+    # Profile → default behavior names (seeded from AGENTS.md Quick Triggers)
+    _PROFILE_DEFAULT_BEHAVIORS: Dict[str, List[str]] = {
+        "guideai-platform": [
+            "behavior_prefer_mcp_tools",
+            "behavior_use_raze_for_logging",
+            "behavior_prevent_secret_leaks",
+        ],
+        "extension-dev": [
+            "behavior_integrate_vscode_extension",
+            "behavior_prefer_mcp_tools",
+        ],
+        "api-backend": [
+            "behavior_design_api_contract",
+            "behavior_use_raze_for_logging",
+        ],
+        "compliance-sensitive": [
+            "behavior_prevent_secret_leaks",
+            "behavior_lock_down_security_surface",
+        ],
+    }
+
+    # Role → mandatory behaviors
+    _ROLE_MANDATORY_BEHAVIORS: Dict[str, List[str]] = {
+        "STRATEGIST": ["behavior_curate_behavior_handbook"],
+        "TEACHER": ["behavior_update_docs_after_changes"],
+    }
+
+    def _apply_context_boosts(
+        self, matches: List[BehaviorMatch], request: RetrieveRequest
+    ) -> List[BehaviorMatch]:
+        """Apply pack-scoped, surface, profile-aware, and phase-aware boosts to matches.
+
+        E3 Runtime Injection (GUIDEAI-288 / T3.2.1):
+        - pack_behavior_refs: 2× boost for behaviors in active pack
+        - surface: 1.1× boost for behaviors tagged with matching surface
+
+        E3 S3.9 (T3.9.2):
+        - phase: boost behaviors whose tags match the current GEP phase's boost_tags
+        """
+        if not matches:
+            return matches
+
+        pack_refs = set(request.pack_behavior_refs or [])
+        surface = request.surface
+        phase = request.phase
+
+        # Import phase boost config
+        from .bci_contracts import PHASE_BOOST_CONFIG
+        phase_config = PHASE_BOOST_CONFIG.get(phase, {}) if phase else {}
+        phase_boost_tags = set(t.lower() for t in phase_config.get("boost_tags", []))
+        phase_boost_factor = phase_config.get("boost_factor", 1.0)
+
+        if not pack_refs and not surface and not phase_boost_tags:
+            return matches
+
+        boosted: List[BehaviorMatch] = []
+        for m in matches:
+            score = m.score
+
+            # Pack boost: behaviors referenced by the active pack get 2× score
+            if pack_refs and (m.behavior_id in pack_refs or m.name in pack_refs):
+                score *= 2.0
+
+            # Surface boost: behaviors whose tags mention the surface get 1.1×
+            if surface and m.tags:
+                surface_lower = surface.lower()
+                if any(surface_lower in tag.lower() for tag in m.tags):
+                    score *= 1.1
+
+            # Phase boost: behaviors whose tags overlap with the GEP phase's boost_tags
+            if phase_boost_tags and m.tags:
+                match_tags = set(t.lower() for t in m.tags)
+                if match_tags & phase_boost_tags:
+                    score *= phase_boost_factor
+
+            if score != m.score:
+                boosted.append(replace(m, score=score))
+            else:
+                boosted.append(m)
+
+        # Re-sort and trim after boosting
+        boosted.sort(key=lambda b: b.score, reverse=True)
+        return boosted[: request.top_k]
+
+    def _apply_fallback_rules(
+        self, request: RetrieveRequest, results: List[BehaviorMatch]
+    ) -> List[BehaviorMatch]:
+        """Inject deterministic behaviors when embedding results are weak.
+
+        Triggers when: top score < 0.3, no results, or pack_behavior_refs
+        specified but none present in results.
+
+        E3 Runtime Injection (GUIDEAI-288 / T3.2.3).
+        """
+        # Only trigger when results look weak
+        top_score = results[0].score if results else 0.0
+        needs_fallback = (
+            not results
+            or top_score < 0.3
+            or (
+                request.pack_behavior_refs
+                and not any(
+                    m.behavior_id in request.pack_behavior_refs
+                    or m.name in request.pack_behavior_refs
+                    for m in results
+                )
+            )
+        )
+        if not needs_fallback:
+            return results
+
+        # Collect fallback behavior names (deduplicated)
+        fallback_names: List[str] = []
+        seen: set[str] = set()
+
+        # 1. Pack behavior refs
+        for ref in request.pack_behavior_refs or []:
+            if ref not in seen:
+                fallback_names.append(ref)
+                seen.add(ref)
+
+        # 2. Profile defaults
+        if request.workspace_profile:
+            for name in self._PROFILE_DEFAULT_BEHAVIORS.get(
+                request.workspace_profile, []
+            ):
+                if name not in seen:
+                    fallback_names.append(name)
+                    seen.add(name)
+
+        # 3. Role mandatory
+        if request.role_focus:
+            for name in self._ROLE_MANDATORY_BEHAVIORS.get(
+                request.role_focus.value, []
+            ):
+                if name not in seen:
+                    fallback_names.append(name)
+                    seen.add(name)
+
+        if not fallback_names:
+            return results
+
+        # Build fallback matches with a low synthetic score
+        existing_ids = {m.behavior_id for m in results} | {m.name for m in results}
+        fallback_matches: List[BehaviorMatch] = []
+        for name in fallback_names:
+            if name in existing_ids:
+                continue
+            fallback_matches.append(
+                BehaviorMatch(
+                    behavior_id=name,
+                    name=name,
+                    version="fallback",
+                    instruction="",
+                    score=0.1,
+                    strategy_breakdown={"fallback": 0.1},
+                    citation_label=name,
+                )
+            )
+
+        # Merge: existing results first, then fallbacks
+        merged = list(results) + fallback_matches
+        return merged[: request.top_k]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1018,9 +1205,18 @@ class BehaviorRetriever:
         if not self._semantic_available or self._index is None or not self._behavior_ids:
             return []
 
+        # E3 S3.9 (T3.9.2): enrich query with phase-specific hint for better semantic match
+        query = request.query
+        if request.phase:
+            from .bci_contracts import PHASE_BOOST_CONFIG
+            phase_cfg = PHASE_BOOST_CONFIG.get(request.phase, {})
+            hint = phase_cfg.get("query_hint", "")
+            if hint:
+                query = f"{hint} {query}"
+
         # Encode query with specified model (Phase 2: supports A/B cohorts)
         model = self._load_model(model_name)
-        query_vec = model.encode([request.query], convert_to_numpy=True)  # pragma: no cover - heavy path
+        query_vec = model.encode([query], convert_to_numpy=True)  # pragma: no cover - heavy path
         assert faiss is not None
         faiss.normalize_L2(query_vec)  # pragma: no cover - heavy path  # type: ignore[attr-defined]
 

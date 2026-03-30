@@ -34,7 +34,7 @@ class ReplayNotFoundError(ActionServiceError):
 class ActionService:
     """In-memory ActionService stub for parity testing.
 
-    The service mimics the behavior described in `ACTION_SERVICE_CONTRACT.md` while
+    The service mimics the behavior described in `docs/contracts/ACTION_SERVICE_CONTRACT.md` while
     remaining lightweight enough for unit tests. It stores actions in memory and
     uses ActionReplayExecutor for real execution with support for sequential/parallel
     strategies and checkpointing.

@@ -858,10 +858,9 @@ class ExecutionWorker:
             return os.environ.get(env_var) if env_var else None
 
         try:
-            from guideai.agent_llm_client import AgentLLMClient
-            llm_client = AgentLLMClient(
+            from guideai.llm import LLMClient
+            llm_client = LLMClient(
                 credential_resolver=credential_resolver,
-                telemetry=self._telemetry,
             )
         except Exception as e:
             error_msg = f"Failed to create LLM client: {e}"

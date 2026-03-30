@@ -12,7 +12,7 @@
  */
 import * as vscode from 'vscode';
 import { GuideAIClient } from '../client/GuideAIClient';
-import { McpClient } from '../client/McpClient';
+import { McpClient, WorkspaceProfile } from '../client/McpClient';
 export interface AuthToken {
     access_token: string;
     refresh_token?: string;
@@ -97,6 +97,14 @@ export declare class AuthProvider implements vscode.AuthenticationProvider {
      * Check if user is authenticated
      */
     isAuthenticated(): boolean;
+    /**
+     * Suggest auth scopes based on the detected workspace profile.
+     * Returns base scopes plus profile-specific additions with rationale.
+     */
+    static getScopeGuidance(profile?: WorkspaceProfile): {
+        scopes: string[];
+        rationale: string;
+    };
     /**
      * Dispose of resources
      */

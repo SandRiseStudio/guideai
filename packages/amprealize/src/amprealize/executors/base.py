@@ -26,6 +26,7 @@ class ContainerRunConfig:
         network: Optional network name to attach container to
         network_aliases: Optional list of DNS aliases for the container on the network
         privileged: Whether to run container in privileged mode (default False)
+        extra_hosts: Extra /etc/hosts entries (e.g., "host.containers.internal:host-gateway")
     """
     image: str
     name: str
@@ -38,6 +39,7 @@ class ContainerRunConfig:
     network: Optional[str] = None
     network_aliases: List[str] = field(default_factory=list)
     privileged: bool = False
+    extra_hosts: List[str] = field(default_factory=list)
 
 
 @dataclass

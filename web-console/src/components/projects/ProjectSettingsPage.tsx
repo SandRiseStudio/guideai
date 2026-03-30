@@ -42,6 +42,11 @@ interface ProjectSettings {
   workflow?: Record<string, unknown>;
   agents?: Record<string, unknown>;
   branding?: Record<string, unknown>;
+  agent_presence?: {
+    enabled?: boolean;
+    poll_interval_s?: number;
+    show_on_board?: boolean;
+  };
 }
 
 interface GitHubBranchInfo {
@@ -103,6 +108,11 @@ export function ProjectSettingsPage(): React.JSX.Element {
   const [credToReEnable, setCredToReEnable] = useState<LLMCredential | null>(null);
   const [showReEnableModal, setShowReEnableModal] = useState(false);
 
+  // Agent presence settings
+  const [presenceEnabled, setPresenceEnabled] = useState(true);
+  const [presencePollInterval, setPresencePollInterval] = useState(30);
+  const [presenceShowOnBoard, setPresenceShowOnBoard] = useState(true);
+
   // Credentials hooks
   const {
     data: credentials,
@@ -120,6 +130,13 @@ export function ProjectSettingsPage(): React.JSX.Element {
       setLocalPath(settings.local_project_path ?? '');
       setGithubUrl(settings.github_repo_url ?? '');
       setSelectedBranch(settings.github_default_branch ?? '');
+
+      // Agent presence settings
+      if (settings.agent_presence) {
+        setPresenceEnabled(settings.agent_presence.enabled ?? true);
+        setPresencePollInterval(settings.agent_presence.poll_interval_s ?? 30);
+        setPresenceShowOnBoard(settings.agent_presence.show_on_board ?? true);
+      }
 
       // If GitHub URL is already set, validate it to load branches
       if (settings.github_repo_url) {
@@ -206,6 +223,11 @@ export function ProjectSettingsPage(): React.JSX.Element {
         local_project_path: localPath.trim() || null,
         github_repo_url: githubUrl.trim() || null,
         github_default_branch: selectedBranch || null,
+        agent_presence: {
+          enabled: presenceEnabled,
+          poll_interval_s: presencePollInterval,
+          show_on_board: presenceShowOnBoard,
+        },
       });
 
       setSaveSuccess(true);
@@ -220,7 +242,7 @@ export function ProjectSettingsPage(): React.JSX.Element {
     } finally {
       setIsSaving(false);
     }
-  }, [projectId, localPath, githubUrl, selectedBranch]);
+  }, [projectId, localPath, githubUrl, selectedBranch, presenceEnabled, presencePollInterval, presenceShowOnBoard]);
 
   // Add credential
   const handleAddCredential = useCallback(async () => {
@@ -346,7 +368,7 @@ export function ProjectSettingsPage(): React.JSX.Element {
             <h2 className="settings-section-title">Local Project Path</h2>
             <p className="settings-section-description">
               Optional: The local filesystem path where this project is located.
-              VS Code can auto-detect this from your workspace.
+              VS Code can auto-detect this from your current folder.
             </p>
 
             <label className="field">
@@ -578,6 +600,60 @@ export function ProjectSettingsPage(): React.JSX.Element {
                   </span>
                 </div>
               )}
+            </div>
+          </div>
+
+          {/* Agent Presence */}
+          <div className="settings-section agent-presence-section">
+            <h2 className="settings-section-title">Agent Presence</h2>
+            <p className="settings-section-description">
+              Configure how agent availability and status are displayed on your boards.
+            </p>
+
+            <div className="agent-presence-form">
+              <label className="field field-toggle">
+                <span className="field-label">Enable presence tracking</span>
+                <input
+                  type="checkbox"
+                  className="field-checkbox"
+                  checked={presenceEnabled}
+                  onChange={(e) => setPresenceEnabled(e.target.checked)}
+                />
+                <span className="field-hint">
+                  When enabled, agent status (available, working, paused) is polled and displayed.
+                </span>
+              </label>
+
+              <label className="field field-toggle">
+                <span className="field-label">Show presence rail on board</span>
+                <input
+                  type="checkbox"
+                  className="field-checkbox"
+                  checked={presenceShowOnBoard}
+                  onChange={(e) => setPresenceShowOnBoard(e.target.checked)}
+                  disabled={!presenceEnabled}
+                />
+                <span className="field-hint">
+                  Display the agent presence bar at the top of the board view.
+                </span>
+              </label>
+
+              <label className="field">
+                <span className="field-label">Poll interval (seconds)</span>
+                <input
+                  type="number"
+                  className="field-input"
+                  min={10}
+                  max={300}
+                  step={5}
+                  value={presencePollInterval}
+                  onChange={(e) => setPresencePollInterval(Number(e.target.value) || 30)}
+                  disabled={!presenceEnabled}
+                />
+                <span className="field-hint">
+                  How often to refresh agent status. Lower values use more resources (10–300s).
+                </span>
+              </label>
             </div>
           </div>
 

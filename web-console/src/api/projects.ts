@@ -5,7 +5,7 @@
  * - behavior_use_raze_for_logging (Student)
  */
 
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient, ApiError } from './client';
 import { dashboardKeys, type Project } from './dashboard';
 import { razeLog } from '../telemetry/raze';
@@ -16,6 +16,43 @@ export interface CreateProjectRequest {
   visibility: 'private' | 'internal' | 'public';
   slug?: string;
 }
+
+export type ProjectParticipantKind = 'human' | 'agent';
+export type ProjectParticipantPresence =
+  | 'available'
+  | 'working'
+  | 'finished_recently'
+  | 'paused'
+  | 'offline'
+  | 'at_capacity';
+
+export interface ProjectParticipant {
+  id: string;
+  kind: ProjectParticipantKind;
+  role?: string | null;
+  display_name?: string | null;
+  email?: string | null;
+  user_id?: string | null;
+  membership_source?: 'owner' | 'project_membership' | 'project_collaborator' | null;
+  agent_id?: string | null;
+  agent_slug?: string | null;
+  description?: string | null;
+  assignment_status?: 'active' | 'inactive' | 'removed' | null;
+  presence?: ProjectParticipantPresence | null;
+}
+
+export interface ProjectParticipantListResponse {
+  items: ProjectParticipant[];
+  totals: {
+    total: number;
+    humans: number;
+    agents: number;
+  };
+}
+
+export const projectKeys = {
+  participants: (projectId?: string | null) => ['projects', 'participants', projectId] as const,
+};
 
 function normalizeApiError(error: unknown): string {
   if (error instanceof ApiError) return error.message;
@@ -74,5 +111,33 @@ export function useCreateProject() {
       await queryClient.invalidateQueries({ queryKey: dashboardKeys.projects(variables.orgId) });
       await queryClient.invalidateQueries({ queryKey: dashboardKeys.stats() });
     },
+  });
+}
+
+export function useProjectParticipants(projectId?: string | null) {
+  return useQuery({
+    queryKey: projectKeys.participants(projectId),
+    queryFn: async (): Promise<ProjectParticipantListResponse> => {
+      if (!projectId) {
+        return {
+          items: [],
+          totals: { total: 0, humans: 0, agents: 0 },
+        };
+      }
+
+      try {
+        return await apiClient.get<ProjectParticipantListResponse>(`/v1/projects/${projectId}/participants`);
+      } catch (error) {
+        if (error instanceof ApiError && error.status < 500) {
+          return {
+            items: [],
+            totals: { total: 0, humans: 0, agents: 0 },
+          };
+        }
+        throw error;
+      }
+    },
+    enabled: Boolean(projectId),
+    staleTime: 30_000,
   });
 }

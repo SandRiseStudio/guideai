@@ -46,6 +46,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AgentDetailPanel = void 0;
 const vscode = __importStar(require("vscode"));
+const actorAvatar_1 = require("../utils/actorAvatar");
 class AgentDetailPanel {
     constructor(panel, extensionUri, client) {
         this._disposables = [];
@@ -329,6 +330,13 @@ class AgentDetailPanel {
         const canPublish = agent.status === 'DRAFT';
         const canDeprecate = agent.status !== 'DEPRECATED';
         const canEdit = agent.status === 'DRAFT';
+        const avatarHtml = (0, actorAvatar_1.buildActorAvatarHtml)((0, actorAvatar_1.createActorViewModel)({
+            id: agent.agent_id,
+            kind: 'agent',
+            displayName: agent.name,
+            subtitle: agent.role_alignment,
+            presenceState: agent.status === 'DEPRECATED' ? 'offline' : agent.status === 'DRAFT' ? 'paused' : 'available',
+        }), 52);
         const versionHistoryHtml = this._versionHistory.length > 0
             ? this._versionHistory.map(v => `
 				<div class="version-item ${v.version === agent.version ? 'current' : ''}"
@@ -353,11 +361,16 @@ class AgentDetailPanel {
 	<div class="container">
 		<header class="agent-header">
 			<div class="agent-title">
-				<span class="role-icon">${roleIcon}</span>
-				<h1>${this._escapeHtml(agent.name)}</h1>
+				${avatarHtml}
+				<div>
+					<div class="agent-meta">
+						<span class="role-icon">${roleIcon}</span>
+						<h1>${this._escapeHtml(agent.name)}</h1>
+					</div>
 				<div class="agent-meta">
 					<span class="agent-id" id="agentId">${agent.agent_id}</span>
 					<button class="copy-btn" onclick="vscode.postMessage({type: 'copyAgentId'})">Copy ID</button>
+				</div>
 				</div>
 			</div>
 			<div class="agent-status">

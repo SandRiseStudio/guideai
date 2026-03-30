@@ -22,8 +22,8 @@ import {
   type ExecutionStepEventPayload,
   type ExecutionStepSnapshotPayload,
   type ExecutionStepsResponse,
-} from '@guideai/collab-client';
-import { apiClient, API_ORIGIN } from './client';
+} from '../lib/collab-client';
+import { apiClient, ApiError, API_ORIGIN } from './client';
 import { razeLog } from '../telemetry/raze';
 
 interface ExecuteResponse {
@@ -297,7 +297,6 @@ export function useExecutionStream(params: {
     nextClient.setAuthToken(apiClient.getToken());
 
     const handleStatus = (payload: ExecutionStatusEventPayload) => {
-      const runId = payload.run_id ?? target.runId ?? null;
       const orgId = payload.org_id ?? target.orgId ?? params.orgId ?? null;
       const projectId = payload.project_id ?? target.projectId ?? params.projectId ?? null;
       const workItemId = payload.work_item_id ?? null;
@@ -387,11 +386,11 @@ export function useExecutionStream(params: {
       const runId = payload.run_id ?? statusPayload?.run_id ?? target.runId ?? null;
 
       if (statusPayload) {
-        const orgId = ('org_id' in statusPayload ? statusPayload.org_id : undefined) ?? target.orgId ?? params.orgId ?? null;
-        const projectId =
-          ('project_id' in statusPayload ? statusPayload.project_id : undefined) ?? target.projectId ?? params.projectId ?? null;
-        const workItemId =
-          ('work_item_id' in statusPayload ? statusPayload.work_item_id : undefined) ?? null;
+        const orgId: string | null = ('org_id' in statusPayload ? statusPayload.org_id as string | undefined : undefined) ?? target.orgId ?? params.orgId ?? null;
+        const projectId: string | null =
+          ('project_id' in statusPayload ? statusPayload.project_id as string | undefined : undefined) ?? target.projectId ?? params.projectId ?? null;
+        const workItemId: string | null =
+          ('work_item_id' in statusPayload ? statusPayload.work_item_id as string | undefined : undefined) ?? null;
 
         if (workItemId && orgId && projectId) {
           queryClient.setQueryData<ExecutionStatus | null>(
@@ -483,6 +482,12 @@ export function useWorkItemExecutionStatus(
   });
 }
 
+/**
+ * When the executions endpoint returns 404 (not deployed), we set this flag
+ * so subsequent poll cycles are suppressed — avoids endless browser network errors.
+ */
+let executionsEndpointUnavailable = false;
+
 export function useExecutionList(
   orgId?: string | null,
   projectId?: string | null,
@@ -492,6 +497,10 @@ export function useExecutionList(
     queryKey: executionKeys.list(orgId, projectId, options?.status ?? null, options?.limit, options?.offset),
     queryFn: async () => {
       if (!projectId) return null;
+      // Skip network call entirely once we know the endpoint is unavailable
+      if (executionsEndpointUnavailable) {
+        return { executions: [], total: 0, offset: 0, limit: options?.limit ?? 50 };
+      }
       const params = new URLSearchParams({
         project_id: projectId,
         limit: String(options?.limit ?? 50),
@@ -501,12 +510,28 @@ export function useExecutionList(
         params.set('org_id', orgId);
       }
       if (options?.status) params.set('status', options.status);
-      const response = await apiClient.get<ExecutionListApiResponse>(`/v1/executions?${params.toString()}`);
-      return mapExecutionList(response);
+      try {
+        const response = await apiClient.get<ExecutionListApiResponse>(`/v1/executions?${params.toString()}`);
+        // Endpoint is back — clear the flag
+        executionsEndpointUnavailable = false;
+        return mapExecutionList(response);
+      } catch (error) {
+        // Treat 404 as "no executions" — endpoint may not be deployed in this environment.
+        if (error instanceof ApiError && error.status === 404) {
+          executionsEndpointUnavailable = true;
+          return { executions: [], total: 0, offset: 0, limit: options?.limit ?? 50 };
+        }
+        throw error;
+      }
     },
     enabled: Boolean(projectId) && (options?.enabled ?? true),
     refetchInterval: options?.refetchInterval,
     staleTime: 3_000,
+    retry: (failureCount, error) => {
+      // Don't retry 404s — endpoint is simply unavailable
+      if (error instanceof ApiError && error.status === 404) return false;
+      return failureCount < 3;
+    },
   });
 }
 

@@ -17,29 +17,36 @@
  * - behavior_prototype_consent_ux (Teacher)
  */
 
-import { useState, useCallback } from 'react';
+import { lazy, Suspense, useState, useCallback } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { AuthProvider } from './auth';
-import { LoginPage } from './components/LoginPage';
-import { OAuthCallback } from './components/OAuthCallback';
-import { Dashboard } from './components/Dashboard';
 import { ProtectedRoute } from './components/ProtectedRoute';
-import { BCIResponsePanel } from './components/BCIResponsePanel';
-import { ExtractionCandidates } from './components/ExtractionCandidates';
-import { NotFoundPage } from './components/NotFoundPage';
-import { SecuritySettings } from './components/SecuritySettings';
-import { ProjectsPage } from './components/projects/ProjectsPage';
-import { NewProjectPage } from './components/projects/NewProjectPage';
-import { ProjectPage } from './components/projects/ProjectPage';
-import { ProjectSettingsPage } from './components/projects/ProjectSettingsPage';
-import { BoardPage } from './components/boards/BoardPage';
-import { OrganizationsPage } from './components/orgs/OrganizationsPage';
-import { AgentsPage } from './components/agents/AgentsPage';
-import { GitHubAppCallbackPage } from './pages/GitHubAppCallbackPage';
+import { ConsoleSidebar } from './components/ConsoleSidebar';
+import { WorkspaceShell } from './components/workspace/WorkspaceShell';
 import type { ReflectionCandidate } from './api/reflection';
 import './styles/design-system.css';
 import './App.css';
+
+const LoginPage = lazy(() => import('./components/LoginPage').then((module) => ({ default: module.LoginPage })));
+const OAuthCallback = lazy(() => import('./components/OAuthCallback').then((module) => ({ default: module.OAuthCallback })));
+const Dashboard = lazy(() => import('./components/Dashboard').then((module) => ({ default: module.Dashboard })));
+const BCIResponsePanel = lazy(() => import('./components/BCIResponsePanel').then((module) => ({ default: module.BCIResponsePanel })));
+const ExtractionCandidates = lazy(() => import('./components/ExtractionCandidates').then((module) => ({ default: module.ExtractionCandidates })));
+const NotFoundPage = lazy(() => import('./components/NotFoundPage').then((module) => ({ default: module.NotFoundPage })));
+const SecuritySettings = lazy(() => import('./components/SecuritySettings').then((module) => ({ default: module.SecuritySettings })));
+const ProjectsPage = lazy(() => import('./components/projects/ProjectsPage').then((module) => ({ default: module.ProjectsPage })));
+const NewProjectPage = lazy(() => import('./components/projects/NewProjectPage').then((module) => ({ default: module.NewProjectPage })));
+const ProjectPage = lazy(() => import('./components/projects/ProjectPage').then((module) => ({ default: module.ProjectPage })));
+const ProjectSettingsPage = lazy(() => import('./components/projects/ProjectSettingsPage').then((module) => ({ default: module.ProjectSettingsPage })));
+const BoardPage = lazy(() => import('./components/boards/BoardPage').then((module) => ({ default: module.BoardPage })));
+const OrganizationsPage = lazy(() => import('./components/orgs/OrganizationsPage').then((module) => ({ default: module.OrganizationsPage })));
+const AgentsPage = lazy(() => import('./components/agents/AgentsPage').then((module) => ({ default: module.AgentsPage })));
+const GitHubAppCallbackPage = lazy(() => import('./pages/GitHubAppCallbackPage').then((module) => ({ default: module.GitHubAppCallbackPage })));
+
+function RouteFallback() {
+  return <div className="app-route-fallback animate-fade-in-up">Loading…</div>;
+}
 
 // Create a client
 const queryClient = new QueryClient({
@@ -55,6 +62,8 @@ const queryClient = new QueryClient({
  * BCI Tools Layout - for BCI and Extraction routes
  */
 function BCILayout() {
+  const location = useLocation();
+  const navigate = useNavigate();
   const [notifications, setNotifications] = useState<string[]>([]);
 
   const handleAutoApproved = useCallback((candidates: ReflectionCandidate[]) => {
@@ -73,30 +82,37 @@ function BCILayout() {
     }, 5000);
   }, []);
 
+  const isExtractionRoute = location.pathname === '/bci/extraction';
+
   return (
-    <>
-      {notifications.length > 0 && (
-        <div className="notifications">
-          {notifications.map((notification, i) => (
-            <div key={i} className="notification">
-              {notification}
-            </div>
-          ))}
-        </div>
-      )}
-      <Routes>
-        <Route index element={<BCIResponsePanel />} />
-        <Route
-          path="extraction"
-          element={
-            <ExtractionCandidates
-              onAutoApproved={handleAutoApproved}
-              onCandidateApproved={handleCandidateApproved}
-            />
-          }
-        />
-      </Routes>
-    </>
+    <WorkspaceShell
+      sidebarContent={<ConsoleSidebar selectedId={isExtractionRoute ? 'extraction' : 'bci'} onNavigate={(path) => navigate(path)} />}
+      documentTitle={isExtractionRoute ? 'Behavior Extraction' : 'Behavior Search'}
+    >
+      <>
+        {notifications.length > 0 && (
+          <div className="notifications">
+            {notifications.map((notification, i) => (
+              <div key={i} className="notification">
+                {notification}
+              </div>
+            ))}
+          </div>
+        )}
+        <Routes>
+          <Route index element={<BCIResponsePanel />} />
+          <Route
+            path="extraction"
+            element={
+              <ExtractionCandidates
+                onAutoApproved={handleAutoApproved}
+                onCandidateApproved={handleCandidateApproved}
+              />
+            }
+          />
+        </Routes>
+      </>
+    </WorkspaceShell>
   );
 }
 
@@ -105,126 +121,128 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <AuthProvider>
-          <Routes>
-            {/* Public routes */}
-            <Route path="/login" element={<LoginPage />} />
-            <Route path="/auth/callback" element={<OAuthCallback />} />
-            <Route path="/auth/github-app/callback" element={<GitHubAppCallbackPage />} />
-
-            {/* Protected routes */}
-            <Route
-              path="/"
-              element={
-                <ProtectedRoute>
-                  <Dashboard />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/bci/*"
-              element={
-                <ProtectedRoute>
-                  <BCILayout />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/settings"
-              element={
-                <ProtectedRoute>
-                  <SecuritySettings />
-                </ProtectedRoute>
-              }
-            />
-
-            {/* Project routes */}
-            <Route
-              path="/orgs"
-              element={
-                <ProtectedRoute>
-                  <OrganizationsPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/agents"
-              element={
-                <ProtectedRoute>
-                  <AgentsPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/agents/new"
-              element={
-                <ProtectedRoute>
-                  <AgentsPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/agents/:agentId"
-              element={
-                <ProtectedRoute>
-                  <AgentsPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/projects"
-              element={
-                <ProtectedRoute>
-                  <ProjectsPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/projects/new"
-              element={
-                <ProtectedRoute>
-                  <NewProjectPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/projects/:projectId"
-              element={
-                <ProtectedRoute>
-                  <ProjectPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/projects/:projectId/settings"
-              element={
-                <ProtectedRoute>
-                  <ProjectSettingsPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/projects/:projectId/boards/:boardId"
-              element={
-                <ProtectedRoute>
-                  <BoardPage />
-                </ProtectedRoute>
-              }
-            />
-            <Route
-              path="/projects/:projectId/boards/:boardId/items/:itemId"
-              element={
-                <ProtectedRoute>
-                  <BoardPage />
-                </ProtectedRoute>
-              }
-            />
-
-            {/* Catch-all */}
-            <Route path="*" element={<NotFoundPage />} />
-          </Routes>
+          <Suspense fallback={<RouteFallback />}>
+            <AnimatedRoutes />
+          </Suspense>
         </AuthProvider>
       </BrowserRouter>
     </QueryClientProvider>
+  );
+}
+
+function AnimatedRoutes() {
+  const location = useLocation();
+  // Only re-animate on top-level route changes (e.g. /agents → /projects),
+  // not sub-path changes within the same section (e.g. /agents/a → /agents/b).
+  const routeSegment = '/' + (location.pathname.split('/')[1] ?? '');
+
+  return (
+    <div key={routeSegment} className="app-route-stage">
+      <Routes location={location}>
+              {/* Public routes */}
+              <Route path="/login" element={<LoginPage />} />
+              <Route path="/auth/callback" element={<OAuthCallback />} />
+              <Route path="/auth/github-app/callback" element={<GitHubAppCallbackPage />} />
+
+              {/* Protected routes */}
+              <Route
+                path="/"
+                element={
+                  <ProtectedRoute>
+                    <Dashboard />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/bci/*"
+                element={
+                  <ProtectedRoute>
+                    <BCILayout />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/settings"
+                element={
+                  <ProtectedRoute>
+                    <SecuritySettings />
+                  </ProtectedRoute>
+                }
+              />
+
+              {/* Project routes */}
+              <Route
+                path="/orgs"
+                element={
+                  <ProtectedRoute>
+                    <OrganizationsPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/agents"
+                element={
+                  <ProtectedRoute>
+                    <AgentsPage />
+                  </ProtectedRoute>
+                }
+              >
+                <Route path="new" element={null} />
+                <Route path=":agentId" element={null} />
+              </Route>
+              <Route
+                path="/projects"
+                element={
+                  <ProtectedRoute>
+                    <ProjectsPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/projects/new"
+                element={
+                  <ProtectedRoute>
+                    <NewProjectPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/projects/:projectId"
+                element={
+                  <ProtectedRoute>
+                    <ProjectPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/projects/:projectId/settings"
+                element={
+                  <ProtectedRoute>
+                    <ProjectSettingsPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/projects/:projectId/boards/:boardId"
+                element={
+                  <ProtectedRoute>
+                    <BoardPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/projects/:projectId/boards/:boardId/items/:itemId"
+                element={
+                  <ProtectedRoute>
+                    <BoardPage />
+                  </ProtectedRoute>
+                }
+              />
+
+              {/* Catch-all */}
+              <Route path="*" element={<NotFoundPage />} />
+      </Routes>
+    </div>
   );
 }
 

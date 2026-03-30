@@ -1,13 +1,14 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "workItems.move",
-  "description": "Move a work item between columns or change its position within a column. Used for Kanban-style drag and drop.",
+  "deprecated": true,
+  "description": "[DEPRECATED: Use workItems.moveToColumn instead] Move a work item between columns or change its position within a column. workItems.moveToColumn is a strict superset that also supports status_mapping and audit fields.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "item_id": {
         "type": "string",
-        "description": "Work item ID to move (required)"
+        "description": "Work item ID or display ID (e.g. 'myproject-42') to move (required)"
       },
       "column_id": {
         "type": "string",

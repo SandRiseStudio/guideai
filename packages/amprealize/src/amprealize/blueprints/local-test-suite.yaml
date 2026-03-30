@@ -50,7 +50,7 @@ services:
   # --- Main Database (Port 5432) - All schemas ---
   # Contains: auth, board, behavior, execution, workflow, consent, audit schemas
   guideai-db:
-    image: docker.io/pgvector/pgvector:pg16
+    image: docker.io/timescale/timescaledb:latest-pg16
     module: core
     ports:
       - "${GUIDEAI_PG_PORT:-5432}:5432"
@@ -175,7 +175,7 @@ services:
     extra_hosts:
       - "host.containers.internal:host-gateway"
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -v grep | grep -q 'execution_worker' || exit 1"]
+      test: ["CMD-SHELL", "grep -r execution_worker /proc/*/cmdline >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 3
@@ -199,7 +199,7 @@ services:
       - "${GUIDEAI_REPO_ROOT:-.}/config/nginx/docker-entrypoint.sh:/docker-entrypoint-custom.sh:ro"
     command: ["/bin/sh", "/docker-entrypoint-custom.sh"]
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost/nginx-health >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -299,13 +299,78 @@ services:
     healthcheck_timeout_s: 90
     post_start_commands:
       # Run Alembic migrations to create all schemas and tables
-      - command: ["python", "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"]
+      # Wait for pip install to finish before running (main command installs deps async)
+      - command: ["sh", "-c", "while ! python -c 'import alembic' 2>/dev/null; do sleep 2; done && python -m alembic -c alembic.ini upgrade head"]
         description: "Run Alembic migrations (creates schemas: auth, board, behavior, execution, workflow, consent, audit)"
-        timeout_s: 120
+        timeout_s: 180
       # Run Telemetry Alembic migrations (separate TimescaleDB)
-      - command: ["python", "-m", "alembic", "-c", "alembic.telemetry.ini", "upgrade", "head"]
+      - command: ["sh", "-c", "while ! python -c 'import alembic' 2>/dev/null; do sleep 2; done && python -m alembic -c alembic.telemetry.ini upgrade head"]
         description: "Run Telemetry Alembic migrations (creates TimescaleDB hypertables: telemetry_events, execution_traces)"
-        timeout_s: 120
+        timeout_s: 180
+
+  # --- MCP Server (stdio transport for IDE/agent tooling) ---
+  # Note: MCP uses stdio; we keep stdin open via tail so the server stays alive
+  # in detached container runtime environments.
+  guideai-mcp:
+    image: docker.io/library/python:3.11-slim-bookworm
+    module: console
+    ports:
+      - "${GUIDEAI_MCP_PORT:-3000}:3000"
+    depends_on:
+      - guideai-db
+      - telemetry-db
+      - redis
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    volumes:
+      - "${GUIDEAI_REPO_ROOT:-.}:/app"
+      - "guideai-mcp-pip-cache:/root/.cache/pip"
+    workdir: /app
+    command:
+      - "sh"
+      - "-c"
+      - "pip install -e . -e ./packages/raze -e ./packages/amprealize -e ./packages/execution-queue && tail -f /dev/null | python -m guideai.mcp_server"
+    environment:
+      MCP_TRANSPORT: "${MCP_TRANSPORT:-stdio}"
+      MCP_IDLE_TIMEOUT: "${MCP_IDLE_TIMEOUT:-3600}"
+      MCP_SHUTDOWN_TIMEOUT: "${MCP_SHUTDOWN_TIMEOUT:-30}"
+      REDIS_URL: "redis://redis:6379/0"
+
+      # =========================================================================
+      # Consolidated database connection (schema-based routing)
+      # =========================================================================
+      DATABASE_URL: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      # Catch-all fallback used by many MCP service inits
+      GUIDEAI_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_ORG_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+
+      # =========================================================================
+      # Per-service DSNs (matches API service for full parity)
+      # =========================================================================
+      GUIDEAI_AUTH_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_BOARD_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dboard,auth,execution,behavior,workflow,consent,audit,public"
+      GUIDEAI_ACTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_RUN_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_EXECUTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_BEHAVIOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dbehavior,auth,execution,board,workflow,consent,audit,public"
+      GUIDEAI_WORKFLOW_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dworkflow,auth,execution,board,behavior,consent,audit,public"
+      GUIDEAI_COMPLIANCE_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dconsent,auth,execution,board,behavior,workflow,audit,public"
+      GUIDEAI_CONSENT_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dconsent,auth,execution,board,behavior,workflow,audit,public"
+      GUIDEAI_AGENT_ORCHESTRATOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_AGENT_REGISTRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_METRICS_PG_DSN: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+      GUIDEAI_TELEMETRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+
+      # LLM provider keys for MCP-triggered agent tasks
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+    healthcheck:
+      test: ["CMD-SHELL", "grep -r guideai.mcp_server /proc/*/cmdline >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+    healthcheck_timeout_s: 60
 
   web-console:
     image: docker.io/library/node:20-bullseye-slim
@@ -402,5 +467,7 @@ volumes:
     name: guideai-local-web-console-node-modules
   guideai-api-pip-cache:
     name: guideai-local-api-pip-cache
+  guideai-mcp-pip-cache:
+    name: guideai-local-mcp-pip-cache
   execution-worker-pip-cache:
     name: guideai-local-execution-worker-pip-cache

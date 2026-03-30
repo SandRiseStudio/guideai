@@ -10,22 +10,19 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #1a1f2a 100%);
+  background: var(--color-bg-app, #edf5fb);
   padding: 1.5rem;
 }
 
 .github-callback-card {
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.84);
   backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--color-border-default, rgba(255, 255, 255, 0.08));
   border-radius: 16px;
   padding: 3rem 4rem;
   text-align: center;
   max-width: 480px;
   width: 100%;
-  box-shadow:
-    0 8px 32px rgba(0, 0, 0, 0.3),
-    0 0 0 1px rgba(255, 255, 255, 0.05) inset;
   animation: cardFloat 0.5s ease-out;
 }
 
@@ -68,7 +65,7 @@
   width: 64px;
   height: 64px;
   margin: 0 auto 1.5rem;
-  background: linear-gradient(135deg, #238636, #2ea043);
+  background: #238636;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -76,9 +73,6 @@
   font-size: 2rem;
   color: white;
   font-weight: bold;
-  box-shadow:
-    0 4px 16px rgba(35, 134, 54, 0.4),
-    0 0 0 3px rgba(35, 134, 54, 0.2);
   animation: successPop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 }
 
@@ -101,7 +95,7 @@
   width: 64px;
   height: 64px;
   margin: 0 auto 1.5rem;
-  background: linear-gradient(135deg, #da3633, #f85149);
+  background: #da3633;
   border-radius: 50%;
   display: flex;
   align-items: center;
@@ -109,9 +103,6 @@
   font-size: 2rem;
   color: white;
   font-weight: bold;
-  box-shadow:
-    0 4px 16px rgba(218, 54, 51, 0.4),
-    0 0 0 3px rgba(218, 54, 51, 0.2);
   animation: errorShake 0.5s ease-in-out;
 }
 
@@ -142,14 +133,14 @@
 .callback-title {
   font-size: 1.5rem;
   font-weight: 600;
-  color: #f0f6fc;
+  color: var(--color-text-primary, #0f172a);
   margin: 0 0 0.75rem;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.03em;
 }
 
 .callback-description {
   font-size: 1rem;
-  color: #8b949e;
+  color: var(--color-text-secondary, #64748b);
   margin: 0;
   line-height: 1.5;
 }
@@ -163,17 +154,17 @@
   padding: 0.75rem 1.5rem;
   font-size: 0.95rem;
   font-weight: 500;
-  color: #f0f6fc;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--color-text-primary, #0f172a);
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid var(--color-border-default, rgba(255, 255, 255, 0.12));
   border-radius: 8px;
   cursor: pointer;
   transition: all 0.2s ease;
 }
 
 .callback-retry-button:hover {
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.96);
+  border-color: var(--color-border-hover, rgba(255, 255, 255, 0.2));
   transform: translateY(-1px);
 }
 

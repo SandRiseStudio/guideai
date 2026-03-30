@@ -585,7 +585,7 @@ class PermissionService:
         with self.pool.connection() as conn:
             cursor = conn.cursor()
 
-            # First check if user is the project owner (personal project)
+            # First check if user is the project owner (user-owned project)
             cursor.execute(
                 """
                 SELECT owner_id FROM projects WHERE project_id = %s
@@ -608,7 +608,7 @@ class PermissionService:
             if row:
                 return ProjectRole(row[0])
 
-            # Check collaborators (for personal projects)
+            # Check collaborators (for user-owned projects)
             cursor.execute(
                 """
                 SELECT role FROM project_collaborators
@@ -1204,7 +1204,7 @@ class AsyncPermissionService:
         """
         pool = await self._get_pool()
         async with pool.acquire() as conn:
-            # First check if user is the project owner (personal project)
+            # First check if user is the project owner (user-owned project)
             row = await conn.fetchrow(
                 "SELECT owner_id FROM projects WHERE project_id = $1",
                 project_id
@@ -1223,7 +1223,7 @@ class AsyncPermissionService:
             if row:
                 return ProjectRole(row["role"])
 
-            # Check collaborators (for personal projects)
+            # Check collaborators (for user-owned projects)
             row = await conn.fetchrow(
                 """
                 SELECT role FROM project_collaborators

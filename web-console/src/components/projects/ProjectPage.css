@@ -14,6 +14,11 @@
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-6);
+  padding: var(--space-4);
+  border-radius: var(--radius-2xl);
+  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 88%, var(--glass-outline));
+  background: rgba(244, 250, 253, 0.86);
+  backdrop-filter: blur(18px) saturate(138%);
 }
 
 .project-header-left {
@@ -25,9 +30,9 @@
 .project-back {
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-lg);
-  border: 1px solid var(--color-border-default);
-  background: rgba(255, 255, 255, 0.6);
-  backdrop-filter: blur(10px);
+  border: 1px solid color-mix(in srgb, var(--color-border-default) 88%, var(--glass-outline));
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(16px) saturate(136%);
   color: var(--color-text-primary);
   transition:
     background-color var(--duration-fast) var(--ease-out-quart),
@@ -35,13 +40,14 @@
 }
 
 .project-back:hover {
-  background: rgba(255, 255, 255, 0.8);
-  border-color: var(--color-border-hover);
+  background: rgba(255, 255, 255, 0.94);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-border-hover));
 }
 
 .project-title {
   font-size: var(--text-2xl);
   font-weight: var(--font-semibold);
+  letter-spacing: -0.04em;
   color: var(--color-text-primary);
   margin: 0;
 }
@@ -62,9 +68,9 @@
 .project-primary {
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-lg);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(255, 255, 255, 0.7);
-  backdrop-filter: blur(10px);
+  border: 1px solid color-mix(in srgb, var(--color-border-default) 88%, var(--glass-outline));
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(16px) saturate(136%);
   color: var(--color-text-primary);
   transition:
     background-color var(--duration-fast) var(--ease-out-quart),
@@ -73,8 +79,8 @@
 }
 
 .project-primary:hover {
-  background: rgba(255, 255, 255, 0.9);
-  border-color: var(--color-border-hover);
+  background: rgba(255, 255, 255, 0.94);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-border-hover));
 }
 
 .project-new-board {
@@ -83,7 +89,7 @@
   justify-content: center;
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-lg);
-  border: 1px solid var(--color-accent);
+  border: 1px solid rgba(34, 118, 210, 0.24);
   background: var(--color-accent);
   color: white;
   transition:
@@ -95,7 +101,6 @@
 
 .project-new-board:hover {
   background: var(--color-accent-hover);
-  border-color: var(--color-accent-hover);
 }
 
 .project-settings {
@@ -105,9 +110,9 @@
   align-items: center;
   justify-content: center;
   border-radius: var(--radius-lg);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(255, 255, 255, 0.6);
-  backdrop-filter: blur(10px);
+  border: 1px solid color-mix(in srgb, var(--color-border-default) 88%, var(--glass-outline));
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(16px) saturate(136%);
   transition:
     background-color var(--duration-fast) var(--ease-out-quart),
     border-color var(--duration-fast) var(--ease-out-quart),
@@ -115,8 +120,8 @@
 }
 
 .project-settings:hover {
-  background: rgba(255, 255, 255, 0.85);
-  border-color: var(--color-border-hover);
+  background: rgba(255, 255, 255, 0.94);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-border-hover));
 }
 
 .project-boards-header {
@@ -148,9 +153,9 @@
   text-align: left;
   padding: var(--space-5);
   border-radius: var(--radius-xl);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(255, 255, 255, 0.65);
-  backdrop-filter: blur(10px);
+  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 88%, var(--glass-outline));
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(16px) saturate(136%);
   transition:
     border-color var(--duration-fast) var(--ease-out-quart),
     background-color var(--duration-fast) var(--ease-out-quart),
@@ -158,8 +163,8 @@
 }
 
 .board-card:hover {
-  border-color: var(--color-border-hover);
-  background: rgba(255, 255, 255, 0.85);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-border-hover));
+  background: rgba(255, 255, 255, 0.94);
 }
 
 .board-card.skeleton {
@@ -227,9 +232,9 @@
   grid-column: 1 / -1;
   padding: var(--space-8);
   border-radius: var(--radius-2xl);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(255, 255, 255, 0.65);
-  backdrop-filter: blur(12px);
+  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 88%, var(--glass-outline));
+  background: rgba(244, 250, 253, 0.88);
+  backdrop-filter: blur(18px) saturate(138%);
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -264,8 +269,8 @@
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.28);
-  backdrop-filter: blur(8px);
+  background: rgba(18, 26, 54, 0.3);
+  backdrop-filter: blur(12px) saturate(120%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -276,9 +281,9 @@
 .modal-card {
   width: min(560px, 100%);
   border-radius: var(--radius-2xl);
-  border: 1px solid rgba(15, 23, 42, 0.12);
-  background: rgba(255, 255, 255, 0.8);
-  backdrop-filter: blur(14px);
+  border: 1px solid color-mix(in srgb, var(--color-border-default) 88%, var(--glass-outline));
+  background: rgba(247, 251, 253, 0.92);
+  backdrop-filter: blur(20px) saturate(140%);
   overflow: hidden;
 }
 
@@ -377,8 +382,8 @@
   gap: var(--space-1);
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-xl);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  background: rgba(59, 130, 246, 0.06);
+  border: 1px solid color-mix(in srgb, var(--color-accent) 18%, var(--color-border-default));
+  background: rgba(34, 118, 210, 0.1);
 }
 
 .toggle input {
@@ -421,14 +426,13 @@
 .modal-primary {
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-lg);
-  border: 1px solid var(--color-accent);
+  border: 1px solid rgba(34, 118, 210, 0.24);
   background: var(--color-accent);
   color: white;
 }
 
 .modal-primary:hover {
   background: var(--color-accent-hover);
-  border-color: var(--color-accent-hover);
 }
 
 .modal-primary:disabled {

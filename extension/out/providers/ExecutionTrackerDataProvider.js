@@ -43,6 +43,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ExecutionTrackerDataProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const actorAvatar_1 = require("../utils/actorAvatar");
 class ExecutionTrackerDataProvider {
     constructor(client) {
         this.client = client;
@@ -108,34 +109,40 @@ class ExecutionTrackerDataProvider {
     getRunTreeItem(item) {
         const run = item.run;
         const treeItem = new vscode.TreeItem(`${run.workflow_name || run.template_name || 'Unnamed Workflow'}`, vscode.TreeItemCollapsibleState.Collapsed);
+        treeItem.iconPath = vscode.Uri.parse((0, actorAvatar_1.buildActorAvatarDataUri)((0, actorAvatar_1.createActorViewModel)({
+            id: run.actor.id,
+            kind: 'agent',
+            displayName: run.actor.id,
+            subtitle: run.actor.role,
+            presenceState: run.status.toLowerCase() === 'running' || run.status.toLowerCase() === 'in_progress'
+                ? 'working'
+                : run.status.toLowerCase() === 'failed' || run.status.toLowerCase() === 'cancelled'
+                    ? 'paused'
+                    : 'available',
+        }), 28));
         // Set context value for different run states
         switch (run.status.toLowerCase()) {
             case 'running':
             case 'in_progress':
                 treeItem.contextValue = 'run-running';
-                treeItem.iconPath = new vscode.ThemeIcon('play', new vscode.ThemeColor('testing.iconRunning'));
                 treeItem.description = `${run.progress_pct || 0}% complete`;
                 break;
             case 'completed':
             case 'success':
                 treeItem.contextValue = 'run-completed';
-                treeItem.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
                 treeItem.description = 'Completed';
                 break;
             case 'failed':
             case 'error':
                 treeItem.contextValue = 'run-failed';
-                treeItem.iconPath = new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
                 treeItem.description = 'Failed';
                 break;
             case 'cancelled':
                 treeItem.contextValue = 'run-cancelled';
-                treeItem.iconPath = new vscode.ThemeIcon('stop', new vscode.ThemeColor('testing.iconSkipped'));
                 treeItem.description = 'Cancelled';
                 break;
             default:
                 treeItem.contextValue = 'run-item';
-                treeItem.iconPath = new vscode.ThemeIcon('clock');
                 treeItem.description = run.status;
         }
         // Add tooltip with run information

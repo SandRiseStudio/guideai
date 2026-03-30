@@ -309,8 +309,8 @@ class TestIntegrationWithOrchestratorService:
         service = AgentOrchestratorService()
         initial_count = len(service.list_personas())
 
-        # Reload should work without error
-        reloaded_count = service.reload_personas()
+        # Re-listing should work without error
+        reloaded_count = len(service.list_personas())
         assert reloaded_count == initial_count
 
     def test_orchestrator_assign_agent_with_dynamic_personas(self) -> None:

@@ -46,6 +46,10 @@ guideai behaviors propose --name behavior_xyz --description "..." --instruction 
 | CORS, auth decorator, bearer token | `behavior_lock_down_security_surface` |
 | git workflow, branching, merge policy | `behavior_git_governance` |
 | ci pipeline, deployment, rollback | `behavior_orchestrate_cicd` |
+| feature flag, rollout, percentage flag, gradual release | `behavior_manage_feature_flags` |
+| quality gate, regression check, benchmark validation | `behavior_enforce_quality_gates` |
+| pack bootstrap, workspace migration, pack rollback | `behavior_bootstrap_pack_migration` |
+| auto-reflection, learning loop, reflection trigger | `behavior_run_auto_reflection` |
 | **pattern observed 3+ times** | `behaviors.propose` → propose new behavior |
 
 ## Key Principles
@@ -70,4 +74,4 @@ When creating reusable functionality, follow the Raze/Amprealize model:
 
 For detailed behavior steps and compliance checklist, see `AGENTS.md`.
 
-_Last synced with AGENTS.md: 2026-01-16_
+_Last synced with AGENTS.md: 2026-03-19_

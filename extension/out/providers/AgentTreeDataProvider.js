@@ -42,6 +42,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AgentTreeDataProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const actorAvatar_1 = require("../utils/actorAvatar");
 class AgentTreeDataProvider {
     constructor(client) {
         this.client = client;
@@ -196,7 +197,13 @@ class AgentTreeItem extends vscode.TreeItem {
         this.tooltip = this.buildTooltip();
         this.contextValue = this.getContextValue();
         // Icon based on status and role
-        this.iconPath = new vscode.ThemeIcon(this.getIconName());
+        this.iconPath = vscode.Uri.parse((0, actorAvatar_1.buildActorAvatarDataUri)((0, actorAvatar_1.createActorViewModel)({
+            id: agent.agent_id,
+            kind: 'agent',
+            displayName: agent.name,
+            subtitle: agent.role_alignment,
+            presenceState: agent.status === 'DEPRECATED' ? 'offline' : agent.status === 'DRAFT' ? 'paused' : 'available',
+        }), 32));
         // Command to view details on click
         this.command = {
             command: 'guideai.viewAgentDetail',
@@ -232,28 +239,6 @@ class AgentTreeItem extends vscode.TreeItem {
         parts.push(this.agent.status.toLowerCase());
         parts.push(this.agent.visibility.toLowerCase());
         return parts.join('.');
-    }
-    getIconName() {
-        // Choose icon based on status first, then role
-        if (this.agent.status === 'DEPRECATED') {
-            return 'archive';
-        }
-        if (this.agent.status === 'DRAFT') {
-            return 'edit';
-        }
-        // Published agents get role-based icon
-        switch (this.agent.role_alignment) {
-            case 'STRATEGIST':
-                return 'graph';
-            case 'TEACHER':
-                return 'mortar-board';
-            case 'STUDENT':
-                return 'check';
-            case 'MULTI':
-                return 'symbol-misc';
-            default:
-                return 'robot';
-        }
     }
 }
 class MessageTreeItem extends vscode.TreeItem {

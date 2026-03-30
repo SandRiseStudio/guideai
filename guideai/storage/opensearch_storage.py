@@ -2,7 +2,7 @@
 
 This module provides real-time indexing of audit events into OpenSearch/Elasticsearch
 for efficient querying, dashboards, and compliance reporting. Part of the multi-tier
-storage architecture per AUDIT_LOG_STORAGE.md.
+storage architecture per docs/contracts/AUDIT_LOG_STORAGE.md.
 
 Storage Tier Hierarchy:
 - Hot: PostgreSQL (7-day partition, full CRUD)
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class AuditEvent:
     """Normalized audit event for indexing.
 
-    Aligns with PostgreSQL audit_log_worm table schema and AUDIT_LOG_STORAGE.md contract.
+    Aligns with PostgreSQL audit_log_worm table schema and docs/contracts/AUDIT_LOG_STORAGE.md contract.
     """
     event_id: str
     event_type: str

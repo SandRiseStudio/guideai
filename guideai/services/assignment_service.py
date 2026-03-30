@@ -1,5 +1,5 @@
 """
-Assignment Service for polymorphic assignment (user/agent) on stories and tasks.
+Assignment Service for polymorphic assignment (user/agent) on features and tasks.
 Supports audit trail in assignment_history and agent suggestion helper.
 """
 from __future__ import annotations
@@ -139,7 +139,7 @@ class AssignmentService:
                            COALESCE(w.active_items, 0) AS active_items,
                            COALESCE(w.in_progress_count, 0) AS in_progress_count,
                            COALESCE(w.completed_count, 0) AS completed_count,
-                           COALESCE(w.total_story_points, 0) AS total_story_points
+                           COALESCE(w.total_points, 0) AS total_story_points
                     FROM agents a
                     LEFT JOIN agent_versions av
                         ON av.agent_id = a.agent_id AND av.version = a.latest_version
@@ -226,8 +226,10 @@ class AssignmentService:
         reason: Optional[str],
         action_override: Optional[AssignmentAction] = None,
     ):
-        if assignable_type not in {"story", "task"}:
+        if assignable_type not in {"story", "feature", "task"}:
             raise AssignmentServiceError(f"Unsupported assignable_type: {assignable_type}")
+        # Normalize: 'feature' maps to legacy 'story' table
+        _table_type = "story" if assignable_type in {"story", "feature"} else "task"
 
         timestamp = _now()
         assignable = self._fetch_assignable_for_context(assignable_id, assignable_type, org_id)
@@ -290,8 +292,8 @@ class AssignmentService:
                     )
 
                 # Update assignable
-                table = "stories" if assignable_type == "story" else "board_tasks"
-                id_col = "story_id" if assignable_type == "story" else "task_id"
+                table = "stories" if _table_type == "story" else "board_tasks"
+                id_col = "story_id" if _table_type == "story" else "task_id"
                 cur.execute(
                     f"""
                     UPDATE {table}
@@ -320,8 +322,9 @@ class AssignmentService:
         return self._fetch_assignable_model(assignable_id, assignable_type, org_id)
 
     def _fetch_assignable_for_context(self, assignable_id: str, assignable_type: str, org_id: Optional[str]) -> Dict[str, Any]:
-        table = "stories" if assignable_type == "story" else "board_tasks"
-        id_col = "story_id" if assignable_type == "story" else "task_id"
+        _table_type = "story" if assignable_type in {"story", "feature"} else "task"
+        table = "stories" if _table_type == "story" else "board_tasks"
+        id_col = "story_id" if _table_type == "story" else "task_id"
         with self._pool.connection() as conn:
             self._pool.set_tenant_context(conn, org_id, None)
             with conn.cursor() as cur:
@@ -343,7 +346,7 @@ class AssignmentService:
                 }
 
     def _fetch_assignable_model(self, assignable_id: str, assignable_type: str, org_id: Optional[str]):
-        if assignable_type == "story":
+        if assignable_type in {"story", "feature"}:
             return self._board_service.get_story(assignable_id, org_id=org_id)
         return self._board_service.get_task(assignable_id, org_id=org_id)
 

@@ -1,19 +1,19 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "board.suggestAgent",
-  "description": "Suggest best agents for a board item (story or task) based on behavior requirements and current workload. Returns ranked suggestions with scoring rationale.",
+  "description": "Suggest best agents for a board item (feature or task) based on behavior requirements and current workload. Returns ranked suggestions with scoring rationale.",
   "inputSchema": {
     "type": "object",
     "required": ["assignable_id", "assignable_type"],
     "properties": {
       "assignable_id": {
         "type": "string",
-        "description": "ID of the story or task to get agent suggestions for"
+        "description": "ID of the feature or task to get agent suggestions for"
       },
       "assignable_type": {
         "type": "string",
-        "enum": ["story", "task"],
-        "description": "Type of the assignable item"
+        "enum": ["feature", "task", "story"],
+        "description": "Type of the assignable item. Use feature/task. Legacy value 'story' is accepted."
       },
       "required_behaviors": {
         "type": "array",
@@ -104,7 +104,7 @@
                 "active_items": { "type": "integer" },
                 "in_progress_count": { "type": "integer" },
                 "completed_count": { "type": "integer" },
-                "total_story_points": { "type": "integer" },
+                "total_points": { "type": "integer" },
                 "allowed_behaviors": {
                   "type": "array",
                   "items": { "type": "string" }
@@ -131,8 +131,8 @@
       },
       "assignable_type": {
         "type": "string",
-        "enum": ["story", "task"],
-        "description": "The requested assignable type"
+        "enum": ["feature", "task", "story"],
+        "description": "The requested assignable type. 'story' is a legacy alias for 'feature'."
       },
       "required_behaviors": {
         "type": "array",

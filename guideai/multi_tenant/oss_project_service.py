@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .contracts import (
+    AgentPresenceResponse,
+    PresenceStatus,
     Project,
     ProjectAgentAssignmentResponse,
     ProjectAgentRole,
@@ -33,7 +35,7 @@ class OSSProjectService:
     """Minimal project service for OSS (personal projects, no org features).
 
     Implements the subset of OrganizationService methods used by projects_api.py.
-    Backs onto the existing auth.projects / auth.project_agent_assignments tables.
+    Backs onto the existing auth.projects / execution.project_agent_assignments tables.
     """
 
     def __init__(self, *, dsn: str) -> None:
@@ -157,6 +159,161 @@ class OSSProjectService:
         finally:
             conn.close()
 
+    def list_project_participants(
+        self,
+        project_id: str,
+    ) -> List[Dict[str, Any]]:
+        """List all project-scoped participants.
+
+        Includes:
+        - project owner
+        - explicit project memberships
+        - collaborators on shared personal projects (when table exists)
+        - assigned agents
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT p.project_id,
+                           p.owner_id,
+                           p.org_id,
+                           owner.display_name,
+                           owner.email
+                    FROM auth.projects p
+                    LEFT JOIN auth.users owner ON owner.id = p.owner_id
+                    WHERE p.project_id = %s
+                    """,
+                    (project_id,),
+                )
+                project_row = cur.fetchone()
+                if project_row is None:
+                    return []
+
+                _, owner_id, _org_id, owner_display_name, owner_email = project_row
+
+                participants: List[Dict[str, Any]] = []
+                seen_humans: set[str] = set()
+
+                def add_human(
+                    *,
+                    user_id: Optional[str],
+                    role: str,
+                    membership_source: str,
+                    display_name: Optional[str] = None,
+                    email: Optional[str] = None,
+                ) -> None:
+                    if not user_id or user_id in seen_humans:
+                        return
+                    seen_humans.add(user_id)
+                    participants.append({
+                        "id": user_id,
+                        "kind": "human",
+                        "user_id": user_id,
+                        "display_name": display_name,
+                        "email": email,
+                        "role": role,
+                        "membership_source": membership_source,
+                    })
+
+                add_human(
+                    user_id=owner_id,
+                    role="owner",
+                    membership_source="owner",
+                    display_name=owner_display_name,
+                    email=owner_email,
+                )
+
+                cur.execute(
+                    """
+                    SELECT pm.user_id,
+                           pm.role,
+                           u.display_name,
+                           u.email
+                    FROM auth.project_memberships pm
+                    LEFT JOIN auth.users u ON u.id = pm.user_id
+                    WHERE pm.project_id = %s
+                    ORDER BY pm.created_at ASC
+                    """,
+                    (project_id,),
+                )
+                for user_id, role, display_name, email in cur.fetchall():
+                    add_human(
+                        user_id=user_id,
+                        role=role or "contributor",
+                        membership_source="project_membership",
+                        display_name=display_name,
+                        email=email,
+                    )
+
+                cur.execute("SELECT to_regclass('auth.project_collaborators')")
+                has_collaborators_table = cur.fetchone()[0] is not None
+                if has_collaborators_table:
+                    cur.execute(
+                        """
+                        SELECT pc.user_id,
+                               pc.role,
+                               u.display_name,
+                               u.email
+                        FROM auth.project_collaborators pc
+                        LEFT JOIN auth.users u ON u.id = pc.user_id
+                        WHERE pc.project_id = %s
+                        ORDER BY pc.invited_at ASC
+                        """,
+                        (project_id,),
+                    )
+                    for user_id, role, display_name, email in cur.fetchall():
+                        add_human(
+                            user_id=user_id,
+                            role=role or "contributor",
+                            membership_source="project_collaborator",
+                            display_name=display_name,
+                            email=email,
+                        )
+
+                cur.execute(
+                    """
+                    SELECT pa.agent_id,
+                           pa.role,
+                           pa.status,
+                           a.name,
+                           a.slug,
+                           a.description,
+                           COALESCE(ap.presence_status,
+                               CASE
+                                   WHEN pa.status = 'active' THEN 'available'
+                                   WHEN pa.status = 'inactive' THEN 'paused'
+                                   ELSE 'offline'
+                               END
+                           ) AS presence_status
+                    FROM execution.project_agent_assignments pa
+                    LEFT JOIN execution.agents a ON a.agent_id = pa.agent_id
+                    LEFT JOIN execution.agent_presence ap
+                        ON ap.agent_id = pa.agent_id AND ap.project_id = pa.project_id
+                    WHERE pa.project_id = %s
+                      AND pa.status <> 'removed'
+                    ORDER BY pa.assigned_at ASC
+                    """,
+                    (project_id,),
+                )
+                for agent_id, role, status, name, slug, description, presence_status in cur.fetchall():
+                    participants.append({
+                        "id": agent_id,
+                        "kind": "agent",
+                        "agent_id": agent_id,
+                        "display_name": name,
+                        "agent_slug": slug,
+                        "description": description,
+                        "role": role or "primary",
+                        "assignment_status": status or "active",
+                        "presence": presence_status or "offline",
+                    })
+
+                return participants
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------------
     # Project-Agent Assignments
     # ------------------------------------------------------------------
@@ -178,7 +335,7 @@ class OSSProjectService:
                                pa.config_overrides, pa.role, pa.status,
                                a.name as agent_name, a.slug as agent_slug,
                                a.description as agent_description
-                        FROM auth.project_agent_assignments pa
+                        FROM execution.project_agent_assignments pa
                         JOIN auth.projects p ON p.project_id = pa.project_id
                         LEFT JOIN execution.agents a ON a.agent_id = pa.agent_id
                         WHERE p.owner_id = %s AND pa.project_id = %s
@@ -194,7 +351,7 @@ class OSSProjectService:
                                pa.config_overrides, pa.role, pa.status,
                                a.name as agent_name, a.slug as agent_slug,
                                a.description as agent_description
-                        FROM auth.project_agent_assignments pa
+                        FROM execution.project_agent_assignments pa
                         JOIN auth.projects p ON p.project_id = pa.project_id
                         LEFT JOIN execution.agents a ON a.agent_id = pa.agent_id
                         WHERE p.owner_id = %s
@@ -222,7 +379,7 @@ class OSSProjectService:
                            pa.config_overrides, pa.role, pa.status,
                            a.name as agent_name, a.slug as agent_slug,
                            a.description as agent_description
-                    FROM auth.project_agent_assignments pa
+                    FROM execution.project_agent_assignments pa
                     LEFT JOIN execution.agents a ON a.agent_id = pa.agent_id
                     WHERE pa.project_id = %s
                     ORDER BY pa.assigned_at DESC
@@ -255,7 +412,7 @@ class OSSProjectService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO auth.project_agent_assignments
+                    INSERT INTO execution.project_agent_assignments
                         (id, project_id, agent_id, assigned_by, assigned_at,
                          config_overrides, role, status)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -291,7 +448,7 @@ class OSSProjectService:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM auth.project_agent_assignments WHERE id = %s",
+                    "DELETE FROM execution.project_agent_assignments WHERE id = %s",
                     (assignment_id,),
                 )
                 removed = cur.rowcount > 0
@@ -376,4 +533,143 @@ class OSSProjectService:
             config=config_overrides,
             role=role_enum,
             status=status_enum,
+        )
+
+    # ------------------------------------------------------------------
+    # Agent Presence
+    # ------------------------------------------------------------------
+
+    def list_agent_presence(
+        self,
+        project_id: str,
+    ) -> List[AgentPresenceResponse]:
+        """List presence state for all assigned agents in a project."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ap.agent_id, ap.project_id,
+                           ap.presence_status,
+                           ap.last_activity_at, ap.last_completed_at,
+                           ap.active_item_count, ap.capacity_max,
+                           ap.current_work_item_id, ap.updated_at,
+                           a.name as agent_name, a.slug as agent_slug
+                    FROM execution.agent_presence ap
+                    LEFT JOIN execution.agents a ON a.agent_id = ap.agent_id
+                    WHERE ap.project_id = %s
+                    ORDER BY ap.presence_status, a.name
+                    """,
+                    (project_id,),
+                )
+                rows = cur.fetchall()
+                return [self._row_to_presence(r) for r in rows]
+        finally:
+            conn.close()
+
+    def update_agent_presence(
+        self,
+        *,
+        agent_id: str,
+        project_id: str,
+        presence_status: Optional[PresenceStatus] = None,
+        active_item_count: Optional[int] = None,
+        capacity_max: Optional[int] = None,
+        current_work_item_id: Optional[str] = None,
+    ) -> AgentPresenceResponse:
+        """Upsert an agent's presence state in a project."""
+        import json
+
+        now = _utc_now()
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO execution.agent_presence
+                        (agent_id, project_id, presence_status,
+                         active_item_count, capacity_max,
+                         current_work_item_id, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (agent_id, project_id) DO UPDATE SET
+                        presence_status = COALESCE(%s, execution.agent_presence.presence_status),
+                        active_item_count = COALESCE(%s, execution.agent_presence.active_item_count),
+                        capacity_max = COALESCE(%s, execution.agent_presence.capacity_max),
+                        current_work_item_id = COALESCE(%s, execution.agent_presence.current_work_item_id),
+                        updated_at = %s
+                    RETURNING agent_id, project_id, presence_status,
+                              last_activity_at, last_completed_at,
+                              active_item_count, capacity_max,
+                              current_work_item_id, updated_at
+                    """,
+                    (
+                        agent_id, project_id,
+                        (presence_status or PresenceStatus.OFFLINE).value,
+                        active_item_count if active_item_count is not None else 0,
+                        capacity_max if capacity_max is not None else 4,
+                        current_work_item_id,
+                        now,
+                        # ON CONFLICT SET values
+                        presence_status.value if presence_status else None,
+                        active_item_count,
+                        capacity_max,
+                        current_work_item_id,
+                        now,
+                    ),
+                )
+                row = cur.fetchone()
+                conn.commit()
+
+                # Fetch agent name for the response
+                cur.execute(
+                    "SELECT name, slug FROM execution.agents WHERE agent_id = %s",
+                    (agent_id,),
+                )
+                agent_row = cur.fetchone()
+                agent_name = agent_row[0] if agent_row else ""
+                agent_slug = agent_row[1] if agent_row else None
+
+                return AgentPresenceResponse(
+                    agent_id=row[0],
+                    project_id=row[1],
+                    name=agent_name,
+                    agent_slug=agent_slug,
+                    presence_status=PresenceStatus(row[2]),
+                    last_activity_at=row[3],
+                    last_completed_at=row[4],
+                    active_item_count=row[5],
+                    capacity_max=row[6],
+                    current_work_item_id=row[7],
+                    updated_at=row[8],
+                )
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _row_to_presence(row) -> AgentPresenceResponse:
+        """Convert a DB row tuple to an AgentPresenceResponse."""
+        (agent_id, project_id,
+         presence_status,
+         last_activity_at, last_completed_at,
+         active_item_count, capacity_max,
+         current_work_item_id, updated_at,
+         agent_name, agent_slug) = row
+
+        try:
+            status_enum = PresenceStatus(presence_status)
+        except (ValueError, KeyError):
+            status_enum = PresenceStatus.OFFLINE
+
+        return AgentPresenceResponse(
+            agent_id=agent_id,
+            project_id=project_id,
+            name=agent_name or "",
+            agent_slug=agent_slug,
+            presence_status=status_enum,
+            last_activity_at=last_activity_at,
+            last_completed_at=last_completed_at,
+            active_item_count=active_item_count or 0,
+            capacity_max=capacity_max or 4,
+            current_work_item_id=current_work_item_id,
+            updated_at=updated_at,
         )

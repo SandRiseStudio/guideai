@@ -7,12 +7,15 @@
  * Following COLLAB_SAAS_REQUIREMENTS.md (Student): optimistic, animated, 60fps.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { ConsoleSidebar } from '../ConsoleSidebar';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { useProject } from '../../api/dashboard';
 import { useBoards, useCreateBoard } from '../../api/boards';
+import { useProjectAgents } from '../../api/agentRegistry';
+import { useAgentPresence } from '../../hooks/useAgentPresence';
+import { ProjectAgentPresenceSummary } from './ProjectAgentPresenceSummary';
 import './ProjectPage.css';
 
 function getRelativeTime(dateString?: string): string {
@@ -67,10 +70,13 @@ function getUserFriendlyMessage(rawMessage: string): string {
 export function ProjectPage(): React.JSX.Element {
   const navigate = useNavigate();
   const { projectId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const { data: project, isLoading: projectLoading } = useProject(projectId);
   const { data: boards = [], isLoading: boardsLoading } = useBoards(projectId);
   const createBoard = useCreateBoard();
+  const { data: projectAgents = [] } = useProjectAgents();
+  const { presences: agentPresences, summary: agentSummary } = useAgentPresence(projectAgents, projectId ?? undefined);
 
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState('');
@@ -79,6 +85,8 @@ export function ProjectPage(): React.JSX.Element {
   const [createError, setCreateError] = useState<string | null>(null);
 
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   const sortedBoards = useMemo(() => {
     return [...boards].sort((a, b) => {
@@ -90,6 +98,7 @@ export function ProjectPage(): React.JSX.Element {
   const primaryBoardId = useMemo(() => sortedBoards[0]?.board_id, [sortedBoards]);
 
   const openCreate = useCallback(() => {
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
     setName('');
     setDescription('');
     setCreateDefaultColumns(true);
@@ -98,9 +107,59 @@ export function ProjectPage(): React.JSX.Element {
     requestAnimationFrame(() => nameInputRef.current?.focus());
   }, []);
 
+  useEffect(() => {
+    if (searchParams.get('newBoard') !== '1') {
+      return;
+    }
+
+    openCreate();
+
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete('newBoard');
+    setSearchParams(nextParams, { replace: true });
+  }, [openCreate, searchParams, setSearchParams]);
+
   const closeCreate = useCallback(() => {
     setCreateOpen(false);
+    window.requestAnimationFrame(() => previousFocusRef.current?.focus());
   }, []);
+
+  useEffect(() => {
+    if (!createOpen) return;
+
+    const handleDialogKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeCreate();
+        return;
+      }
+
+      if (event.key !== 'Tab' || !modalRef.current) return;
+
+      const focusable = modalRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (!focusable.length) return;
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+        return;
+      }
+
+      if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleDialogKeyDown);
+    return () => document.removeEventListener('keydown', handleDialogKeyDown);
+  }, [closeCreate, createOpen]);
 
   const onCreate = useCallback(async () => {
     if (!projectId) return;
@@ -193,7 +252,7 @@ export function ProjectPage(): React.JSX.Element {
                 onClick={() => navigate(`/projects/${projectId}/boards/${primaryBoardId}`)}
                 data-haptic="medium"
               >
-                Continue
+                Open board
               </button>
             )}
             <button
@@ -202,20 +261,22 @@ export function ProjectPage(): React.JSX.Element {
               onClick={openCreate}
               data-haptic="light"
             >
-              New Board
+              Create Board
             </button>
             <button
               type="button"
               className="project-settings pressable"
               onClick={() => navigate(`/projects/${projectId}/settings`)}
               data-haptic="light"
-              aria-label="Project settings"
-              title="Project settings"
+              aria-label="Open project settings"
+              title="Open project settings"
             >
               ⚙️
             </button>
           </div>
         </header>
+
+        <ProjectAgentPresenceSummary presences={agentPresences} summary={agentSummary} />
 
         <section className="project-boards" aria-label="Boards">
           <div className="project-boards-header">
@@ -258,7 +319,7 @@ export function ProjectPage(): React.JSX.Element {
               <div className="boards-empty animate-fade-in-up" role="listitem">
                 <h3 className="boards-empty-title">No boards yet</h3>
                 <p className="boards-empty-description">
-                  Create a board in one click. Default columns come ready for sprint flow.
+                  Create your first board to organize work with ready-made sprint columns.
                 </p>
                 <button
                   type="button"
@@ -276,15 +337,16 @@ export function ProjectPage(): React.JSX.Element {
         {createOpen && (
           <div className="modal-overlay" role="presentation" onClick={closeCreate}>
             <div
+              ref={modalRef}
               className="modal-card animate-scale-in"
               role="dialog"
               aria-modal="true"
-              aria-label="Create board"
+              aria-labelledby="create-board-title"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="modal-header">
                 <div>
-                  <h2 className="modal-title">New board</h2>
+                  <h2 id="create-board-title" className="modal-title">New board</h2>
                   <p className="modal-subtitle">⌘/Ctrl + Enter to create instantly</p>
                 </div>
                 <button type="button" className="modal-close pressable" onClick={closeCreate} aria-label="Close">
@@ -328,7 +390,7 @@ export function ProjectPage(): React.JSX.Element {
                     onChange={(e) => setCreateDefaultColumns(e.target.checked)}
                   />
                   <span className="toggle-label">Create default columns</span>
-                  <span className="toggle-hint">Backlog → To Do → In Progress → Review → Done</span>
+                  <span className="toggle-hint">Creates default columns based on your board template</span>
                 </label>
               </div>
 
@@ -343,7 +405,7 @@ export function ProjectPage(): React.JSX.Element {
                   disabled={!name.trim() || createBoard.isPending}
                   data-haptic="medium"
                 >
-                  {createBoard.isPending ? 'Creating…' : 'Create board'}
+                  {createBoard.isPending ? 'Creating…' : 'Create Board'}
                 </button>
               </div>
             </div>

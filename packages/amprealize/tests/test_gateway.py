@@ -189,6 +189,15 @@ class TestGatewayBlueprintIntegration:
         assert "healthcheck" in gateway_section
         assert "/health" in gateway_section
 
+    def test_mcp_service_defined(self, blueprint_config: str) -> None:
+        """Verify guideai-mcp service is in the development blueprint."""
+        assert "guideai-mcp:" in blueprint_config
+
+    def test_mcp_service_runs_guideai_server(self, blueprint_config: str) -> None:
+        """Verify guideai-mcp command runs guideai.mcp_server."""
+        mcp_section = blueprint_config.split("guideai-mcp:")[1].split("\n  web-console:")[0]
+        assert "python -m guideai.mcp_server" in mcp_section
+
 
 class TestGatewayEndpointRouting:
     """Tests for expected routing behavior."""

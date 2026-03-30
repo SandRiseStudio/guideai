@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, MutableSequence, Optional, Sequence
 
 from guideai.telemetry import TelemetryEvent, TelemetrySink
@@ -334,6 +334,100 @@ class PostgresTelemetryWarehouse:
         with self._pool.connection(autocommit=True) as conn:
             with self._cursor(conn) as cur:
                 cur.execute("SELECT refresh_prd_metric_views();")
+
+    def query_events(
+        self,
+        *,
+        event_type: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        actor_surface: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Query telemetry events with filtering.
+
+        Parameters
+        ----------
+        event_type : Filter by event type (exact match).
+        since : Start of time window (ISO 8601 or relative e.g. '7d').
+        until : End of time window (ISO 8601).
+        run_id / session_id : Correlation filters.
+        actor_surface : Surface filter (web, cli, vscode, mcp, api).
+        limit : Max results, capped at 1000.
+        offset : Pagination offset.
+
+        Returns a list of event dicts suitable for JSON serialisation.
+        """
+        limit = min(max(limit, 1), 1000)
+        offset = max(offset, 0)
+
+        conditions: List[str] = []
+        params: List[Any] = []
+
+        if event_type:
+            conditions.append("event_type = %s")
+            params.append(event_type)
+        if run_id:
+            conditions.append("run_id = %s")
+            params.append(run_id)
+        if session_id:
+            conditions.append("session_id = %s")
+            params.append(session_id)
+        if actor_surface:
+            conditions.append("actor_surface = %s")
+            params.append(normalize_actor_surface(actor_surface))
+        if since:
+            ts = self._parse_relative_or_iso(since)
+            conditions.append("event_timestamp >= %s")
+            params.append(ts)
+        if until:
+            ts = self._parse_relative_or_iso(until)
+            conditions.append("event_timestamp <= %s")
+            params.append(ts)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"""
+            SELECT event_id, event_timestamp, event_type,
+                   actor_id, actor_role, actor_surface,
+                   run_id, action_id, session_id, payload
+            FROM telemetry_events
+            {where}
+            ORDER BY event_timestamp DESC
+            LIMIT %s OFFSET %s
+        """
+        params.extend([limit, offset])
+
+        rows: List[Dict[str, Any]] = []
+        with self._pool.connection(autocommit=True) as conn:
+            with self._cursor(conn) as cur:
+                cur.execute(sql, params)
+                for row in cur.fetchall():
+                    rows.append({
+                        "event_id": str(row[0]),
+                        "timestamp": row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
+                        "event_type": row[2],
+                        "actor": {"id": row[3], "role": row[4], "surface": row[5]},
+                        "run_id": row[6],
+                        "action_id": row[7],
+                        "session_id": row[8],
+                        "payload": row[9] if isinstance(row[9], dict) else {},
+                    })
+        return rows
+
+    @staticmethod
+    def _parse_relative_or_iso(value: str) -> datetime:
+        """Parse an ISO timestamp string or a relative duration like '7d', '24h'."""
+        import re as _re
+        m = _re.fullmatch(r"(\d+)([dhms])", value.strip())
+        if m:
+            amount, unit = int(m.group(1)), m.group(2)
+            delta = {"d": timedelta(days=amount), "h": timedelta(hours=amount),
+                     "m": timedelta(minutes=amount), "s": timedelta(seconds=amount)}[unit]
+            return datetime.now(timezone.utc) - delta
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
     def close(self) -> None:
         """Close the connection pool (no-op with shared PostgresPool)."""
@@ -672,6 +766,10 @@ class PostgresTelemetrySink(TelemetrySink):
 
     def refresh_metric_views(self) -> None:
         self._warehouse.refresh_metric_views()
+
+    def query_events(self, **kwargs: Any) -> List[Dict[str, Any]]:
+        """Query telemetry events. Delegates to warehouse."""
+        return self._warehouse.query_events(**kwargs)
 
     def close(self) -> None:
         self._warehouse.close()

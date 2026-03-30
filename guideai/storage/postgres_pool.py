@@ -308,7 +308,7 @@ class PostgresPool:
         with conn.cursor() as cur:
             # Set search_path to include all application schemas
             # This allows unqualified table names to work across schemas
-            cur.execute("SET LOCAL search_path = board, auth, execution, workflow, public")
+            cur.execute("SET LOCAL search_path = board, auth, execution, workflow, research, public")
 
             # Set org context for RLS policies
             if org_id:
@@ -354,7 +354,11 @@ class PostgresPool:
         start_time = time.time()
 
         try:
-            with self.connection(autocommit=True) as conn:
+            # Use autocommit=False so SET LOCAL search_path (set by
+            # set_tenant_context) persists across all statements in
+            # the executor – autocommit=True would auto-commit each
+            # statement individually, losing LOCAL settings.
+            with self.connection(autocommit=False) as conn:
                 if telemetry:
                     telemetry.emit_event(
                         event_type=f"{service_prefix}_query_start",

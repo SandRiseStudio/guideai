@@ -16,7 +16,8 @@ import {
   type KeyboardEvent,
   type ChangeEvent,
 } from 'react';
-import { useCollaboration, type CollabClientConfig } from '@guideai/collab-client';
+import { useCollaboration, type CollabClientConfig } from '../../lib/collab-client';
+import { collabStore } from '../../store/collabStore';
 import './PlanComposer.css';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,8 +336,10 @@ export const PlanComposer: FC<PlanComposerProps> = ({
   // Connect to document for real-time collaboration
   const {
     document: collabDoc,
+    connectionState,
     isConnected,
     cursors,
+    presence,
     operations: _operations,
     replace: sendReplace,
     error: collabError,
@@ -362,6 +365,28 @@ export const PlanComposer: FC<PlanComposerProps> = ({
   const [focusedStepId, setFocusedStepId] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'error'>('synced');
   const [showConflictModal, setShowConflictModal] = useState(false);
+
+  useEffect(() => {
+    collabStore.setActiveDocument(documentId);
+    if (_workspaceId) {
+      collabStore.setActiveWorkspace(_workspaceId);
+    }
+
+    return () => {
+      collabStore.setActiveDocument(null);
+      collabStore.setActiveWorkspace(null);
+      collabStore.clearPresence();
+      collabStore.setConnectionState('disconnected');
+    };
+  }, [documentId, _workspaceId]);
+
+  useEffect(() => {
+    collabStore.setConnectionState(connectionState);
+  }, [connectionState]);
+
+  useEffect(() => {
+    collabStore.replacePresence(presence.values());
+  }, [presence]);
 
   // Build remote cursors from presence data (using cursors from hook)
   const remoteCursors = useMemo<RemoteCursor[]>(() => {

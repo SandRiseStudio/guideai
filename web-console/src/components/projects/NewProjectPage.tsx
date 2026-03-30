@@ -13,6 +13,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
 import { ConsoleSidebar } from '../ConsoleSidebar';
 import { useCreateProject } from '../../api/projects';
+import { CREATE_PROJECT_CTA, SCOPE_LABEL } from '../../copy/scopeLabels';
 import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
 import './NewProjectPage.css';
 
@@ -109,7 +110,7 @@ export function NewProjectPage(): React.JSX.Element {
             <div>
               <h1 className="new-project-title animate-fade-in-up">Create a new project</h1>
               <p className="new-project-subtitle animate-fade-in-up">
-                Set up a workspace with permissions, defaults, and collaboration-ready structure.
+                Set up a project with the right {SCOPE_LABEL.toLowerCase()}, visibility, and collaboration-ready structure.
               </p>
             </div>
           </div>
@@ -264,7 +265,7 @@ export function NewProjectPage(): React.JSX.Element {
                 disabled={!canContinue}
                 data-haptic="light"
               >
-                Continue
+                Next
               </button>
             ) : (
               <button
@@ -274,7 +275,7 @@ export function NewProjectPage(): React.JSX.Element {
                 disabled={mutation.isPending || Boolean(nameError)}
                 data-haptic="medium"
               >
-                {mutation.isPending ? 'Creating…' : 'Create Project'}
+                {mutation.isPending ? 'Creating…' : CREATE_PROJECT_CTA}
               </button>
             )}
           </div>

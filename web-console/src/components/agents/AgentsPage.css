@@ -23,6 +23,7 @@
 .agents-title {
   font-size: var(--text-2xl);
   font-weight: var(--font-semibold);
+  letter-spacing: -0.04em;
   color: var(--color-text-primary);
 }
 
@@ -46,7 +47,7 @@
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-lg);
   border: 1px solid var(--color-border-default);
-  background: var(--color-bg-surface);
+  background: rgba(255, 255, 255, 0.8);
   color: var(--color-text-primary);
   cursor: pointer;
   transition:
@@ -57,13 +58,12 @@
 
 .agents-primary-button {
   background: var(--color-accent);
-  border-color: var(--color-accent);
+  border-color: rgba(34, 118, 210, 0.24);
   color: white;
 }
 
 .agents-primary-button:hover {
   background: var(--color-accent-hover);
-  border-color: var(--color-accent-hover);
 }
 
 .agents-primary-button:disabled,
@@ -75,8 +75,8 @@
 }
 
 .agents-secondary-button:hover {
-  background: var(--color-bg-elevated);
-  border-color: var(--color-border-hover);
+  background: rgba(255, 255, 255, 0.94);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-border-hover));
 }
 
 .agents-metrics {
@@ -88,9 +88,9 @@
 .agents-metric-card {
   padding: var(--space-3);
   border-radius: var(--radius-lg);
-  border: 1px solid var(--color-border-subtle);
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(12px);
+  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 88%, var(--glass-outline));
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(18px) saturate(138%);
 }
 
 .agents-metric-label {
@@ -131,7 +131,7 @@
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-lg);
   border: 1px solid var(--color-border-default);
-  background: var(--color-bg-surface);
+  background: rgba(255, 255, 255, 0.8);
   color: var(--color-text-primary);
   transition: border-color var(--duration-fast) var(--ease-out-quart);
 }
@@ -165,7 +165,7 @@
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-full);
   border: 1px solid var(--color-border-default);
-  background: var(--color-bg-surface);
+  background: rgba(255, 255, 255, 0.8);
   color: var(--color-text-secondary);
   font-size: var(--text-sm);
   cursor: pointer;
@@ -175,8 +175,8 @@
 }
 
 .agents-filter-pill.active {
-  background: var(--color-bg-active);
-  border-color: var(--color-accent);
+  background: rgba(34, 118, 210, 0.12);
+  border-color: color-mix(in srgb, var(--color-accent) 36%, var(--color-border-default));
   color: var(--color-text-primary);
 }
 
@@ -245,17 +245,17 @@
 .agents-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 
 .agents-list-card {
   text-align: left;
   width: 100%;
-  padding: var(--space-4);
-  border-radius: var(--radius-xl);
-  border: 1px solid var(--color-border-subtle);
-  background: rgba(255, 255, 255, 0.7);
-  backdrop-filter: blur(10px);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 88%, var(--glass-outline));
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(16px) saturate(136%);
   cursor: pointer;
   transition:
     background-color var(--duration-fast) var(--ease-out-quart),
@@ -264,13 +264,13 @@
 }
 
 .agents-list-card.active {
-  border-color: var(--color-accent);
-  background: var(--color-bg-elevated);
+  border-color: color-mix(in srgb, var(--color-accent) 38%, var(--color-border-default));
+  background: rgba(34, 118, 210, 0.12);
 }
 
 .agents-list-card:hover {
-  background: var(--color-bg-elevated);
-  border-color: var(--color-border-hover);
+  background: rgba(255, 255, 255, 0.94);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-border-hover));
 }
 
 .agents-list-card-top {
@@ -282,7 +282,7 @@
 
 .agents-list-name {
   font-weight: var(--font-semibold);
-  font-size: var(--text-lg);
+  font-size: var(--text-sm);
   color: var(--color-text-primary);
   display: block;
 }
@@ -293,19 +293,24 @@
 }
 
 .agents-list-description {
-  margin: var(--space-2) 0;
+  margin: var(--space-1) 0;
   color: var(--color-text-secondary);
-  line-height: var(--leading-relaxed);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agents-list-tags {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
+  flex-wrap: nowrap;
+  gap: var(--space-1);
+  overflow: hidden;
 }
 
 .agents-list-footer {
-  margin-top: var(--space-3);
+  margin-top: var(--space-1);
   display: flex;
   justify-content: space-between;
   color: var(--color-text-tertiary);
@@ -314,20 +319,20 @@
 
 .agents-detail-card {
   border-radius: var(--radius-2xl);
-  border: 1px solid var(--color-border-subtle);
-  background: rgba(255, 255, 255, 0.78);
-  backdrop-filter: blur(14px);
-  padding: var(--space-5);
+  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 88%, var(--glass-outline));
+  background: rgba(244, 250, 253, 0.88);
+  backdrop-filter: blur(20px) saturate(140%);
+  padding: var(--space-3) var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-3);
 }
 
 .agents-detail-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: var(--space-4);
+  gap: var(--space-3);
 }
 
 .agents-detail-actions {
@@ -394,13 +399,13 @@
 .agents-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-4);
+  gap: var(--space-2) var(--space-3);
 }
 
 .agents-field {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: var(--space-1);
 }
 
 .agents-field.full {
@@ -415,11 +420,12 @@
 .agents-input,
 .agents-textarea {
   width: 100%;
-  padding: var(--space-3);
-  border-radius: var(--radius-lg);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
   border: 1px solid var(--color-border-default);
   background: var(--color-bg-surface);
   color: var(--color-text-primary);
+  font-size: var(--text-sm);
 }
 
 .agents-input:disabled,
@@ -442,25 +448,25 @@
 }
 
 .agents-lockout {
-  padding: var(--space-3);
-  border-radius: var(--radius-lg);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
   background: rgba(15, 23, 42, 0.04);
   color: var(--color-text-secondary);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
 }
 
 .agents-assignments {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--space-3);
   border-top: 1px solid var(--color-border-subtle);
-  padding-top: var(--space-4);
+  padding-top: var(--space-3);
 }
 
 .agents-assignments-header {
   display: flex;
   justify-content: space-between;
-  gap: var(--space-4);
+  gap: var(--space-2);
   align-items: flex-start;
   flex-wrap: wrap;
 }
@@ -482,37 +488,37 @@
 }
 
 .agents-assignment-note {
-  padding: var(--space-3);
-  border-radius: var(--radius-lg);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
   border: 1px solid var(--color-border-subtle);
   background: rgba(59, 130, 246, 0.08);
   color: var(--color-text-secondary);
-  font-size: var(--text-sm);
-  line-height: var(--leading-relaxed);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
 }
 
 .agents-assignments-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-4);
+  gap: var(--space-3);
 }
 
 .agents-assignment-card {
-  border-radius: var(--radius-xl);
-  border: 1px solid var(--color-border-subtle);
-  background: rgba(255, 255, 255, 0.78);
-  backdrop-filter: blur(12px);
-  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 88%, var(--glass-outline));
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(18px) saturate(136%);
+  padding: var(--space-3);
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
   transition:
     border-color var(--duration-fast) var(--ease-out-quart),
     transform var(--duration-fast) var(--ease-spring);
 }
 
 .agents-assignment-card:hover {
-  border-color: var(--color-border-hover);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, var(--color-border-hover));
   transform: translateY(-1px);
 }
 
@@ -524,15 +530,15 @@
 }
 
 .agents-assignment-title {
-  font-size: var(--text-lg);
+  font-size: var(--text-sm);
   font-weight: var(--font-semibold);
 }
 
 .agents-assignment-subtitle {
-  margin-top: var(--space-1);
+  margin-top: 0;
   color: var(--color-text-tertiary);
-  font-size: var(--text-sm);
-  line-height: var(--leading-relaxed);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
 }
 
 .agents-assignment-actions {
@@ -545,9 +551,9 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-3);
-  border-radius: var(--radius-lg);
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
   border: 1px solid var(--color-border-subtle);
   background: var(--color-bg-surface);
 }
@@ -605,8 +611,8 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: var(--space-3);
-  border-radius: var(--radius-lg);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
   border: 1px solid var(--color-border-subtle);
   background: var(--color-bg-surface);
   transition: border-color var(--duration-fast) var(--ease-out-quart);
@@ -737,14 +743,14 @@
 }
 
 .agents-section-title {
-  font-size: var(--text-lg);
+  font-size: var(--text-base);
   font-weight: var(--font-semibold);
 }
 
 .agents-section-subtitle {
-  margin: var(--space-1) 0 0 0;
+  margin: 0;
   color: var(--color-text-tertiary);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
 }
 
 .agents-error {

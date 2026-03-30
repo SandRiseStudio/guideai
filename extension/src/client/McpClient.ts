@@ -262,6 +262,47 @@ export interface ActionReplayStatusResult {
 }
 
 // ============================================
+// Bootstrap Types (GUIDEAI-276)
+// ============================================
+
+export type WorkspaceProfile = 'solo-dev' | 'guideai-platform' | 'team-collab' | 'extension-dev' | 'api-backend' | 'compliance-sensitive';
+
+export interface BootstrapSignal {
+    signal_name: string;
+    detected: boolean;
+    confidence: number;
+    evidence: string;
+}
+
+export interface BootstrapDetectResult {
+    profile: WorkspaceProfile;
+    confidence: number;
+    is_ambiguous: boolean;
+    runner_up: WorkspaceProfile | null;
+    signals: BootstrapSignal[];
+}
+
+export interface BootstrapStatusResult {
+    is_bootstrapped: boolean;
+    profile: WorkspaceProfile | null;
+    pack_id: string | null;
+    pack_version: string | null;
+    agents_md_exists: boolean;
+    guideai_dir_exists: boolean;
+    last_updated: string | null;
+}
+
+export interface BootstrapInitResult {
+    success: boolean;
+    profile: WorkspaceProfile;
+    detection: BootstrapDetectResult;
+    pack_id: string;
+    pack_version: string;
+    files_written: string[];
+    notes: string[];
+}
+
+// ============================================
 // Connection States
 // ============================================
 
@@ -965,6 +1006,43 @@ export class McpClient extends EventEmitter {
         });
     }
 
+    /**
+     * Full runtime injection: resolve context, retrieve behaviors, compose enriched prompt.
+     * E3 S3.3 (T3.3.2): Inject context blocks into extension chat.
+     */
+    async bciInject(params: {
+        task: string;
+        surface?: string;
+        role?: string;
+        workspacePath?: string;
+        topK?: number;
+        strategy?: 'embedding' | 'keyword' | 'hybrid';
+        format?: 'list' | 'prose' | 'structured';
+        citationMode?: 'explicit' | 'implicit' | 'inline';
+        tags?: string[];
+        phase?: string;
+    }): Promise<{
+        composed_prompt: string;
+        behaviors_injected: string[];
+        overlays_included: string[];
+        context: Record<string, unknown>;
+        token_estimate: number;
+        latency_ms: number;
+    }> {
+        return this.callTool('bci.inject', {
+            task: params.task,
+            surface: params.surface || 'vscode',
+            role: params.role,
+            workspace_path: params.workspacePath,
+            top_k: params.topK || 5,
+            strategy: params.strategy || 'hybrid',
+            format: params.format || 'list',
+            citation_mode: params.citationMode || 'explicit',
+            tags: params.tags,
+            phase: params.phase
+        });
+    }
+
     // ============================================
     // Amprealize Environment Orchestration
     // ============================================
@@ -1215,6 +1293,28 @@ export class McpClient extends EventEmitter {
                 surface: 'MCP'
             }
         });
+    }
+
+    // ============================================
+    // Bootstrap Tools (GUIDEAI-276)
+    // ============================================
+
+    async bootstrapDetect(params?: { workspace_path?: string }): Promise<BootstrapDetectResult> {
+        return this.callTool<BootstrapDetectResult>('bootstrap.detect', params || {});
+    }
+
+    async bootstrapStatus(params?: { workspace_path?: string }): Promise<BootstrapStatusResult> {
+        return this.callTool<BootstrapStatusResult>('bootstrap.status', params || {});
+    }
+
+    async bootstrapInit(params: {
+        workspace_path?: string;
+        profile?: string;
+        skip_primer?: boolean;
+        skip_pack?: boolean;
+        force?: boolean;
+    }): Promise<BootstrapInitResult> {
+        return this.callTool<BootstrapInitResult>('bootstrap.init', params);
     }
 
     // ============================================

@@ -2,18 +2,28 @@
 
 This package provides storage adapters for:
 - PostgreSQL: Primary database with connection pooling
+- SQLite: Local/OSS single-file database for offline use
 - OpenSearch/Elasticsearch: Audit log indexing and search
 - S3: WORM-compliant archive storage
 - Redis: Caching layer
 
-Storage Tier Hierarchy (per AUDIT_LOG_STORAGE.md):
+Storage Tier Hierarchy (per docs/contracts/AUDIT_LOG_STORAGE.md):
 - Hot: PostgreSQL (7-day partition, full CRUD)
 - Warm: OpenSearch (90-day retention, query-optimized)
 - Cold: S3 WORM (7-year archive, immutable)
+
+Use :func:`create_storage_pool` or :func:`guideai.storage.factory.create_storage_pool`
+to get a config-driven pool instance.
 """
 
 # PostgreSQL - always available
 from guideai.storage.postgres_pool import PostgresPool
+
+# SQLite - always available (stdlib)
+from guideai.storage.sqlite_pool import SQLitePool
+
+# Storage factory
+from guideai.storage.factory import create_storage_pool
 
 # OpenSearch - optional dependency
 try:
@@ -44,6 +54,10 @@ except ImportError:
 __all__ = [
     # PostgreSQL
     "PostgresPool",
+    # SQLite
+    "SQLitePool",
+    # Factory
+    "create_storage_pool",
     # OpenSearch (optional)
     "OPENSEARCH_AVAILABLE",
     "AuditEvent",

@@ -1,0 +1,13 @@
+# GuideAI code owners
+# Replace placeholder owners with the appropriate GitHub teams or usernames.
+
+* @guideai/maintainers
+
+/.github/ @guideai/maintainers
+/docs/ @guideai/maintainers
+/guideai/ @guideai/backend
+/packages/ @guideai/platform
+/extension/ @guideai/vscode
+/web-console/ @guideai/frontend
+/tests/ @guideai/maintainers
+/scripts/ @guideai/maintainers

@@ -85,6 +85,7 @@ def sample_project() -> Project:
     """Sample project fixture."""
     return Project(
         id="proj-abc123",
+        owner_id="user-test123",
         org_id="org-xyz789",
         name="Test Project",
         slug="test-project",
@@ -101,6 +102,7 @@ def sample_agent() -> Agent:
     """Sample agent fixture."""
     return Agent(
         id="agent-abc123",
+        owner_id="user-test123",
         org_id="org-xyz789",
         project_id="proj-abc123",
         name="Test Agent",

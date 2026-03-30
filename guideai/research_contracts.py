@@ -231,8 +231,42 @@ class ConflictItem(SerializableMixin):
 
 
 @dataclass
+class CompetitiveLandscapeItem(SerializableMixin):
+    """An existing tool, framework, library, or pattern that addresses a similar problem."""
+
+    name: str
+    category: str  # "tool", "framework", "library", "pattern", "paper"
+    url: Optional[str] = None
+    description: str = ""
+    maturity: str = "unknown"  # "experimental", "stable", "mature", "deprecated"
+    overlap_description: str = ""
+    differentiators: List[str] = field(default_factory=list)
+
+
+@dataclass
+class StructuredCon(SerializableMixin):
+    """A concern or risk with severity, likelihood, and mitigation."""
+
+    description: str
+    severity: str = "medium"  # "low", "medium", "high", "critical"
+    likelihood: str = "medium"  # "low", "medium", "high"
+    mitigation: str = ""
+    category: str = ""  # "technical", "operational", "security", "licensing"
+
+
+@dataclass
+class ValueProposition(SerializableMixin):
+    """Structured effectiveness and value assessment."""
+
+    effectiveness_summary: str
+    key_benefits: List[str] = field(default_factory=list)
+    measurable_outcomes: List[str] = field(default_factory=list)
+    value_to_guideai: str = ""
+
+
+@dataclass
 class EvaluationResult(SerializableMixin):
-    """Honest assessment of whether GuideAI should adopt this research."""
+    """Brutally honest assessment of whether GuideAI should adopt this research."""
 
     # Scores (1-10 each)
     relevance_score: float = 0.0
@@ -253,6 +287,9 @@ class EvaluationResult(SerializableMixin):
     # Weighted overall (calculated)
     overall_score: float = 0.0
 
+    # Unvarnished gut-check: plain-language, no-hedging assessment
+    honest_assessment: str = ""
+
     # Conflict Detection
     conflicts_with_existing: List[ConflictItem] = field(default_factory=list)
 
@@ -262,12 +299,21 @@ class EvaluationResult(SerializableMixin):
     expertise_gap: Complexity = Complexity.MEDIUM
     estimated_effort: str = ""  # T-shirt size + justification
 
-    # Honest Concerns
+    # Honest Concerns (flat lists kept for backward compatibility)
     concerns: List[str] = field(default_factory=list)
     risks: List[str] = field(default_factory=list)
 
+    # Structured cons with severity, likelihood, and mitigation
+    structured_cons: List[StructuredCon] = field(default_factory=list)
+
     # Benefits
     potential_benefits: List[str] = field(default_factory=list)
+
+    # Competitive Landscape
+    competitive_landscape: List[CompetitiveLandscapeItem] = field(default_factory=list)
+
+    # Value Proposition
+    value_proposition: Optional[ValueProposition] = None
 
     # Metadata
     llm_model: str = ""
@@ -320,19 +366,38 @@ class ImplementationRoadmap(SerializableMixin):
 
 
 @dataclass
+class AdoptionStrategy(SerializableMixin):
+    """Recommendation for how to adopt research findings."""
+
+    approach: str  # "use_directly", "extract_concepts", "hybrid", "build_custom"
+    rationale: str
+    direct_use_candidates: List[str] = field(default_factory=list)
+    concepts_to_extract: List[str] = field(default_factory=list)
+    integration_points: List[str] = field(default_factory=list)
+    estimated_time_saved: str = ""
+
+
+@dataclass
 class Recommendation(SerializableMixin):
     """Final recommendation with verdict and actionable next steps."""
 
     verdict: Verdict
     verdict_rationale: str
 
+    # Executive summary for human consumption
+    executive_summary: str = ""
+
     # Only if ADOPT or ADAPT
     implementation_roadmap: Optional[ImplementationRoadmap] = None
+
+    # Adoption strategy: use directly, extract concepts, hybrid, or build custom
+    adoption_strategy: Optional[AdoptionStrategy] = None
 
     # Handoff
     next_agent: Optional[str] = None  # architect, engineering, etc.
     priority: Priority = Priority.P3
     blocking_dependencies: List[str] = field(default_factory=list)
+    handoff_context: Dict[str, Any] = field(default_factory=dict)
 
     # Metadata
     created_at: datetime = field(default_factory=lambda: datetime.now())
@@ -350,7 +415,7 @@ class EvaluatePaperRequest(SerializableMixin):
     source: str  # URL, file path, or arxiv ID
     source_type: Optional[SourceType] = None
     context_documents: List[str] = field(
-        default_factory=lambda: ["AGENTS.md", "PRD.md", "MCP_SERVER_DESIGN.md"]
+        default_factory=lambda: ["AGENTS.md", "PRD.md", "docs/contracts/MCP_SERVER_DESIGN.md"]
     )
     llm_model: Optional[str] = None  # Defaults to ANTHROPIC_MODEL env var or claude-opus-4-20250514
     save_to_db: bool = True
@@ -363,11 +428,11 @@ class EvaluatePaperResponse(SerializableMixin):
     paper_id: str
     paper_title: str
 
-    # Phase results
-    ingested_paper: IngestedPaper
-    comprehension: ComprehensionResult
-    evaluation: EvaluationResult
-    recommendation: Recommendation
+    # Phase results (Optional when loaded from storage summary views)
+    ingested_paper: Optional[IngestedPaper] = None
+    comprehension: Optional[ComprehensionResult] = None
+    evaluation: Optional[EvaluationResult] = None
+    recommendation: Optional[Recommendation] = None
 
     # Metadata
     total_tokens_used: int = 0

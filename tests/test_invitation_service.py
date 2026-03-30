@@ -15,8 +15,13 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, call
 from typing import List, Dict, Any, Optional
 
-# Mark all tests in this module as unit tests (no DB infrastructure needed)
-pytestmark = pytest.mark.unit
+from guideai.multi_tenant.invitation_service import InvitationService
+
+# Mark all tests in this module as unit tests; skip entirely if enterprise not installed
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skipif(InvitationService is None, reason="InvitationService requires guideai-enterprise"),
+]
 
 # Import contracts
 from guideai.multi_tenant.contracts import (

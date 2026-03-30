@@ -19,11 +19,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from guideai.llm_provider import (
+from guideai.llm import (
+    LLMClient,
     LLMConfig,
-    LLMMessage,
-    LLMRequest,
-    get_provider,
 )
 from guideai.bci_contracts import (
     BehaviorMatch,
@@ -208,20 +206,15 @@ def main():
     print()
 
     config = LLMConfig.from_env()
-    provider = get_provider(config)
+    client = LLMClient(config)
 
     # Create request with BCI prompt
-    llm_request = LLMRequest(
-        messages=[
-            LLMMessage(role="system", content="You are a helpful assistant that follows the behavior guidelines provided."),
-            LLMMessage(role="user", content=bci_prompt),
-        ],
-        model=config.model,
-        max_tokens=500,
-        temperature=0.7,
-    )
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that follows the behavior guidelines provided."},
+        {"role": "user", "content": bci_prompt},
+    ]
 
-    response = provider.generate(llm_request)
+    response = client.call(messages, max_tokens=500, temperature=0.7)
 
     print("=" * 60)
     print("    Response")

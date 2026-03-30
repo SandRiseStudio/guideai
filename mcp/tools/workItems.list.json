@@ -15,13 +15,17 @@
       },
       "item_type": {
         "type": "string",
-        "enum": ["epic", "story", "task"],
-        "description": "Filter by work item type"
+        "enum": ["goal", "feature", "task", "bug", "epic", "story"],
+        "description": "Filter by work item type. Use goal/feature/task/bug. Legacy values epic/story are accepted"
       },
       "status": {
         "type": "string",
-        "enum": ["draft", "backlog", "todo", "in_progress", "in_review", "done", "cancelled"],
+        "enum": ["backlog", "in_progress", "in_review", "done"],
         "description": "Filter by status"
+      },
+      "parent_id": {
+        "type": "string",
+        "description": "Filter by parent work item ID (returns direct children of this item)"
       },
       "org_id": {
         "type": "string",

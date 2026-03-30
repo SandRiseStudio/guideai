@@ -41,9 +41,17 @@ def temp_key_dir(tmp_path):
     return tmp_path
 
 
+from guideai.crypto.signing import AuditSigner as _AuditSigner
+
+_has_real_signer = hasattr(_AuditSigner, 'save_key_pair')
+
 # ── Ed25519 Signing Tests ──────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(
+    not _has_real_signer,
+    reason="Full AuditSigner requires guideai-enterprise[crypto]",
+)
 class TestAuditSigner:
     """Tests for Ed25519 signing module."""
 
@@ -386,7 +394,7 @@ class TestAuditLogService:
             action="test",
         )
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             service.log_event(event)
         )
 

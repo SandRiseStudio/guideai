@@ -44,6 +44,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AgentPerformanceTreeDataProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const actorAvatar_1 = require("../utils/actorAvatar");
 class AgentPerformanceTreeDataProvider {
     constructor(client) {
         this.client = client;
@@ -200,9 +201,15 @@ class AgentPerformanceTreeDataProvider {
                 ? `${metricValuePct.toFixed(0)}%`
                 : metricValuePct.toFixed(0);
             return {
-                label: `${medal} ${performer.agentId}`,
+                label: `${medal} ${performer.agentName || performer.agentId}`,
                 description: `${displayValue} ${performer.metricName} • ${performer.totalTasks} tasks`,
-                iconPath: new vscode.ThemeIcon('account'),
+                iconPath: vscode.Uri.parse((0, actorAvatar_1.buildActorAvatarDataUri)((0, actorAvatar_1.createActorViewModel)({
+                    id: performer.agentId,
+                    kind: 'agent',
+                    displayName: performer.agentName || performer.agentId,
+                    subtitle: performer.metricName,
+                    presenceState: 'available',
+                }), 28)),
                 collapsibleState: vscode.TreeItemCollapsibleState.None,
                 contextValue: 'top-performer',
                 agentId: performer.agentId,

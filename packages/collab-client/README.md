@@ -39,6 +39,7 @@ function CollaborativeEditor({ documentId }: { documentId: string }) {
     replace,
     updateCursor,
     cursors,
+    presence,
     error,
   } = useCollaboration({
     config: {
@@ -77,6 +78,12 @@ function CollaborativeEditor({ documentId }: { documentId: string }) {
       {/* Render remote cursors */}
       {Array.from(cursors.entries()).map(([userId, cursor]) => (
         <div key={userId}>User {userId} at position {cursor.position}</div>
+      ))}
+      {/* Render remote presence */}
+      {Array.from(presence.entries()).map(([userId, info]) => (
+        <div key={`presence-${userId}`}>
+          {info.display_name ?? userId}: {info.status}
+        </div>
       ))}
       {error && <div className="error">{error.message}</div>}
     </div>

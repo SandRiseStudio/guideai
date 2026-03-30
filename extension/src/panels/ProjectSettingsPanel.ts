@@ -19,6 +19,11 @@ import {
 	GitHubCredential,
 	GitHubAppInstallation
 } from '../client/GuideAIClient';
+import {
+	McpClient,
+	BootstrapStatusResult,
+	WorkspaceProfile
+} from '../client/McpClient';
 
 // Execution mode determines where file changes are written
 export type ExecutionMode = 'local' | 'github_pr' | 'local_and_pr';
@@ -49,9 +54,11 @@ export class ProjectSettingsPanel {
 	private readonly _panel: vscode.WebviewPanel;
 	private readonly _extensionUri: vscode.Uri;
 	private readonly _client: GuideAIClient;
+	private readonly _mcpClient: McpClient | null;
 	private _disposables: vscode.Disposable[] = [];
 	private _projectId: string;
 	private _settings: ProjectSettings | null = null;
+	private _bootstrapStatus: BootstrapStatusResult | null = null;
 	private _validatedGithub: GitHubValidationResult | null = null;
 	private _credentials: LLMCredential[] = [];
 	// GitHub credential linking
@@ -64,11 +71,13 @@ export class ProjectSettingsPanel {
 		panel: vscode.WebviewPanel,
 		extensionUri: vscode.Uri,
 		client: GuideAIClient,
-		projectId: string
+		projectId: string,
+		mcpClient?: McpClient
 	) {
 		this._panel = panel;
 		this._extensionUri = extensionUri;
 		this._client = client;
+		this._mcpClient = mcpClient || null;
 		this._projectId = projectId;
 
 		this._update();
@@ -109,6 +118,9 @@ export class ProjectSettingsPanel {
 					case 'unlinkGitHub':
 						await this._unlinkGitHub(message.linkType);
 						return;
+					case 'openOnboarding':
+						vscode.commands.executeCommand('guideai.openOnboarding');
+						return;
 				}
 			},
 			null,
@@ -123,7 +135,8 @@ export class ProjectSettingsPanel {
 		extensionUri: vscode.Uri,
 		client: GuideAIClient,
 		projectId: string,
-		projectName?: string
+		projectName?: string,
+		mcpClient?: McpClient
 	) {
 		const column = vscode.ViewColumn.One;
 
@@ -151,7 +164,8 @@ export class ProjectSettingsPanel {
 			panel,
 			extensionUri,
 			client,
-			projectId
+			projectId,
+			mcpClient
 		);
 	}
 
@@ -159,13 +173,15 @@ export class ProjectSettingsPanel {
 		panel: vscode.WebviewPanel,
 		extensionUri: vscode.Uri,
 		client: GuideAIClient,
-		projectId: string
+		projectId: string,
+		mcpClient?: McpClient
 	) {
 		ProjectSettingsPanel.currentPanel = new ProjectSettingsPanel(
 			panel,
 			extensionUri,
 			client,
-			projectId
+			projectId,
+			mcpClient
 		);
 	}
 
@@ -192,10 +208,23 @@ export class ProjectSettingsPanel {
 				this._myGitHubCredentials = [];
 				this._myGitHubAppInstallations = [];
 			}
+			// Load bootstrap status (local workspace)
+			await this._loadBootstrapStatus();
 			this._update();
 		} catch (error) {
 			console.error('Failed to load project settings:', error);
 			vscode.window.showErrorMessage(`Failed to load settings: ${error}`);
+		}
+	}
+
+	private async _loadBootstrapStatus() {
+		if (!this._mcpClient) {
+			return;
+		}
+		try {
+			this._bootstrapStatus = await this._mcpClient.bootstrapStatus();
+		} catch {
+			this._bootstrapStatus = null;
 		}
 	}
 
@@ -366,6 +395,58 @@ export class ProjectSettingsPanel {
 
 	private _update() {
 		this._panel.webview.html = this._getHtmlForWebview();
+	}
+
+	private _renderBootstrapSection(): string {
+		const status = this._bootstrapStatus;
+		if (!this._mcpClient) {
+			return '';
+		}
+
+		const profileLabels: Record<WorkspaceProfile, string> = {
+			'solo-dev': 'Solo Developer',
+			'guideai-platform': 'GuideAI Platform',
+			'team-collab': 'Team Collaboration',
+			'extension-dev': 'Extension Development',
+			'api-backend': 'API Backend',
+			'compliance-sensitive': 'Compliance-Sensitive'
+		};
+
+		if (!status || !status.is_bootstrapped) {
+			return `
+			<section class="settings-section">
+				<h2>Workspace Profile</h2>
+				<p class="section-description">
+					Detect your workspace type and install a tailored knowledge pack with behaviors and AGENTS.md.
+				</p>
+				<div class="info-card warning">
+					<span class="info-icon">⚠️</span>
+					<span>This workspace has not been bootstrapped yet.</span>
+				</div>
+				<button class="primary-btn" id="setupWorkspaceBtn">Set Up Workspace</button>
+			</section>`;
+		}
+
+		const profileLabel = profileLabels[status.profile as WorkspaceProfile] || status.profile || 'Unknown';
+		return `
+		<section class="settings-section">
+			<h2>Workspace Profile</h2>
+			<p class="section-description">
+				Your workspace profile determines which knowledge pack and behaviors are active.
+			</p>
+			<div class="result-summary">
+				<div class="form-row">
+					<span class="field-label">Profile</span>
+					<span>${escapeHtml(profileLabel)}</span>
+				</div>
+				${status.pack_id ? `
+				<div class="form-row">
+					<span class="field-label">Knowledge Pack</span>
+					<span>${escapeHtml(status.pack_id)}${status.pack_version ? ` v${escapeHtml(status.pack_version)}` : ''}</span>
+				</div>` : ''}
+			</div>
+			<button class="secondary-btn" id="setupWorkspaceBtn" style="margin-top: 8px;">Reconfigure</button>
+		</section>`;
 	}
 
 	private _renderGitHubResolutionStatus(): string {
@@ -686,6 +767,8 @@ export class ProjectSettingsPanel {
 			${this._renderGitHubLinkSection()}
 		</section>
 
+		${this._renderBootstrapSection()}
+
 		<div class="actions">
 			<button class="primary-btn" id="saveBtn">Save Settings</button>
 		</div>
@@ -869,6 +952,13 @@ export class ProjectSettingsPanel {
 						type: 'unlinkGitHub',
 						linkType: linkType
 					});
+				});
+			}
+
+			const setupWorkspaceBtn = document.getElementById('setupWorkspaceBtn');
+			if (setupWorkspaceBtn) {
+				setupWorkspaceBtn.addEventListener('click', () => {
+					vscode.postMessage({ type: 'openOnboarding' });
 				});
 			}
 

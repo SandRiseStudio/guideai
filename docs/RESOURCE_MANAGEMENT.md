@@ -5,7 +5,7 @@
 | Resource | Size | Impact | Can Remove? |
 |----------|------|--------|-------------|
 | HuggingFace models (~/.cache/huggingface) | **4.3 GB** | High | ⚠️ Yes, but will re-download |
-| Podman images | **~4.8 GB** | High | ⚠️ Partial (keep postgres:16-alpine, pgvector:pg16, redis:7-alpine) |
+| Podman images | **~2.1 GB** | High | ⚠️ Partial (keep timescaledb:latest-pg16, redis:7-alpine) |
 | Python venv (.venv) | 894 MB | Low | ❌ No (needed for development) |
 | Extension node_modules | 82 MB | Low | ⚠️ Yes (can reinstall) |
 | Project data (data/) | 7 MB | Minimal | ❌ No (contains your data) |

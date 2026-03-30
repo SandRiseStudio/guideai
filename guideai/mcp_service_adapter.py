@@ -310,7 +310,7 @@ class ContextSwitchHandler:
         Switch to a different project context.
 
         For org-owned projects, verifies the project belongs to the
-        current org context (if set). For personal projects, verifies
+        current org context (if set). For user-owned projects, verifies
         the user is the owner or collaborator.
 
         Args:
@@ -358,7 +358,7 @@ class ContextSwitchHandler:
                             error_code="ACCESS_DENIED",
                         )
             else:
-                # Personal project - verify user is owner or collaborator
+                # User-owned project - verify user is owner or collaborator
                 if project.owner_id != identity:
                     # TODO: Check collaborators when implemented
                     pass

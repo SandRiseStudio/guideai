@@ -40,11 +40,18 @@ from .task_cycle_contracts import (
 )
 from .task_cycle_service import TaskCycleService
 from .telemetry import TelemetryClient
+from .agents.work_item_planner.prompts import GWS_COMPACT_SUMMARY
 
-# EKA (Early Knowledge Alignment) configuration
+# Feature flags (formal service replaces ad-hoc env vars — T4.4.1)
 import os
-ENABLE_EARLY_RETRIEVAL = os.getenv("GUIDEAI_ENABLE_EARLY_RETRIEVAL", "true").lower() == "true"
+from .feature_flags import FeatureFlagService
+
 EARLY_RETRIEVAL_TOP_K = int(os.getenv("GUIDEAI_EARLY_RETRIEVAL_TOP_K", "5"))
+
+# Legacy module-level constants kept for backward compat; callers should
+# prefer FeatureFlagService.is_enabled() instead.
+ENABLE_EARLY_RETRIEVAL = os.getenv("GUIDEAI_ENABLE_EARLY_RETRIEVAL", "true").lower() == "true"
+ENABLE_AUTO_REFLECTION = os.getenv("GUIDEAI_ENABLE_AUTO_REFLECTION", "false").lower() == "true"
 
 from .work_item_execution_contracts import (
     AgentResponse,
@@ -89,6 +96,7 @@ class PhaseContext:
     available_tools: List[str]
     messages: List[Dict[str, Any]] = field(default_factory=list)
     outputs: Dict[str, Any] = field(default_factory=dict)
+    phase_bci: Optional[Dict[str, Any]] = None  # E3 S3.9: per-phase BCI injection result
 
 
 @dataclass
@@ -137,6 +145,8 @@ class AgentExecutionLoop:
         bci_service: Optional[Any] = None,  # BCIService for early retrieval
         enable_early_retrieval: Optional[bool] = None,  # Override env var config
         gate_notifier: Optional[Any] = None,  # GateNotifier for gate event notifications
+        runtime_injector: Optional[Any] = None,  # RuntimeInjector for per-phase BCI
+        feature_flag_service: Optional[FeatureFlagService] = None,  # T4.4.1
     ) -> None:
         """Initialize AgentExecutionLoop.
 
@@ -150,7 +160,12 @@ class AgentExecutionLoop:
             bci_service: BCIService for Early Knowledge Alignment (EKA) retrieval
             enable_early_retrieval: Override GUIDEAI_ENABLE_EARLY_RETRIEVAL env var
             gate_notifier: Notifier for gate events (SSE, webhook, Slack)
+            runtime_injector: RuntimeInjector for per-phase BCI (E3 S3.9)
+            feature_flag_service: Formal feature flag service (T4.4.1)
         """
+        # T4.4.1: Feature flag service (shared registry)
+        self._feature_flags = feature_flag_service or FeatureFlagService()
+
         # Initialize run service - prefer PostgreSQL when DSN is available
         if run_service is not None:
             self._run_service = run_service
@@ -173,10 +188,14 @@ class AgentExecutionLoop:
         self._github_service = github_service
         self._gate_notifier = gate_notifier
 
+        # E3 S3.9: RuntimeInjector for per-phase behavior injection
+        self._runtime_injector = runtime_injector
+
         # EKA (Early Knowledge Alignment) - retrieve behaviors before planning
         self._bci_service = bci_service
         self._enable_early_retrieval = (
-            enable_early_retrieval if enable_early_retrieval is not None else ENABLE_EARLY_RETRIEVAL
+            enable_early_retrieval if enable_early_retrieval is not None
+            else self._feature_flags.is_enabled("feature.early_knowledge_alignment")
         )
 
         # PR execution context (set during run() if in PR mode)
@@ -201,6 +220,15 @@ class AgentExecutionLoop:
     def set_tool_executor(self, executor: Any) -> None:
         """Set the tool executor (avoids circular import)."""
         self._tool_executor = executor
+        # Propagate tool schemas to LLM client so the model gets proper
+        # parameter descriptions instead of empty fallback schemas.
+        if self._llm_client and hasattr(executor, "get_tool_schemas"):
+            try:
+                schemas = executor.get_tool_schemas()
+                if schemas and hasattr(self._llm_client, "register_tools"):
+                    self._llm_client.register_tools(schemas)
+            except Exception:
+                pass  # Non-critical; LLM falls back to generic schemas
 
     def set_github_service(self, service: Any) -> None:
         """Set the GitHub service (avoids circular import)."""
@@ -324,6 +352,71 @@ class AgentExecutionLoop:
 
             return []  # Graceful degradation - proceed without behaviors
 
+    def _inject_phase_behaviors(
+        self,
+        phase: CyclePhase,
+        work_item: WorkItem,
+        run_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Inject phase-specific behaviors via RuntimeInjector (E3 S3.9 / T3.9.3).
+
+        Called at the start of each phase to retrieve behaviors boosted for the
+        current GEP phase.  Returns the injection result as a dict, or None if
+        injection is unavailable.
+        """
+        if not self._runtime_injector:
+            return None
+
+        from time import perf_counter
+
+        query = f"{work_item.title}"
+        if work_item.description:
+            query = f"{query} {work_item.description[:500]}"
+
+        start = perf_counter()
+        try:
+            result = self._runtime_injector.inject(
+                task_description=query,
+                surface="agent_loop",
+                phase=phase.value,
+            )
+            elapsed_ms = (perf_counter() - start) * 1000.0
+
+            self._telemetry.emit_event(
+                event_type="bci.phase_injection",
+                payload={
+                    "run_id": run_id,
+                    "phase": phase.value,
+                    "behaviors_injected": result.behaviors_injected,
+                    "overlays_included": result.overlays_included,
+                    "token_estimate": result.token_estimate,
+                    "latency_ms": round(elapsed_ms, 2),
+                },
+            )
+            logger.info(
+                f"Phase BCI injected {len(result.behaviors_injected)} behaviors "
+                f"for phase {phase.value} run {run_id} in {elapsed_ms:.1f}ms"
+            )
+            return {
+                "behaviors_injected": result.behaviors_injected,
+                "overlays_included": result.overlays_included,
+                "composed_prompt": result.composed_prompt,
+                "token_estimate": result.token_estimate,
+            }
+        except Exception as e:
+            elapsed_ms = (perf_counter() - start) * 1000.0
+            logger.warning(f"Phase BCI injection failed for {phase.value}: {e}")
+            self._telemetry.emit_event(
+                event_type="bci.phase_injection",
+                payload={
+                    "run_id": run_id,
+                    "phase": phase.value,
+                    "error": str(e),
+                    "latency_ms": round(elapsed_ms, 2),
+                },
+            )
+            return None  # Graceful degradation
+
     async def run(
         self,
         *,
@@ -436,6 +529,9 @@ class AgentExecutionLoop:
                         outputs=self._merge_outputs(phase_outputs),
                         metadata={"phase": CyclePhase.COMPLETING.value},
                     )
+
+                    # E4: Auto-reflection on successful runs
+                    self._try_post_run_reflection(run_id, phase_outputs)
 
                     logger.info(f"Execution completed for run {run_id}")
                     return {
@@ -722,6 +818,9 @@ class AgentExecutionLoop:
         )
         self._add_run_step(run_id, step)
 
+        # E3 S3.9 (T3.9.3): inject phase-specific behaviors
+        phase_bci = self._inject_phase_behaviors(phase, work_item, run_id)
+
         # Build phase context
         context = PhaseContext(
             phase=phase,
@@ -731,6 +830,7 @@ class AgentExecutionLoop:
             playbook=playbook,
             available_tools=self._get_available_tools(phase, exec_policy),
             outputs=dict(previous_outputs.get(phase, {})),
+            phase_bci=phase_bci,
         )
 
         try:
@@ -1727,7 +1827,7 @@ class AgentExecutionLoop:
 
         # Add internet tools if enabled
         if exec_policy.internet_access == InternetAccessPolicy.ENABLED:
-            tools.extend(["fetch_url", "search_web"])
+            tools.extend(["fetch_url", "search_web", "research_evaluate"])
 
         return tools
 
@@ -1769,18 +1869,23 @@ class AgentExecutionLoop:
                 )
 
             # Record tool call step with both inputs AND outputs
+            tool_output = result.output if result.success else None
+            content: Dict[str, Any] = {
+                "tool_name": call.tool_name,
+                "inputs": call.tool_args,
+                "success": result.success,
+                "output": tool_output,
+                "error": result.error if not result.success else None,
+            }
+            # Bubble up text from tool output for rich rendering (e.g. markdown reports)
+            if isinstance(tool_output, dict) and "text" in tool_output:
+                content["text"] = tool_output["text"]
             step = ExecutionStep(
                 step_id=_short_id("step"),
                 step_type=ExecutionStepType.TOOL_CALL,
                 phase="tool_execution",
                 timestamp=start_time,
-                content={
-                    "tool_name": call.tool_name,
-                    "inputs": call.tool_args,
-                    "success": result.success,
-                    "output": result.output if result.success else None,
-                    "error": result.error if not result.success else None,
-                },
+                content=content,
                 tool_name=call.tool_name,
             )
             self._add_run_step(run_id, step)
@@ -1797,7 +1902,7 @@ class AgentExecutionLoop:
             return False
 
         # Internet tools check
-        internet_tools = {"fetch_url"}
+        internet_tools = {"fetch_url", "research_evaluate"}
         if tool_name in internet_tools and exec_policy.internet_access == InternetAccessPolicy.DISABLED:
             return False
 
@@ -1850,7 +1955,14 @@ class AgentExecutionLoop:
 
             # Store full content as JSON for retrieval, and a short preview for display
             content_json = json.dumps(content, ensure_ascii=True) if content else None
-            preview = content_json[:240] if content_json else None
+            # Prefer human-readable preview from tool output, fall back to truncated JSON
+            tool_output = content.get("output") if isinstance(content, dict) else None
+            explicit_preview = (
+                tool_output.get("content_preview")
+                if isinstance(tool_output, dict)
+                else None
+            )
+            preview = explicit_preview or (content_json[:240] if content_json else None)
 
             metadata: Dict[str, Any] = {
                 "phase": phase,
@@ -2066,6 +2178,154 @@ class AgentExecutionLoop:
         return merged
 
     # =========================================================================
+    # Post-Run Reflection (E4: Learning Loop)
+    # =========================================================================
+
+    def _try_post_run_reflection(
+        self,
+        run_id: str,
+        phase_outputs: Dict[CyclePhase, Dict[str, Any]],
+    ) -> None:
+        """Attempt auto-reflection on a completed run to extract candidate behaviors.
+
+        Gated by feature.auto_reflection flag. Failures are logged but never
+        block the run completion path.
+        """
+        if not self._feature_flags.is_enabled("feature.auto_reflection"):
+            return
+
+        try:
+            self._run_post_run_reflection(run_id, phase_outputs)
+        except Exception:
+            logger.debug("Post-run reflection failed for run %s", run_id, exc_info=True)
+
+    def _run_post_run_reflection(
+        self,
+        run_id: str,
+        phase_outputs: Dict[CyclePhase, Dict[str, Any]],
+    ) -> None:
+        """Core reflection logic — separated for testability."""
+        from .reflection_contracts import ReflectRequest
+        from .reflection_service import ReflectionService
+        from .telemetry_events import (
+            ReflectionCandidateExtractedPayload,
+            TelemetryEventType,
+        )
+
+        # Build trace text from accumulated phase outputs
+        trace_parts: List[str] = []
+        for phase in (
+            CyclePhase.PLANNING,
+            CyclePhase.CLARIFYING,
+            CyclePhase.ARCHITECTING,
+            CyclePhase.EXECUTING,
+            CyclePhase.TESTING,
+            CyclePhase.FIXING,
+            CyclePhase.VERIFYING,
+            CyclePhase.COMPLETING,
+        ):
+            outputs = phase_outputs.get(phase)
+            if not outputs:
+                continue
+            summary = outputs.get("summary") or outputs.get("plan") or ""
+            if summary:
+                trace_parts.append(f"[{phase.value.upper()}] {summary}")
+
+        if not trace_parts:
+            logger.debug("No trace content for reflection on run %s", run_id)
+            return
+
+        trace_text = "\n\n".join(trace_parts)
+
+        # Create a lightweight ReflectionService (reuse BCI service if available)
+        reflection = ReflectionService(
+            bci_service=self._bci_service,
+            telemetry=self._telemetry,
+        )
+
+        request = ReflectRequest(
+            trace_text=trace_text,
+            run_id=run_id,
+            max_candidates=5,
+            min_quality_score=0.6,
+        )
+        response = reflection.reflect(request)
+
+        if not response.candidates:
+            logger.info("Auto-reflection for run %s produced no candidates", run_id)
+            return
+
+        logger.info(
+            "Auto-reflection for run %s extracted %d candidates (top: %s, %.2f)",
+            run_id,
+            len(response.candidates),
+            response.candidates[0].display_name,
+            response.candidates[0].confidence,
+        )
+
+        # Emit typed telemetry for each candidate
+        for candidate in response.candidates:
+            try:
+                payload = ReflectionCandidateExtractedPayload(
+                    candidate_id=candidate.slug,
+                    confidence=candidate.confidence,
+                    run_id=run_id,
+                    candidate_slug=candidate.slug,
+                    quality_scores={
+                        "clarity": candidate.quality_scores.clarity,
+                        "generality": candidate.quality_scores.generality,
+                        "reusability": candidate.quality_scores.reusability,
+                        "correctness": candidate.quality_scores.correctness,
+                    },
+                )
+                self._telemetry.emit_event(
+                    event_type=TelemetryEventType.REFLECTION_CANDIDATE_EXTRACTED.value,
+                    payload=payload.to_dict(),
+                )
+            except Exception:
+                logger.debug("Failed to emit reflection telemetry", exc_info=True)
+
+        # Persist candidates if PostgresReflectionService is available
+        self._persist_reflection_candidates(run_id, response)
+
+    def _persist_reflection_candidates(self, run_id: str, response: Any) -> None:
+        """Store reflection candidates in PostgreSQL if configured."""
+        try:
+            from .utils.dsn import apply_host_overrides
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_REFLECTION_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "REFLECTION",
+            )
+            if not dsn:
+                return
+
+            from .reflection_service_postgres import PostgresReflectionService
+
+            pg_reflection = PostgresReflectionService(dsn=dsn)
+            for candidate in response.candidates:
+                pg_reflection.create_candidate(
+                    name=candidate.slug,
+                    summary=candidate.instruction,
+                    triggers=[f"Extracted from run {run_id}"],
+                    steps=candidate.supporting_steps,
+                    confidence=candidate.confidence,
+                    role="student",
+                    keywords=candidate.tags,
+                    metadata={
+                        "source_run_id": run_id,
+                        "quality_scores": {
+                            "clarity": candidate.quality_scores.clarity,
+                            "generality": candidate.quality_scores.generality,
+                            "reusability": candidate.quality_scores.reusability,
+                            "correctness": candidate.quality_scores.correctness,
+                        },
+                    },
+                )
+            logger.info("Persisted %d reflection candidates for run %s", len(response.candidates), run_id)
+        except Exception:
+            logger.debug("Failed to persist reflection candidates for run %s", run_id, exc_info=True)
+
+    # =========================================================================
     # Prompt Builders
     # =========================================================================
 
@@ -2106,6 +2366,8 @@ Work Item:
 - Description: {context.work_item.description or 'No description'}
 - Labels: {', '.join(context.work_item.labels) if context.work_item.labels else 'None'}
 {eka_section}
+{GWS_COMPACT_SUMMARY}
+
 Playbook Instructions:
 {json.dumps(context.playbook.get('planning_instructions', {}), indent=2)}
 

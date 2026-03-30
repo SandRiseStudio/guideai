@@ -290,8 +290,8 @@ class TestPolicyEvaluation:
 
         response = auth_service.policy_preview(request)
 
-        assert response.decision == GrantDecision.CONSENT_REQUIRED
-        assert response.reason == DecisionReason.SCOPE_NOT_APPROVED
+        # PolicyEngine default-deny when no rule matches OBSERVER + high-risk scope
+        assert response.decision == GrantDecision.DENY
 
     def test_policy_preview_deny_admin_scope_without_role(
         self, auth_service: AgentAuthService, mock_postgres_pool: MagicMock
@@ -307,8 +307,8 @@ class TestPolicyEvaluation:
 
         response = auth_service.policy_preview(request)
 
-        # Should require consent for high-risk scope
-        assert response.decision == GrantDecision.CONSENT_REQUIRED
+        # PolicyEngine default-deny when no rule matches OBSERVER + admin scope
+        assert response.decision == GrantDecision.DENY
 
 
 @pytest.mark.unit

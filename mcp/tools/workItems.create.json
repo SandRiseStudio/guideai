@@ -1,14 +1,14 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "workItems.create",
-  "description": "Create a new work item (epic, story, or task). Tasks represent the smallest unit of work and can be linked to behaviors.",
+  "description": "Create a new work item (goal, feature, task, or bug). Legacy values 'epic' and 'story' are accepted for backward compatibility.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "item_type": {
         "type": "string",
-        "enum": ["epic", "story", "task"],
-        "description": "Type of work item to create (required)"
+        "enum": ["goal", "feature", "task", "bug", "epic", "story"],
+        "description": "Type of work item to create. Use goal/feature/task/bug. Legacy values epic/story are accepted (required)"
       },
       "project_id": {
         "type": "string",
@@ -24,7 +24,7 @@
       },
       "parent_id": {
         "type": "string",
-        "description": "Parent work item ID (for stories under epics, or tasks under stories)"
+        "description": "Parent work item ID (for features under goals, or tasks under features)"
       },
       "title": {
         "type": "string",
@@ -48,11 +48,17 @@
         "items": { "type": "string" },
         "description": "Labels/tags for categorization"
       },
+      "points": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "description": "Point estimate for this work item"
+      },
       "story_points": {
         "type": "integer",
         "minimum": 0,
         "maximum": 100,
-        "description": "Story point estimate"
+        "description": "Deprecated alias for 'points'. Use 'points' instead."
       },
       "estimated_hours": {
         "type": "number",

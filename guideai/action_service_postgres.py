@@ -2,7 +2,7 @@
 
 Provides WORM (Write-Once-Read-Many) storage for platform actions with replay tracking.
 Schema defined in ``schema/migrations/004_create_action_service.sql``.
-Contract documented in ``ACTION_SERVICE_CONTRACT.md``.
+Contract documented in ``docs/contracts/ACTION_SERVICE_CONTRACT.md``.
 
 For in-memory testing, use ActionService from action_service.py instead.
 """

@@ -298,39 +298,6 @@ export function useProject(projectId?: string) {
 }
 
 /**
- * Fetch agents (optionally filtered by organization)
- */
-export function useAgents(orgId?: string, enabled = true) {
-  return useQuery({
-    queryKey: dashboardKeys.agents(orgId),
-    queryFn: async (): Promise<Agent[]> => {
-      const endpoints = orgId
-        ? [`/v1/orgs/${orgId}/agents`, `/v1/organizations/${orgId}/agents`]
-        : ['/v1/agents'];
-      let lastError: unknown = null;
-      for (const endpoint of endpoints) {
-        try {
-          const response = await apiClient.get(endpoint) as ListResponse<Agent> | Agent[];
-          return extractItems(response);
-        } catch (error) {
-          if (error instanceof ApiError && error.status === 404) {
-            continue;
-          }
-          lastError = error;
-        }
-      }
-      if (lastError) {
-        throw lastError;
-      }
-      return [];
-    },
-    refetchInterval: POLLING_INTERVAL,
-    staleTime: POLLING_INTERVAL / 2,
-    enabled,
-  });
-}
-
-/**
  * Fetch recent runs
  */
 export function useRecentRuns(limit = 10) {

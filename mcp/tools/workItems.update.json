@@ -1,13 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "name": "workItems.update",
-  "description": "Update work item fields. Only provided fields will be updated.",
+  "description": "Update work item fields. Only provided fields will be updated. When setting status to 'done' with cascade_to_children=true, all incomplete descendants will also be marked done.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "item_id": {
         "type": "string",
-        "description": "Work item ID to update (required)"
+        "description": "Work item ID or display ID (e.g. 'myproject-42') to update (required)"
+      },
+      "item_type": {
+        "type": "string",
+        "enum": ["goal", "feature", "task", "bug"],
+        "description": "Change the work item type (optional, uses session). Accepts legacy names: epic→goal, story→feature."
       },
       "title": {
         "type": "string",
@@ -22,7 +27,7 @@
       },
       "status": {
         "type": "string",
-        "enum": ["draft", "backlog", "todo", "in_progress", "in_review", "done", "cancelled"],
+        "enum": ["backlog", "in_progress", "in_review", "done"],
         "description": "New status"
       },
       "priority": {
@@ -35,11 +40,17 @@
         "items": { "type": "string" },
         "description": "New labels (replaces existing)"
       },
+      "points": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "description": "Point estimate for this work item"
+      },
       "story_points": {
         "type": "integer",
         "minimum": 0,
         "maximum": 100,
-        "description": "Story point estimate"
+        "description": "Deprecated alias for 'points'. Use 'points' instead."
       },
       "estimated_hours": {
         "type": "number",
@@ -78,6 +89,15 @@
         "type": "object",
         "description": "Additional metadata"
       },
+      "parent_id": {
+        "type": "string",
+        "description": "New parent work item ID to reparent this item under a different goal/feature"
+      },
+      "cascade_to_children": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true and status is set to 'done', also mark all incomplete descendants as done"
+      },
       "user_id": {
         "type": "string",
         "description": "ID of the user updating the item"
@@ -102,6 +122,17 @@
           "status": { "type": "string" },
           "priority": { "type": "string" },
           "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "cascade_result": {
+        "type": "object",
+        "description": "Only present when cascade_to_children=true",
+        "properties": {
+          "updated_count": { "type": "integer" },
+          "updated_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
         }
       },
       "message": { "type": "string" },

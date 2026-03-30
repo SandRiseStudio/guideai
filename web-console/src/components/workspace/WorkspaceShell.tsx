@@ -1,7 +1,12 @@
 /**
  * WorkspaceShell Component
  *
- * High-performance collaborative workspace shell with:
+ * Internal application shell for the web console.
+ *
+ * Note: the name is kept for compatibility, but user-facing copy should prefer
+ * Personal / Organization / Scope terminology instead of "workspace".
+ *
+ * High-performance collaborative shell with:
  * - Smooth sidebar collapse animation
  * - Presence indicators
  * - Command palette ready
@@ -9,41 +14,61 @@
  */
 
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useCollabStore, collabStore, usePresenceList } from '../../store/collabStore';
 import { useAuth } from '../../auth';
-import { useOrganizations } from '../../api/dashboard';
+import { useOrganizations, useProject } from '../../api/dashboard';
+import { useProjectAgents } from '../../api/agentRegistry';
+import { useExecutionList, useExecutionStream } from '../../api/executions';
+import {
+  CURRENT_SCOPE_LABEL,
+  NEW_PROJECT_CTA,
+  PERSONAL_SCOPE_LABEL,
+  resolveScopeSubtitle,
+} from '../../copy/scopeLabels';
 import { OrgSwitcher } from '../OrgSwitcher';
 import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
+import { ActorAvatar } from '../actors/ActorAvatar';
+import { toActorViewModel } from '../../utils/actorViewModel';
 import './WorkspaceShell.css';
+
+type ShellPresenceStatus = 'active' | 'idle' | 'away' | 'disconnected';
+
+interface ShellPresenceParticipant {
+  user_id: string;
+  display_name?: string;
+  color?: string;
+  status: ShellPresenceStatus;
+}
 
 // ---------------------------------------------------------------------------
 // Presence Avatar Component
 // ---------------------------------------------------------------------------
 
 interface PresenceAvatarProps {
+  id: string;
   name: string;
   color: string;
-  status: 'active' | 'idle' | 'away' | 'disconnected';
+  status: ShellPresenceStatus;
   showStatus?: boolean;
 }
 
 const PresenceAvatar = memo(function PresenceAvatar({
+  id,
   name,
   color,
   status,
   showStatus = true,
 }: PresenceAvatarProps) {
-  const initials = name
-    .split(' ')
-    .map((n) => n[0])
-    .join('')
-    .toUpperCase()
-    .slice(0, 2);
+  const participantStatus = status === 'disconnected' ? 'away' : status;
+  const actor = toActorViewModel(
+    { user_id: id, display_name: name, color, status: participantStatus },
+    { presenceState: status === 'active' ? 'working' : status === 'idle' ? 'available' : status === 'away' ? 'paused' : 'offline' },
+  );
 
   return (
     <div className="presence-avatar" style={{ '--avatar-color': color } as React.CSSProperties}>
-      <span className="presence-avatar-initials">{initials}</span>
+      <ActorAvatar actor={actor} size="sm" surfaceType="rail" decorative className="presence-avatar-image" />
       {showStatus && (
         <span
           className={`presence-avatar-status presence-status-${status}`}
@@ -71,7 +96,7 @@ const Sidebar = memo(function Sidebar({ collapsed, onToggle, children }: Sidebar
     <aside
       ref={sidebarRef}
       className={`workspace-sidebar ${collapsed ? 'collapsed' : ''}`}
-      aria-label="Workspace navigation"
+      aria-label="Primary navigation"
     >
       <div className="sidebar-header">
         <button
@@ -97,7 +122,7 @@ const Sidebar = memo(function Sidebar({ collapsed, onToggle, children }: Sidebar
           </svg>
         </button>
         {!collapsed && (
-          <span className="sidebar-title animate-fade-in-up">Workspace</span>
+          <span className="sidebar-title animate-fade-in-up">GuideAI</span>
         )}
       </div>
 
@@ -117,23 +142,48 @@ const Sidebar = memo(function Sidebar({ collapsed, onToggle, children }: Sidebar
 interface HeaderProps {
   documentTitle?: string;
   connectionState: string;
+  presenceList: ShellPresenceParticipant[];
 }
 
-const Header = memo(function Header({ documentTitle, connectionState }: HeaderProps) {
+const Header = memo(function Header({ documentTitle, connectionState, presenceList }: HeaderProps) {
   const { actor, logout, isAuthenticated } = useAuth();
+  const location = useLocation();
   const navigate = useNavigate();
-  const presenceList = usePresenceList();
   const { data: organizations = [] } = useOrganizations();
   const { currentOrgId } = useOrgContext();
   const sortedOrganizations = useMemo(
     () => [...organizations].sort((a, b) => a.name.localeCompare(b.name)),
     [organizations]
   );
+  const currentOrg = useMemo(
+    () => organizations.find((org) => org.id === currentOrgId) ?? null,
+    [currentOrgId, organizations]
+  );
   const [commandPaletteHint, setCommandPaletteHint] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const profileMenuRef = useRef<HTMLDivElement>(null);
+  const profileTriggerRef = useRef<HTMLButtonElement>(null);
+  const { projectId } = useParams();
+  const surfaceLabel = useMemo(() => {
+    if (location.pathname === '/') return 'Home';
+    if (location.pathname.startsWith('/projects')) return 'Projects';
+    if (location.pathname.startsWith('/agents')) return 'Agents';
+    if (location.pathname.startsWith('/orgs')) return 'Organizations';
+    if (location.pathname.startsWith('/bci')) return 'Tools';
+    if (location.pathname.startsWith('/settings')) return 'Settings';
+    return 'GuideAI';
+  }, [location.pathname]);
+
+  const resolvedDocumentTitle = documentTitle ?? 'Untitled';
+  const showDocumentTitle = useMemo(() => {
+    return resolvedDocumentTitle.trim().toLocaleLowerCase() !== surfaceLabel.trim().toLocaleLowerCase();
+  }, [resolvedDocumentTitle, surfaceLabel]);
 
   const displayName = actor?.displayName ?? actor?.email ?? actor?.id ?? 'Profile';
+  const currentScopeSubtitle = useMemo(
+    () => resolveScopeSubtitle(currentOrg?.name),
+    [currentOrg?.name]
+  );
   const initials = displayName
     .split(' ')
     .map((segment) => segment[0])
@@ -165,6 +215,98 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
     };
   }, [profileMenuOpen]);
 
+  const focusProfileMenuItem = useCallback((target: 'first' | 'last' | number) => {
+    const items = profileMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]');
+    if (!items?.length) return;
+
+    if (target === 'first') {
+      items[0]?.focus();
+      return;
+    }
+
+    if (target === 'last') {
+      items[items.length - 1]?.focus();
+      return;
+    }
+
+    items[target]?.focus();
+  }, []);
+
+  const closeProfileMenu = useCallback((restoreFocus = false) => {
+    setProfileMenuOpen(false);
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => profileTriggerRef.current?.focus());
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!profileMenuOpen) return;
+    window.requestAnimationFrame(() => focusProfileMenuItem('first'));
+  }, [focusProfileMenuItem, profileMenuOpen]);
+
+  const handleProfileTriggerKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setProfileMenuOpen(true);
+      window.requestAnimationFrame(() => focusProfileMenuItem('first'));
+      return;
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setProfileMenuOpen(true);
+      window.requestAnimationFrame(() => focusProfileMenuItem('last'));
+      return;
+    }
+
+    if (event.key === 'Escape' && profileMenuOpen) {
+      event.preventDefault();
+      closeProfileMenu(true);
+    }
+  }, [closeProfileMenu, focusProfileMenuItem, profileMenuOpen]);
+
+  const handleProfileMenuKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    const items = profileMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]');
+    if (!items?.length) return;
+    const currentIndex = Array.from(items).indexOf(document.activeElement as HTMLButtonElement);
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeProfileMenu(true);
+      return;
+    }
+
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      const nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % items.length;
+      items[nextIndex]?.focus();
+      return;
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      const nextIndex = currentIndex <= 0 ? items.length - 1 : currentIndex - 1;
+      items[nextIndex]?.focus();
+      return;
+    }
+
+    if (event.key === 'Home') {
+      event.preventDefault();
+      items[0]?.focus();
+      return;
+    }
+
+    if (event.key === 'End') {
+      event.preventDefault();
+      items[items.length - 1]?.focus();
+      return;
+    }
+
+    if (event.key === 'Tab') {
+      closeProfileMenu();
+    }
+  }, [closeProfileMenu]);
+
   useEffect(() => {
     if (!currentOrgId) return;
     const orgExists = organizations.some((org) => org.id === currentOrgId);
@@ -173,17 +315,82 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
     }
   }, [currentOrgId, organizations]);
 
+  const topAction = useMemo(() => {
+    if (location.pathname === '/' || location.pathname === '/projects') {
+      return {
+        label: 'New Project',
+        path: currentOrgId ? `/projects/new?org=${encodeURIComponent(currentOrgId)}` : '/projects/new',
+      };
+    }
+
+    if (location.pathname.startsWith('/projects/') && !location.pathname.includes('/boards/') && projectId) {
+      return {
+        label: 'Create Board',
+        path: `/projects/${projectId}?newBoard=1`,
+      };
+    }
+
+    if (location.pathname.startsWith('/agents')) {
+      return {
+        label: 'New Agent',
+        path: '/agents/new',
+      };
+    }
+
+    if (location.pathname === '/bci') {
+      return {
+        label: 'Extract Behavior',
+        path: '/bci/extraction',
+      };
+    }
+
+    if (location.pathname === '/bci/extraction') {
+      return {
+        label: 'Behavior Search',
+        path: '/bci',
+      };
+    }
+
+    if (location.pathname === '/orgs') {
+      return {
+        label: 'Projects',
+        path: '/projects',
+      };
+    }
+
+    return null;
+  }, [currentOrgId, location.pathname, projectId]);
+
+  const showInvite = useMemo(
+    () => location.pathname.startsWith('/projects/') || location.pathname.startsWith('/agents/'),
+    [location.pathname]
+  );
+
   return (
     <header className="workspace-header">
       <div className="header-left">
-        <div className="header-breadcrumb">
-          <OrgSwitcher
-            organizations={sortedOrganizations}
-            currentOrgId={currentOrgId}
-            onSelect={(orgId) => orgContextStore.setCurrentOrgId(orgId)}
-          />
-          <span className="breadcrumb-separator">/</span>
-          <span className="breadcrumb-item current">{documentTitle ?? 'Untitled'}</span>
+        <div className="header-context">
+          <div className="header-scope-panel" aria-label={CURRENT_SCOPE_LABEL}>
+            <span className="header-scope-kicker">{CURRENT_SCOPE_LABEL}</span>
+            <div className="header-scope-row">
+              <OrgSwitcher
+                organizations={sortedOrganizations}
+                currentOrgId={currentOrgId}
+                onSelect={(orgId) => orgContextStore.setCurrentOrgId(orgId)}
+              />
+              <span className="header-scope-subtitle">{currentScopeSubtitle}</span>
+            </div>
+          </div>
+
+          <div className="header-breadcrumb" aria-label="Current location">
+            <span className="breadcrumb-surface">{surfaceLabel}</span>
+            {showDocumentTitle && (
+              <>
+                <span className="breadcrumb-separator">/</span>
+                <span className="breadcrumb-item current">{resolvedDocumentTitle}</span>
+              </>
+            )}
+          </div>
         </div>
       </div>
 
@@ -199,7 +406,7 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
             <circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.5" />
             <path d="M11 11L14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
           </svg>
-          <span>Search or jump to...</span>
+          <span>Jump to scopes, projects, boards, agents, or tools…</span>
           {commandPaletteHint && (
             <kbd className="shortcut-hint animate-fade-in-up">⌘K</kbd>
           )}
@@ -220,7 +427,8 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
           {presenceList.slice(0, 5).map((p) => (
             <PresenceAvatar
               key={p.user_id}
-              name={p.user_id} // TODO: Fetch display name
+              id={p.user_id}
+              name={p.display_name ?? p.user_id}
               color={p.color ?? '#3b82f6'}
               status={p.status}
             />
@@ -230,37 +438,53 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
           )}
         </div>
 
-        {/* Share button */}
-        <button className="share-button pressable" data-haptic="medium">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-            <path
-              d="M12 5.5C13.1046 5.5 14 4.60457 14 3.5C14 2.39543 13.1046 1.5 12 1.5C10.8954 1.5 10 2.39543 10 3.5C10 4.60457 10.8954 5.5 12 5.5Z"
-              stroke="currentColor"
-              strokeWidth="1.5"
-            />
-            <path
-              d="M4 10C5.10457 10 6 9.10457 6 8C6 6.89543 5.10457 6 4 6C2.89543 6 2 6.89543 2 8C2 9.10457 2.89543 10 4 10Z"
-              stroke="currentColor"
-              strokeWidth="1.5"
-            />
-            <path
-              d="M12 14.5C13.1046 14.5 14 13.6046 14 12.5C14 11.3954 13.1046 10.5 12 10.5C10.8954 10.5 10 11.3954 10 12.5C10 13.6046 10.8954 14.5 12 14.5Z"
-              stroke="currentColor"
-              strokeWidth="1.5"
-            />
-            <path d="M5.7 9.1L10.3 11.9" stroke="currentColor" strokeWidth="1.5" />
-            <path d="M10.3 4.1L5.7 6.9" stroke="currentColor" strokeWidth="1.5" />
-          </svg>
-          Share
-        </button>
+        {topAction && (
+          <button
+            className="share-button pressable"
+            data-haptic="medium"
+            onClick={() => navigate(topAction.path)}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path d="M8 3v10M3 8h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            {topAction.label === 'New Project' ? NEW_PROJECT_CTA : topAction.label}
+          </button>
+        )}
+
+        {showInvite && (
+          <button className="share-button share-button-secondary pressable" data-haptic="medium">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path
+                d="M12 5.5C13.1046 5.5 14 4.60457 14 3.5C14 2.39543 13.1046 1.5 12 1.5C10.8954 1.5 10 2.39543 10 3.5C10 4.60457 10.8954 5.5 12 5.5Z"
+                stroke="currentColor"
+                strokeWidth="1.5"
+              />
+              <path
+                d="M4 10C5.10457 10 6 9.10457 6 8C6 6.89543 5.10457 6 4 6C2.89543 6 2 6.89543 2 8C2 9.10457 2.89543 10 4 10Z"
+                stroke="currentColor"
+                strokeWidth="1.5"
+              />
+              <path
+                d="M12 14.5C13.1046 14.5 14 13.6046 14 12.5C14 11.3954 13.1046 10.5 12 10.5C10.8954 10.5 10 11.3954 10 12.5C10 13.6046 10.8954 14.5 12 14.5Z"
+                stroke="currentColor"
+                strokeWidth="1.5"
+              />
+              <path d="M5.7 9.1L10.3 11.9" stroke="currentColor" strokeWidth="1.5" />
+              <path d="M10.3 4.1L5.7 6.9" stroke="currentColor" strokeWidth="1.5" />
+            </svg>
+            Invite
+          </button>
+        )}
 
         {/* Profile menu */}
         {isAuthenticated && (
           <div className="profile-menu" ref={profileMenuRef}>
             <button
+              ref={profileTriggerRef}
               type="button"
               className="profile-trigger pressable"
               onClick={() => setProfileMenuOpen((prev) => !prev)}
+              onKeyDown={handleProfileTriggerKeyDown}
               aria-haspopup="menu"
               aria-expanded={profileMenuOpen}
               data-haptic="light"
@@ -288,7 +512,7 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
               </svg>
             </button>
             {profileMenuOpen && (
-              <div className="profile-dropdown animate-scale-in" role="menu" aria-label="Profile menu">
+              <div className="profile-dropdown animate-scale-in" role="menu" aria-label="Profile menu" onKeyDown={handleProfileMenuKeyDown}>
                 <div className="profile-dropdown-header">
                   <span className="profile-dropdown-name">{displayName}</span>
                   {actor?.email && (
@@ -300,7 +524,7 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
                   className="profile-menu-item"
                   role="menuitem"
                   onClick={() => {
-                    setProfileMenuOpen(false);
+                    closeProfileMenu();
                     navigate('/settings');
                   }}
                 >
@@ -311,7 +535,7 @@ const Header = memo(function Header({ documentTitle, connectionState }: HeaderPr
                   className="profile-menu-item profile-menu-item-logout"
                   role="menuitem"
                   onClick={async () => {
-                    setProfileMenuOpen(false);
+                    closeProfileMenu();
                     await logout();
                   }}
                 >
@@ -385,7 +609,69 @@ export interface WorkspaceShellProps {
 
 export function WorkspaceShell({ children, sidebarContent, documentTitle }: WorkspaceShellProps) {
   const { sidebarCollapsed, connectionState, activeDocumentId, documents } = useCollabStore();
+  const collabPresence = usePresenceList();
   const activeDocument = activeDocumentId ? documents.get(activeDocumentId) : null;
+  const { projectId } = useParams();
+  const { currentOrgId } = useOrgContext();
+  const { data: project } = useProject(projectId);
+  const liveOrgId = currentOrgId ?? project?.org_id ?? null;
+  const { data: agents = [] } = useProjectAgents(Boolean(projectId));
+  const { data: executionList } = useExecutionList(liveOrgId, projectId, {
+    enabled: Boolean(projectId),
+    limit: 12,
+    refetchInterval: 4000,
+  });
+  const executionStream = useExecutionStream({
+    orgId: liveOrgId,
+    projectId,
+    enabled: Boolean(projectId && liveOrgId),
+  });
+
+  const livePresenceList = useMemo<ShellPresenceParticipant[]>(() => {
+    const merged = new Map<string, ShellPresenceParticipant>();
+
+    for (const participant of collabPresence) {
+      merged.set(participant.user_id, {
+        user_id: participant.user_id,
+        display_name: participant.display_name,
+        color: participant.color,
+        status: participant.status,
+      });
+    }
+
+    const activeExecutions = (executionList?.executions ?? []).filter((execution) => {
+      const state = String(execution.state).toLowerCase();
+      return state === 'running' || state === 'pending' || state === 'paused';
+    });
+
+    for (const execution of activeExecutions) {
+      const agent = agents.find((candidate) => candidate.id === execution.agentId);
+      const agentKey = `agent:${execution.agentId}`;
+      const agentName = agent?.name ?? execution.agentId;
+      merged.set(agentKey, {
+        user_id: agentKey,
+        display_name: agentName,
+        color: '#1098ad',
+        status: String(execution.state).toLowerCase() === 'paused' ? 'idle' : 'active',
+      });
+    }
+
+    return Array.from(merged.values());
+  }, [collabPresence, executionList?.executions, agents]);
+
+  const resolvedConnectionState = useMemo(() => {
+    if (executionStream.connectionState === 'connected' || executionStream.connectionState === 'reconnecting') {
+      return executionStream.connectionState;
+    }
+    return connectionState;
+  }, [connectionState, executionStream.connectionState]);
+
+  const activeScopeLabel = useMemo(() => {
+    if (currentOrgId || project?.org_id) {
+      return CURRENT_SCOPE_LABEL;
+    }
+    return PERSONAL_SCOPE_LABEL;
+  }, [currentOrgId, project?.org_id]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -417,8 +703,9 @@ export function WorkspaceShell({ children, sidebarContent, documentTitle }: Work
 
       <div className="workspace-content">
         <Header
-          documentTitle={documentTitle ?? activeDocument?.title}
-          connectionState={connectionState}
+          documentTitle={documentTitle ?? activeDocument?.title ?? activeScopeLabel}
+          connectionState={resolvedConnectionState}
+          presenceList={livePresenceList}
         />
         <MainContent>{children}</MainContent>
       </div>

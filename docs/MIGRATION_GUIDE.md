@@ -231,7 +231,7 @@ Migrations are validated in CI via pre-commit. The workflow:
 
 ## Feature Flags Migration (E4)
 
-Epic E4 introduced a `feature_flags` table via Alembic migration `20260319_add_feature_flags`.
+Goal E4 (previously called Epic E4) introduced a `feature_flags` table via Alembic migration `20260319_add_feature_flags`.
 
 ### Applying the Migration
 

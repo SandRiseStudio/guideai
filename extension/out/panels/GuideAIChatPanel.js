@@ -266,17 +266,41 @@ Tool invocation:
         await this._handleToolCall(toolName, args);
     }
     async _handleNaturalLanguage(text) {
-        // For now, suggest using behaviors.getForTask
-        const suggestMessage = `I understand: "${text}"
+        // Inject BCI behaviors for the user's task
+        try {
+            this._addSystemMessage('Retrieving relevant behaviors...');
+            const bciResult = await this._mcpClient.bciInject({
+                task: text,
+                surface: 'vscode'
+            });
+            const behaviors = bciResult.behaviors_injected || [];
+            const overlays = bciResult.overlays_included || [];
+            let response = '';
+            if (bciResult.composed_prompt) {
+                response += `**BCI Context for your task:**\n\n${bciResult.composed_prompt}\n\n`;
+            }
+            if (behaviors.length > 0) {
+                response += `**Behaviors injected** (${behaviors.length}): ${behaviors.join(', ')}\n`;
+            }
+            if (overlays.length > 0) {
+                response += `**Overlays included** (${overlays.length}): ${overlays.join(', ')}\n`;
+            }
+            if (bciResult.token_estimate) {
+                response += `\n_Token estimate: ${bciResult.token_estimate}_\n`;
+            }
+            response += `\nYou can also:\n• Use @toolname {...args} to call a specific tool\n• Type /tools to see available tools`;
+            this._addAssistantMessage(response);
+        }
+        catch {
+            // Fallback to suggestion if BCI inject unavailable
+            const suggestMessage = `I understand: "${text}"
 
-To get relevant behaviors for this task, I can call:
+To get relevant behaviors for this task, try:
 @behaviors.getForTask {"task_description": "${text}"}
 
-Would you like me to do that? Or you can:
-• Type /tools to see available tools
-• Type /groups to see tool groups
-• Use @toolname {...args} to call a specific tool`;
-        this._addAssistantMessage(suggestMessage);
+Or type /tools to see available tools.`;
+            this._addAssistantMessage(suggestMessage);
+        }
     }
     async _handleToolCall(toolName, args) {
         // Add a streaming indicator

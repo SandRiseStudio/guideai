@@ -1,7 +1,7 @@
 """
 Board Service - Unified WorkItem-based Agile Board management.
 
-Uses a single work_items table with item_type discriminator for epics/stories/tasks.
+Uses a single work_items table with item_type discriminator for goals/features/tasks.
 Provides CRUD for boards, columns, work items, and sprints.
 
 Feature: 13.4.5 (Agent assignment) and 13.5.x (Agile Board System)
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
@@ -25,6 +26,7 @@ from guideai.multi_tenant.board_contracts import (
     BoardEvent,
     BoardEventType,
     BoardSettings,
+    BoardTemplate,
     BoardVisibility,
     BoardWithColumns,
     ChecklistItem,
@@ -41,7 +43,9 @@ from guideai.multi_tenant.board_contracts import (
     Label,
     LabelColor,
     LabelListResponse,
+    IncompleteWorkItemSummary,
     MoveWorkItemRequest,
+    ProgressBucketCounts,
     ReorderBoardColumnsRequest,
     ReorderWorkItemsRequest,
     Sprint,
@@ -60,11 +64,15 @@ from guideai.multi_tenant.board_contracts import (
     UpdateTaskRequest,
     UpdateWorkItemRequest,
     WorkItem,
+    WorkItemProgressRollup,
     WorkItemPriority,
+    RemainingWorkSummary,
     WorkItemStatus,
     WorkItemType,
     is_valid_status_transition,
+    normalize_item_type,
 )
+from guideai.agents.work_item_planner.prompts import validate_title as _gws_validate_title
 from guideai.storage.postgres_pool import PostgresPool
 from guideai.telemetry import TelemetryClient
 from guideai.utils.dsn import resolve_postgres_dsn
@@ -92,6 +100,33 @@ def _parse_jsonb(value: Any, default: Any = None) -> Any:
     if isinstance(value, str):
         return json.loads(value) if value else (default if default is not None else {})
     return value
+
+
+# Display-ID pattern: "{slug}-{number}" where slug is lowercase alphanumeric
+# with hyphens (matching Project.slug pattern) and number is a positive integer.
+# Internal IDs have hex suffixes (e.g. task-a1b2c3d4e5f6) or are full UUIDs,
+# so we distinguish by checking that the trailing segment is purely decimal.
+_DISPLAY_ID_RE = re.compile(r"^(?P<slug>[a-z][a-z0-9-]*)-(?P<number>[1-9]\d*)$")
+
+
+def parse_display_id(value: str) -> tuple[str, int] | None:
+    """Parse a display ID like 'myproject-42' into (slug, number).
+
+    Returns None if *value* doesn't match the display-ID format.
+    """
+    m = _DISPLAY_ID_RE.match(value)
+    if not m:
+        return None
+    slug = m.group("slug")
+    number = int(m.group("number"))
+    # Reject values that look like internal short-IDs (hex suffixes).
+    # Internal IDs: "task-a1b2c3d4e5f6" — the suffix is 12 hex chars.
+    # Display IDs: "myproject-42" — the suffix is purely decimal.
+    # The regex already enforces digits-only for the number, so we just
+    # need to reject known prefixes that are internal type tags.
+    if slug in ("epic", "story", "task", "bug", "goal", "feature"):
+        return None
+    return slug, number
 
 
 class Actor:
@@ -122,11 +157,15 @@ class WorkItemNotFoundError(BoardServiceError):
 
 # Backwards-compat exceptions (older API had type-specific not-found errors)
 class EpicNotFoundError(WorkItemNotFoundError):
-    """Epic not found."""
+    """Epic/Goal not found."""
 
 
 class StoryNotFoundError(WorkItemNotFoundError):
-    """Story not found."""
+    """Story/Feature not found."""
+
+# Aliases for new naming
+GoalNotFoundError = EpicNotFoundError
+FeatureNotFoundError = StoryNotFoundError
 
 
 class TaskNotFoundError(WorkItemNotFoundError):
@@ -146,6 +185,9 @@ class AssigneeNotFoundError(BoardServiceError):
 
 class ConcurrencyConflictError(BoardServiceError):
     """Optimistic concurrency conflict."""
+
+class WorkItemValidationError(BoardServiceError):
+    """Work item field validation failure (e.g. GWS title rules)."""
 
 
 # Callback types
@@ -195,6 +237,192 @@ class BoardService:
                 logger.warning(f"Event handler error: {e}")
 
     # =========================================================================
+    # Display number helpers
+    # =========================================================================
+
+    def _next_display_number(self, cur: Any, project_id: str, entity_type: str) -> int:
+        """Atomically allocate the next sequential display number for a project.
+
+        Uses INSERT ... ON CONFLICT ... UPDATE ... RETURNING for race-safe
+        counter increments within the current transaction.
+
+        Args:
+            cur: Database cursor (must be inside a transaction)
+            project_id: The project scope for the counter
+            entity_type: 'board' or 'work_item'
+
+        Returns:
+            The allocated display number (1-based)
+        """
+        cur.execute(
+            """
+            INSERT INTO project_counters (project_id, entity_type, next_number)
+            VALUES (%s, %s, 1)
+            ON CONFLICT (project_id, entity_type)
+            DO UPDATE SET next_number = project_counters.next_number + 1
+            RETURNING next_number
+            """,
+            (project_id, entity_type),
+        )
+        row = cur.fetchone()
+        return int(row[0])
+
+    # =========================================================================
+    # Display-ID resolution
+    # =========================================================================
+
+    def resolve_work_item_id(
+        self,
+        identifier: str,
+        *,
+        org_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> str:
+        """Resolve a display ID (e.g. 'myproject-42') or internal ID to a UUID.
+
+        Auto-detects the format:
+        - Full UUID (xxxxxxxx-xxxx-...) → returned as-is
+        - Internal short ID (task-a1b2c3d4e5f6) → returned as-is
+        - Display ID (slug-number, e.g. 'myproject-42') → looked up via project slug + display_number
+        - Bare number ('42' or '#42') with project_id context → looked up via display_number
+
+        Returns:
+            The internal UUID string for the work item.
+
+        Raises:
+            WorkItemNotFoundError: If the display ID cannot be resolved.
+        """
+        if not identifier:
+            raise WorkItemNotFoundError("Work item identifier is required")
+
+        # Strip optional '#' prefix for bare numbers
+        cleaned = identifier.lstrip("#")
+
+        # 1. Full UUID — return as-is
+        try:
+            uuid.UUID(cleaned)
+            return cleaned
+        except ValueError:
+            pass
+
+        # 2. Internal short ID (type-hex12) — return as-is
+        if re.match(r"^(goal|feature|epic|story|task|bug)-[a-f0-9]{12}$", cleaned.lower()):
+            return cleaned
+
+        # 3. Display ID: slug-number (case-insensitive, e.g. "GUIDEAI-7" or "guideai-7")
+        parsed = parse_display_id(cleaned.lower())
+        if parsed:
+            slug, display_number = parsed
+            return self._resolve_by_slug_and_number(slug, display_number, org_id=org_id)
+
+        # 4. Bare number (with project_id context)
+        if cleaned.isdigit() and int(cleaned) > 0:
+            if not project_id:
+                raise WorkItemNotFoundError(
+                    f"Cannot resolve bare number '{identifier}' without project context. "
+                    f"Use the full display ID (e.g. 'project-slug-{cleaned}') or provide project_id."
+                )
+            return self._resolve_by_project_and_number(
+                project_id, int(cleaned), org_id=org_id
+            )
+
+        # 5. Not recognized — assume it's an internal ID and let downstream
+        # queries fail naturally if it doesn't exist.
+        return identifier
+
+    def _resolve_by_slug_and_number(
+        self,
+        slug: str,
+        display_number: int,
+        *,
+        org_id: Optional[str] = None,
+    ) -> str:
+        """Look up a work item UUID by project slug and display number."""
+        def _query(conn: Any) -> Optional[str]:
+            # Always set tenant context to configure search_path (handles None org_id)
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT wi.id
+                    FROM work_items wi
+                    JOIN projects p ON p.project_id = wi.project_id
+                    WHERE p.slug = %s
+                      AND wi.display_number = %s
+                      AND p.archived_at IS NULL
+                    """,
+                    (slug, display_number),
+                )
+                row = cur.fetchone()
+                return str(row[0]) if row else None
+
+        result = self._pool.run_query(
+            operation="work_item.resolve_display_id",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+        if not result:
+            raise WorkItemNotFoundError(
+                f"Work item '{slug}-{display_number}' not found"
+            )
+        return result
+
+    def _resolve_by_project_and_number(
+        self,
+        project_id: str,
+        display_number: int,
+        *,
+        org_id: Optional[str] = None,
+    ) -> str:
+        """Look up a work item UUID by project ID and display number."""
+        def _query(conn: Any) -> Optional[str]:
+            # Always set tenant context to configure search_path (handles None org_id)
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id FROM work_items
+                    WHERE project_id = %s AND display_number = %s
+                    """,
+                    (project_id, display_number),
+                )
+                row = cur.fetchone()
+                return str(row[0]) if row else None
+
+        result = self._pool.run_query(
+            operation="work_item.resolve_by_number",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+        if not result:
+            raise WorkItemNotFoundError(
+                f"Work item #{display_number} not found in project {project_id}"
+            )
+        return result
+
+    def _get_project_slug(self, project_id: str, *, org_id: Optional[str] = None) -> Optional[str]:
+        """Look up the slug for a project by ID."""
+        def _query(conn: Any) -> Optional[str]:
+            # Always set tenant context to configure search_path (handles None org_id)
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT slug FROM projects WHERE project_id = %s AND archived_at IS NULL",
+                    (project_id,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+
+        return self._pool.run_query(
+            operation="project.get_slug",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
+    # =========================================================================
     # Board CRUD
     # =========================================================================
 
@@ -208,23 +436,30 @@ class BoardService:
         def _execute(conn: Any) -> None:
             self._pool.set_tenant_context(conn, org_id, actor.id)
             with conn.cursor() as cur:
+                # Allocate sequential display number for the project
+                display_num = None
+                if request.project_id:
+                    display_num = self._next_display_number(cur, request.project_id, "board")
+
                 # Let database generate UUID via gen_random_uuid()
                 cur.execute(
                     """
                     INSERT INTO boards (project_id, name, description, settings,
-                                       created_at, updated_at, created_by, org_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                       created_at, updated_at, created_by, org_id,
+                                       display_number)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (request.project_id, request.name, request.description,
-                     json.dumps(settings.model_dump()), timestamp, timestamp, actor.id, org_id),
+                     json.dumps(settings.model_dump()), timestamp, timestamp, actor.id, org_id,
+                     display_num),
                 )
                 row = cur.fetchone()
                 board_uuid = str(row[0]) if row else None
                 if board_uuid:
                     board_id_holder.append(board_uuid)
                     if request.create_default_columns:
-                        self._create_default_columns(cur, board_uuid, timestamp)
+                        self._create_default_columns(cur, board_uuid, timestamp, request.template)
 
         self._pool.run_transaction(
             operation="board.create", service_prefix="board",
@@ -233,28 +468,74 @@ class BoardService:
         )
         return self.get_board(board_id_holder[0], org_id=org_id)
 
-    def _create_default_columns(self, cur: Any, board_id: str, timestamp: datetime) -> None:
-        """Create default columns for a board.
+    # Legacy fallback: column name → WorkItemStatus for columns created before
+    # the status_mapping DB column was populated.  Only used by
+    # _infer_status_from_column_name() when status_mapping is NULL.
+    _COLUMN_NAME_TO_STATUS: Dict[str, WorkItemStatus] = {
+        "backlog": WorkItemStatus.BACKLOG,
+        "in progress": WorkItemStatus.IN_PROGRESS,
+        "in review": WorkItemStatus.IN_REVIEW,
+        "done": WorkItemStatus.DONE,
+    }
+
+    _STATUS_TO_PROGRESS_BUCKET: Dict[WorkItemStatus, str] = {
+        WorkItemStatus.BACKLOG: "not_started",
+        WorkItemStatus.IN_PROGRESS: "in_progress",
+        WorkItemStatus.IN_REVIEW: "in_progress",
+        WorkItemStatus.DONE: "completed",
+    }
+
+    @staticmethod
+    def _infer_status_from_column_name(name: str) -> WorkItemStatus:
+        """Infer a WorkItemStatus from a column's display name.
+
+        Used as a fallback when status_mapping is NULL in the database (i.e.
+        columns created before the status_mapping column was populated).
+        """
+        return BoardService._COLUMN_NAME_TO_STATUS.get(
+            name.strip().lower(), WorkItemStatus.BACKLOG
+        )
+
+    # Column presets per template (name, position, color, status_mapping)
+    _TEMPLATE_COLUMNS: Dict[BoardTemplate, list] = {
+        BoardTemplate.MINIMAL: [
+            ("Backlog", 0, "#6B7280", WorkItemStatus.BACKLOG),
+            ("In Progress", 1, "#F59E0B", WorkItemStatus.IN_PROGRESS),
+            ("Done", 2, "#10B981", WorkItemStatus.DONE),
+        ],
+        BoardTemplate.STANDARD: [
+            ("Backlog", 0, "#6B7280", WorkItemStatus.BACKLOG),
+            ("In Progress", 1, "#F59E0B", WorkItemStatus.IN_PROGRESS),
+            ("In Review", 2, "#8B5CF6", WorkItemStatus.IN_REVIEW),
+            ("Done", 3, "#10B981", WorkItemStatus.DONE),
+        ],
+        BoardTemplate.FULL: [
+            ("Backlog", 0, "#6B7280", WorkItemStatus.BACKLOG),
+            ("In Progress", 1, "#F59E0B", WorkItemStatus.IN_PROGRESS),
+            ("In Review", 2, "#8B5CF6", WorkItemStatus.IN_REVIEW),
+            ("Done", 3, "#10B981", WorkItemStatus.DONE),
+        ],
+    }
+
+    def _create_default_columns(
+        self, cur: Any, board_id: str, timestamp: datetime,
+        template: BoardTemplate = BoardTemplate.MINIMAL,
+    ) -> None:
+        """Create default columns for a board based on the chosen template.
 
         Args:
             cur: Database cursor
             board_id: UUID string of the board
             timestamp: Creation timestamp
+            template: Which column preset to use (minimal/standard/full)
         """
-        # Default columns with name, position, optional color
-        defaults = [
-            ("Backlog", 0, "#6B7280"),
-            ("To Do", 1, "#3B82F6"),
-            ("In Progress", 2, "#F59E0B"),
-            ("In Review", 3, "#8B5CF6"),
-            ("Done", 4, "#10B981"),
-        ]
-        for name, pos, color in defaults:
+        defaults = self._TEMPLATE_COLUMNS.get(template, self._TEMPLATE_COLUMNS[BoardTemplate.MINIMAL])
+        for name, pos, color, status_map in defaults:
             # Let database generate UUID via gen_random_uuid()
             cur.execute(
-                """INSERT INTO columns (board_id, name, position, color, created_at, updated_at)
-                   VALUES (%s::uuid, %s, %s, %s, %s, %s)""",
-                (board_id, name, pos, color, timestamp, timestamp),
+                """INSERT INTO columns (board_id, name, position, color, status_mapping, created_at, updated_at)
+                   VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)""",
+                (board_id, name, pos, color, status_map.value, timestamp, timestamp),
             )
 
     def get_board(
@@ -288,6 +569,7 @@ class BoardService:
             created_at=result["created_at"], updated_at=result["updated_at"],
             created_by=result["created_by"], is_default=False,  # is_default not in schema, default to False
             org_id=result.get("org_id"),
+            display_number=result.get("display_number"),
         )
 
         if include_columns:
@@ -341,6 +623,7 @@ class BoardService:
                 created_by=r["created_by"],
                 is_default=r.get("is_default", False),
                 org_id=r.get("org_id"),
+                display_number=r.get("display_number"),
             )
             for r in results
         ]
@@ -406,11 +689,18 @@ class BoardService:
             with conn.cursor() as cur:
                 # Let database generate UUID, use 'columns' table
                 cur.execute(
-                    """INSERT INTO columns (board_id, name, position, wip_limit, created_at, updated_at)
-                       VALUES (%s::uuid, %s, %s, %s, %s, %s)
+                    """INSERT INTO columns (board_id, name, position, status_mapping, wip_limit, created_at, updated_at)
+                       VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
                        RETURNING id""",
-                    (request.board_id, request.name, request.position,
-                     request.wip_limit, timestamp, timestamp),
+                    (
+                        request.board_id,
+                        request.name,
+                        request.position,
+                        request.status_mapping.value,
+                        request.wip_limit,
+                        timestamp,
+                        timestamp,
+                    ),
                 )
                 row = cur.fetchone()
                 if row:
@@ -441,15 +731,15 @@ class BoardService:
         if not result:
             raise ColumnNotFoundError(f"Column {column_id} not found")
 
-        # Parse status_mapping from DB if present, fallback to TODO
+        # Parse status_mapping from DB if present, infer from column name as fallback
         status_mapping_val = result.get("status_mapping")
         if status_mapping_val:
             try:
                 status_mapping = WorkItemStatus(status_mapping_val)
             except ValueError:
-                status_mapping = WorkItemStatus.TODO
+                status_mapping = self._infer_status_from_column_name(result["name"])
         else:
-            status_mapping = WorkItemStatus.TODO
+            status_mapping = self._infer_status_from_column_name(result["name"])
 
         return BoardColumn(
             column_id=str(result["id"]), board_id=str(result["board_id"]),
@@ -480,7 +770,11 @@ class BoardService:
             BoardColumn(
                 column_id=str(r["id"]), board_id=str(r["board_id"]),
                 name=r["name"], position=r["position"],
-                status_mapping=WorkItemStatus.TODO,  # Default, status_mapping not in schema
+                status_mapping=(
+                    WorkItemStatus(r["status_mapping"])
+                    if r.get("status_mapping")
+                    else self._infer_status_from_column_name(r["name"])
+                ),
                 wip_limit=r.get("wip_limit"),
                 settings={},  # settings not in schema
                 created_at=r["created_at"],
@@ -591,7 +885,11 @@ class BoardService:
     def move_work_item(
         self, item_id: str, request: MoveWorkItemRequest, actor: Actor, *, org_id: Optional[str] = None
     ) -> WorkItem:
-        """Move a work item between columns and/or change its position."""
+        """Move a work item between columns and/or change its position.
+
+        Bidirectional sync: when moving to a new column, the item's status is
+        automatically updated to match the destination column's status_mapping.
+        """
         item = self.get_work_item(item_id, org_id=org_id)
         if item.board_id is None:
             raise BoardServiceError(f"Work item {item_id} has no board_id")
@@ -600,6 +898,14 @@ class BoardService:
         to_column_id = request.column_id if request.column_id is not None else item.column_id
         if to_column_id is None:
             raise BoardServiceError(f"Work item {item_id} has no column_id")
+
+        # Resolve the destination column's status_mapping for bidirectional sync
+        new_status: Optional[WorkItemStatus] = None
+        if to_column_id != from_column_id:
+            dest_column = self.get_column(to_column_id, org_id=org_id)
+            if dest_column.status_mapping and dest_column.status_mapping != item.status:
+                if is_valid_status_transition(item.status, dest_column.status_mapping):
+                    new_status = dest_column.status_mapping
 
         requested_position = max(0, int(request.position))
         timestamp = _now()
@@ -654,12 +960,21 @@ class BoardService:
                            WHERE board_id = %s AND column_id = %s AND position >= %s""",
                         (item.board_id, to_column_id, target_position),
                     )
-                    cur.execute(
-                        """UPDATE work_items
-                           SET column_id = %s, position = %s, updated_at = %s
-                           WHERE id = %s""",
-                        (to_column_id, target_position, timestamp, item_id),
-                    )
+                    # Also sync status from destination column's status_mapping
+                    if new_status is not None:
+                        cur.execute(
+                            """UPDATE work_items
+                               SET column_id = %s, position = %s, status = %s, updated_at = %s
+                               WHERE id = %s""",
+                            (to_column_id, target_position, new_status.value, timestamp, item_id),
+                        )
+                    else:
+                        cur.execute(
+                            """UPDATE work_items
+                               SET column_id = %s, position = %s, updated_at = %s
+                               WHERE id = %s""",
+                            (to_column_id, target_position, timestamp, item_id),
+                        )
 
                 # Update column versions last (optimistic concurrency guard)
                 if from_column_id is not None:
@@ -730,7 +1045,7 @@ class BoardService:
                        WHERE board_id = %s AND column_id = %s""",
                     (column.board_id, request.column_id),
                 )
-                existing_ids = [r[0] for r in cur.fetchall()]
+                existing_ids = [str(r[0]) for r in cur.fetchall()]
                 if set(existing_ids) != set(request.ordered_item_ids):
                     raise BoardServiceError("ordered_item_ids must match items in the column")
 
@@ -864,32 +1179,35 @@ class BoardService:
         return DeleteResult(deleted_id=column_id, deleted_type="column")
 
     # =========================================================================
-    # WorkItem CRUD (unified for epic/story/task)
+    # WorkItem CRUD (unified for goal/feature/task)
     # =========================================================================
 
     def create_work_item(
         self, request: CreateWorkItemRequest, actor: Actor, *, org_id: Optional[str] = None
     ) -> WorkItem:
-        """Create a work item (epic, story, or task)."""
+        """Create a work item (goal, feature, task, or bug)."""
+        # GWS title validation at the service layer
+        title_error = _gws_validate_title(request.item_type.value, request.title)
+        if title_error:
+            raise WorkItemValidationError(title_error)
+
         timestamp = _now()
 
         # Default status to preserve legacy expectations.
         initial_status = WorkItemStatus.BACKLOG
-        if request.item_type == WorkItemType.EPIC:
-            initial_status = WorkItemStatus.DRAFT
-        elif request.item_type == WorkItemType.TASK:
-            initial_status = WorkItemStatus.TODO
 
-        # Default column_id to "Backlog" column if not provided
+        # Default column_id: prefer board's first column (position-ordered).
+        # Columns are user-managed; we don't assume any specific name.
         column_id = request.column_id
         if not column_id and request.board_id:
             columns = self.list_columns(request.board_id, org_id=org_id)
-            # Find "Backlog" column, or fall back to first column
-            backlog_col = next((c for c in columns if c.name.lower() == "backlog"), None)
-            if backlog_col:
-                column_id = backlog_col.column_id
-            elif columns:
-                column_id = columns[0].column_id  # First column as fallback
+            if columns:
+                # Prefer a column mapped to BACKLOG status, else first column
+                default_col = next(
+                    (c for c in columns if c.status_mapping == WorkItemStatus.BACKLOG),
+                    columns[0],
+                )
+                column_id = default_col.column_id
 
         # Convert acceptance criteria strings to objects
         criteria = [
@@ -906,27 +1224,44 @@ class BoardService:
             # Map priority enum to integer (critical=4, high=3, medium=2, low=1)
             priority_map = {"critical": 4, "high": 3, "medium": 2, "low": 1}
             priority_int = priority_map.get(request.priority.value, 2)
+
+            # Resolve project_id for counter allocation
+            project_id = None
+            if request.board_id:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT project_id FROM boards WHERE id = %s::uuid", (request.board_id,))
+                    prow = cur.fetchone()
+                    if prow:
+                        project_id = prow[0]
+
             with conn.cursor() as cur:
+                # Allocate sequential display number for the project
+                display_num = None
+                if project_id:
+                    display_num = self._next_display_number(cur, project_id, "work_item")
+
                 cur.execute(
                     """
                     INSERT INTO work_items (
-                        item_type, board_id, column_id, parent_id,
+                        item_type, project_id, board_id, column_id, parent_id,
                         title, description, status, priority, position,
                         labels, metadata,
-                        created_at, updated_at
+                        created_at, updated_at, display_number
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                     RETURNING id
                     """,
                     (
                         request.item_type.value,
+                        request.project_id,
                         request.board_id, column_id, request.parent_id,
                         request.title, request.description,
                         initial_status.value, priority_int, 0,
                         request.labels,  # Postgres array, not JSON
                         json.dumps(request.metadata),
                         timestamp, timestamp,
+                        display_num,
                     ),
                 )
                 row = cur.fetchone()
@@ -965,7 +1300,38 @@ class BoardService:
         )
         if not result:
             raise WorkItemNotFoundError(f"Work item {item_id} not found")
-        return self._row_to_work_item(result)
+        item = self._row_to_work_item(result)
+        self._enrich_child_aggregation([item], org_id=org_id)
+        self._enrich_display_ids([item], org_id=org_id)
+        return item
+
+    def get_work_items_batch(
+        self, item_ids: List[str], *, org_id: Optional[str] = None
+    ) -> List[WorkItem]:
+        """Get multiple work items by IDs in a single query."""
+        if not item_ids:
+            return []
+
+        def _query(conn: Any) -> List[Dict]:
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM work_items WHERE id = ANY(%s) ORDER BY created_at",
+                    (item_ids,),
+                )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        results = self._pool.run_query(
+            operation="work_item.get_batch",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+        items = [self._row_to_work_item(r) for r in results]
+        self._enrich_child_aggregation(items, org_id=org_id)
+        self._enrich_display_ids(items, org_id=org_id)
+        return items
 
     def _row_to_work_item(self, row: Dict) -> WorkItem:
         """Convert a database row to a WorkItem."""
@@ -976,7 +1342,7 @@ class BoardService:
 
         return WorkItem(
             item_id=str(row["id"]),  # Map UUID id to item_id for contract
-            item_type=WorkItemType(row["item_type"]),
+            item_type=WorkItemType(normalize_item_type(row["item_type"])),
             project_id=str(row["project_id"]) if row.get("project_id") else None,
             board_id=str(row["board_id"]) if row.get("board_id") else None,
             column_id=str(row["column_id"]) if row.get("column_id") else None,
@@ -986,7 +1352,7 @@ class BoardService:
             status=WorkItemStatus(row["status"]),
             priority=WorkItemPriority(priority_str),
             position=row.get("position", 0),
-            story_points=row.get("story_points"),
+            story_points=row.get("points") or row.get("story_points"),  # Works pre- and post-migration
             estimated_hours=row.get("estimated_hours"),
             actual_hours=row.get("actual_hours"),
             assignee_id=row.get("assignee_id"),
@@ -1014,25 +1380,149 @@ class BoardService:
             updated_at=row["updated_at"],
             created_by=row.get("created_by") or "system",  # Default to system if not set
             org_id=row.get("org_id"),
+            display_number=row.get("display_number"),
         )
+
+    def _enrich_display_ids(
+        self, items: List[WorkItem], *, org_id: Optional[str] = None
+    ) -> List[WorkItem]:
+        """Populate display_id (e.g. 'myproject-42') on items that have a display_number."""
+        need = [i for i in items if i.display_number and i.project_id and not i.display_id]
+        if not need:
+            return items
+        project_ids = list({i.project_id for i in need})
+
+        def _query(conn: Any) -> List[tuple]:
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT project_id, slug FROM auth.projects WHERE project_id = ANY(%s) AND archived_at IS NULL",
+                    (project_ids,),
+                )
+                return cur.fetchall()
+
+        rows = self._pool.run_query(
+            operation="project.slug_batch",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+        slug_map = {str(r[0]): r[1] for r in rows} if rows else {}
+        for item in need:
+            slug = slug_map.get(item.project_id)
+            if slug:
+                item.display_id = f"{slug}-{item.display_number}"
+        return items
+
+    def _enrich_child_aggregation(
+        self, items: List[WorkItem], *, org_id: Optional[str] = None
+    ) -> List[WorkItem]:
+        """Populate child_count, completed_child_count, and progress_percent for items.
+        
+        Note: Requires `parent_id` column in work_items table. If column doesn't exist,
+        returns items unchanged (sub-task hierarchy feature not yet migrated).
+        """
+        if not items:
+            return items
+
+        parent_ids = [i.item_id for i in items]
+
+        def _query(conn: Any) -> List[Dict]:
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                if not getattr(self, "_parent_id_exists", None):
+                    cur.execute(
+                        """SELECT column_name FROM information_schema.columns 
+                           WHERE table_schema = 'board' AND table_name = 'work_items' AND column_name = 'parent_id'"""
+                    )
+                    self._parent_id_exists = bool(cur.fetchone())
+                if not self._parent_id_exists:
+                    return []
+                
+                cur.execute(
+                    """SELECT parent_id,
+                              COUNT(*) AS child_count,
+                              COUNT(*) FILTER (WHERE status IN ('done')) AS completed_child_count
+                       FROM work_items
+                       WHERE parent_id = ANY(%s::uuid[])
+                       GROUP BY parent_id""",
+                    (parent_ids,),
+                )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        agg_rows = self._pool.run_query(
+            operation="work_item.child_agg",
+            service_prefix="board",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+        if not agg_rows:
+            return items  # No child aggregation data (column missing or no children)
+            
+        agg_map = {str(r["parent_id"]): r for r in agg_rows}
+
+        for item in items:
+            agg = agg_map.get(item.item_id)
+            if agg:
+                total = agg["child_count"]
+                completed = agg["completed_child_count"]
+                item.child_count = total
+                item.completed_child_count = completed
+                item.progress_percent = round((completed / total) * 100, 1) if total > 0 else 0.0
+            else:
+                item.child_count = 0
+                item.completed_child_count = 0
+                item.progress_percent = 0.0
+
+        return items
 
     def update_work_item(
         self, item_id: str, request: UpdateWorkItemRequest, actor: Actor, *, org_id: Optional[str] = None
     ) -> WorkItem:
-        """Update a work item."""
+        """Update a work item.
+
+        Bidirectional sync: when status changes without an explicit column_id,
+        the item is automatically moved to the column whose status_mapping
+        matches the new status.
+        """
         item = self.get_work_item(item_id, org_id=org_id)
+
+        # GWS title validation at the service layer (if title is being changed)
+        if request.title is not None:
+            effective_type = request.item_type.value if request.item_type else item.item_type
+            title_error = _gws_validate_title(effective_type, request.title)
+            if title_error:
+                raise WorkItemValidationError(title_error)
 
         # Validate status transition
         if request.status and not is_valid_status_transition(item.status, request.status):
             raise WorkItemTransitionError(
                 f"Invalid status transition: {item.status} -> {request.status}"
             )
+
+        # Bidirectional sync: status changed without explicit column_id → resolve column
+        resolved_column_id = request.column_id
+        if (
+            request.status is not None
+            and request.status != item.status
+            and request.column_id is None
+            and item.board_id is not None
+        ):
+            matched_col = self.get_column_by_status_mapping(
+                item.board_id, request.status, org_id=org_id
+            )
+            if matched_col is not None:
+                resolved_column_id = matched_col.column_id
+
         timestamp = _now()
 
         def _execute(conn: Any) -> None:
             self._pool.set_tenant_context(conn, org_id, actor.id)
             updates, values = [], []
 
+            if request.item_type is not None:
+                updates.append("item_type = %s"); values.append(request.item_type.value)
             if request.title is not None:
                 updates.append("title = %s"); values.append(request.title)
             if request.description is not None:
@@ -1040,17 +1530,19 @@ class BoardService:
             if request.status is not None:
                 updates.append("status = %s"); values.append(request.status.value)
             if request.priority is not None:
-                updates.append("priority = %s"); values.append(request.priority.value)
+                priority_map = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+                updates.append("priority = %s"); values.append(priority_map.get(request.priority.value, 2))
             if request.board_id is not None:
                 updates.append("board_id = %s"); values.append(request.board_id)
-            if request.column_id is not None:
-                updates.append("column_id = %s"); values.append(request.column_id)
+            if resolved_column_id is not None:
+                updates.append("column_id = %s"); values.append(resolved_column_id)
             if request.parent_id is not None:
                 updates.append("parent_id = %s"); values.append(request.parent_id)
             if request.position is not None:
                 updates.append("position = %s"); values.append(request.position)
-            if request.story_points is not None:
-                updates.append("story_points = %s"); values.append(request.story_points)
+            if request.points is not None:
+                # Use story_points (pre-migration) or points (post-migration)
+                updates.append("story_points = %s"); values.append(request.points)
             if request.estimated_hours is not None:
                 updates.append("estimated_hours = %s"); values.append(float(request.estimated_hours))
             if request.actual_hours is not None:
@@ -1064,7 +1556,7 @@ class BoardService:
             if request.color is not None:
                 updates.append("color = %s"); values.append(request.color)
             if request.labels is not None:
-                updates.append("labels = %s"); values.append(json.dumps(request.labels))
+                updates.append("labels = %s"); values.append(request.labels)
             if request.acceptance_criteria is not None:
                 updates.append("acceptance_criteria = %s")
                 values.append(json.dumps([c.model_dump() for c in request.acceptance_criteria]))
@@ -1099,7 +1591,113 @@ class BoardService:
             actor_id=actor.id, actor_type=actor.role, timestamp=timestamp,
             payload={}, org_id=org_id,
         ))
+
+        # Upward cascade: if item moved to a terminal status, check if parent should auto-complete
+        if request.status in (WorkItemStatus.DONE,):
+            try:
+                self._cascade_parent_completion(item_id, actor, org_id=org_id)
+            except Exception:
+                pass  # cascade is best-effort; don't fail the primary update
+
         return updated
+
+    def complete_with_descendants(
+        self,
+        item_id: str,
+        actor: Actor,
+        *,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Complete a work item and all incomplete descendants.
+
+        Sets status to 'done' for the target item and all its descendants
+        that are not already 'done'.
+
+        Args:
+            item_id: Root work item to complete
+            actor: Actor performing the operation
+            org_id: Optional org scope
+
+        Returns:
+            Dict with updated_count (number of items updated) and updated_ids (list)
+        """
+        root = self.get_work_item(item_id, org_id=org_id)
+        if not root.board_id:
+            raise BoardServiceError(f"Work item {item_id} has no board_id")
+
+        timestamp = _now()
+        board_items = self.list_work_items(board_id=root.board_id, org_id=org_id, limit=10000, offset=0)
+        descendants = self._collect_descendants(root.item_id, board_items)
+
+        # Include root + incomplete descendants
+        incomplete_statuses = {WorkItemStatus.BACKLOG, WorkItemStatus.IN_PROGRESS, WorkItemStatus.IN_REVIEW}
+        items_to_complete: List[str] = []
+        if root.status in incomplete_statuses:
+            items_to_complete.append(root.item_id)
+        for item in descendants:
+            if item.status in incomplete_statuses:
+                items_to_complete.append(item.item_id)
+
+        if not items_to_complete:
+            return {"updated_count": 0, "updated_ids": []}
+
+        # Find "done" column for this board to sync column_id
+        done_column_id: Optional[str] = None
+        try:
+            columns = self.list_columns(root.board_id, org_id=org_id)
+            for col in columns:
+                if col.status_mapping == WorkItemStatus.DONE:
+                    done_column_id = col.column_id
+                    break
+        except Exception:
+            pass  # Column sync is best-effort
+
+        def _execute(conn: Any) -> None:
+            self._pool.set_tenant_context(conn, org_id, actor.id)
+            with conn.cursor() as cur:
+                # Batch update all items to done
+                if done_column_id:
+                    cur.execute(
+                        "UPDATE work_items SET status = %s, column_id = %s, updated_at = %s WHERE id = ANY(%s)",
+                        (WorkItemStatus.DONE.value, done_column_id, timestamp, items_to_complete),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE work_items SET status = %s, updated_at = %s WHERE id = ANY(%s)",
+                        (WorkItemStatus.DONE.value, timestamp, items_to_complete),
+                    )
+
+        self._pool.run_transaction(
+            operation="work_item.complete_with_descendants",
+            service_prefix="board",
+            actor=_actor_payload(actor),
+            metadata={"root_item_id": item_id, "updated_count": len(items_to_complete)},
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
+
+        # Emit events for all updated items
+        for updated_id in items_to_complete:
+            self._emit_event(BoardEvent(
+                event_id=_short_id("evt"),
+                event_type=BoardEventType.ITEM_UPDATED,
+                board_id=root.board_id,
+                item_id=updated_id,
+                item_type=root.item_type,
+                actor_id=actor.id,
+                actor_type=actor.role,
+                timestamp=timestamp,
+                payload={"cascade_complete": True},
+                org_id=org_id,
+            ))
+
+        # Upward cascade: the root itself is now done — check if its parent should auto-complete
+        try:
+            self._cascade_parent_completion(root.item_id, actor, org_id=org_id)
+        except Exception:
+            pass  # cascade is best-effort
+
+        return {"updated_count": len(items_to_complete), "updated_ids": items_to_complete}
 
     def delete_work_item(
         self, item_id: str, actor: Actor, *, org_id: Optional[str] = None, cascade: bool = True
@@ -1142,9 +1740,16 @@ class BoardService:
         item_type: Optional[WorkItemType] = None,
         parent_id: Optional[str] = None,
         status: Optional[WorkItemStatus] = None,
+        priority: Optional[WorkItemPriority] = None,
         assignee_id: Optional[str] = None,
+        assignee_type: Optional[str] = None,
         labels: Optional[List[str]] = None,
         sprint_id: Optional[str] = None,
+        title_search: Optional[str] = None,
+        due_before: Optional[str] = None,
+        due_after: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        order: Optional[str] = None,
         org_id: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
@@ -1158,7 +1763,27 @@ class BoardService:
             labels: Filter by labels (any of - items with at least one matching label).
                    Uses PostgreSQL JSONB ?| operator for efficient GIN index queries.
             sprint_id: Filter by sprint (items assigned to this sprint).
+            priority: Filter by priority level (critical/high/medium/low).
+            assignee_type: Filter by assignee type (user/agent).
+            title_search: Case-insensitive substring search on title.
+            due_before: ISO date — return items due on or before this date.
+            due_after: ISO date — return items due on or after this date.
+            sort_by: Sort column — one of position, priority, created_at, updated_at,
+                     due_date, title, points (or story_points).
+            order: Sort direction — asc or desc (default asc).
         """
+        # Allow-list for sort columns to prevent SQL injection
+        SORT_COLUMNS = {
+            "position": "w.position",
+            "priority": "CASE w.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",
+            "created_at": "w.created_at",
+            "updated_at": "w.updated_at",
+            "due_date": "w.due_date",
+            "title": "w.title",
+            "story_points": "w.story_points",
+            "points": "w.story_points",
+        }
+
         def _query(conn: Any) -> List[Dict]:
             self._pool.set_tenant_context(conn, org_id, None)
             conditions, values = [], []
@@ -1171,20 +1796,48 @@ class BoardService:
             if board_id:
                 conditions.append("w.board_id = %s"); values.append(board_id)
             if item_type:
-                conditions.append("w.item_type = %s"); values.append(item_type.value)
+                # Match both new and legacy DB values (pre-migration compat)
+                _REVERSE_ALIASES = {"goal": "epic", "feature": "story"}
+                legacy = _REVERSE_ALIASES.get(item_type.value)
+                if legacy:
+                    conditions.append("w.item_type IN (%s, %s)")
+                    values.extend([item_type.value, legacy])
+                else:
+                    conditions.append("w.item_type = %s"); values.append(item_type.value)
             if parent_id:
                 conditions.append("w.parent_id = %s"); values.append(parent_id)
             if status:
                 conditions.append("w.status = %s"); values.append(status.value)
+            if priority:
+                conditions.append("w.priority = %s"); values.append(priority.value)
             if assignee_id:
                 conditions.append("w.assignee_id = %s"); values.append(assignee_id)
+            if assignee_type:
+                conditions.append("w.assignee_type = %s"); values.append(assignee_type)
             if labels:
                 # Use && operator for array overlap (works with varchar[] columns)
                 conditions.append("w.labels && %s::varchar[]"); values.append(labels)
             if sprint_id:
                 conditions.append("w.sprint_id = %s"); values.append(sprint_id)
+            if title_search:
+                conditions.append("w.title ILIKE %s"); values.append(f"%{title_search}%")
+            if due_before:
+                conditions.append("w.due_date <= %s"); values.append(due_before)
+            if due_after:
+                conditions.append("w.due_date >= %s"); values.append(due_after)
 
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            # Build ORDER BY clause
+            sort_direction = "DESC" if order and order.lower() == "desc" else "ASC"
+            sort_col_expr = SORT_COLUMNS.get(sort_by, None) if sort_by else None
+            if sort_col_expr:
+                # Add NULLS LAST for nullable columns so nulls don't dominate
+                nulls_clause = "NULLS LAST" if sort_by in ("due_date", "story_points", "points") else ""  # sort maps to w.story_points
+                order_clause = f"ORDER BY {sort_col_expr} {sort_direction} {nulls_clause}".strip()
+            else:
+                order_clause = "ORDER BY w.position, w.created_at"
+
             values.extend([limit, offset])
 
             with conn.cursor() as cur:
@@ -1193,12 +1846,12 @@ class BoardService:
                     cur.execute(
                         f"""SELECT w.* FROM work_items w
                             JOIN boards b ON w.board_id = b.id
-                            {where} ORDER BY w.position, w.created_at LIMIT %s OFFSET %s""",
+                            {where} {order_clause} LIMIT %s OFFSET %s""",
                         values
                     )
                 else:
                     cur.execute(
-                        f"SELECT * FROM work_items w {where} ORDER BY w.position, w.created_at LIMIT %s OFFSET %s",
+                        f"SELECT * FROM work_items w {where} {order_clause} LIMIT %s OFFSET %s",
                         values
                     )
                 cols = [d[0] for d in cur.description]
@@ -1207,7 +1860,272 @@ class BoardService:
         results = self._pool.run_query(
             operation="work_item.list", service_prefix="board", executor=_query, telemetry=self._telemetry
         )
-        return [self._row_to_work_item(r) for r in results]
+        items = [self._row_to_work_item(r) for r in results]
+        self._enrich_child_aggregation(items, org_id=org_id)
+        self._enrich_display_ids(items, org_id=org_id)
+        return items
+
+    # ------------------------------------------------------------------
+    # Upward cascade: auto-promote parent when all children are complete
+    # ------------------------------------------------------------------
+
+    def _cascade_parent_completion(
+        self,
+        item_id: str,
+        actor: Actor,
+        *,
+        org_id: Optional[str] = None,
+        _depth: int = 0,
+    ) -> List[str]:
+        """Walk up the parent chain and mark parents as done when all their children are done.
+
+        Returns list of parent item_ids that were auto-promoted.
+        """
+        if _depth > 20:
+            return []  # safety guard against cycles
+
+        item = self.get_work_item(item_id, org_id=org_id)
+        if not item.parent_id:
+            return []
+
+        parent = self.get_work_item(item.parent_id, org_id=org_id)
+
+        # Parent already terminal — nothing to do
+        terminal = {WorkItemStatus.DONE}
+        if parent.status in terminal:
+            return []
+
+        # Check whether ALL children of this parent are done
+        def _all_children_complete(conn: Any) -> bool:
+            self._pool.set_tenant_context(conn, org_id, None)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS total,
+                              COUNT(*) FILTER (WHERE status IN ('done')) AS completed
+                       FROM work_items
+                       WHERE parent_id = %s""",
+                    (parent.item_id,),
+                )
+                row = cur.fetchone()
+                total, completed = row[0], row[1]
+                return total > 0 and total == completed
+
+        all_done: bool = self._pool.run_query(
+            operation="work_item.check_sibling_completion",
+            service_prefix="board",
+            executor=_all_children_complete,
+            telemetry=self._telemetry,
+        )
+
+        if not all_done:
+            return []
+
+        # All children are complete — promote parent to DONE
+        done_column_id: Optional[str] = None
+        if parent.board_id:
+            matched = self.get_column_by_status_mapping(
+                parent.board_id, WorkItemStatus.DONE, org_id=org_id
+            )
+            if matched:
+                done_column_id = matched.column_id
+
+        timestamp = _now()
+
+        def _promote(conn: Any) -> None:
+            self._pool.set_tenant_context(conn, org_id, actor.id)
+            with conn.cursor() as cur:
+                if done_column_id:
+                    cur.execute(
+                        "UPDATE work_items SET status = %s, column_id = %s, updated_at = %s WHERE id = %s",
+                        (WorkItemStatus.DONE.value, done_column_id, timestamp, parent.item_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE work_items SET status = %s, updated_at = %s WHERE id = %s",
+                        (WorkItemStatus.DONE.value, timestamp, parent.item_id),
+                    )
+
+        self._pool.run_transaction(
+            operation="work_item.cascade_parent_complete",
+            service_prefix="board",
+            actor=_actor_payload(actor),
+            metadata={"parent_id": parent.item_id, "trigger_item_id": item_id},
+            executor=_promote,
+            telemetry=self._telemetry,
+        )
+
+        self._emit_event(BoardEvent(
+            event_id=_short_id("evt"),
+            event_type=BoardEventType.ITEM_UPDATED,
+            board_id=parent.board_id,
+            item_id=parent.item_id,
+            item_type=parent.item_type,
+            actor_id=actor.id,
+            actor_type=actor.role,
+            timestamp=timestamp,
+            payload={"cascade_parent_complete": True, "trigger_item_id": item_id},
+            org_id=org_id,
+        ))
+
+        promoted = [parent.item_id]
+        # Recurse upward
+        promoted.extend(
+            self._cascade_parent_completion(parent.item_id, actor, org_id=org_id, _depth=_depth + 1)
+        )
+        return promoted
+
+    def _collect_descendants(self, root_id: str, all_items: List[WorkItem]) -> List[WorkItem]:
+        """Collect all descendants of a work item in board-local memory."""
+        children_by_parent: Dict[str, List[WorkItem]] = {}
+        for item in all_items:
+            if not item.parent_id:
+                continue
+            bucket = children_by_parent.get(item.parent_id)
+            if bucket is None:
+                children_by_parent[item.parent_id] = [item]
+            else:
+                bucket.append(item)
+
+        descendants: List[WorkItem] = []
+        stack: List[str] = [root_id]
+        visited: set[str] = set()
+
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            for child in children_by_parent.get(current, []):
+                descendants.append(child)
+                stack.append(child.item_id)
+
+        return descendants
+
+    def _compute_rollup_from_items(
+        self,
+        root: "WorkItem",
+        all_items: List["WorkItem"],
+        *,
+        include_incomplete_descendants: bool = False,
+    ) -> WorkItemProgressRollup:
+        """Pure computation: rollup stats from a pre-fetched item list (no DB calls)."""
+        descendants = self._collect_descendants(root.item_id, all_items)
+
+        counts = ProgressBucketCounts()
+        incomplete_items: List[IncompleteWorkItemSummary] = []
+        hours_remaining_total = 0.0
+        hours_covered_count = 0
+        points_remaining_total = 0
+        points_covered_count = 0
+
+        for item in descendants:
+            counts.total += 1
+            bucket = self._STATUS_TO_PROGRESS_BUCKET.get(item.status, "not_started")
+            if bucket == "completed":
+                counts.completed += 1
+            elif bucket == "in_progress":
+                counts.in_progress += 1
+            else:
+                counts.not_started += 1
+
+            if bucket in ("not_started", "in_progress"):
+                if include_incomplete_descendants:
+                    incomplete_items.append(
+                        IncompleteWorkItemSummary(
+                            item_id=item.item_id,
+                            item_type=item.item_type,
+                            title=item.title,
+                            status=item.status,
+                            parent_id=item.parent_id,
+                            assignee_id=item.assignee_id,
+                            assignee_type=item.assignee_type,
+                            story_points=item.points,
+                            estimated_hours=float(item.estimated_hours) if item.estimated_hours is not None else None,
+                            actual_hours=float(item.actual_hours) if item.actual_hours is not None else None,
+                        )
+                    )
+
+                if item.estimated_hours is not None:
+                    estimated = float(item.estimated_hours)
+                    actual = float(item.actual_hours) if item.actual_hours is not None else 0.0
+                    hours_remaining_total += max(estimated - actual, 0.0)
+                    hours_covered_count += 1
+
+                if item.points is not None:
+                    points_remaining_total += int(item.points)
+                    points_covered_count += 1
+
+        actionable_total = counts.total
+        completion_percent = 0.0
+        if actionable_total > 0:
+            completion_percent = round((counts.completed / actionable_total) * 100.0, 1)
+
+        items_remaining = counts.not_started + counts.in_progress
+        estimate_coverage_ratio = None
+        if items_remaining > 0:
+            estimate_coverage_ratio = round(hours_covered_count / items_remaining, 2)
+
+        remaining = RemainingWorkSummary(
+            items_remaining=items_remaining,
+            estimated_hours_remaining=round(hours_remaining_total, 2) if hours_covered_count > 0 else None,
+            points_remaining=points_remaining_total if points_covered_count > 0 else None,
+            estimate_coverage_ratio=estimate_coverage_ratio,
+        )
+
+        return WorkItemProgressRollup(
+            item_id=root.item_id,
+            item_type=root.item_type,
+            title=root.title,
+            status=root.status,
+            buckets=counts,
+            remaining=remaining,
+            completion_percent=completion_percent,
+            incomplete_items=incomplete_items,
+        )
+
+    def get_work_item_progress_rollup(
+        self,
+        item_id: str,
+        *,
+        include_incomplete_descendants: bool = False,
+        org_id: Optional[str] = None,
+    ) -> WorkItemProgressRollup:
+        """Compute a canonical progress rollup for a work item subtree."""
+        root = self.get_work_item(item_id, org_id=org_id)
+        if not root.board_id:
+            raise BoardServiceError(f"Work item {item_id} has no board_id")
+
+        board_items = self.list_work_items(board_id=root.board_id, org_id=org_id, limit=10000, offset=0)
+        return self._compute_rollup_from_items(
+            root, board_items, include_incomplete_descendants=include_incomplete_descendants,
+        )
+
+    def list_board_progress_rollups(
+        self,
+        board_id: str,
+        *,
+        item_type: Optional[WorkItemType] = None,
+        include_incomplete_descendants: bool = False,
+        org_id: Optional[str] = None,
+    ) -> List[WorkItemProgressRollup]:
+        """Compute progress rollups for top-level board items.
+        
+        Fetches all items once and computes rollups in-memory (O(1) DB calls
+        regardless of root count).
+        """
+        self.get_board(board_id, include_columns=False, org_id=org_id)
+        all_items = self.list_work_items(board_id=board_id, org_id=org_id, limit=10000, offset=0)
+        if item_type is not None:
+            roots = [i for i in all_items if i.item_type == item_type]
+        else:
+            roots = [i for i in all_items if i.parent_id is None]
+
+        return [
+            self._compute_rollup_from_items(
+                root, all_items, include_incomplete_descendants=include_incomplete_descendants,
+            )
+            for root in roots
+        ]
 
     # =========================================================================
     # Assignment
@@ -1435,15 +2353,11 @@ class BoardService:
     # =========================================================================
 
     def _epic_status_from_work_item(self, status: WorkItemStatus) -> EpicStatus:
-        if status == WorkItemStatus.DRAFT:
-            return EpicStatus.DRAFT
         if status == WorkItemStatus.DONE:
             return EpicStatus.COMPLETED
         return EpicStatus.ACTIVE
 
     def _work_item_status_from_epic(self, status: EpicStatus) -> WorkItemStatus:
-        if status == EpicStatus.DRAFT:
-            return WorkItemStatus.DRAFT
         if status == EpicStatus.COMPLETED:
             return WorkItemStatus.DONE
         return WorkItemStatus.IN_PROGRESS
@@ -1457,7 +2371,7 @@ class BoardService:
             description=item.description,
             status=self._epic_status_from_work_item(item.status),
             priority=item.priority,
-            story_points=item.story_points,
+            story_points=item.points,
             color=item.color,
             labels=list(item.labels or []),
             created_at=item.created_at,
@@ -1477,7 +2391,7 @@ class BoardService:
             description=item.description,
             status=item.status,
             priority=item.priority,
-            story_points=item.story_points,
+            story_points=item.points,
             labels=list(item.labels or []),
             created_at=item.created_at,
             updated_at=item.updated_at,
@@ -1788,7 +2702,15 @@ class BoardService:
             executor=_query,
             telemetry=self._telemetry,
         )
-        return [SprintStory(**r) for r in results]
+        return [
+            SprintStory(
+                sprint_id=str(r["sprint_id"]),
+                story_id=str(r["story_id"]),
+                added_at=r.get("added_at"),
+                added_by=r.get("added_by"),
+            )
+            for r in results
+        ]
 
     # =========================================================================
     # Label CRUD Operations
@@ -2214,6 +3136,7 @@ class BoardService:
         def _query(conn: Any) -> Optional[Dict]:
             self._pool.set_tenant_context(conn, org_id, None)
             with conn.cursor() as cur:
+                # First try exact status_mapping match
                 cur.execute(
                     """
                     SELECT * FROM columns
@@ -2224,6 +3147,26 @@ class BoardService:
                     (board_id, status_mapping.value),
                 )
                 row = cur.fetchone()
+                if not row:
+                    # Fallback: infer from column name for columns with NULL status_mapping
+                    name_candidates = [
+                        name for name, st in BoardService._COLUMN_NAME_TO_STATUS.items()
+                        if st == status_mapping
+                    ]
+                    if name_candidates:
+                        placeholders = ",".join(["%s"] * len(name_candidates))
+                        cur.execute(
+                            f"""
+                            SELECT * FROM columns
+                            WHERE board_id = %s::uuid
+                              AND status_mapping IS NULL
+                              AND LOWER(TRIM(name)) IN ({placeholders})
+                            ORDER BY position ASC
+                            LIMIT 1
+                            """,
+                            (board_id, *name_candidates),
+                        )
+                        row = cur.fetchone()
                 if row:
                     cols = [d[0] for d in cur.description]
                     return dict(zip(cols, row))
@@ -2244,7 +3187,7 @@ class BoardService:
             board_id=str(result["board_id"]),
             name=result["name"],
             position=result["position"],
-            status_mapping=WorkItemStatus(result["status_mapping"]) if result.get("status_mapping") else WorkItemStatus.TODO,
+            status_mapping=WorkItemStatus(result["status_mapping"]) if result.get("status_mapping") else WorkItemStatus.BACKLOG,
             wip_limit=result.get("wip_limit"),
             settings={},
             created_at=result["created_at"],

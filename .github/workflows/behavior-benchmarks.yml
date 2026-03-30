@@ -138,6 +138,64 @@ jobs:
 
           echo "✅ Performance thresholds passed"
 
+      - name: Run quality gates
+        id: quality_gates
+        env:
+          BEHAVIOR_PG_DSN: postgresql://guideai:guideai_test@localhost:5432/guideai_behavior
+        run: |
+          # Download previous results if available
+          PREV_FLAG=""
+          if [ -f data/benchmarks/previous_results.json ]; then
+            PREV_FLAG="--previous data/benchmarks/previous_results.json"
+          fi
+
+          python scripts/run_quality_gates.py \
+            --anchors packages/midnighter/benchmarks/regression_anchors.json \
+            --output quality_gate_results.json \
+            $PREV_FLAG || GATE_EXIT=$?
+
+          # Extract summary for step output
+          if [ -f quality_gate_results.json ]; then
+            PASSED=$(jq -r '.passed_gates // 0' quality_gate_results.json)
+            TOTAL=$(jq -r '.total_gates // 0' quality_gate_results.json)
+            OVERALL=$(jq -r '.overall_passed // false' quality_gate_results.json)
+            echo "passed=$PASSED" >> $GITHUB_OUTPUT
+            echo "total=$TOTAL" >> $GITHUB_OUTPUT
+            echo "overall=$OVERALL" >> $GITHUB_OUTPUT
+          fi
+
+          # Save current results as baseline for next run
+          mkdir -p data/benchmarks
+          cp quality_gate_results.json data/benchmarks/previous_results.json 2>/dev/null || true
+
+          exit ${GATE_EXIT:-0}
+
+      - name: Upload quality gate results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-results-${{ github.run_number }}
+          path: quality_gate_results.json
+          retention-days: 90
+
+      - name: Quality gate summary
+        if: always()
+        run: |
+          echo "## 🚦 Quality Gates" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.quality_gates.outputs.overall }}" = "true" ]; then
+            echo "✅ **All gates passed** (${{ steps.quality_gates.outputs.passed }}/${{ steps.quality_gates.outputs.total }})" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Gate failures** (${{ steps.quality_gates.outputs.passed }}/${{ steps.quality_gates.outputs.total }} passed)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Failure details</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            jq '.gates[] | select(.passed == false)' quality_gate_results.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No details available" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
+
   notify:
     name: Notify on Failure
     runs-on: ubuntu-latest

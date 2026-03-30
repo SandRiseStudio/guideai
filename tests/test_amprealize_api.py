@@ -88,7 +88,7 @@ def test_plan_endpoint(client, mock_container):
 
     # API requires actor_id and actor_role query params
     response = client.post(
-        "/v1/amprealize/plan?actor_id=test-user&actor_role=engineer",
+        "/api/v1/amprealize/plan?actor_id=test-user&actor_role=engineer",
         json={
             "blueprint_id": "bp-123",
             "environment": "development",
@@ -112,7 +112,7 @@ def test_apply_endpoint(client, mock_container):
 
     # API requires actor_id and actor_role query params
     response = client.post(
-        "/v1/amprealize/apply?actor_id=test-user&actor_role=engineer",
+        "/api/v1/amprealize/apply?actor_id=test-user&actor_role=engineer",
         json={
             "plan_id": "plan-123",
             "watch": False
@@ -136,7 +136,7 @@ def test_status_endpoint(client, mock_container):
         telemetry=TelemetryData(token_savings_pct=0.3, behavior_reuse_pct=0.7)
     )
 
-    response = client.get("/v1/amprealize/status/run-123")
+    response = client.get("/api/v1/amprealize/status/run-123")
 
     assert response.status_code == 200
     data = response.json()
@@ -153,7 +153,7 @@ def test_destroy_endpoint(client, mock_container):
 
     # API requires actor_id and actor_role query params
     response = client.post(
-        "/v1/amprealize/destroy?actor_id=test-user&actor_role=engineer",
+        "/api/v1/amprealize/destroy?actor_id=test-user&actor_role=engineer",
         json={
             "amp_run_id": "run-123",
             "reason": "Test complete"
