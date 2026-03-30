@@ -13,6 +13,7 @@ import { ExecutionStatusBadge, type ExecutionListItem } from '../../lib/collab-c
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { ConsoleSidebar } from '../ConsoleSidebar';
 import { WorkspaceShell } from '../workspace/WorkspaceShell';
+import { useApiCapabilities } from '../../api/capabilities';
 import { type Agent, type AgentStatus, useProject } from '../../api/dashboard';
 import { useProjectAgents } from '../../api/agentRegistry';
 import { useProjectParticipants } from '../../api/projects';
@@ -376,6 +377,7 @@ interface WorkItemCardProps {
   isCollapsed?: boolean;
   hierarchyCountLabel?: string;
   onToggleCollapse?: (itemId: string) => void;
+  executionAvailable?: boolean;
   /** When true, card renders with reduced opacity (filter non-match / ancestor) */
   isDimmed?: boolean;
   progressRollup?: WorkItemProgressRollup | null;
@@ -410,6 +412,7 @@ const WorkItemCard = memo(function WorkItemCard({
   isCollapsed,
   hierarchyCountLabel,
   onToggleCollapse,
+  executionAvailable = false,
   isDimmed,
   progressRollup,
   summarized,
@@ -467,11 +470,13 @@ const WorkItemCard = memo(function WorkItemCard({
   const hasAgentAssignment = Boolean(item.assignee_id && item.assignee_type === 'agent');
   // Orphaned assignment: work item references an agent that no longer exists
   const isOrphanedAssignment = hasAgentAssignment && !assignee;
-  const canStartExecution = Boolean(hasAgentAssignment && !isActiveExecution && !isOrphanedAssignment);
-  const canCancelExecution = Boolean(isActiveExecution);
+  const canStartExecution = Boolean(executionAvailable && hasAgentAssignment && !isActiveExecution && !isOrphanedAssignment);
+  const canCancelExecution = Boolean(executionAvailable && isActiveExecution);
   const showExecutionRow = showExecutionBadge || hasAgentAssignment || isActiveExecution;
   const startButtonTitle = isOrphanedAssignment
     ? 'Assigned agent no longer exists. Please re-assign.'
+    : !executionAvailable
+      ? 'Execution is unavailable in this deployment'
     : !hasAgentAssignment
       ? 'Assign an agent to enable execution'
       : isActiveExecution
@@ -1398,6 +1403,7 @@ interface ColumnLaneProps {
   items: WorkItem[];
   assigneeIndex: Map<string, AssigneeProfile>;
   executionByItemId: Map<string, ExecutionListItem>;
+  executionAvailable: boolean;
   childTaskCountByParent: Map<string, number>;
   featureCountByGoal: Map<string, number>;
   taskCountByGoal: Map<string, number>;
@@ -1567,6 +1573,7 @@ const ColumnLane = memo(function ColumnLane({
   items,
   assigneeIndex,
   executionByItemId,
+  executionAvailable,
   childTaskCountByParent,
   featureCountByGoal,
   taskCountByGoal,
@@ -2108,6 +2115,7 @@ const ColumnLane = memo(function ColumnLane({
           isCollapsed={options?.isCollapsed}
           hierarchyCountLabel={options?.hierarchyCountLabel}
           onToggleCollapse={toggleCollapse}
+          executionAvailable={executionAvailable}
           isDimmed={isItemDimmed(item.item_id)}
           progressRollup={progressByItemId.get(item.item_id) ?? null}
           summarized={options?.summarized}
@@ -2123,6 +2131,7 @@ const ColumnLane = memo(function ColumnLane({
       draggedItemId,
       justDroppedItemId,
       executionByItemId,
+      executionAvailable,
       isCancelPending,
       isItemDimmed,
       isStartPending,
@@ -2639,6 +2648,7 @@ export function BoardPage(): React.JSX.Element {
   const deleteCommitTimerRef = useRef<number | null>(null);
   const [pendingDelete, setPendingDelete] = useState<PendingBoardDelete | null>(null);
   const [isDeleteDockHovered, setIsDeleteDockHovered] = useState(false);
+  const capabilitiesQuery = useApiCapabilities();
   const items = useMemo(() => {
     if (!pendingDelete) return workItems;
     const hidden = new Set(pendingDelete.hiddenIds);
@@ -2650,6 +2660,7 @@ export function BoardPage(): React.JSX.Element {
 
   const participantsQuery = useProjectParticipants(projectId ?? null);
   const projectAgentsQuery = useProjectAgents(Boolean(projectId));
+  const executionAvailable = capabilitiesQuery.data?.routes.executions ?? false;
   const participantRecords = participantsQuery.data?.items ?? [];
   const projectAgents = projectAgentsQuery.data ?? EMPTY_AGENTS;
   const participantsError = participantsQuery.error;
@@ -3505,6 +3516,7 @@ export function BoardPage(): React.JSX.Element {
                 items={itemsByColumnId[col.column_id] ?? EMPTY_ITEMS}
                 assigneeIndex={assigneeIndex}
                 executionByItemId={executionByItemId}
+                executionAvailable={executionAvailable}
                 childTaskCountByParent={childTaskCountByParent}
                 featureCountByGoal={featureCountByGoal}
                 taskCountByGoal={taskCountByGoal}

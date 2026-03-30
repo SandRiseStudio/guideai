@@ -7,6 +7,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient, ApiError } from './client';
+import { getApiCapabilities } from './capabilities';
 import { dashboardKeys, type Project } from './dashboard';
 import { razeLog } from '../telemetry/raze';
 
@@ -119,6 +120,13 @@ export function useProjectParticipants(projectId?: string | null) {
     queryKey: projectKeys.participants(projectId),
     queryFn: async (): Promise<ProjectParticipantListResponse> => {
       if (!projectId) {
+        return {
+          items: [],
+          totals: { total: 0, humans: 0, agents: 0 },
+        };
+      }
+      const capabilities = await getApiCapabilities();
+      if (!capabilities.routes.participants) {
         return {
           items: [],
           totals: { total: 0, humans: 0, agents: 0 },

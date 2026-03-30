@@ -81,3 +81,37 @@ def test_create_project_with_org_id_still_single_resource_type() -> None:
     payload = list_resp.json()
     assert len(payload["items"]) == 1
     assert payload["items"][0]["id"] == "proj-aaa"
+
+
+def test_list_project_participants() -> None:
+    svc = MagicMock()
+    proj = _make_project()
+    svc.get_project.return_value = proj
+    svc.list_project_participants.return_value = [
+        {
+            "id": "user-123",
+            "kind": "human",
+            "user_id": "user-123",
+            "display_name": "Nick Sanders",
+            "role": "owner",
+            "membership_source": "owner",
+        },
+        {
+            "id": "agent-123",
+            "kind": "agent",
+            "agent_id": "agent-123",
+            "display_name": "Architect Agent",
+            "role": "primary",
+            "assignment_status": "active",
+            "presence": "available",
+        },
+    ]
+
+    client = _make_client(svc)
+
+    resp = client.get("/v1/projects/proj-aaa/participants")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["totals"] == {"total": 2, "humans": 1, "agents": 1}
+    assert payload["items"][0]["kind"] == "human"
+    assert payload["items"][1]["kind"] == "agent"

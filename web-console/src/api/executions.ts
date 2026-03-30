@@ -23,6 +23,7 @@ import {
   type ExecutionStepSnapshotPayload,
   type ExecutionStepsResponse,
 } from '../lib/collab-client';
+import { getApiCapabilities } from './capabilities';
 import { apiClient, ApiError, API_ORIGIN } from './client';
 import { razeLog } from '../telemetry/raze';
 
@@ -284,17 +285,8 @@ export function useExecutionStream(params: {
       setConnectionState(ConnectionState.Disconnected);
       return;
     }
-
-    const nextClient =
-      client ??
-      new ExecutionStreamClient({
-        baseUrl: API_ORIGIN,
-        authToken: apiClient.getToken() ?? undefined,
-        getAuthToken: async () => apiClient.getToken(),
-      });
-
-    clientRef.current = nextClient;
-    nextClient.setAuthToken(apiClient.getToken());
+    let isDisposed = false;
+    let cleanup: (() => void) | undefined;
 
     const handleStatus = (payload: ExecutionStatusEventPayload) => {
       const orgId = payload.org_id ?? target.orgId ?? params.orgId ?? null;
@@ -410,33 +402,57 @@ export function useExecutionStream(params: {
       }
     };
 
-    const unsubscribeConnected = nextClient.on('connected', () => {
-      setConnectionState(ConnectionState.Connected);
-    });
-    const unsubscribeDisconnected = nextClient.on('disconnected', () => {
-      setConnectionState(ConnectionState.Disconnected);
-    });
-    const unsubscribeStatus = nextClient.on('status', handleStatus);
-    const unsubscribeStep = nextClient.on('step', handleStep);
-    const unsubscribeSnapshot = nextClient.on('snapshot', handleSnapshot);
-    const unsubscribeReady = nextClient.on('ready', () => {
-      setConnectionState(ConnectionState.Connected);
-    });
-    const unsubscribeError = nextClient.on('error', () => {
-      setConnectionState(ConnectionState.Disconnected);
-    });
+    void getApiCapabilities().then((capabilities) => {
+      if (isDisposed || !capabilities.routes.executions) {
+        client?.disconnect('stream_disabled');
+        setConnectionState(ConnectionState.Disconnected);
+        return;
+      }
 
-    nextClient.connect(target);
+      const nextClient =
+        client ??
+        new ExecutionStreamClient({
+          baseUrl: API_ORIGIN,
+          authToken: apiClient.getToken() ?? undefined,
+          getAuthToken: async () => apiClient.getToken(),
+        });
+
+      clientRef.current = nextClient;
+      nextClient.setAuthToken(apiClient.getToken());
+
+      const unsubscribeConnected = nextClient.on('connected', () => {
+        setConnectionState(ConnectionState.Connected);
+      });
+      const unsubscribeDisconnected = nextClient.on('disconnected', () => {
+        setConnectionState(ConnectionState.Disconnected);
+      });
+      const unsubscribeStatus = nextClient.on('status', handleStatus);
+      const unsubscribeStep = nextClient.on('step', handleStep);
+      const unsubscribeSnapshot = nextClient.on('snapshot', handleSnapshot);
+      const unsubscribeReady = nextClient.on('ready', () => {
+        setConnectionState(ConnectionState.Connected);
+      });
+      const unsubscribeError = nextClient.on('error', () => {
+        setConnectionState(ConnectionState.Disconnected);
+      });
+
+      nextClient.connect(target);
+
+      cleanup = () => {
+        unsubscribeConnected();
+        unsubscribeDisconnected();
+        unsubscribeStatus();
+        unsubscribeStep();
+        unsubscribeSnapshot();
+        unsubscribeReady();
+        unsubscribeError();
+        nextClient.disconnect('stream_cleanup');
+      };
+    });
 
     return () => {
-      unsubscribeConnected();
-      unsubscribeDisconnected();
-      unsubscribeStatus();
-      unsubscribeStep();
-      unsubscribeSnapshot();
-      unsubscribeReady();
-      unsubscribeError();
-      nextClient.disconnect('stream_cleanup');
+      isDisposed = true;
+      cleanup?.();
     };
   }, [params.enabled, params.orgId, params.projectId, queryClient, target]);
 
@@ -456,6 +472,10 @@ export function useWorkItemExecutionStatus(
     queryKey: executionKeys.status(itemId, orgId, projectId),
     queryFn: async () => {
       if (!itemId || !projectId) {
+        return null;
+      }
+      const capabilities = await getApiCapabilities();
+      if (!capabilities.routes.executions) {
         return null;
       }
       const params = new URLSearchParams({
@@ -482,12 +502,6 @@ export function useWorkItemExecutionStatus(
   });
 }
 
-/**
- * When the executions endpoint returns 404 (not deployed), we set this flag
- * so subsequent poll cycles are suppressed — avoids endless browser network errors.
- */
-let executionsEndpointUnavailable = false;
-
 export function useExecutionList(
   orgId?: string | null,
   projectId?: string | null,
@@ -497,8 +511,8 @@ export function useExecutionList(
     queryKey: executionKeys.list(orgId, projectId, options?.status ?? null, options?.limit, options?.offset),
     queryFn: async () => {
       if (!projectId) return null;
-      // Skip network call entirely once we know the endpoint is unavailable
-      if (executionsEndpointUnavailable) {
+      const capabilities = await getApiCapabilities();
+      if (!capabilities.routes.executions) {
         return { executions: [], total: 0, offset: 0, limit: options?.limit ?? 50 };
       }
       const params = new URLSearchParams({
@@ -512,13 +526,10 @@ export function useExecutionList(
       if (options?.status) params.set('status', options.status);
       try {
         const response = await apiClient.get<ExecutionListApiResponse>(`/v1/executions?${params.toString()}`);
-        // Endpoint is back — clear the flag
-        executionsEndpointUnavailable = false;
         return mapExecutionList(response);
       } catch (error) {
         // Treat 404 as "no executions" — endpoint may not be deployed in this environment.
         if (error instanceof ApiError && error.status === 404) {
-          executionsEndpointUnavailable = true;
           return { executions: [], total: 0, offset: 0, limit: options?.limit ?? 50 };
         }
         throw error;
@@ -545,6 +556,10 @@ export function useExecutionSteps(
     queryKey: executionKeys.steps(runId),
     queryFn: async () => {
       if (!runId || !projectId) return null;
+      const capabilities = await getApiCapabilities();
+      if (!capabilities.routes.executions) {
+        return null;
+      }
       const params = new URLSearchParams();
       if (orgId) params.set('org_id', orgId);
       params.set('project_id', projectId);

@@ -427,7 +427,8 @@ class WriteTargetResolver:
         self._pool = pool
         self._settings_service = settings_service
         # Create settings service if pool is provided but service is not
-        if self._pool and not self._settings_service:
+        # SettingsService is None in OSS (enterprise-only), so guard the call
+        if self._pool and not self._settings_service and SettingsService is not None:
             self._settings_service = SettingsService(pool=self._pool)
 
     def get_write_scope(

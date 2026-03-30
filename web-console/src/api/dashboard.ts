@@ -11,6 +11,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { apiClient, ApiError } from './client';
+import { getApiCapabilities } from './capabilities';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -217,6 +218,10 @@ export function useOrganizations() {
   return useQuery({
     queryKey: dashboardKeys.organizations(),
     queryFn: async (): Promise<Organization[]> => {
+      const capabilities = await getApiCapabilities();
+      if (!capabilities.routes.orgs) {
+        return [];
+      }
       const endpoints = ['/v1/orgs', '/v1/organizations'];
       for (const endpoint of endpoints) {
         try {

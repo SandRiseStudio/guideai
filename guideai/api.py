@@ -233,6 +233,39 @@ class _UnavailableWarehouse:
     get_compliance_coverage = _unavailable
 
 
+class RouteCapabilitiesResponse(BaseModel):
+    projects: bool = False
+    participants: bool = False
+    orgs: bool = False
+    settings: bool = False
+    executions: bool = False
+
+
+class ServiceCapabilitiesResponse(BaseModel):
+    project_service: bool = False
+    org_service: bool = False
+    settings_service: bool = False
+    execution_enabled: bool = False
+    execution_service: bool = False
+
+
+class ApiCapabilitiesResponse(BaseModel):
+    routes: RouteCapabilitiesResponse
+    services: ServiceCapabilitiesResponse
+
+
+def _env_flag(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 class _ServiceContainer:
     """Lazily constructed service instances shared by API routes."""
 
@@ -616,18 +649,29 @@ class _ServiceContainer:
         # Work Item Execution Service (optional - uses PostgreSQL)
         # Uses wire_execution_service to connect AgentExecutionLoop + AgentLLMClient
         self.work_item_execution_service: Optional[Any] = None
-        if WORK_ITEM_EXECUTION_AVAILABLE and wire_execution_service is not None:
-            execution_dsn = resolve_optional_postgres_dsn(
-                service="EXECUTION",
-                explicit_dsn=os.getenv("GUIDEAI_EXECUTION_PG_DSN"),
-                env_var="GUIDEAI_EXECUTION_PG_DSN",
-            )
-            # Fall back to DATABASE_URL if specific env var not set
+        explicit_execution_dsn = os.getenv("GUIDEAI_EXECUTION_PG_DSN")
+        execution_dsn = resolve_optional_postgres_dsn(
+            service="EXECUTION",
+            explicit_dsn=explicit_execution_dsn,
+            env_var="GUIDEAI_EXECUTION_PG_DSN",
+        )
+        execution_enabled = _env_flag("GUIDEAI_EXECUTION_ENABLED")
+        if execution_enabled is None:
+            execution_enabled = bool(execution_dsn)
+        self.execution_enabled = bool(execution_enabled)
+
+        if self.execution_enabled:
             if not execution_dsn:
                 execution_dsn = os.getenv("DATABASE_URL")
+            if not WORK_ITEM_EXECUTION_AVAILABLE or wire_execution_service is None:
+                raise RuntimeError(
+                    "Work item execution service failed to initialize: execution dependencies are unavailable"
+                )
+            if not execution_dsn:
+                raise RuntimeError(
+                    "Work item execution service failed to initialize: missing GUIDEAI_EXECUTION_PG_DSN or DATABASE_URL"
+                )
             try:
-                # Use wire_execution_service to create fully-wired service
-                # This connects AgentExecutionLoop + AgentLLMClient for real execution
                 self.work_item_execution_service = wire_execution_service(
                     dsn=execution_dsn,
                     board_service=self.board_service,
@@ -637,7 +681,29 @@ class _ServiceContainer:
                 )
                 logger.info("WorkItemExecutionService initialized with AgentExecutionLoop wired")
             except Exception as exc:
-                logger.warning(f"WorkItemExecutionService unavailable: {exc}")
+                raise RuntimeError(
+                    f"Work item execution service failed to initialize: {exc}"
+                ) from exc
+        else:
+            logger.info("WorkItemExecutionService disabled by capability gating")
+
+        self.execution_service_available = self.work_item_execution_service is not None
+        self.api_capabilities = ApiCapabilitiesResponse(
+            routes=RouteCapabilitiesResponse(
+                projects=self.project_service_available,
+                participants=self.participants_available,
+                orgs=self.org_routes_available,
+                settings=self.settings_routes_available,
+                executions=self.execution_service_available,
+            ),
+            services=ServiceCapabilitiesResponse(
+                project_service=self.project_service_available,
+                org_service=self.org_service is not None,
+                settings_service=self.settings_service is not None,
+                execution_enabled=self.execution_enabled,
+                execution_service=self.execution_service_available,
+            ),
+        )
 
 
 def _normalize_user_code(user_code: str) -> str:
@@ -1058,6 +1124,8 @@ def create_app(
         workflow_db_path=workflow_db_path,
         execution_event_hub=execution_event_hub,
     )
+    app.state.container = container
+    app.state.api_capabilities = container.api_capabilities
 
     # ------------------------------------------------------------------
     # Auth Middleware & Permission Service
@@ -1074,6 +1142,7 @@ def create_app(
     auth_config = AuthConfig(
         skip_paths={
             "/health", "/health/", "/metrics", "/docs", "/openapi.json", "/redoc",
+            "/api/v1/capabilities",
             "/api/v1/device/authorize",  # Device flow doesn't need auth
             "/api/v1/device/token",  # Token endpoint
             "/api/v1/activate",  # Activation page
@@ -1085,6 +1154,10 @@ def create_app(
         config=auth_config,
         device_flow_manager=container.device_flow_manager,
     )
+
+    @app.get("/api/v1/capabilities", response_model=ApiCapabilitiesResponse, tags=["platform"])
+    def get_api_capabilities() -> ApiCapabilitiesResponse:
+        return app.state.api_capabilities
 
     if auth_enabled:
         from guideai.multi_tenant.permissions import AsyncPermissionService
@@ -4133,166 +4206,137 @@ def create_app(
     # Work Item Execution Streaming
     # ------------------------------------------------------------------
 
-    @app.get("/api/v1/executions/{run_id}/steps")
-    def get_execution_steps(
-        run_id: str,
-        org_id: Optional[str] = None,
-        project_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get execution steps for a run.
+    if container.execution_service_available:
+        @app.get("/api/v1/executions/{run_id}/steps")
+        def get_execution_steps(
+            run_id: str,
+            org_id: Optional[str] = None,
+            project_id: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """Get execution steps for a run."""
+            run_id = _validated_uuid(run_id, "Run")
 
-        Returns steps with token counts, phases, and other execution metadata.
-        This endpoint supports the ExecutionTimeline component in the frontend.
+            try:
+                run = container.run_service.get_run(run_id)
+                steps = []
+                for step in run.steps:
+                    step_dict = step.to_dict()
+                    metadata = step_dict.get("metadata", {})
+                    input_data = metadata.get("input_data", {})
+                    if isinstance(input_data, dict):
+                        input_tokens = input_data.get("input_tokens", 0)
+                        output_tokens = input_data.get("output_tokens", 0)
+                        step_type = input_data.get("step_type", step_dict.get("name", "step"))
+                        phase = input_data.get("phase", "unknown")
+                        content_preview = input_data.get("content_preview")
+                    else:
+                        input_tokens = metadata.get("input_tokens", 0)
+                        output_tokens = metadata.get("output_tokens", 0)
+                        step_type = metadata.get("step_type", step_dict.get("name", "step"))
+                        phase = metadata.get("phase", "unknown")
+                        content_preview = metadata.get("content_preview")
 
-        Response format expected by frontend:
-        {
-            "steps": [
-                {
-                    "step_id": "...",
-                    "phase": "EXECUTING",
-                    "step_type": "llm_response",
-                    "started_at": "2025-01-15T...",
-                    "completed_at": "2025-01-15T...",
-                    "input_tokens": 493,
-                    "output_tokens": 90,
-                    "tool_calls": 0,
-                    "content_preview": "...",
-                    "content_full": null,
-                    "tool_names": null,
-                    "model_id": null
-                }
-            ],
-            "total": 9
-        }
-        """
-        run_id = _validated_uuid(run_id, "Run")
+                    tool_calls_data = (
+                        input_data.get("tool_calls")
+                        if isinstance(input_data, dict)
+                        else metadata.get("tool_calls")
+                    )
+                    if isinstance(tool_calls_data, list):
+                        tool_call_count = len(tool_calls_data)
+                        tool_names = [
+                            tc.get("tool_name")
+                            for tc in tool_calls_data
+                            if isinstance(tc, dict) and tc.get("tool_name")
+                        ]
+                    elif isinstance(tool_calls_data, int):
+                        tool_call_count = tool_calls_data
+                        tool_names = metadata.get("tool_names") or []
+                    else:
+                        tool_call_count = 0
+                        tool_names = metadata.get("tool_names") or []
 
-        # Try to get steps from run_service (preferred path with PostgreSQL)
-        try:
-            run = container.run_service.get_run(run_id)
-            steps = []
-            for step in run.steps:
-                step_dict = step.to_dict()
-                metadata = step_dict.get("metadata", {})
-                input_data = metadata.get("input_data", {})
-                if isinstance(input_data, dict):
-                    # Extract from nested input_data if present
-                    input_tokens = input_data.get("input_tokens", 0)
-                    output_tokens = input_data.get("output_tokens", 0)
-                    step_type = input_data.get("step_type", step_dict.get("name", "step"))
-                    phase = input_data.get("phase", "unknown")
-                    content_preview = input_data.get("content_preview")
-                else:
-                    # Already flattened
-                    input_tokens = metadata.get("input_tokens", 0)
-                    output_tokens = metadata.get("output_tokens", 0)
-                    step_type = metadata.get("step_type", step_dict.get("name", "step"))
-                    phase = metadata.get("phase", "unknown")
-                    content_preview = metadata.get("content_preview")
+                    steps.append(
+                        {
+                            "step_id": step_dict.get("id") or step_dict.get("step_id", ""),
+                            "phase": phase,
+                            "step_type": step_type,
+                            "started_at": step_dict.get("started_at") or step_dict.get("created_at", ""),
+                            "completed_at": step_dict.get("completed_at"),
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "tool_calls": tool_call_count,
+                            "content_preview": content_preview,
+                            "content_full": metadata.get("content_full"),
+                            "tool_names": tool_names if tool_names else None,
+                            "model_id": metadata.get("model_id"),
+                        }
+                    )
 
-                # Extract tool_calls array and convert to count + names
-                tool_calls_data = input_data.get("tool_calls") if isinstance(input_data, dict) else metadata.get("tool_calls")
-                if isinstance(tool_calls_data, list):
-                    # tool_calls is an array like [{"tool_name": "list_dir"}]
-                    tool_call_count = len(tool_calls_data)
-                    tool_names = [tc.get("tool_name") for tc in tool_calls_data if isinstance(tc, dict) and tc.get("tool_name")]
-                elif isinstance(tool_calls_data, int):
-                    # Already a count
-                    tool_call_count = tool_calls_data
-                    tool_names = metadata.get("tool_names") or []
-                else:
-                    tool_call_count = 0
-                    tool_names = metadata.get("tool_names") or []
+                steps.sort(key=lambda s: s.get("started_at") or "")
+                return {"steps": steps, "total": len(steps)}
+            except RunNotFoundError:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run {run_id} not found")
+            except Exception as exc:
+                logger.exception(f"Error fetching execution steps for run {run_id}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
-                # Format step in the shape expected by frontend
-                formatted_step = {
-                    "step_id": step_dict.get("id") or step_dict.get("step_id", ""),
-                    "phase": phase,
-                    "step_type": step_type,
-                    "started_at": step_dict.get("started_at") or step_dict.get("created_at", ""),
-                    "completed_at": step_dict.get("completed_at"),
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "tool_calls": tool_call_count,
-                    "content_preview": content_preview,
-                    "content_full": metadata.get("content_full"),
-                    "tool_names": tool_names if tool_names else None,
-                    "model_id": metadata.get("model_id"),
-                }
-                steps.append(formatted_step)
+        @app.websocket("/api/v1/executions/ws")
+        async def executions_ws(websocket: WebSocket) -> None:
+            hub: ExecutionEventHub = app.state.execution_event_hub
 
-            # Sort steps by started_at ascending (chronological order for timeline)
-            logger.info(f"Before sort: {len(steps)} steps, first={steps[0].get('started_at') if steps else None}")
-            steps.sort(key=lambda s: s.get("started_at") or "")
-            logger.info(f"After sort: first={steps[0].get('started_at') if steps else None}")
+            run_id = websocket.query_params.get("run_id")
+            org_id = websocket.query_params.get("org_id")
+            project_id = websocket.query_params.get("project_id")
 
-            return {
-                "steps": steps,
-                "total": len(steps),
-            }
-        except RunNotFoundError:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run {run_id} not found")
-        except Exception as exc:
-            logger.exception(f"Error fetching execution steps for run {run_id}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
-
-    @app.websocket("/api/v1/executions/ws")
-    async def executions_ws(websocket: WebSocket) -> None:
-        hub: ExecutionEventHub = app.state.execution_event_hub
-
-        run_id = websocket.query_params.get("run_id")
-        org_id = websocket.query_params.get("org_id")
-        project_id = websocket.query_params.get("project_id")
-
-        if not run_id and not (org_id and project_id):
-            await websocket.accept()
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "code": "BAD_REQUEST",
-                    "message": "Provide run_id or org_id + project_id",
-                }
-            )
-            await websocket.close(code=1008)
-            return
-
-        await hub.connect(websocket, run_id=run_id, org_id=org_id, project_id=project_id)
-
-        try:
-            if run_id and container.work_item_execution_service:
-                status = container.work_item_execution_service.get_execution_by_run_id(run_id, org_id)
-                steps = container.work_item_execution_service.get_execution_steps(run_id, org_id)
+            if not run_id and not (org_id and project_id):
+                await websocket.accept()
                 await websocket.send_json(
                     {
-                        "type": "execution.snapshot",
-                        "payload": {
-                            "run_id": run_id,
-                            "status": status.to_dict() if status else None,
-                            "steps": steps,
-                        },
+                        "type": "error",
+                        "code": "BAD_REQUEST",
+                        "message": "Provide run_id or org_id + project_id",
                     }
                 )
-            else:
-                await websocket.send_json(
-                    {
-                        "type": "execution.ready",
-                        "payload": {
-                            "run_id": run_id,
-                            "org_id": org_id,
-                            "project_id": project_id,
-                        },
-                    }
-                )
+                await websocket.close(code=1008)
+                return
 
-            while True:
-                message = await websocket.receive_json()
-                if message.get("type") == "ping":
-                    await websocket.send_json({"type": "pong"})
-        except WebSocketDisconnect:
-            await hub.disconnect(websocket)
-        except Exception:
-            await hub.disconnect(websocket)
-            raise
+            await hub.connect(websocket, run_id=run_id, org_id=org_id, project_id=project_id)
+
+            try:
+                if run_id and container.work_item_execution_service:
+                    status = container.work_item_execution_service.get_execution_by_run_id(run_id, org_id)
+                    steps = container.work_item_execution_service.get_execution_steps(run_id, org_id)
+                    await websocket.send_json(
+                        {
+                            "type": "execution.snapshot",
+                            "payload": {
+                                "run_id": run_id,
+                                "status": status.to_dict() if status else None,
+                                "steps": steps,
+                            },
+                        }
+                    )
+                else:
+                    await websocket.send_json(
+                        {
+                            "type": "execution.ready",
+                            "payload": {
+                                "run_id": run_id,
+                                "org_id": org_id,
+                                "project_id": project_id,
+                            },
+                        }
+                    )
+
+                while True:
+                    message = await websocket.receive_json()
+                    if message.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+            except WebSocketDisconnect:
+                await hub.disconnect(websocket)
+            except Exception:
+                await hub.disconnect(websocket)
+                raise
 
     # ------------------------------------------------------------------
     # BCI
@@ -7813,7 +7857,7 @@ def create_app(
     # ------------------------------------------------------------------
     # Multi-tenant Organization Management
     # ------------------------------------------------------------------
-    if MULTI_TENANT_AVAILABLE and container.org_service is not None:
+    if container.org_routes_available:
         # Add organization management routes at /api/v1/orgs/*
         org_routes = create_org_routes(
             org_service=container.org_service,
@@ -7826,7 +7870,7 @@ def create_app(
     # ------------------------------------------------------------------
     # Settings Management (Project and Org settings)
     # ------------------------------------------------------------------
-    if MULTI_TENANT_AVAILABLE and container.settings_service is not None:
+    if container.settings_routes_available:
         # Add settings routes at /api/v1/projects/{project_id}/settings/*
         settings_routes = create_settings_routes(
             settings_service=container.settings_service,
@@ -7838,7 +7882,7 @@ def create_app(
     # ------------------------------------------------------------------
     # Projects (always available when a project service exists)
     # ------------------------------------------------------------------
-    if container.org_service is not None:
+    if container.project_service_available:
         app.include_router(
             create_project_routes(
                 org_service=container.org_service,
@@ -7863,7 +7907,7 @@ def create_app(
     # ------------------------------------------------------------------
     # Work Item Execution (Agent execution of work items)
     # ------------------------------------------------------------------
-    if WORK_ITEM_EXECUTION_AVAILABLE and container.work_item_execution_service is not None:
+    if container.execution_service_available:
         execution_routes = create_work_item_execution_routes(
             service=container.work_item_execution_service,
         )
@@ -7875,6 +7919,15 @@ def create_app(
             sse_routes = create_run_events_routes(event_hub=container.execution_event_hub)
             app.include_router(sse_routes, prefix="/api")
             logger.info("Run events SSE routes registered at /api/v1/runs/{run_id}/events")
+
+    logger.info(
+        "API route capabilities mounted: projects=%s participants=%s orgs=%s settings=%s executions=%s",
+        container.api_capabilities.routes.projects,
+        container.api_capabilities.routes.participants,
+        container.api_capabilities.routes.orgs,
+        container.api_capabilities.routes.settings,
+        container.api_capabilities.routes.executions,
+    )
 
     # ------------------------------------------------------------------
     # Billing Service
