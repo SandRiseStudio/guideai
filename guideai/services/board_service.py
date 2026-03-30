@@ -1418,7 +1418,7 @@ class BoardService:
         self, items: List[WorkItem], *, org_id: Optional[str] = None
     ) -> List[WorkItem]:
         """Populate child_count, completed_child_count, and progress_percent for items.
-        
+
         Note: Requires `parent_id` column in work_items table. If column doesn't exist,
         returns items unchanged (sub-task hierarchy feature not yet migrated).
         """
@@ -1432,13 +1432,13 @@ class BoardService:
             with conn.cursor() as cur:
                 if not getattr(self, "_parent_id_exists", None):
                     cur.execute(
-                        """SELECT column_name FROM information_schema.columns 
+                        """SELECT column_name FROM information_schema.columns
                            WHERE table_schema = 'board' AND table_name = 'work_items' AND column_name = 'parent_id'"""
                     )
                     self._parent_id_exists = bool(cur.fetchone())
                 if not self._parent_id_exists:
                     return []
-                
+
                 cur.execute(
                     """SELECT parent_id,
                               COUNT(*) AS child_count,
@@ -1459,7 +1459,7 @@ class BoardService:
         )
         if not agg_rows:
             return items  # No child aggregation data (column missing or no children)
-            
+
         agg_map = {str(r["parent_id"]): r for r in agg_rows}
 
         for item in items:
@@ -2109,7 +2109,7 @@ class BoardService:
         org_id: Optional[str] = None,
     ) -> List[WorkItemProgressRollup]:
         """Compute progress rollups for top-level board items.
-        
+
         Fetches all items once and computes rollups in-memory (O(1) DB calls
         regardless of root count).
         """

@@ -8,8 +8,8 @@ cur = conn.cursor()
 # Check pg_stat_statements for truncate/drop on board
 try:
     cur.execute("""
-        SELECT query, calls, rows 
-        FROM pg_stat_statements 
+        SELECT query, calls, rows
+        FROM pg_stat_statements
         WHERE query ILIKE '%truncate%board%' OR query ILIKE '%drop%board%'
         ORDER BY calls DESC LIMIT 10
     """)

@@ -35,13 +35,13 @@ ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 def expand_env_vars(value: str) -> str:
     """Expand environment variable references in a string.
-    
+
     Supports two syntaxes:
     - ${VAR_NAME} - standard syntax with braces
     - $VAR_NAME - shell-style syntax
-    
+
     Missing variables are replaced with empty string.
-    
+
     Examples:
         postgresql://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/db
         postgresql://$PGUSER:$PGPASSWORD@localhost:5432/db
@@ -50,7 +50,7 @@ def expand_env_vars(value: str) -> str:
         # Group 1 is ${VAR}, Group 2 is $VAR
         var_name = match.group(1) or match.group(2)
         return os.environ.get(var_name, "")
-    
+
     return ENV_VAR_PATTERN.sub(replace_match, value)
 
 
@@ -63,11 +63,11 @@ class ServerConfig(BaseModel):
 
 class PostgresStorageConfig(BaseModel):
     """PostgreSQL connection settings.
-    
+
     DSN values support environment variable expansion:
     - ${VAR_NAME} - braces syntax
     - $VAR_NAME - shell-style syntax
-    
+
     Examples:
         dsn: postgresql://${PGUSER}:${PGPASSWORD}@localhost:5432/guideai
         dsn: postgresql://$PGUSER:$PGPASSWORD@${PGHOST}:${PGPORT:-5432}/db
@@ -76,7 +76,7 @@ class PostgresStorageConfig(BaseModel):
 
     dsn: str = "postgresql://guideai:guideai_dev@localhost:5432/guideai"
     telemetry_dsn: str = "postgresql://telemetry:telemetry_dev@localhost:5433/telemetry"
-    
+
     # Raw values before env expansion (for display/serialization)
     _raw_dsn: str = PrivateAttr(default="")
     _raw_telemetry_dsn: str = PrivateAttr(default="")
@@ -104,11 +104,11 @@ class PostgresStorageConfig(BaseModel):
             object.__setattr__(self, "_raw_dsn", getattr(self, "_raw_dsn_init"))
         if hasattr(self, "_raw_telemetry_dsn_init"):
             object.__setattr__(self, "_raw_telemetry_dsn", getattr(self, "_raw_telemetry_dsn_init"))
-    
+
     def get_raw_dsn(self) -> str:
         """Get the DSN with env vars unexpanded (for config display)."""
         return self._raw_dsn if self._raw_dsn else self.dsn
-    
+
     def get_raw_telemetry_dsn(self) -> str:
         """Get the telemetry DSN with env vars unexpanded."""
         return self._raw_telemetry_dsn if self._raw_telemetry_dsn else self.telemetry_dsn
@@ -200,7 +200,7 @@ class GuideAIConfig(BaseModel):
 
     This represents the full local config file. Defaults are chosen for
     the simplest local developer experience (sqlite, local auth, stdio MCP).
-    
+
     Note: For v2 configs with named contexts, use GuideAIConfigV2.
     """
 
@@ -229,10 +229,10 @@ class GuideAIConfig(BaseModel):
 
 class ContextConfig(BaseModel):
     """Configuration for a single named context.
-    
+
     Similar to GuideAIConfig but without version field.
     Each context defines its own storage, auth, and server settings.
-    
+
     Example:
         contexts:
           local:
@@ -251,10 +251,10 @@ class ContextConfig(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     infra: InfraConfig = Field(default_factory=InfraConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
-    
+
     # Optional context metadata
     description: Optional[str] = None
-    
+
     def to_guideai_config(self) -> GuideAIConfig:
         """Convert to GuideAIConfig (v1 format) for compatibility."""
         return GuideAIConfig(
@@ -270,9 +270,9 @@ class ContextConfig(BaseModel):
 
 class GuideAIConfigV2(BaseModel):
     """Root configuration model for v2 config format with named contexts.
-    
+
     Enables kubectl-style context switching between different environments.
-    
+
     Example:
         version: 2
         current_context: local
@@ -299,7 +299,7 @@ class GuideAIConfigV2(BaseModel):
                 f"GuideAIConfigV2 requires version=2, got {v}"
             )
         return v
-    
+
     @model_validator(mode="after")
     def validate_current_context_exists(self) -> "GuideAIConfigV2":
         """Ensure current_context references an existing context."""
@@ -310,16 +310,16 @@ class GuideAIConfigV2(BaseModel):
                 f"Available contexts: {available}"
             )
         return self
-    
+
     def get_current_config(self) -> ContextConfig:
         """Get the ContextConfig for the current context."""
         if not self.contexts:
             return ContextConfig()
         return self.contexts.get(self.current_context, ContextConfig())
-    
+
     def switch_context(self, name: str) -> None:
         """Switch to a different context.
-        
+
         Raises ValueError if context doesn't exist.
         """
         if name not in self.contexts:
@@ -328,16 +328,16 @@ class GuideAIConfigV2(BaseModel):
                 f"Context '{name}' not found. Available: {available}"
             )
         self.current_context = name
-    
+
     def add_context(self, name: str, config: ContextConfig) -> None:
         """Add a new named context."""
         if name in self.contexts:
             raise ValueError(f"Context '{name}' already exists")
         self.contexts[name] = config
-    
+
     def remove_context(self, name: str) -> None:
         """Remove a named context.
-        
+
         Raises ValueError if trying to remove current context.
         """
         if name == self.current_context:
@@ -345,11 +345,11 @@ class GuideAIConfigV2(BaseModel):
         if name not in self.contexts:
             raise ValueError(f"Context '{name}' not found")
         del self.contexts[name]
-    
+
     @classmethod
     def from_v1(cls, v1_config: GuideAIConfig) -> "GuideAIConfigV2":
         """Migrate from v1 config to v2 format.
-        
+
         Creates a 'default' context from the v1 settings.
         """
         default_context = ContextConfig(
@@ -365,7 +365,7 @@ class GuideAIConfigV2(BaseModel):
             current_context="default",
             contexts={"default": default_context},
         )
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dict for YAML output."""
         return {

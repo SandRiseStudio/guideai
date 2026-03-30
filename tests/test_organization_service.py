@@ -1026,5 +1026,3 @@ class TestContractValidation:
 
         with pytest.raises(ValueError, match="Must set either org_id or user_id"):
             UsageRecord(metric_name="tokens")
-
-

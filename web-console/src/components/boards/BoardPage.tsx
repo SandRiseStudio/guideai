@@ -291,7 +291,7 @@ function useItemDiffState(items: WorkItem[]): ItemDiffMap {
   const [diffMap, setDiffMap] = useState<ItemDiffMap>(EMPTY_DIFF_MAP);
   // Track if this is the initial load (skip animation on first render)
   const isInitialLoadRef = useRef(true);
-  
+
   useEffect(() => {
     // Skip diff tracking on initial load
     if (isInitialLoadRef.current && items.length > 0) {
@@ -307,16 +307,16 @@ function useItemDiffState(items: WorkItem[]): ItemDiffMap {
       isInitialLoadRef.current = false;
       return;
     }
-    
+
     // Only compute diffs when we have previous data
     if (prevItemsRef.current.size === 0) return;
-    
+
     const prev = prevItemsRef.current;
     const newDiffs = new Map<string, ItemDiffState>();
-    
+
     for (const item of items) {
       const prevItem = prev.get(item.item_id);
-      
+
       if (!prevItem) {
         // New item that wasn't in previous snapshot
         newDiffs.set(item.item_id, 'added');
@@ -328,7 +328,7 @@ function useItemDiffState(items: WorkItem[]): ItemDiffMap {
         newDiffs.set(item.item_id, 'updated');
       }
     }
-    
+
     // Update snapshot for next comparison
     const newSnapshot = new Map<string, ItemSnapshot>();
     for (const item of items) {
@@ -338,20 +338,20 @@ function useItemDiffState(items: WorkItem[]): ItemDiffMap {
       });
     }
     prevItemsRef.current = newSnapshot;
-    
+
     // Apply new diff states only if actual changes detected
     if (newDiffs.size > 0) {
       setDiffMap(newDiffs);
-      
+
       // Clear diff states after animation completes
       const timer = window.setTimeout(() => {
         setDiffMap(EMPTY_DIFF_MAP);
       }, DIFF_ANIMATION_DURATION);
-      
+
       return () => window.clearTimeout(timer);
     }
   }, [items]);
-  
+
   return diffMap;
 }
 
@@ -2173,7 +2173,7 @@ const ColumnLane = memo(function ColumnLane({
             <WorkItemSkeleton />
           </>
         )}
-        
+
         {hierarchyView.goalRoots.map((goal) => {
           const features = hierarchyView.featuresByGoal.get(goal.item_id) ?? [];
           const goalCollapsed = collapsed.has(goal.item_id);

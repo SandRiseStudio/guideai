@@ -145,7 +145,7 @@
   .board-refresh.refreshing .board-refresh-icon {
     animation: none;
   }
-  
+
   .board-refresh.refreshing::after {
     content: '…';
     position: absolute;
@@ -1546,7 +1546,7 @@
     transition: none;
     box-shadow: none;
   }
-  
+
   .column-lane-refreshing::after {
     animation: none;
     background: rgba(59, 130, 246, 0.02);
@@ -3170,7 +3170,7 @@
   .column-summary-pill-skeleton {
     animation: none;
   }
-  
+
   .board-content-enter {
     animation: none;
   }

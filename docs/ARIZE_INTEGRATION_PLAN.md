@@ -311,14 +311,14 @@ The LLM observability and evaluation space has exploded since 2024, with players
 # packages/raze/src/raze/sinks/phoenix_sink.py
 class PhoenixSink(RazeSink):
     """Forward GuideAI telemetry to Arize Phoenix as dataset entries."""
-    
+
     def __init__(self, phoenix_url: str = "http://localhost:6006"):
         self.client = px.Client(endpoint=phoenix_url)
-    
+
     async def write(self, event: TelemetryEvent):
         # Map Raze events to Phoenix spans/dataset entries
         ...
-    
+
     async def write_batch(self, events: list[TelemetryEvent]):
         # Batch upload for efficiency
         ...
@@ -466,7 +466,7 @@ with tracer.start_as_current_span("bci_inference") as span:
     span.set_attribute("guideai.token_savings_pct", savings_pct)
     span.set_attribute("guideai.actor_role", "Student")
     span.set_attribute("guideai.actor_surface", "MCP")
-    
+
     response = llm_provider.complete(prompt_with_behaviors)
 ```
 

@@ -109,14 +109,14 @@ class FilterExpression:
     labels: List[str] = field(default_factory=list)
     title_search: Optional[str] = None
     parent_id: Optional[str] = None
-    
+
     @classmethod
     def parse(cls, expr: Optional[str]) -> "FilterExpression":
         """Parse a filter expression string.
-        
+
         Format: key=value,key=value,...
         Supported keys: type, status, priority, project, board, labels, title, parent
-        
+
         Examples:
             type=goal
             type=feature,status=in_progress
@@ -126,7 +126,7 @@ class FilterExpression:
         result = cls()
         if not expr:
             return result
-            
+
         for part in expr.split(","):
             part = part.strip()
             if "=" not in part:
@@ -134,7 +134,7 @@ class FilterExpression:
             key, value = part.split("=", 1)
             key = key.strip().lower()
             value = value.strip()
-            
+
             if key == "type":
                 try:
                     result.item_type = WorkItemType(value.lower())
@@ -160,7 +160,7 @@ class FilterExpression:
                 result.title_search = value
             elif key == "parent":
                 result.parent_id = value
-                
+
         return result
 
 
@@ -188,22 +188,22 @@ class MigrationReport:
     dry_run: bool = False
     filter_expression: Optional[str] = None
     conflict_resolution: ConflictResolution = ConflictResolution.SKIP
-    
+
     # Statistics
     total_items: int = 0
     successful: int = 0
     skipped: int = 0
     conflicts: int = 0
     failed: int = 0
-    
+
     # Detailed results
     items: List[ItemMigrationResult] = field(default_factory=list)
     id_mapping: Dict[str, str] = field(default_factory=dict)  # source_id -> target_id
-    
+
     # Boards/projects mapping
     board_mapping: Dict[str, str] = field(default_factory=dict)
     project_mapping: Dict[str, str] = field(default_factory=dict)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert report to dictionary."""
         return {
@@ -685,7 +685,7 @@ class _SQLiteAdapter:
 
 class MigrationEngine:
     """Engine for migrating work items between contexts."""
-    
+
     def __init__(
         self,
         source_context: str,
@@ -700,19 +700,19 @@ class MigrationEngine:
         self.dry_run = dry_run
         self.conflict_resolution = conflict_resolution
         self.progress = progress_callback or default_progress
-        
+
         # Services (initialized on first use)
         _SvcType = Union[BoardService, "_SQLiteAdapter"]
         self._source_service: Optional[Union[BoardService, _SQLiteAdapter]] = None
         self._target_service: Optional[Union[BoardService, _SQLiteAdapter]] = None
-        
+
     def _load_contexts(self) -> Dict[str, Dict[str, Any]]:
         """Load all contexts from config."""
         data = _load_raw_config()
         if not _is_v2_config(data):
             raise ValueError("Migration requires config v2 format with named contexts")
         return data.get("contexts", {})
-        
+
     def _get_service_for_context(self, context_name: str) -> "Union[BoardService, _SQLiteAdapter]":
         """Create a service for the given context.
 
@@ -738,35 +738,35 @@ class MigrationEngine:
                 f"Context '{context_name}' uses '{backend}' backend. "
                 "Migration supports 'postgres' and 'sqlite' backends."
             )
-    
+
     @property
     def source_service(self) -> "Union[BoardService, _SQLiteAdapter]":
         """Get or create source service."""
         if self._source_service is None:
             self._source_service = self._get_service_for_context(self.source_context)
         return self._source_service
-        
+
     @property
     def target_service(self) -> "Union[BoardService, _SQLiteAdapter]":
         """Get or create target service."""
         if self._target_service is None:
             self._target_service = self._get_service_for_context(self.target_context)
         return self._target_service
-    
+
     def validate_contexts(self) -> Tuple[bool, List[str]]:
         """Validate both source and target contexts are accessible.
-        
+
         Returns:
             Tuple of (all_valid, list_of_errors)
         """
         errors = []
-        
+
         try:
             contexts = self._load_contexts()
         except ValueError as e:
             errors.append(str(e))
             return (False, errors)
-        
+
         # Check source
         if self.source_context not in contexts:
             errors.append(f"Source context '{self.source_context}' not found")
@@ -775,7 +775,7 @@ class MigrationEngine:
             is_valid, msg = validate_context_connection(src_cfg)
             if not is_valid:
                 errors.append(f"Source context error: {msg}")
-        
+
         # Check target
         if self.target_context not in contexts:
             errors.append(f"Target context '{self.target_context}' not found")
@@ -784,13 +784,13 @@ class MigrationEngine:
             is_valid, msg = validate_context_connection(tgt_cfg)
             if not is_valid:
                 errors.append(f"Target context error: {msg}")
-                
+
         # Check same context
         if self.source_context == self.target_context:
             errors.append("Source and target contexts must be different")
-            
+
         return (len(errors) == 0, errors)
-    
+
     def list_source_items(
         self,
         filter_expr: Optional[FilterExpression] = None,
@@ -799,7 +799,7 @@ class MigrationEngine:
     ) -> List[WorkItem]:
         """List items from source context with optional filtering."""
         filter_expr = filter_expr or FilterExpression()
-        
+
         return self.source_service.list_work_items(
             project_id=filter_expr.project_id,
             board_id=filter_expr.board_id,
@@ -812,10 +812,10 @@ class MigrationEngine:
             org_id=org_id,
             limit=10000,  # High limit for migration
         )
-    
+
     def _sort_by_hierarchy(self, items: List[WorkItem]) -> List[WorkItem]:
         """Sort items so parents come before children.
-        
+
         Order: goals -> features -> tasks
         Within each level, sort by parent_id to group children together.
         """
@@ -823,25 +823,25 @@ class MigrationEngine:
         stories = [i for i in items if i.item_type == WorkItemType.STORY]  # STORY alias = "feature"
         tasks = [i for i in items if i.item_type == WorkItemType.TASK]
         bugs = [i for i in items if i.item_type == WorkItemType.BUG]
-        
+
         # Sort features by parent_id (goal) - put orphans first
         stories.sort(key=lambda s: (s.parent_id or "", s.title))
-        
+
         # Sort tasks by parent_id (feature) - put orphans first
         tasks.sort(key=lambda t: (t.parent_id or "", t.title))
 
         # Sort bugs by parent_id - put orphans first
         bugs.sort(key=lambda b: (b.parent_id or "", b.title))
-        
+
         return epics + stories + tasks + bugs
-    
+
     def _check_conflict(
         self,
         item: WorkItem,
         existing_items: List[WorkItem],
     ) -> Optional[WorkItem]:
         """Check if item conflicts with existing items in target.
-        
+
         Conflict is defined as: same title AND same item_type AND same parent_id.
         """
         for existing in existing_items:
@@ -852,7 +852,7 @@ class MigrationEngine:
             ):
                 return existing
         return None
-    
+
     def _create_work_item_request(
         self,
         item: WorkItem,
@@ -860,7 +860,7 @@ class MigrationEngine:
         board_mapping: Dict[str, str],
     ) -> CreateWorkItemRequest:
         """Create a CreateWorkItemRequest from a source WorkItem.
-        
+
         Remaps parent_id and board_id using the provided mappings.
         """
         # Remap parent_id if it was migrated
@@ -870,12 +870,12 @@ class MigrationEngine:
         elif item.parent_id:
             # Parent wasn't migrated - could be filtered out
             parent_id = None  # Create as orphan
-            
+
         # Remap board_id if available
         board_id = None
         if item.board_id and item.board_id in board_mapping:
             board_id = board_mapping[item.board_id]
-            
+
         return CreateWorkItemRequest(
             item_type=item.item_type,
             board_id=board_id,
@@ -895,7 +895,7 @@ class MigrationEngine:
             behavior_id=item.behavior_id,
             metadata=item.metadata,
         )
-    
+
     def migrate(
         self,
         filter_expr: Optional[FilterExpression] = None,
@@ -904,12 +904,12 @@ class MigrationEngine:
         migrate_boards: bool = True,
     ) -> MigrationReport:
         """Execute the migration.
-        
+
         Args:
             filter_expr: Optional filter to select items
             org_id: Organization ID for multi-tenant isolation
             migrate_boards: Whether to also migrate boards (default True)
-            
+
         Returns:
             MigrationReport with results and ID mapping
         """
@@ -921,7 +921,7 @@ class MigrationEngine:
             filter_expression=str(filter_expr) if filter_expr else None,
             conflict_resolution=self.conflict_resolution,
         )
-        
+
         # Validate contexts first
         valid, errors = self.validate_contexts()
         if not valid:
@@ -936,34 +936,34 @@ class MigrationEngine:
                 report.failed += 1
             report.completed_at = datetime.now(timezone.utc)
             return report
-        
+
         # Get items from source
         self.progress(0, 1, "Fetching items from source...")
         source_items = self.list_source_items(filter_expr, org_id=org_id)
         report.total_items = len(source_items)
-        
+
         if not source_items:
             self.progress(1, 1, "No items to migrate")
             report.completed_at = datetime.now(timezone.utc)
             return report
-        
+
         # Sort by hierarchy (parents before children)
         sorted_items = self._sort_by_hierarchy(source_items)
-        
+
         # Migrate boards first if requested
         if migrate_boards:
             self._migrate_boards(sorted_items, report, org_id)
-        
+
         # Get existing items in target for conflict detection
         self.progress(0, 1, "Checking for conflicts...")
         target_items = self.target_service.list_work_items(org_id=org_id, limit=10000)
-        
+
         # Migrate items
         actor = Actor(id="migration-cli", role="system", surface="cli")
-        
+
         for i, item in enumerate(sorted_items):
             self.progress(i + 1, len(sorted_items), f"Migrating: {item.title[:30]}...")
-            
+
             result = ItemMigrationResult(
                 source_id=item.item_id,
                 source_title=item.title,
@@ -971,12 +971,12 @@ class MigrationEngine:
                 status=MigrationStatus.PENDING,
                 parent_source_id=item.parent_id,
             )
-            
+
             # Check for conflicts
             conflict = self._check_conflict(item, target_items)
             if conflict:
                 result.status = MigrationStatus.CONFLICT
-                
+
                 if self.conflict_resolution == ConflictResolution.FAIL:
                     result.error = f"Conflict with existing item: {conflict.item_id}"
                     result.status = MigrationStatus.FAILED
@@ -984,7 +984,7 @@ class MigrationEngine:
                     report.failed += 1
                     report.completed_at = datetime.now(timezone.utc)
                     return report
-                    
+
                 elif self.conflict_resolution == ConflictResolution.SKIP:
                     result.error = f"Skipped: conflicts with {conflict.item_id}"
                     result.status = MigrationStatus.SKIPPED
@@ -995,11 +995,11 @@ class MigrationEngine:
                     report.skipped += 1
                     report.conflicts += 1
                     continue
-                    
+
                 elif self.conflict_resolution == ConflictResolution.RENAME:
                     # Will rename below when creating
                     pass
-                    
+
                 elif self.conflict_resolution == ConflictResolution.OVERWRITE:
                     # TODO: Implement update logic
                     result.error = "Overwrite not yet implemented"
@@ -1007,7 +1007,7 @@ class MigrationEngine:
                     report.items.append(result)
                     report.skipped += 1
                     continue
-            
+
             # Create item in target
             if self.dry_run:
                 result.status = MigrationStatus.SUCCESS
@@ -1021,42 +1021,42 @@ class MigrationEngine:
                         report.id_mapping,
                         report.board_mapping,
                     )
-                    
+
                     # Rename if conflict and using rename strategy
                     if conflict and self.conflict_resolution == ConflictResolution.RENAME:
                         request.title = f"{item.title} (migrated)"
-                    
+
                     new_item = self.target_service.create_work_item(
                         request, actor, org_id=org_id
                     )
                     result.target_id = new_item.item_id
                     result.status = MigrationStatus.SUCCESS
                     report.id_mapping[item.item_id] = new_item.item_id
-                    
+
                     # Also add to target_items for future conflict checks
                     target_items.append(new_item)
-                    
+
                 except Exception as e:
                     result.status = MigrationStatus.FAILED
                     result.error = str(e)
                     report.failed += 1
                     report.items.append(result)
                     continue
-            
+
             # Update parent mapping
             if item.parent_id and item.parent_id in report.id_mapping:
                 result.parent_target_id = report.id_mapping[item.parent_id]
-            
+
             report.items.append(result)
-            
+
             if result.status == MigrationStatus.SUCCESS:
                 report.successful += 1
             elif result.status == MigrationStatus.SKIPPED:
                 report.skipped += 1
-        
+
         report.completed_at = datetime.now(timezone.utc)
         return report
-    
+
     def _migrate_boards(
         self,
         items: List[WorkItem],
@@ -1068,24 +1068,24 @@ class MigrationEngine:
         board_ids = set(item.board_id for item in items if item.board_id)
         if not board_ids:
             return
-            
+
         self.progress(0, len(board_ids), "Migrating boards...")
-        
+
         # Get existing boards in target
         target_boards = self.target_service.list_boards(org_id=org_id)
         target_board_names = {b.name: b for b in target_boards}
-        
+
         actor = Actor(id="migration-cli", role="system", surface="cli")
-        
+
         for i, board_id in enumerate(board_ids):
             try:
                 source_board = self.source_service.get_board(board_id, org_id=org_id)
-                
+
                 # Skip boards without project_id (required for creation)
                 if not source_board.project_id:
                     logger.warning(f"Skipping board {board_id}: no project_id")
                     continue
-                
+
                 # Check if board with same name exists
                 if source_board.name in target_board_names:
                     # Use existing board
@@ -1104,10 +1104,10 @@ class MigrationEngine:
                     report.board_mapping[board_id] = new_board.board_id
                 else:
                     report.board_mapping[board_id] = f"dry-run-board-{board_id}"
-                    
+
             except Exception as e:
                 logger.warning(f"Failed to migrate board {board_id}: {e}")
-            
+
             self.progress(i + 1, len(board_ids), f"Board: {board_id[:20]}...")
 
 
@@ -1128,14 +1128,14 @@ def format_migration_summary(report: MigrationReport) -> str:
         f"  Dry Run:    {'Yes' if report.dry_run else 'No'}",
         f"  Started:    {report.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
     ]
-    
+
     if report.completed_at:
         duration = (report.completed_at - report.started_at).total_seconds()
         lines.append(f"  Duration:   {duration:.1f}s")
-    
+
     if report.filter_expression:
         lines.append(f"  Filter:     {report.filter_expression}")
-    
+
     lines.extend([
         "",
         "  RESULTS",
@@ -1147,7 +1147,7 @@ def format_migration_summary(report: MigrationReport) -> str:
         f"  ✗ Failed:       {report.failed:>6}",
         "",
     ])
-    
+
     # Show ID mapping if not too large
     if report.id_mapping and len(report.id_mapping) <= 20:
         lines.append("  ID MAPPING")
@@ -1159,9 +1159,9 @@ def format_migration_summary(report: MigrationReport) -> str:
         lines.append(f"  ID mapping contains {len(report.id_mapping)} entries")
         lines.append("  Use --output to save full report to file")
         lines.append("")
-    
+
     lines.append("═" * 60)
-    
+
     return "\n".join(lines)
 
 
@@ -1172,14 +1172,14 @@ def format_items_table(items: List[WorkItem], max_items: int = 20) -> str:
         f"{'TYPE':<8} {'STATUS':<12} {'TITLE':<40} {'ID':<36}",
         "─" * 100,
     ]
-    
+
     for item in items[:max_items]:
         title = item.title[:38] + ".." if len(item.title) > 40 else item.title
         lines.append(
             f"{item.item_type.value:<8} {item.status.value:<12} {title:<40} {item.item_id}"
         )
-    
+
     if len(items) > max_items:
         lines.append(f"... and {len(items) - max_items} more items")
-    
+
     return "\n".join(lines)

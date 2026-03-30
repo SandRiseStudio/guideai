@@ -79,7 +79,7 @@ def handle_knowledge_pack_build(
     # Import lazily to avoid circular dependencies
     from ...knowledge_pack.builder import PackBuilder, PackBuildConfig
     from ...knowledge_pack.source_registry import SourceRegistryService
-    
+
     pack_id = arguments.get("pack_id")
     version = arguments.get("version", "1.0.0")
     profile = arguments.get("profile", "dev_local")
@@ -100,7 +100,7 @@ def handle_knowledge_pack_build(
             version=version,
             token_budget=token_budget,
         )
-        
+
         # Create builder with source registry
         registry = SourceRegistryService()
         builder = PackBuilder(registry=registry, config=config)
@@ -169,7 +169,7 @@ def handle_knowledge_pack_validate(
 
         # Parse into Pydantic model for validation
         parsed_manifest = KnowledgePackManifest.model_validate(manifest_data)
-        
+
         # Use the validator function for semantic checks
         result: ValidationResult = validate_manifest(parsed_manifest)
 
@@ -232,7 +232,7 @@ def handle_knowledge_pack_inspect(
     Inspect a built knowledge pack.
 
     MCP Tool: knowledgePacks.inspect
-    
+
     Note: This is a placeholder until KnowledgePackStorage is implemented.
     """
     pack_id = arguments.get("pack_id")
@@ -265,7 +265,7 @@ def handle_knowledge_pack_list(
     List available knowledge packs.
 
     MCP Tool: knowledgePacks.list
-    
+
     Note: This is a placeholder until KnowledgePackStorage is implemented.
     """
     _scope = arguments.get("scope")

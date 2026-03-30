@@ -359,12 +359,12 @@ export const BoardFilterBar = memo(function BoardFilterBar({
               aria-label={isRefreshing ? 'Refreshing…' : 'Refresh board'}
               title={lastSyncedAt ? `Last synced ${formatRelativeTime(lastSyncedAt)}` : 'Refresh board'}
             >
-              <RefreshCw 
-                className="board-refresh-icon" 
-                size={15} 
-                strokeWidth={2.2} 
-                absoluteStrokeWidth 
-                aria-hidden="true" 
+              <RefreshCw
+                className="board-refresh-icon"
+                size={15}
+                strokeWidth={2.2}
+                absoluteStrokeWidth
+                aria-hidden="true"
               />
             </button>
           )}
@@ -750,7 +750,7 @@ function formatRelativeTime(date: Date): string {
   const diffMs = now - date.getTime();
   const diffSecs = Math.floor(diffMs / 1000);
   const diffMins = Math.floor(diffSecs / 60);
-  
+
   if (diffSecs < 10) return 'just now';
   if (diffSecs < 60) return `${diffSecs}s ago`;
   if (diffMins < 60) return `${diffMins}m ago`;

@@ -1,13 +1,13 @@
 # GuideAI Domain Expertise Product Strategy Memo
 
 > **Status:** Proposed
-> 
+>
 > **Date:** 2026-03-16
-> 
+>
 > **Author:** GitHub Copilot (GPT-5.4) working session
-> 
+>
 > **Audience:** Product, Platform Engineering, DX, Extension, MCP, Behavior/BCI, Leadership
-> 
+>
 > **Related:** `AGENTS.md`, `.github/copilot-instructions.md`, `CLAUDE.md`, `docs/work_management_guide.md`, `docs/ONBOARDING_QUICKSTARTS.md`, `docs/INSTALLATION_AND_REPO_OPTIMIZATION_PLAN.md`, `docs/BCI_IMPLEMENTATION_SPEC.md`, `docs/PRD.md`
 
 ---

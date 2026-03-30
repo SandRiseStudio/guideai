@@ -26,25 +26,25 @@ class TestBootstrapDetectParity:
         """CLI --format json output matches MCP bootstrap.detect response schema."""
         # Create a minimal workspace
         (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
-        
+
         # Run CLI
         result = subprocess.run(
-            [sys.executable, "-m", "guideai.cli", "bootstrap", "detect", 
+            [sys.executable, "-m", "guideai.cli", "bootstrap", "detect",
              "--path", str(tmp_path), "--format", "json"],
             capture_output=True,
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        
+
         cli_output = json.loads(result.stdout)
-        
+
         # Verify MCP schema fields are present
         assert "profile" in cli_output
         assert "confidence" in cli_output
         assert "is_ambiguous" in cli_output
         assert "runner_up" in cli_output  # nullable
         assert "signals" in cli_output
-        
+
         # Verify signals structure
         for signal in cli_output["signals"]:
             assert "signal_name" in signal
@@ -57,7 +57,7 @@ class TestBootstrapDetectParity:
         (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
         (tmp_path / ".github").mkdir()
         (tmp_path / "SECURITY.md").write_text("# Security\n")
-        
+
         # Get CLI result
         result = subprocess.run(
             [sys.executable, "-m", "guideai.cli", "bootstrap", "detect",
@@ -67,17 +67,17 @@ class TestBootstrapDetectParity:
         )
         assert result.returncode == 0
         cli_result = json.loads(result.stdout)
-        
-        # Get MCP handler result  
+
+        # Get MCP handler result
         from guideai.mcp.handlers.bootstrap_handlers import handle_bootstrap_detect
         mcp_result = handle_bootstrap_detect({"workspace_path": str(tmp_path)})
-        
+
         # Compare key fields
         assert cli_result["profile"] == mcp_result["profile"]
         assert cli_result["confidence"] == mcp_result["confidence"]
         assert cli_result["is_ambiguous"] == mcp_result["is_ambiguous"]
         assert cli_result["runner_up"] == mcp_result["runner_up"]
-        
+
         # Compare signals (order may differ but content should match)
         cli_signals = {s["signal_name"]: s for s in cli_result["signals"]}
         mcp_signals = {s["signal_name"]: s for s in mcp_result["signals"]}
@@ -99,9 +99,9 @@ class TestBootstrapStatusParity:
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        
+
         cli_output = json.loads(result.stdout)
-        
+
         # Verify MCP schema fields are present
         assert "is_bootstrapped" in cli_output
         assert "profile" in cli_output  # nullable
@@ -120,7 +120,7 @@ class TestBootstrapStatusParity:
             text=True,
         )
         assert result.returncode == 0
-        
+
         cli_output = json.loads(result.stdout)
         assert cli_output["is_bootstrapped"] is False
         assert cli_output["agents_md_exists"] is False
@@ -129,7 +129,7 @@ class TestBootstrapStatusParity:
     def test_cli_status_with_agents_md(self, tmp_path: Path) -> None:
         """Workspace with AGENTS.md shows bootstrapped."""
         (tmp_path / "AGENTS.md").write_text("# Agent Handbook\n")
-        
+
         result = subprocess.run(
             [sys.executable, "-m", "guideai.cli", "bootstrap", "status",
              "--path", str(tmp_path), "--format", "json"],
@@ -137,7 +137,7 @@ class TestBootstrapStatusParity:
             text=True,
         )
         assert result.returncode == 0
-        
+
         cli_output = json.loads(result.stdout)
         assert cli_output["is_bootstrapped"] is True
         assert cli_output["agents_md_exists"] is True
@@ -145,7 +145,7 @@ class TestBootstrapStatusParity:
     def test_cli_status_with_guideai_dir(self, tmp_path: Path) -> None:
         """Workspace with .guideai/ shows bootstrapped."""
         (tmp_path / ".guideai").mkdir()
-        
+
         result = subprocess.run(
             [sys.executable, "-m", "guideai.cli", "bootstrap", "status",
              "--path", str(tmp_path), "--format", "json"],
@@ -153,7 +153,7 @@ class TestBootstrapStatusParity:
             text=True,
         )
         assert result.returncode == 0
-        
+
         cli_output = json.loads(result.stdout)
         assert cli_output["is_bootstrapped"] is True
         assert cli_output["guideai_dir_exists"] is True
@@ -162,7 +162,7 @@ class TestBootstrapStatusParity:
         """CLI status and MCP handler return identical results."""
         # Create partial bootstrap state
         (tmp_path / "AGENTS.md").write_text("# Agent Handbook\n")
-        
+
         # Get CLI result
         result = subprocess.run(
             [sys.executable, "-m", "guideai.cli", "bootstrap", "status",
@@ -172,11 +172,11 @@ class TestBootstrapStatusParity:
         )
         assert result.returncode == 0
         cli_result = json.loads(result.stdout)
-        
+
         # Get MCP handler result
         from guideai.mcp.handlers.bootstrap_handlers import handle_bootstrap_status
         mcp_result = handle_bootstrap_status({"workspace_path": str(tmp_path)})
-        
+
         # Compare all fields
         assert cli_result["is_bootstrapped"] == mcp_result["is_bootstrapped"]
         assert cli_result["profile"] == mcp_result["profile"]
@@ -197,9 +197,9 @@ class TestBootstrapInitParity:
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        
+
         cli_output = json.loads(result.stdout)
-        
+
         # Verify MCP schema fields are present
         assert "success" in cli_output
         assert "profile" in cli_output
@@ -217,11 +217,11 @@ class TestBootstrapInitParity:
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        
+
         cli_output = json.loads(result.stdout)
         assert cli_output["success"] is True
         assert (tmp_path / "AGENTS.md").exists()
-        
+
         # Verify file in files_written
         files = cli_output["files_written"]
         agents_written = any("AGENTS.md" in f for f in files)
@@ -237,7 +237,7 @@ class TestBootstrapInitParity:
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        
+
         cli_output = json.loads(result.stdout)
         assert cli_output["profile"] == "api-backend"
 
@@ -250,7 +250,7 @@ class TestBootstrapInitParity:
             text=True,
         )
         assert result.returncode == 0, f"CLI failed: {result.stderr}"
-        
+
         cli_output = json.loads(result.stdout)
         assert cli_output["success"] is True
         assert not (tmp_path / "AGENTS.md").exists()
@@ -262,7 +262,7 @@ class TestBootstrapInitParity:
         mcp_workspace = tmp_path / "mcp_ws"
         cli_workspace.mkdir()
         mcp_workspace.mkdir()
-        
+
         # Run CLI
         result = subprocess.run(
             [sys.executable, "-m", "guideai.cli", "bootstrap", "init",
@@ -272,19 +272,19 @@ class TestBootstrapInitParity:
         )
         assert result.returncode == 0
         cli_result = json.loads(result.stdout)
-        
+
         # Run MCP handler
         from guideai.mcp.handlers.bootstrap_handlers import handle_bootstrap_init
         mcp_result = handle_bootstrap_init({
             "workspace_path": str(mcp_workspace),
             "skip_pack": True,
         })
-        
+
         # Compare key fields (paths will differ)
         assert cli_result["success"] == mcp_result["success"]
         assert cli_result["profile"] == mcp_result["profile"]
         assert cli_result["pack_id"] == mcp_result["pack_id"]
-        
+
         # Both should have created AGENTS.md
         assert (cli_workspace / "AGENTS.md").exists()
         assert (mcp_workspace / "AGENTS.md").exists()

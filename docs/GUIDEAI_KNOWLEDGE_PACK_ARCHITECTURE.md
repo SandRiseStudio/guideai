@@ -1,13 +1,13 @@
 # GuideAI Knowledge Pack + BCI + Adaptive Bootstrap Architecture Plan
 
 > **Status:** Proposed
-> 
+>
 > **Date:** 2026-03-16
-> 
+>
 > **Author:** GitHub Copilot (GPT-5.4) working session
-> 
+>
 > **Audience:** Platform Engineering, DX, Extension, MCP, CLI, Behavior/BCI, Analytics
-> 
+>
 > **Related:** `AGENTS.md`, `.github/copilot-instructions.md`, `CLAUDE.md`, `docs/work_management_guide.md`, `docs/BCI_IMPLEMENTATION_SPEC.md`, `docs/INSTALLATION_AND_REPO_OPTIMIZATION_PLAN.md`, `docs/PRD.md`
 
 ---

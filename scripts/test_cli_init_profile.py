@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     pyproject.write_text('[project]\nname = "test"\ndependencies = ["fastapi"]')
     openapi = Path(tmpdir) / "openapi.yaml"
     openapi.write_text("openapi: 3.0.0")
-    
+
     # Run init
     result = subprocess.run(
         ["python", "-m", "guideai", "init", "--name", "test-api"],
@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         text=True,
         env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
     )
-    
+
     agents_path = Path(tmpdir) / "AGENTS.md"
     if not agents_path.exists():
         print(f"  ❌ AGENTS.md not created!")
@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         text=True,
         env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
     )
-    
+
     agents_path = Path(tmpdir) / "AGENTS.md"
     if not agents_path.exists():
         print(f"  ❌ AGENTS.md not created!")
@@ -77,7 +77,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         text=True,
         env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)},
     )
-    
+
     agents_path = Path(tmpdir) / "AGENTS.md"
     if not agents_path.exists():
         print(f"  ❌ AGENTS.md not created!")

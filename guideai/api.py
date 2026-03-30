@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Query, Response, status, Request, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -182,12 +182,13 @@ try:
     from .multi_tenant.organization_service import OrganizationService
     from .multi_tenant.invitation_service import InvitationService
     from .multi_tenant.settings import SettingsService
-    from .multi_tenant.api import create_org_routes
-    from .multi_tenant.settings_api import create_settings_routes
-    # Stubs set these to None when enterprise is not installed
+    from .multi_tenant.api import ORG_ROUTES_AVAILABLE, create_org_routes
+    from .multi_tenant.settings_api import SETTINGS_ROUTES_AVAILABLE, create_settings_routes
     MULTI_TENANT_AVAILABLE = OrganizationService is not None
 except ImportError:
     MULTI_TENANT_AVAILABLE = False
+    ORG_ROUTES_AVAILABLE = False
+    SETTINGS_ROUTES_AVAILABLE = False
     OrganizationService = None  # type: ignore[assignment, misc]
     InvitationService = None  # type: ignore[assignment, misc]
     SettingsService = None  # type: ignore[assignment, misc]
@@ -251,6 +252,12 @@ class _ServiceContainer:
                 "surface": "api",
             },
         )
+        self.project_service_available = False
+        self.participants_available = False
+        self.org_routes_available = False
+        self.settings_routes_available = False
+        self.execution_service_available = False
+        self.execution_enabled = False
 
         # ActionService now uses PostgreSQL DSN from environment or default
         action_dsn = resolve_optional_postgres_dsn(
@@ -504,7 +511,14 @@ class _ServiceContainer:
             explicit_dsn=os.getenv("GUIDEAI_ORG_PG_DSN") or os.getenv("GUIDEAI_AUTH_PG_DSN"),
             env_var="GUIDEAI_ORG_PG_DSN",
         )
-        if MULTI_TENANT_AVAILABLE and org_dsn:
+        enterprise_org_routes_available = bool(
+            MULTI_TENANT_AVAILABLE
+            and ORG_ROUTES_AVAILABLE
+            and SETTINGS_ROUTES_AVAILABLE
+            and create_org_routes is not None
+            and create_settings_routes is not None
+        )
+        if enterprise_org_routes_available and org_dsn:
             self.org_service = OrganizationService(
                 dsn=org_dsn,
                 board_service=self.board_service,
@@ -515,9 +529,20 @@ class _ServiceContainer:
             )
             self.settings_service = SettingsService(dsn=org_dsn)
         elif org_dsn:
-            # Enterprise not installed — use lightweight OSS project service
+            # OSS fallback: project-scoped features only, no org/settings route families.
             self.org_service = OSSProjectService(dsn=org_dsn)
             logger.info("Using OSS project service (enterprise not installed)")
+        self.project_service_available = self.org_service is not None
+        self.participants_available = self.project_service_available
+        self.org_routes_available = bool(
+            enterprise_org_routes_available
+            and self.org_service is not None
+            and self.invitation_service is not None
+        )
+        self.settings_routes_available = bool(
+            enterprise_org_routes_available
+            and self.settings_service is not None
+        )
 
         # Billing service (uses Stripe if credentials provided, otherwise mock)
         self.billing_service: Optional[Any] = None

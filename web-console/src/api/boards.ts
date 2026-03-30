@@ -340,7 +340,7 @@ export function useBoard(boardId?: string) {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    Work Item Loading
-   
+
    Fetches all work items for a board in a single query (paginating internally
    so the UI never sees a partial set). Background polling silently refreshes
    the data every few seconds without any visual loading indicators.
@@ -371,7 +371,7 @@ const BACKGROUND_POLL_INTERVAL = 15_000;
 
 /** Hook to track document visibility for smart polling */
 function useDocumentVisible(): boolean {
-  const [isVisible, setIsVisible] = React.useState(() => 
+  const [isVisible, setIsVisible] = React.useState(() =>
     typeof document !== 'undefined' ? !document.hidden : true
   );
 
