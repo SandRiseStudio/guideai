@@ -6,7 +6,10 @@ Install: pip install guideai-enterprise
 
 try:
     from guideai_enterprise.multi_tenant.settings_api import create_settings_routes
+    SETTINGS_ROUTES_AVAILABLE = True
 except ImportError:
+    SETTINGS_ROUTES_AVAILABLE = False
+
     def create_settings_routes(*args, **kwargs):
         """No-op: settings routes require guideai-enterprise."""
         raise ImportError(
@@ -14,4 +17,4 @@ except ImportError:
             "Install: pip install guideai-enterprise"
         )
 
-__all__ = ["create_settings_routes"]
+__all__ = ["create_settings_routes", "SETTINGS_ROUTES_AVAILABLE"]
