@@ -12,6 +12,15 @@ dist
 dist-ssr
 *.local
 
+# Vite cache (timestamp deps)
+.vite/
+
+# Ad-hoc scratch scripts at package root (not src/test or Vitest)
+/test_api.ts
+/test_assignment_logic.js
+/test_serialize.py
+/fix_agents_page.cjs
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

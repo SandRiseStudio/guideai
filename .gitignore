@@ -35,6 +35,22 @@ htmlcov/
 Thumbs.db
 .idea/
 
+# ---------------------------------------------------------------------------
+# IDE, local AI assistants, and ephemeral tooling (machine-specific)
+# ---------------------------------------------------------------------------
+.cursor/
+.continue/
+.claude/
+.codex/
+.cline/
+.playwright-mcp/
+.serena/
+.agents/
+.tmp/
+
+# Local scratch / accidental exports at repo root
+/board-state.md
+
 .env.github-oauth
 
 # OAuth client secret exports (do not commit)
