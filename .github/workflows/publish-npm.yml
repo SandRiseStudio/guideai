@@ -85,7 +85,7 @@ jobs:
         run: sleep 30
 
       - name: Install from npm
-        run: npm install -g guideai
+        run: npm install -g @sandrisesf/guideai
 
       - name: Verify CLI
         run: guideai --version

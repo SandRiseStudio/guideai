@@ -1,5 +1,5 @@
 {
-  "name": "guideai",
+  "name": "@sandrisesf/guideai",
   "version": "0.1.0",
   "description": "AI-powered developer tooling and task orchestration CLI",
   "keywords": [

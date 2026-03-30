@@ -5,7 +5,7 @@ AI-powered developer tooling and task orchestration.
 ## Installation
 
 ```bash
-npm install -g guideai
+npm install -g @sandrisesf/guideai
 ```
 
 This npm package is a wrapper that manages the Python-based GuideAI CLI. Python 3.10+ is required and will be detected automatically.
