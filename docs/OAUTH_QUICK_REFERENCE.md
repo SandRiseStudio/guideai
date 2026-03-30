@@ -40,7 +40,7 @@ oauth_client_secret: str = "your_client_secret_here"
 3. **Fill in details**:
    ```
    Application name: GuideAI Device Flow (Dev)
-   Homepage URL: https://github.com/Nas4146/guideai
+   Homepage URL: https://github.com/SandRiseStudio/guideai
    Authorization callback URL: http://localhost:8000/auth/callback
    ```
 

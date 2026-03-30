@@ -64,7 +64,7 @@ guideai workflows list
 
 ```bash
 # Download VSIX from releases
-wget https://github.com/guideai/guideai/releases/latest/download/guideai-ide-extension-1.0.0.vsix
+wget https://github.com/SandRiseStudio/guideai/releases/latest/download/guideai-ide-extension-1.0.0.vsix
 
 # Install via command line
 code --install-extension guideai-ide-extension-1.0.0.vsix
@@ -111,7 +111,7 @@ code --install-extension guideai-ide-extension-1.0.0.vsix
 
 ```bash
 # Download Cursor-compatible VSIX
-wget https://github.com/guideai/guideai/releases/latest/download/guideai-cursor-extension-1.0.0.vsix
+wget https://github.com/SandRiseStudio/guideai/releases/latest/download/guideai-cursor-extension-1.0.0.vsix
 
 # Install via command line
 cursor --install-extension guideai-cursor-extension-1.0.0.vsix
@@ -374,8 +374,8 @@ After successful installation:
 ## Support & Resources
 
 - **Documentation**: [docs.guideai.com](https://docs.guideai.com)
-- **GitHub**: [github.com/guideai/guideai](https://github.com/guideai/guideai)
-- **Community**: [github.com/guideai/guideai/discussions](https://github.com/guideai/guideai/discussions)
+- **GitHub**: [github.com/SandRiseStudio/guideai](https://github.com/SandRiseStudio/guideai)
+- **Community**: [github.com/SandRiseStudio/guideai/discussions](https://github.com/SandRiseStudio/guideai/discussions)
 - **Support**: [guideai.com/support](https://guideai.com/support)
 
 ---

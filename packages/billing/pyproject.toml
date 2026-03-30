@@ -53,9 +53,9 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/guideai/guideai"
+Homepage = "https://github.com/SandRiseStudio/guideai"
 Documentation = "https://docs.guideai.dev/billing"
-Repository = "https://github.com/guideai/guideai"
+Repository = "https://github.com/SandRiseStudio/guideai"
 
 [tool.setuptools.packages.find]
 where = ["src"]

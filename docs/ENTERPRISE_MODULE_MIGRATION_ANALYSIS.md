@@ -144,7 +144,7 @@ After migration, these stubs/no-ops are needed in the OSS repo:
 
 > **Total**: 70 files across Dockerfiles, compose configs, scripts, monitoring, docs
 
-### Files Staying in OSS (`guideai/guideai`)
+### Files Staying in OSS (`SandRiseStudio/guideai`)
 
 These support local development and basic self-hosted deployments:
 
@@ -165,7 +165,7 @@ These support local development and basic self-hosted deployments:
 | `infra/data/test-events/parity_test_events.json` | Test fixtures |
 | `infra/requirements-verify.txt` | Verification requirements |
 
-### Files Moving to Enterprise (`guideai/guideai-enterprise`)
+### Files Moving to Enterprise (`SandRiseStudio/guideai-enterprise`)
 
 Production, staging, scaling, and cloud deployment configs:
 

@@ -173,7 +173,7 @@ environments:
       provider: podman
       auto_start: true
     infrastructure:
-      blueprint_id: postgres-dev
+      blueprint_id: local-test-suite
 
   staging:
     description: Staging environment
@@ -193,6 +193,8 @@ amprealize validate environments.yaml
 ```
 
 See `examples/environments.yaml.example` for a complete template with all options.
+
+`local-test-suite` includes `guideai-api`, `guideai-mcp`, `gateway`, and `web-console` for a full local GuideAI development stack.
 
 ## Executors
 
@@ -243,5 +245,5 @@ Contributions are welcome! Please see our [Contributing Guide](CONTRIBUTING.md) 
 
 ## Related Projects
 
-- [GuideAI](https://github.com/Nas4146/guideai) - AI-assisted development platform (uses Amprealize for environment orchestration)
+- [GuideAI](https://github.com/SandRiseStudio/guideai) - AI-assisted development platform (uses Amprealize for environment orchestration)
 - [Raze](https://github.com/Nas4146/raze) - Structured logging with centralized storage

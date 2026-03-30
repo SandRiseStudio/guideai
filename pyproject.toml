@@ -46,9 +46,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://amprealize.ai"
 Documentation = "https://amprealize.ai/docs"
-Source = "https://github.com/guideai/guideai"
-"Bug Tracker" = "https://github.com/guideai/guideai/issues"
-Changelog = "https://github.com/guideai/guideai/blob/main/BUILD_TIMELINE.md"
+Source = "https://github.com/SandRiseStudio/guideai"
+"Bug Tracker" = "https://github.com/SandRiseStudio/guideai/issues"
+Changelog = "https://github.com/SandRiseStudio/guideai/blob/main/BUILD_TIMELINE.md"
 
 [project.optional-dependencies]
 dev = [

@@ -107,10 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Support
 
 - 📚 **Documentation**: [GuideAI Documentation](https://docs.guideai.com)
-- 🐛 **Issues**: [GitHub Issues](https://github.com/guideai/guideai/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/guideai/guideai/discussions)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/SandRiseStudio/guideai/issues)
+- 💬 **Discussions**: [GitHub Discussions](https://github.com/SandRiseStudio/guideai/discussions)
 - 🔗 **Website**: [https://guideai.com](https://guideai.com)
 
 ## License
 
-MIT License - see [LICENSE](https://github.com/guideai/guideai/blob/main/LICENSE) for details.
+Apache License 2.0 — see [LICENSE](https://github.com/SandRiseStudio/guideai/blob/main/LICENSE) for details.

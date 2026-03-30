@@ -13,10 +13,10 @@
   "homepage": "https://amprealize.ai",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/guideai/guideai.git"
+    "url": "git+https://github.com/SandRiseStudio/guideai.git"
   },
   "bugs": {
-    "url": "https://github.com/guideai/guideai/issues"
+    "url": "https://github.com/SandRiseStudio/guideai/issues"
   },
   "license": "Apache-2.0",
   "author": "GuideAI Team",

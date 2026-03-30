@@ -24,7 +24,7 @@ pipx install guideai
 guideai init
 ```
 
-**Desktop app:** not shipped from this repository yet; use the **cloud** console, **CLI**, **VS Code extension**, or **MCP** today. Watch [GitHub Releases](https://github.com/guideai/guideai/releases) for future desktop builds.
+**Desktop app:** not shipped from this repository yet; use the **cloud** console, **CLI**, **VS Code extension**, or **MCP** today. Watch [GitHub Releases](https://github.com/SandRiseStudio/guideai/releases) for future desktop builds.
 
 ---
 
@@ -144,7 +144,7 @@ guideai/
 
 ```bash
 # Clone and set up
-git clone https://github.com/guideai/guideai.git
+git clone https://github.com/SandRiseStudio/guideai.git
 cd guideai
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
@@ -182,6 +182,14 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 ## Security
 
 To report security vulnerabilities, please see [SECURITY.md](SECURITY.md). **Do NOT use GitHub Issues for security reports.**
+
+---
+
+## Canonical GitHub repository
+
+Public source of truth: **[github.com/SandRiseStudio/guideai](https://github.com/SandRiseStudio/guideai)**.
+
+**Maintainers (after org or repo moves):** point PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) at `SandRiseStudio/guideai`, confirm GitHub Actions secrets and environments still apply to this repository, and re-check branch protection and Dependabot on the default branch.
 
 ---
 

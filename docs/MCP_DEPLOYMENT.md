@@ -102,7 +102,7 @@ GUIDEAI_LOG_FORMAT=json
 
 ```bash
 # Clone repository
-git clone https://github.com/guideai/guideai.git
+git clone https://github.com/SandRiseStudio/guideai.git
 cd guideai
 
 # Set staging secrets (env injection pattern)

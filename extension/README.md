@@ -6,9 +6,9 @@
 
 **Transform your IDE into an intelligent development companion with AI agent orchestration, real-time monitoring, and compliance validation.**
 
-[![Version](https://img.shields.io/github/v/release/guideai/guideai?label=version)](https://github.com/guideai/guideai/releases)
-[![Build Status](https://img.shields.io/github/workflow/status/guideai/guideai/CI?label=build)](https://github.com/guideai/guideai/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/guideai/guideai/blob/main/LICENSE)
+[![Version](https://img.shields.io/github/v/release/SandRiseStudio/guideai?label=version)](https://github.com/SandRiseStudio/guideai/releases)
+[![Build Status](https://img.shields.io/github/workflow/status/SandRiseStudio/guideai/CI?label=build)](https://github.com/SandRiseStudio/guideai/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/SandRiseStudio/guideai/blob/main/LICENSE)
 [![VSCode Marketplace](https://img.shields.io/badge/vscode-marketplace-blue)](https://marketplace.visualstudio.com/items?itemName=guideai.guideai-ide-extension)
 
 </div>
@@ -135,17 +135,17 @@ GuideAI is also available for:
 ## 📚 Documentation & Support
 
 - 📖 **Full Documentation**: [docs.guideai.com](https://docs.guideai.com)
-- 🐛 **Issue Tracking**: [GitHub Issues](https://github.com/guideai/guideai/issues)
-- 💬 **Community Support**: [GitHub Discussions](https://github.com/guideai/guideai/discussions)
+- 🐛 **Issue Tracking**: [GitHub Issues](https://github.com/SandRiseStudio/guideai/issues)
+- 💬 **Community Support**: [GitHub Discussions](https://github.com/SandRiseStudio/guideai/discussions)
 - 🏢 **Enterprise Support**: [guideai.com/enterprise](https://guideai.com/enterprise)
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guide](https://github.com/guideai/guideai/blob/main/CONTRIBUTING.md) for details.
+We welcome contributions! Please see our [Contributing Guide](https://github.com/SandRiseStudio/guideai/blob/main/.github/CONTRIBUTING.md) for details.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](https://github.com/guideai/guideai/blob/main/LICENSE) file for details.
+This project is licensed under the Apache License 2.0 — see the [LICENSE](https://github.com/SandRiseStudio/guideai/blob/main/LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
@@ -159,6 +159,6 @@ This project is licensed under the MIT License - see the [LICENSE](https://githu
 
 **Made with ❤️ for developers who build the future**
 
-[Download from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=guideai.guideai-ide-extension) | [View on GitHub](https://github.com/guideai/guideai) | [Get Started](https://docs.guideai.com)
+[Download from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=guideai.guideai-ide-extension) | [View on GitHub](https://github.com/SandRiseStudio/guideai) | [Get Started](https://docs.guideai.com)
 
 </div>

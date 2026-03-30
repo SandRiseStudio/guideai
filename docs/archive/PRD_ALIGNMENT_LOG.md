@@ -1545,7 +1545,7 @@ The CI/CD pipeline supports PRD success metrics by:
 
 **Evidence:**
 - Timeline: `BUILD_TIMELINE.md` entry #84 (comprehensive implementation log)
-- Pipeline runs: https://github.com/Nas4146/guideai/actions/runs/18766769492 (latest)
+- Pipeline runs: https://github.com/SandRiseStudio/guideai/actions/runs/18766769492 (latest)
 - Progress: `PROGRESS_TRACKER.md` updated with CI/CD milestone
 - Capability matrix: `docs/capability_matrix.md` updated with CI/CD row
 - Commits: 5 commits (initial, pre-commit fix, test files, dev deps, services)

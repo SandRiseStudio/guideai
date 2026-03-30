@@ -1200,7 +1200,7 @@ class WorkItemExecutionService:
                         repo_url = row[0] or row[1]
                         if repo_url:
                             # Extract owner/repo from URL if needed
-                            # e.g., "https://github.com/Nas4146/guideai" -> "Nas4146/guideai"
+                            # e.g., "https://github.com/SandRiseStudio/guideai" -> "Nas4146/guideai"
                             if repo_url.startswith("https://github.com/"):
                                 return repo_url.replace("https://github.com/", "").rstrip("/")
                             elif repo_url.startswith("git@github.com:"):

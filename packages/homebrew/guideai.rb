@@ -3,7 +3,7 @@
 # Usage:
 #   1. Create a tap repository: github.com/<org>/homebrew-guideai
 #   2. Copy this formula to Formula/guideai.rb in the tap
-#   3. Install with: brew install <org>/guideai/guideai
+#   3. After tapping: brew install guideai
 #
 # Or install directly from PyPI:
 #   brew install python@3.11
@@ -17,7 +17,7 @@ class Guideai < Formula
   url "https://files.pythonhosted.org/packages/source/g/guideai/guideai-0.1.0.tar.gz"
   sha256 "REPLACE_WITH_ACTUAL_SHA256_AFTER_PYPI_PUBLISH"
   license "Apache-2.0"
-  head "https://github.com/Nas4146/guideai.git", branch: "main"
+  head "https://github.com/SandRiseStudio/guideai.git", branch: "main"
 
   depends_on "python@3.11"
   depends_on "podman" => :optional

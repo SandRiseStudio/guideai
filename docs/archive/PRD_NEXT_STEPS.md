@@ -520,7 +520,7 @@ Test failures in earlier CI runs were due to missing infrastructure (PostgreSQL,
 
 **Primary Function → Agent:** DevOps → `AGENT_DEVOPS.md`
 **Supporting Functions → Agents:** Engineering → `AGENT_ENGINEERING.md`; Security → `AGENT_SECURITY.md`
-**Evidence:** `BUILD_TIMELINE.md` #84, #116 (CI/CD alignment 2025-10-30), Pipeline runs: https://github.com/Nas4146/guideai/actions/runs/18766769492
+**Evidence:** `BUILD_TIMELINE.md` #84, #116 (CI/CD alignment 2025-10-30), Pipeline runs: https://github.com/SandRiseStudio/guideai/actions/runs/18766769492
 **Behaviors:** `behavior_orchestrate_cicd`, `behavior_prevent_secret_leaks`, `behavior_git_governance`, `behavior_update_docs_after_changes`, `behavior_align_storage_layers`
 
 **Next Actions:**

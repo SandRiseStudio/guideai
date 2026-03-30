@@ -6,11 +6,11 @@
 	"publisher": "guideai",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/guideai/guideai"
+		"url": "https://github.com/SandRiseStudio/guideai"
 	},
-	"homepage": "https://github.com/guideai/guideai",
+	"homepage": "https://github.com/SandRiseStudio/guideai",
 	"bugs": {
-		"url": "https://github.com/guideai/guideai/issues"
+		"url": "https://github.com/SandRiseStudio/guideai/issues"
 	},
 	"engines": {
 		"vscode": "^1.74.0"
@@ -33,13 +33,13 @@
 	"icon": "resources/icon.png",
 	"badges": [
 		{
-			"url": "https://img.shields.io/github/v/release/guideai/guideai?label=version",
-			"href": "https://github.com/guideai/guideai/releases",
+			"url": "https://img.shields.io/github/v/release/SandRiseStudio/guideai?label=version",
+			"href": "https://github.com/SandRiseStudio/guideai/releases",
 			"description": "Latest Release"
 		},
 		{
-			"url": "https://img.shields.io/github/workflow/status/guideai/guideai/CI?label=build",
-			"href": "https://github.com/guideai/guideai/actions/workflows/ci.yml",
+			"url": "https://img.shields.io/github/workflow/status/SandRiseStudio/guideai/CI?label=build",
+			"href": "https://github.com/SandRiseStudio/guideai/actions/workflows/ci.yml",
 			"description": "Build Status"
 		}
 	],
@@ -49,7 +49,7 @@
 		"theme": "dark"
 	},
 	"markdown": "github",
-	"qna": "https://github.com/guideai/guideai/discussions",
+	"qna": "https://github.com/SandRiseStudio/guideai/discussions",
 	"pricing": "Free",
 	"activationEvents": [
 		"onStartupFinished"

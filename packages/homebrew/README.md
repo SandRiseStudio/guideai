@@ -11,8 +11,11 @@ pip install guideai
 ```
 
 ### Option 2: Install from Tap (Once Published)
+
+After you publish a tap repo named `SandRiseStudio/homebrew-guideai` (see below):
+
 ```bash
-brew tap Nas4146/guideai
+brew tap sandrisestudio/guideai
 brew install guideai
 ```
 
@@ -20,7 +23,7 @@ brew install guideai
 
 ### Setting Up the Tap
 
-1. Create a new repository: `github.com/Nas4146/homebrew-guideai`
+1. Create a new repository: `github.com/SandRiseStudio/homebrew-guideai`
 
 2. Copy the formula:
    ```bash
@@ -74,7 +77,7 @@ jobs:
         uses: dawidd6/action-homebrew-bump-formula@v4
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          tap: Nas4146/guideai
+          tap: sandrisestudio/guideai
           formula: guideai
           tag: ${{ github.ref }}
 ```
