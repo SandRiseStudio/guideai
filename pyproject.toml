@@ -95,7 +95,7 @@ amprealize = [
   "amprealize[cli]>=0.1.0",
 ]
 enterprise = [
-  "guideai-enterprise>=0.1.0",
+  "guideai-enterprise~=0.1.0",
 ]
 
 [project.scripts]

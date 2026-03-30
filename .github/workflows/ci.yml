@@ -163,6 +163,11 @@ jobs:
           /tmp/guideai-wheel-venv/bin/pip install dist/*.whl
           /tmp/guideai-wheel-venv/bin/guideai mcp-server doctor
 
+      - name: Validate wheel version matches .guideai-version
+        run: |
+          /tmp/guideai-wheel-venv/bin/pip install packaging
+          /tmp/guideai-wheel-venv/bin/python scripts/check_oss_version.py --strict
+
   # ============================================================================
   # Python Test Matrix (3.10, 3.11, 3.12) with Service Containers
   # ============================================================================
@@ -298,6 +303,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,postgres,telemetry,semantic]"
+
+      - name: Validate OSS version pin
+        run: python scripts/check_oss_version.py
 
       - name: Wait for services to be ready
         run: |
