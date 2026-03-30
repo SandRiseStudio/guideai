@@ -46,9 +46,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://amprealize.ai"
 Documentation = "https://amprealize.ai/docs"
-Source = "https://github.com/Nas4146/guideai"
-"Bug Tracker" = "https://github.com/Nas4146/guideai/issues"
-Changelog = "https://github.com/Nas4146/guideai/blob/main/BUILD_TIMELINE.md"
+Source = "https://github.com/guideai/guideai"
+"Bug Tracker" = "https://github.com/guideai/guideai/issues"
+Changelog = "https://github.com/guideai/guideai/blob/main/BUILD_TIMELINE.md"
 
 [project.optional-dependencies]
 dev = [
@@ -104,6 +104,9 @@ guideai-mcp-server = "guideai.cli:main_mcp_server"
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.package-data]
+guideai = ["agents/playbooks/*.md", "mcp_tool_manifests/*.json"]
 
 [tool.setuptools.packages.find]
 where = ["."]

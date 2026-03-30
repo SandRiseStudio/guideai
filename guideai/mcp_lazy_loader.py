@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .mcp_tools_dir import get_mcp_tools_directory
 from .mcp_tool_groups import (
     CORE_TOOLS,
     OUTCOME_TOOLS,
@@ -86,10 +87,13 @@ class MCPLazyToolLoader:
         if tools_dir:
             self._tools_dir = tools_dir
         else:
-            self._tools_dir = Path(__file__).parent.parent / "mcp" / "tools"
+            resolved = get_mcp_tools_directory()
+            self._tools_dir = resolved
 
-        if not self._tools_dir.exists():
-            self._logger.warning(f"MCP tools directory not found: {self._tools_dir}")
+        if not self._tools_dir or not self._tools_dir.exists():
+            self._logger.warning(
+                f"MCP tools directory not found: {self._tools_dir!r}"
+            )
             return
 
         # Scan all manifests but don't load into active set yet

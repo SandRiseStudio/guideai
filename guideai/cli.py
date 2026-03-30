@@ -6,6 +6,9 @@ import argparse
 import json
 import os
 import platform
+import re
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,7 +19,8 @@ import webbrowser
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone, date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from guideai.action_service import ActionService
 from guideai.adapters import (
@@ -68,6 +72,7 @@ from guideai.task_assignments import TaskAssignmentService
 from guideai.telemetry import TelemetryClient, create_sink_from_env, FileTelemetrySink, KafkaTelemetrySink
 from guideai.workflow_service import WorkflowService
 from guideai.utils.dsn import apply_host_overrides
+from guideai.mcp_env import collect_mcp_client_env, merge_mcp_runtime_env
 from guideai.auth_tokens import (
     AuthTokenBundle,
     TokenStore,
@@ -111,6 +116,526 @@ _AGENT_ORCHESTRATOR_ADAPTER: CLIAgentOrchestratorAdapter | None = None
 def _create_telemetry_client(default_actor: Dict[str, str]) -> TelemetryClient:
     sink = create_sink_from_env(default_path=DEFAULT_TELEMETRY_EVENTS_PATH)
     return TelemetryClient(sink=sink, default_actor=default_actor)
+
+
+def _build_cli_actor(actor_id: str, actor_role: str) -> "Actor":
+    """Build the canonical CLI actor used for telemetry-aware service calls."""
+
+    from guideai.action_contracts import Actor
+
+    return Actor(id=actor_id, role=actor_role, surface="cli")
+
+
+def _find_local_agents_md(start: Optional[Path] = None) -> Path:
+    """Find the nearest AGENTS.md, falling back to the bundled starter template."""
+
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        path = candidate / "AGENTS.md"
+        if path.exists():
+            return path
+    return Path(__file__).parent / "templates" / "AGENTS.md.starter"
+
+
+def _parse_behaviors_from_markdown(markdown_text: str) -> List[Dict[str, Any]]:
+    """Parse behavior definitions from an AGENTS-style markdown document."""
+
+    pattern = re.compile(
+        r"### `(behavior_\w+)`\s*\n"
+        r"- \*\*When\*\*:\s*(.+?)\n"
+        r"- \*\*Steps\*\*:\s*\n"
+        r"((?:\s+\d+\.\s+.+?\n)+)",
+        re.MULTILINE,
+    )
+    behaviors: List[Dict[str, Any]] = []
+
+    for match in pattern.finditer(markdown_text):
+        name = match.group(1)
+        when_clause = match.group(2).strip()
+        steps_raw = match.group(3)
+
+        steps: List[str] = []
+        for step_match in re.finditer(
+            r"\d+\.\s+(.+?)(?=\n\s+\d+\.|\n\n|\Z)",
+            steps_raw,
+            re.DOTALL,
+        ):
+            steps.append(re.sub(r"\s+", " ", step_match.group(1).strip()))
+
+        keywords = sorted(
+            {
+                token
+                for token in re.findall(r"[a-z0-9_]+", f"{name} {when_clause}".lower())
+                if len(token) > 2
+                and token not in {"behavior", "when", "with", "from", "that", "this"}
+            }
+        )
+
+        behaviors.append(
+            {
+                "name": name,
+                "description": f"Trigger: {when_clause}",
+                "instruction": "Steps:\n" + "\n".join(
+                    f"{index}. {step}" for index, step in enumerate(steps, start=1)
+                ),
+                "role_focus": "Student",
+                "trigger_keywords": keywords,
+                "score": 0.0,
+                "confidence_score": None,
+            }
+        )
+
+    return behaviors
+
+
+def _score_local_behavior(task_description: str, behavior: Dict[str, Any]) -> float:
+    """Score a local handbook behavior against the task using token overlap."""
+
+    query_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9_]+", task_description.lower())
+        if len(token) > 2
+    }
+    if not query_tokens:
+        return 0.0
+
+    haystack = " ".join(
+        [
+            behavior["name"],
+            behavior["description"],
+            behavior["instruction"],
+            " ".join(behavior["trigger_keywords"]),
+        ]
+    ).lower()
+    haystack_tokens = {
+        token for token in re.findall(r"[a-z0-9_]+", haystack) if len(token) > 2
+    }
+    if not haystack_tokens:
+        return 0.0
+
+    matches = sum(1 for token in query_tokens if token in haystack_tokens)
+    return matches / len(query_tokens)
+
+
+def _get_local_behaviors_for_task(
+    task_description: str,
+    role: str,
+    limit: int,
+) -> Dict[str, Any]:
+    """Return behavior guidance from the local handbook without database access."""
+
+    from guideai.behavior_service import BehaviorService
+
+    agents_path = _find_local_agents_md()
+    behaviors = _parse_behaviors_from_markdown(agents_path.read_text(encoding="utf-8"))
+    scored: List[Dict[str, Any]] = []
+
+    for behavior in behaviors:
+        scored_behavior = dict(behavior)
+        scored_behavior["score"] = _score_local_behavior(task_description, behavior)
+        if task_description and scored_behavior["score"] == 0.0:
+            continue
+        scored.append(scored_behavior)
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    recommended = scored[:limit]
+
+    return {
+        "behaviors": recommended,
+        "recommended_behaviors": recommended,
+        "role_advisory": BehaviorService._get_role_advisory(BehaviorService, role, recommended),
+        "role": role,
+        "task_description": task_description,
+        "source": "local_handbook_fallback",
+        "agents_path": str(agents_path),
+    }
+
+
+def _should_use_local_behavior_fallback(exc: Exception) -> bool:
+    """Return True when the behavior backend is unavailable and CLI should fall back."""
+
+    message = str(exc).lower()
+    markers = (
+        "connection to server at",
+        "connection refused",
+        "could not connect",
+        "operation not permitted",
+        "temporary failure in name resolution",
+        "redis",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _behavior_backend_is_reachable() -> bool:
+    """Check whether a configured behavior Postgres backend is reachable from the CLI."""
+
+    from guideai.utils.dsn import build_dsn_from_components, apply_host_overrides
+
+    dsn = (
+        os.getenv("GUIDEAI_BEHAVIOR_PG_DSN")
+        or build_dsn_from_components("BEHAVIOR")
+        or os.getenv("DATABASE_URL")
+    )
+    if not dsn:
+        return False
+
+    parsed = urlparse(apply_host_overrides(dsn, "BEHAVIOR") or dsn)
+    host = parsed.hostname
+    port = parsed.port or 5432
+    if not host:
+        return False
+
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _collect_mcp_env(workspace_root: Optional[Path] = None) -> Dict[str, str]:
+    """Collect the small client env shim needed to launch the MCP server."""
+
+    _ = workspace_root
+    return collect_mcp_client_env(os.environ)
+
+
+def _repo_mcp_launcher_path(workspace_root: Path) -> Path:
+    return workspace_root / "scripts" / "start_guideai_mcp.py"
+
+
+def _use_repo_mcp_launcher(workspace_root: Path) -> bool:
+    """True when the monorepo launcher script is present (clone / editable dev)."""
+
+    return _repo_mcp_launcher_path(workspace_root).is_file()
+
+
+def _build_mcp_server_base_config(
+    workspace_root: Optional[Path] = None,
+    python_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the shared stdio launch config used across MCP clients."""
+
+    root = (workspace_root or Path.cwd()).resolve()
+    resolved_python = python_path or (
+        shutil.which("python3") or shutil.which("python") or sys.executable
+    )
+    if _use_repo_mcp_launcher(root):
+        args: List[str] = [str(Path("scripts") / "start_guideai_mcp.py")]
+    else:
+        args = ["-m", "guideai.mcp_server"]
+    config: Dict[str, Any] = {
+        "command": resolved_python,
+        "args": args,
+        "cwd": str(root),
+    }
+    env = _collect_mcp_env(root)
+    if env:
+        config["env"] = env
+    return config
+
+
+def _build_cursor_mcp_config(
+    workspace_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Build Cursor-specific MCP config using ${workspaceFolder} interpolation.
+
+    Cursor does not support ``cwd`` in its MCP config.  It requires
+    ``type: "stdio"`` and resolves ``${workspaceFolder}`` to the directory
+    containing ``.cursor/mcp.json``.
+    """
+
+    root = (workspace_root or Path.cwd()).resolve()
+    venv_unix = root / ".venv" / "bin" / "python"
+    venv_win = root / ".venv" / "Scripts" / "python.exe"
+    if venv_unix.exists():
+        command = "${workspaceFolder}/.venv/bin/python"
+    elif venv_win.exists():
+        command = "${workspaceFolder}/.venv/Scripts/python.exe"
+    else:
+        command = "python3" if os.name != "nt" else "python"
+
+    if _use_repo_mcp_launcher(root):
+        mcp_args = ["${workspaceFolder}/scripts/start_guideai_mcp.py"]
+    else:
+        mcp_args = ["-m", "guideai.mcp_server"]
+
+    config: Dict[str, Any] = {
+        "type": "stdio",
+        "command": command,
+        "args": mcp_args,
+        "env": {"PYTHONUNBUFFERED": "1"},
+    }
+    env_file = root / ".env"
+    if env_file.exists():
+        config["envFile"] = "${workspaceFolder}/.env"
+    return config
+
+
+def _build_ide_mcp_configs(
+    workspace_root: Optional[Path] = None,
+    python_path: Optional[str] = None,
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Build portable IDE MCP configs that launch via the shared workspace script."""
+
+    base = _build_mcp_server_base_config(workspace_root=workspace_root, python_path=python_path)
+
+    vscode_config = {"servers": {"guideai": {"type": "stdio", **base}}}
+    claude_config = {"mcpServers": {"guideai": dict(base)}}
+    cursor_config = {"mcpServers": {"guideai": _build_cursor_mcp_config(workspace_root)}}
+
+    return [
+        (".vscode/mcp.json", vscode_config),
+        (".claude/mcp.json", claude_config),
+        (".cursor/mcp.json", cursor_config),
+    ]
+
+
+def _build_codex_mcp_server_config(
+    workspace_root: Optional[Path] = None,
+    python_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the GuideAI MCP server entry for Codex config.toml.
+
+    Uses absolute paths for command and args since Codex does not support
+    variable interpolation like ``${workspaceFolder}``.  Prefers the repo
+    ``.venv`` python to avoid re-exec overhead.
+    """
+
+    root = (workspace_root or Path.cwd()).resolve()
+    venv_unix = root / ".venv" / "bin" / "python"
+    venv_win = root / ".venv" / "Scripts" / "python.exe"
+    if venv_unix.exists():
+        resolved_python = str(venv_unix)
+    elif venv_win.exists():
+        resolved_python = str(venv_win)
+    else:
+        resolved_python = python_path or (
+            shutil.which("python3") or shutil.which("python") or sys.executable
+        )
+    if _use_repo_mcp_launcher(root):
+        codex_args = [str(root / "scripts" / "start_guideai_mcp.py")]
+    else:
+        codex_args = ["-m", "guideai.mcp_server"]
+
+    return {
+        "enabled": True,
+        "required": False,
+        "command": resolved_python,
+        "args": codex_args,
+        "cwd": str(root),
+        "startup_timeout_sec": 20,
+        "tool_timeout_sec": 120,
+        "env": collect_mcp_client_env(os.environ),
+    }
+
+
+def _render_toml_value(value: Any) -> str:
+    """Render a small TOML value subset used by the Codex MCP config writer."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if isinstance(value, list):
+        return "[" + ", ".join(_render_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(
+            f"{key} = {_render_toml_value(item)}" for key, item in value.items()
+        ) + " }"
+    raise TypeError(f"Unsupported TOML value type: {type(value)!r}")
+
+
+def _render_codex_mcp_server_block(
+    server_name: str,
+    config: Dict[str, Any],
+) -> str:
+    """Render a `[mcp_servers.<name>]` block for Codex config.toml."""
+
+    ordered_keys = [
+        "enabled",
+        "required",
+        "command",
+        "args",
+        "cwd",
+        "startup_timeout_sec",
+        "tool_timeout_sec",
+        "env",
+    ]
+    lines = [f"[mcp_servers.{server_name}]"]
+    for key in ordered_keys:
+        if key in config:
+            lines.append(f"{key} = {_render_toml_value(config[key])}")
+    return "\n".join(lines) + "\n"
+
+
+def _upsert_codex_mcp_server_config(
+    config_path: Path,
+    server_name: str = "guideai",
+    workspace_root: Optional[Path] = None,
+    python_path: Optional[str] = None,
+) -> str:
+    """Create or update the GuideAI MCP server block in Codex config.toml."""
+
+    block = _render_codex_mcp_server_block(
+        server_name,
+        _build_codex_mcp_server_config(workspace_root=workspace_root, python_path=python_path),
+    )
+    header = f"[mcp_servers.{server_name}]"
+    pattern = re.compile(
+        rf"(?ms)^\[{re.escape(f'mcp_servers.{server_name}')}\]\n.*?(?=^\[|\Z)"
+    )
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if not config_path.exists():
+        config_path.write_text(block, encoding="utf-8")
+        return "created"
+
+    contents = config_path.read_text(encoding="utf-8")
+    match = pattern.search(contents)
+    if match:
+        existing_block = match.group(0)
+        if existing_block.rstrip() + "\n" == block:
+            return "unchanged"
+        updated = contents[: match.start()] + block + contents[match.end() :]
+        config_path.write_text(updated.rstrip() + "\n", encoding="utf-8")
+        return "updated"
+
+    separator = ""
+    if contents and not contents.endswith("\n"):
+        separator = "\n\n"
+    elif contents and not contents.endswith("\n\n"):
+        separator = "\n"
+
+    config_path.write_text(contents + separator + block, encoding="utf-8")
+    return "updated"
+
+
+def _frame_mcp_message(message: Dict[str, Any]) -> bytes:
+    """Encode an MCP JSON-RPC message with Content-Length framing."""
+
+    body = json.dumps(message).encode("utf-8")
+    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+    return header + body
+
+
+def _read_framed_mcp_message(stream: Any) -> Dict[str, Any]:
+    """Read a single Content-Length framed MCP response."""
+
+    headers: Dict[str, str] = {}
+    while True:
+        line = stream.readline()
+        if line == b"":
+            raise RuntimeError("MCP server closed stdout before returning a response")
+        if line in (b"\r\n", b"\n"):
+            break
+        key, _, value = line.decode("utf-8").partition(":")
+        if not value:
+            raise RuntimeError(f"Malformed MCP header line: {line!r}")
+        headers[key.strip().lower()] = value.strip()
+
+    content_length = headers.get("content-length")
+    if not content_length:
+        raise RuntimeError("MCP response missing Content-Length header")
+
+    body = stream.read(int(content_length))
+    if not body:
+        raise RuntimeError("MCP response body was empty")
+    return json.loads(body)
+
+
+def _run_mcp_smoke_test(timeout: float = 10.0) -> Dict[str, Any]:
+    """Start the MCP server, run initialize + tools/list, and return summary data."""
+
+    repo_root = Path.cwd().resolve()
+    env = merge_mcp_runtime_env(repo_root, os.environ)
+    launcher = repo_root / "scripts" / "start_guideai_mcp.py"
+    if launcher.is_file():
+        mcp_argv = [sys.executable, str(launcher)]
+    else:
+        mcp_argv = [sys.executable, "-m", "guideai.mcp_server"]
+
+    proc = subprocess.Popen(  # noqa: S603
+        mcp_argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=str(repo_root),
+    )
+
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+
+    try:
+        proc.stdin.write(
+            _frame_mcp_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "guideai-cli", "version": "0.1"},
+                    },
+                }
+            )
+        )
+        proc.stdin.write(
+            _frame_mcp_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "tools",
+                    "method": "tools/list",
+                }
+            )
+        )
+        proc.stdin.flush()
+
+        responses: Dict[str, Dict[str, Any]] = {}
+        started_at = time.time()
+        while len(responses) < 2:
+            if time.time() - started_at > timeout:
+                raise RuntimeError(
+                    f"Timed out after {timeout:.1f}s waiting for MCP smoke-test responses"
+                )
+            response = _read_framed_mcp_message(proc.stdout)
+            response_id = response.get("id")
+            if response_id:
+                responses[str(response_id)] = response
+
+        init_response = responses["init"]
+        tools_response = responses["tools"]
+        if init_response.get("error"):
+            raise RuntimeError(f"initialize failed: {init_response['error']}")
+        if tools_response.get("error"):
+            raise RuntimeError(f"tools/list failed: {tools_response['error']}")
+
+        tools = tools_response.get("result", {}).get("tools", [])
+        if not tools:
+            raise RuntimeError("tools/list succeeded but returned zero tools")
+
+        return {
+            "protocol_version": init_response.get("result", {}).get("protocolVersion"),
+            "server_name": init_response.get("result", {}).get("serverInfo", {}).get("name"),
+            "tool_count": len(tools),
+            "sample_tools": [tool.get("name") for tool in tools[:5]],
+        }
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=2)
 
 
 def _get_action_adapter() -> CLIActionServiceAdapter:
@@ -2285,6 +2810,31 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     bci_improve_parser.add_argument("--max-behaviors", type=int, default=10, help="Max behaviors to extract")
     bci_improve_parser.add_argument("--output", "-o", help="Output file path (default: stdout)")
 
+    # bci inject — E3 Runtime Injection command
+    bci_inject_parser = bci_subparsers.add_parser(
+        "inject",
+        help="Full runtime injection: resolve context, retrieve behaviors, compose enriched prompt",
+    )
+    bci_inject_parser.add_argument("task", help="Task or prompt description")
+    bci_inject_parser.add_argument("--surface", default="cli", help="Invoking surface (cli, mcp, vscode, web, api)")
+    bci_inject_parser.add_argument("--role", choices=["Student", "Teacher", "Strategist"], help="Agent role")
+    bci_inject_parser.add_argument("--workspace-path", help="Workspace path for profile detection")
+    bci_inject_parser.add_argument("--pack-id", help="Active pack ID override")
+    bci_inject_parser.add_argument("--pack-version", help="Active pack version override")
+    bci_inject_parser.add_argument("--top-k", type=int, default=5, help="Number of behaviors to retrieve")
+    bci_inject_parser.add_argument(
+        "--strategy", choices=["hybrid", "embedding", "keyword"], default="hybrid", help="Retrieval strategy"
+    )
+    bci_inject_parser.add_argument(
+        "--format", choices=["list", "prose", "structured"], default="list", help="Prompt format"
+    )
+    bci_inject_parser.add_argument(
+        "--citation-mode", choices=["explicit", "implicit", "inline"], default="explicit", help="Citation mode"
+    )
+    bci_inject_parser.add_argument("--tags", nargs="*", help="Filter behaviors by tags")
+    bci_inject_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    bci_inject_parser.add_argument("--output", "-o", help="Output file path (default: stdout)")
+
     # ── Audit log commands ──────────────────────────────────────────────────────
     audit_parser = subparsers.add_parser(
         "audit",
@@ -2612,9 +3162,16 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # ── Reflection command ──────────────────────────────────────────────────────
     reflection_parser = subparsers.add_parser(
         "reflection",
+        help="Analyze traces, manage behavior candidates, and review queue",
+    )
+    reflection_subparsers = reflection_parser.add_subparsers(dest="reflection_command")
+
+    # reflection extract
+    reflection_extract_parser = reflection_subparsers.add_parser(
+        "extract",
         help="Analyze traces and propose reusable behavior candidates",
     )
-    trace_input_group = reflection_parser.add_mutually_exclusive_group()
+    trace_input_group = reflection_extract_parser.add_mutually_exclusive_group()
     trace_input_group.add_argument(
         "--trace",
         dest="trace_text",
@@ -2625,44 +3182,143 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         dest="trace_file",
         help="Path to file containing trace text",
     )
-    reflection_parser.add_argument(
+    reflection_extract_parser.add_argument(
         "--trace-format",
         dest="trace_format",
         choices=["chain_of_thought", "structured", "free_form"],
         default="chain_of_thought",
         help="Format of the trace text (default: chain_of_thought)",
     )
-    reflection_parser.add_argument(
+    reflection_extract_parser.add_argument(
         "--run-id",
         dest="run_id",
         help="Run ID to associate with reflection results",
     )
-    reflection_parser.add_argument(
+    reflection_extract_parser.add_argument(
         "--min-score",
         dest="min_score",
         type=float,
         default=0.6,
         help="Minimum quality score for candidate behaviors (0.0-1.0, default: 0.6)",
     )
-    reflection_parser.add_argument(
+    reflection_extract_parser.add_argument(
         "--max-candidates",
         dest="max_candidates",
         type=int,
         default=5,
         help="Maximum number of behavior candidates to return (default: 5)",
     )
-    reflection_parser.add_argument(
+    reflection_extract_parser.add_argument(
         "--no-examples",
         dest="no_examples",
         action="store_true",
         help="Exclude examples from candidate output",
     )
-    reflection_parser.add_argument(
+    reflection_extract_parser.add_argument(
         "--tags",
         nargs="+",
         help="Preferred tags to assign to candidates",
     )
-    reflection_parser.add_argument(
+    reflection_extract_parser.add_argument(
+        "--output",
+        choices=["json", "table"],
+        default="json",
+        help="Output format (default: json)",
+    )
+
+    # reflection list - list behavior candidates for review
+    reflection_list_parser = reflection_subparsers.add_parser(
+        "list",
+        help="List behavior candidates for review",
+    )
+    reflection_list_parser.add_argument(
+        "--status",
+        choices=["proposed", "approved", "rejected", "merged"],
+        help="Filter by candidate status",
+    )
+    reflection_list_parser.add_argument(
+        "--role",
+        choices=["Student", "Teacher", "Metacognitive Strategist"],
+        help="Filter by role",
+    )
+    reflection_list_parser.add_argument(
+        "--min-confidence",
+        dest="min_confidence",
+        type=float,
+        help="Filter by minimum confidence score (0.0-1.0)",
+    )
+    reflection_list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of results (default: 50)",
+    )
+    reflection_list_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Pagination offset (default: 0)",
+    )
+    reflection_list_parser.add_argument(
+        "--output",
+        choices=["json", "table"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # reflection approve - approve a behavior candidate
+    reflection_approve_parser = reflection_subparsers.add_parser(
+        "approve",
+        help="Approve a behavior candidate",
+    )
+    reflection_approve_parser.add_argument(
+        "candidate_id",
+        help="ID of the candidate to approve",
+    )
+    reflection_approve_parser.add_argument(
+        "--reviewer",
+        dest="reviewed_by",
+        default=DEFAULT_ACTOR_ID,
+        help=f"Reviewer identifier (default: {DEFAULT_ACTOR_ID})",
+    )
+    reflection_approve_parser.add_argument(
+        "--merge",
+        dest="merge_to_handbook",
+        action="store_true",
+        help="Immediately merge to behavior handbook",
+    )
+    reflection_approve_parser.add_argument(
+        "--behavior-name",
+        dest="behavior_name",
+        help="Override behavior name when merging",
+    )
+    reflection_approve_parser.add_argument(
+        "--output",
+        choices=["json", "table"],
+        default="json",
+        help="Output format (default: json)",
+    )
+
+    # reflection reject - reject a behavior candidate
+    reflection_reject_parser = reflection_subparsers.add_parser(
+        "reject",
+        help="Reject a behavior candidate",
+    )
+    reflection_reject_parser.add_argument(
+        "candidate_id",
+        help="ID of the candidate to reject",
+    )
+    reflection_reject_parser.add_argument(
+        "--reviewer",
+        dest="reviewed_by",
+        default=DEFAULT_ACTOR_ID,
+        help=f"Reviewer identifier (default: {DEFAULT_ACTOR_ID})",
+    )
+    reflection_reject_parser.add_argument(
+        "--reason",
+        help="Reason for rejection",
+    )
+    reflection_reject_parser.add_argument(
         "--output",
         choices=["json", "table"],
         default="json",
@@ -2889,7 +3545,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "execute",
         help="Start execution of a work item using its assigned agent",
     )
-    wi_execute_parser.add_argument("item_id", help="Work item ID")
+    wi_execute_parser.add_argument("item_id", help="Work item ID or display ID (e.g. 'myproject-42')")
     wi_execute_parser.add_argument("--project-id", required=True, help="Project ID")
     wi_execute_parser.add_argument("--org-id", help="Organization ID")
     wi_execute_parser.add_argument("--model", help="Model override")
@@ -2909,7 +3565,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "status",
         help="Get execution status of a work item",
     )
-    wi_status_parser.add_argument("item_id", help="Work item ID")
+    wi_status_parser.add_argument("item_id", help="Work item ID or display ID (e.g. 'myproject-42')")
     wi_status_parser.add_argument("--project-id", required=True, help="Project ID")
     wi_status_parser.add_argument("--org-id", help="Organization ID")
     wi_status_parser.add_argument("--format", choices=["table", "json"], default="table")
@@ -2919,7 +3575,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "clarify",
         help="Provide a clarification response for a paused execution",
     )
-    wi_clarify_parser.add_argument("item_id", help="Work item ID")
+    wi_clarify_parser.add_argument("item_id", help="Work item ID or display ID (e.g. 'myproject-42')")
     wi_clarify_parser.add_argument("--project-id", required=True, help="Project ID")
     wi_clarify_parser.add_argument("--org-id", help="Organization ID")
     wi_clarify_parser.add_argument(
@@ -2934,11 +3590,699 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "approve-gate",
         help="Approve a strict gate and resume execution",
     )
-    wi_approve_parser.add_argument("item_id", help="Work item ID")
+    wi_approve_parser.add_argument("item_id", help="Work item ID or display ID (e.g. 'myproject-42')")
     wi_approve_parser.add_argument("--project-id", required=True, help="Project ID")
     wi_approve_parser.add_argument("--org-id", help="Organization ID")
     wi_approve_parser.add_argument("--phase", help="Phase gate to approve")
     wi_approve_parser.add_argument("--notes", help="Approval notes/feedback")
+
+    # ── config ─────────────────────────────────────────────────────────────
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Show or update local GuideAI configuration (~/.guideai/config.yaml)",
+    )
+    config_subparsers = config_parser.add_subparsers(dest="config_command")
+
+    config_show_parser = config_subparsers.add_parser(
+        "show",
+        help="Display resolved configuration",
+    )
+    config_show_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Output format (default: yaml)",
+    )
+
+    config_set_parser = config_subparsers.add_parser(
+        "set",
+        help="Set a config value in ~/.guideai/config.yaml",
+    )
+    config_set_parser.add_argument(
+        "key",
+        help="Dot-separated config key, e.g. storage.backend",
+    )
+    config_set_parser.add_argument(
+        "value",
+        help="Value to set",
+    )
+
+    config_subparsers.add_parser(
+        "path",
+        help="Print path to user config file",
+    )
+
+    # ── context ────────────────────────────────────────────────────────────
+    context_parser = subparsers.add_parser(
+        "context",
+        help="Manage named contexts (like kubectl context)",
+    )
+    context_subparsers = context_parser.add_subparsers(dest="context_command")
+
+    context_subparsers.add_parser(
+        "current",
+        help="Show the active context",
+    )
+
+    context_list_parser = context_subparsers.add_parser(
+        "list",
+        help="List all available contexts with status",
+    )
+    context_list_parser.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    context_use_parser = context_subparsers.add_parser(
+        "use",
+        help="Switch to a named context",
+    )
+    context_use_parser.add_argument(
+        "name",
+        help="Name of the context to switch to",
+    )
+
+    context_add_parser = context_subparsers.add_parser(
+        "add",
+        help="Create a new named context",
+    )
+    context_add_parser.add_argument(
+        "name",
+        help="Unique name for the new context",
+    )
+    context_add_parser.add_argument(
+        "--backend",
+        choices=("postgres", "sqlite", "memory"),
+        default="sqlite",
+        help="Storage backend type (default: sqlite)",
+    )
+    context_add_parser.add_argument(
+        "--dsn",
+        help="PostgreSQL DSN (required for postgres backend)",
+    )
+    context_add_parser.add_argument(
+        "--sqlite-path",
+        help="SQLite file path (optional, has sensible default)",
+    )
+
+    context_remove_parser = context_subparsers.add_parser(
+        "remove",
+        help="Remove a named context",
+    )
+    context_remove_parser.add_argument(
+        "name",
+        help="Name of the context to remove",
+    )
+
+    # ── items ──────────────────────────────────────────────────────────────
+    items_parser = subparsers.add_parser(
+        "items",
+        help="Manage work items across contexts",
+    )
+    items_subparsers = items_parser.add_subparsers(dest="items_command")
+
+    items_migrate_parser = items_subparsers.add_parser(
+        "migrate",
+        help="Migrate work items from one context to another",
+    )
+    items_migrate_parser.add_argument(
+        "source",
+        help="Source context name",
+    )
+    items_migrate_parser.add_argument(
+        "target",
+        help="Target context name",
+    )
+    items_migrate_parser.add_argument(
+        "--filter",
+        metavar="EXPR",
+        help="Filter expression: type=story,status=in_progress,labels=bug|urgent",
+    )
+    items_migrate_parser.add_argument(
+        "--project",
+        metavar="ID",
+        help="Filter by project ID",
+    )
+    items_migrate_parser.add_argument(
+        "--board",
+        metavar="ID",
+        help="Filter by board ID",
+    )
+    items_migrate_parser.add_argument(
+        "--type",
+        choices=("epic", "story", "task", "bug"),
+        help="Filter by item type",
+    )
+    items_migrate_parser.add_argument(
+        "--status",
+        help="Filter by status (e.g., in_progress, done)",
+    )
+    items_migrate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview migration without making changes",
+    )
+    items_migrate_parser.add_argument(
+        "--on-conflict",
+        choices=("skip", "overwrite", "rename", "fail"),
+        default="skip",
+        help="How to handle conflicts (default: skip)",
+    )
+    items_migrate_parser.add_argument(
+        "--org",
+        metavar="ORG_ID",
+        help="Organization ID for multi-tenant isolation",
+    )
+    items_migrate_parser.add_argument(
+        "--no-boards",
+        action="store_true",
+        help="Skip migrating boards (will lose board associations)",
+    )
+    items_migrate_parser.add_argument(
+        "--output",
+        "-o",
+        metavar="FILE",
+        help="Save migration report to JSON file",
+    )
+    items_migrate_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
+    items_migrate_parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress progress output",
+    )
+
+    # ── db ─────────────────────────────────────────────────────────────────
+    db_parser = subparsers.add_parser(
+        "db",
+        help="Local SQLite database management",
+    )
+    db_subparsers = db_parser.add_subparsers(dest="db_command")
+
+    db_subparsers.add_parser(
+        "migrate",
+        help="Apply pending SQLite migrations",
+    )
+
+    db_subparsers.add_parser(
+        "status",
+        help="Show applied and pending migrations",
+    )
+
+    # ── knowledge-pack ─────────────────────────────────────────────────────
+    kp_parser = subparsers.add_parser(
+        "knowledge-pack",
+        help="Build, validate, inspect, and manage knowledge packs",
+    )
+    kp_subparsers = kp_parser.add_subparsers(dest="knowledge_pack_command")
+
+    kp_build_parser = kp_subparsers.add_parser(
+        "build",
+        help="Build a knowledge pack from registered sources",
+    )
+    kp_build_parser.add_argument(
+        "--pack-id",
+        help="Pack identifier (default: derived from project config)",
+    )
+    kp_build_parser.add_argument(
+        "--version",
+        help="Explicit version string e.g. '1.0.0' (default: auto-generated)",
+    )
+    kp_build_parser.add_argument(
+        "--profile",
+        default="solo-dev",
+        choices=["solo-dev", "guideai-platform", "custom"],
+        help="Target profile with budget/overlay rules (default: solo-dev)",
+    )
+    kp_build_parser.add_argument(
+        "--primer-template",
+        help="Path to custom primer template file",
+    )
+    kp_build_parser.add_argument(
+        "--token-budget",
+        type=int,
+        help="Override default token budget for pack",
+    )
+    kp_build_parser.add_argument(
+        "--output-dir",
+        help="Directory to write built pack artifacts",
+    )
+    kp_build_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="json",
+        help="Output format",
+    )
+
+    kp_validate_parser = kp_subparsers.add_parser(
+        "validate",
+        help="Validate a knowledge pack manifest file",
+    )
+    kp_validate_parser.add_argument(
+        "manifest_path",
+        metavar="MANIFEST_PATH",
+        help="Path to the manifest JSON file to validate",
+    )
+    kp_validate_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail on warnings as well as errors",
+    )
+    kp_validate_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    kp_inspect_parser = kp_subparsers.add_parser(
+        "inspect",
+        help="Inspect an existing knowledge pack",
+    )
+    kp_inspect_parser.add_argument(
+        "--pack-id",
+        help="Pack identifier to inspect",
+    )
+    kp_inspect_parser.add_argument(
+        "--version",
+        help="Specific version to inspect (default: latest)",
+    )
+    kp_inspect_parser.add_argument(
+        "--show-sources",
+        action="store_true",
+        help="Include source provenance details",
+    )
+    kp_inspect_parser.add_argument(
+        "--show-overlays",
+        action="store_true",
+        help="Include overlay breakdown by task/surface/role",
+    )
+    kp_inspect_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    kp_list_parser = kp_subparsers.add_parser(
+        "list",
+        help="List all available knowledge packs",
+    )
+    kp_list_parser.add_argument(
+        "--pack-id",
+        help="Filter by pack identifier",
+    )
+    kp_list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Maximum number of results (default: 25)",
+    )
+    kp_list_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    # ── pack (bootstrap / rollback) ────────────────────────────────────────
+    pack_parser = subparsers.add_parser(
+        "pack",
+        help="Bootstrap or rollback knowledge packs for existing workspaces",
+    )
+    pack_subparsers = pack_parser.add_subparsers(dest="pack_command")
+
+    pack_bootstrap_parser = pack_subparsers.add_parser(
+        "bootstrap",
+        help="Bootstrap a knowledge pack from an existing workspace",
+    )
+    pack_bootstrap_parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace root path (default: current directory)",
+    )
+    pack_bootstrap_parser.add_argument(
+        "--profile",
+        choices=["solo-dev", "guideai-platform", "team-collab",
+                 "extension-dev", "api-backend", "compliance-sensitive"],
+        default=None,
+        help="Override detected workspace profile",
+    )
+    pack_bootstrap_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing AGENTS.md and config files",
+    )
+    pack_bootstrap_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    pack_rollback_parser = pack_subparsers.add_parser(
+        "rollback",
+        help="Deactivate the active pack and restore pre-pack behaviour",
+    )
+    pack_rollback_parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace root path (default: current directory)",
+    )
+    pack_rollback_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    pack_status_parser = pack_subparsers.add_parser(
+        "status",
+        help="Show workspace storage and pack activation status",
+    )
+    pack_status_parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace root path (default: current directory)",
+    )
+    pack_status_parser.add_argument(
+        "--format",
+        choices=("json", "table"),
+        default="table",
+        help="Output format",
+    )
+
+    # ── init ───────────────────────────────────────────────────────────────
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Scaffold a new GuideAI project in the current directory",
+    )
+    init_parser.add_argument(
+        "--name",
+        default=None,
+        help="Project name (default: current directory name). Skips interactive prompt.",
+    )
+    init_parser.add_argument(
+        "--storage",
+        choices=["sqlite", "postgres"],
+        default=None,
+        help="Storage backend (default: sqlite). Skips interactive prompt.",
+    )
+    init_parser.add_argument(
+        "--auth",
+        choices=["local", "cloud"],
+        default=None,
+        help="Auth mode (default: local). Skips interactive prompt.",
+    )
+    init_parser.add_argument(
+        "--template",
+        choices=["full", "minimal"],
+        default="full",
+        help="Scaffolding template (default: full)",
+    )
+    init_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        default=False,
+        help="Skip all prompts, use defaults or provided flags",
+    )
+    init_parser.add_argument(
+        "--profile",
+        choices=[
+            "solo-dev",
+            "guideai-platform",
+            "team-collab",
+            "extension-dev",
+            "api-backend",
+            "compliance-sensitive",
+        ],
+        default=None,
+        help="Workspace profile to use (skips auto-detection)",
+    )
+    init_parser.add_argument(
+        "--detect-only",
+        action="store_true",
+        default=False,
+        help="Run workspace detection and print result without scaffolding",
+    )
+    init_parser.add_argument(
+        "--skip-pack",
+        action="store_true",
+        default=False,
+        help="Skip knowledge-pack activation during init",
+    )
+
+    # ── bootstrap ──────────────────────────────────────────────────────────
+    # MCP-parity commands for workspace profiling
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help="Workspace profiling and initialization commands",
+    )
+    bootstrap_subparsers = bootstrap_parser.add_subparsers(dest="bootstrap_command")
+
+    # bootstrap detect
+    bootstrap_detect_parser = bootstrap_subparsers.add_parser(
+        "detect",
+        help="Detect workspace profile by analyzing project structure",
+    )
+    bootstrap_detect_parser.add_argument(
+        "--path",
+        default=".",
+        help="Path to workspace (default: current directory)",
+    )
+    bootstrap_detect_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # bootstrap status
+    bootstrap_status_parser = bootstrap_subparsers.add_parser(
+        "status",
+        help="Show bootstrap status for workspace",
+    )
+    bootstrap_status_parser.add_argument(
+        "--path",
+        default=".",
+        help="Path to workspace (default: current directory)",
+    )
+    bootstrap_status_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # bootstrap init (alias for guideai init with bootstrap focus)
+    bootstrap_init_parser = bootstrap_subparsers.add_parser(
+        "init",
+        help="Initialize workspace with GuideAI (alias for guideai init)",
+    )
+    bootstrap_init_parser.add_argument(
+        "--path",
+        default=".",
+        help="Path to workspace (default: current directory)",
+    )
+    bootstrap_init_parser.add_argument(
+        "--profile",
+        choices=[
+            "solo-dev",
+            "guideai-platform",
+            "team-collab",
+            "extension-dev",
+            "api-backend",
+            "compliance-sensitive",
+        ],
+        default=None,
+        help="Override auto-detected profile",
+    )
+    bootstrap_init_parser.add_argument(
+        "--skip-primer",
+        action="store_true",
+        default=False,
+        help="Skip AGENTS.md generation",
+    )
+    bootstrap_init_parser.add_argument(
+        "--skip-pack",
+        action="store_true",
+        default=False,
+        help="Skip knowledge pack activation",
+    )
+    bootstrap_init_parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Overwrite existing files",
+    )
+    bootstrap_init_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+
+    # ── flags ──────────────────────────────────────────────────────────────
+    flags_parser = subparsers.add_parser(
+        "flags",
+        help="Feature flag management (list, get, set)",
+    )
+    flags_subparsers = flags_parser.add_subparsers(dest="flags_command")
+
+    # flags list
+    flags_list_parser = flags_subparsers.add_parser(
+        "list",
+        help="List all registered feature flags",
+    )
+    flags_list_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # flags get
+    flags_get_parser = flags_subparsers.add_parser(
+        "get",
+        help="Get a single feature flag by name",
+    )
+    flags_get_parser.add_argument("flag_name", help="Dotted flag name (e.g. feature.auto_reflection)")
+    flags_get_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # flags set
+    flags_set_parser = flags_subparsers.add_parser(
+        "set",
+        help="Update a feature flag's state",
+    )
+    flags_set_parser.add_argument("flag_name", help="Dotted flag name")
+    flags_set_parser.add_argument("--enabled", type=lambda v: v.lower() in ("true", "1", "yes"), help="Enable/disable")
+    flags_set_parser.add_argument("--percentage", type=int, help="Rollout percentage (0-100)")
+    flags_set_parser.add_argument("--user-list", nargs="*", help="User allowlist")
+    flags_set_parser.add_argument("--format", choices=("table", "json"), default="table", help="Output format")
+
+    # ── mcp-server ─────────────────────────────────────────────────────────
+    mcp_parser = subparsers.add_parser(
+        "mcp-server",
+        help="Start the GuideAI MCP server",
+    )
+    mcp_parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default=None,
+        help="Transport mode (default: from config, fallback stdio)",
+    )
+    mcp_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for SSE transport (default: 8765)",
+    )
+    mcp_parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default=None,
+        help="Override log level",
+    )
+    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command")
+    mcp_subparsers.add_parser(
+        "init",
+        help="Generate MCP configuration for IDEs and Codex",
+    )
+    mcp_doctor_parser = mcp_subparsers.add_parser(
+        "doctor",
+        help="Smoke-test MCP startup with initialize + tools/list",
+    )
+    mcp_doctor_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Timeout in seconds for the MCP smoke test (default: 10)",
+    )
+
+    # ── open ────────────────────────────────────────────────────────────────
+    open_parser = subparsers.add_parser(
+        "open",
+        help="Launch the GuideAI dashboard in your browser",
+    )
+    open_parser.add_argument(
+        "page",
+        nargs="?",
+        default=None,
+        choices=["behaviors", "runs", "boards", "settings"],
+        help="Deep-link to a specific dashboard page",
+    )
+    open_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        default=False,
+        help="Start server but don't open the browser (just print URL)",
+    )
+    open_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Override server port (default: from config, fallback 8765)",
+    )
+    open_parser.add_argument(
+        "--stop",
+        action="store_true",
+        default=False,
+        help="Stop a running GuideAI server",
+    )
+
+    # ── guideai infra (provider-agnostic infrastructure management) ────
+    infra_parser = subparsers.add_parser(
+        "infra",
+        help="Manage local infrastructure (amprealize, docker-compose, or external)",
+    )
+    infra_parser.add_argument(
+        "--provider",
+        choices=["auto", "amprealize", "docker-compose", "external", "none"],
+        default=None,
+        help="Override infrastructure provider (default: from config or auto-detect)",
+    )
+    infra_sub = infra_parser.add_subparsers(dest="infra_action")
+
+    infra_up = infra_sub.add_parser("up", help="Start infrastructure services")
+    infra_up.add_argument(
+        "--profile",
+        choices=["minimal", "standard", "full"],
+        default="standard",
+        help="Service profile (default: standard)",
+    )
+
+    infra_sub.add_parser("down", help="Stop infrastructure services")
+    infra_sub.add_parser("status", help="List active environments and their state")
+    infra_sub.add_parser("resources", help="Show resource utilisation (memory, disk, CPU)")
+    infra_sub.add_parser("reset", help="Destroy and recreate all infrastructure (destructive)")
+    infra_sub.add_parser("configure", help="Interactively select infrastructure provider")
+
+    # ── doctor ─────────────────────────────────────────────────────────────
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run diagnostics to verify GuideAI installation health",
+    )
+    doctor_parser.add_argument(
+        "--fix",
+        action="store_true",
+        default=False,
+        help="Attempt to automatically fix detected issues",
+    )
+    doctor_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Show detailed check output",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Output results as JSON",
+    )
 
     args = parser.parse_args(argv)
     if not args.command:
@@ -2986,6 +4330,25 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if args.command == "work-item" and not getattr(args, "wi_command", None):
         wi_parser.print_help()
         parser.exit(1)
+    if args.command == "config" and not getattr(args, "config_command", None):
+        config_parser.print_help()
+        parser.exit(1)
+    if args.command == "context" and not getattr(args, "context_command", None):
+        context_parser.print_help()
+        parser.exit(1)
+    if args.command == "db" and not getattr(args, "db_command", None):
+        db_parser.print_help()
+        parser.exit(1)
+    if args.command == "knowledge-pack" and not getattr(args, "knowledge_pack_command", None):
+        kp_parser.print_help()
+        parser.exit(1)
+    if args.command == "pack" and not getattr(args, "pack_command", None):
+        pack_parser.print_help()
+        parser.exit(1)
+    if args.command == "flags" and not getattr(args, "flags_command", None):
+        flags_parser.print_help()
+        parser.exit(1)
+    # mcp-server has no required subcommand — bare invocation starts the server
     return args
 
 
@@ -3406,8 +4769,6 @@ def _command_behaviors_propose(args: argparse.Namespace) -> int:
         ProposeBehaviorRequest,
         RoleContext,
     )
-    from guideai.action_contracts import Actor
-
     try:
         # Load optional metadata and examples
         metadata = _load_metadata([], args.metadata_file) if args.metadata_file else {}
@@ -3437,7 +4798,7 @@ def _command_behaviors_propose(args: argparse.Namespace) -> int:
             behaviors_cited=["behavior_curate_behavior_handbook"],
         )
 
-        actor = Actor(id=args.actor_id, role=args.actor_role)
+        actor = _build_cli_actor(args.actor_id, args.actor_role)
 
         # Get service and propose
         service = BehaviorService()
@@ -3470,11 +4831,8 @@ def _command_behaviors_get_for_task(args: argparse.Namespace) -> int:
     to retrieve applicable behaviors. Returns role-specific advisory.
     """
     from guideai.behavior_service import BehaviorService, RoleContext
-    from guideai.action_contracts import Actor
-
     try:
-        service = BehaviorService()
-        actor = Actor(id=args.actor_id, role=args.actor_role)
+        actor = _build_cli_actor(args.actor_id, args.actor_role)
 
         # Build role context for telemetry
         role_context = RoleContext(
@@ -3482,17 +4840,31 @@ def _command_behaviors_get_for_task(args: argparse.Namespace) -> int:
             rationale=f"Retrieving behaviors for task: {args.task_description[:50]}...",
         )
 
-        result = service.get_relevant_behaviors_for_task(
+        if _behavior_backend_is_reachable():
+            service = BehaviorService()
+            result = service.get_relevant_behaviors_for_task(
+                task_description=args.task_description,
+                role=args.role,
+                limit=args.limit,
+                actor=actor,
+                role_context=role_context,
+            )
+        else:
+            result = _get_local_behaviors_for_task(
+                task_description=args.task_description,
+                role=args.role,
+                limit=args.limit,
+            )
+    except Exception as exc:
+        if not _should_use_local_behavior_fallback(exc):
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        result = _get_local_behaviors_for_task(
             task_description=args.task_description,
             role=args.role,
             limit=args.limit,
-            actor=actor,
-            role_context=role_context,
         )
-
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        result["backend_error"] = str(exc)
 
     if args.format == "json":
         # Serialize behaviors for JSON output
@@ -3502,9 +4874,19 @@ def _command_behaviors_get_for_task(args: argparse.Namespace) -> int:
             "role_advisory": result["role_advisory"],
             "recommended_behaviors": result["recommended_behaviors"],
         }
+        if result.get("source"):
+            output["source"] = result["source"]
+            output["agents_path"] = result.get("agents_path")
+        if result.get("backend_error"):
+            output["backend_error"] = result["backend_error"]
         _print_json(output)
     else:
         # Table format with advisory
+        if result.get("source") == "local_handbook_fallback":
+            print(
+                f"Using local handbook fallback from {result['agents_path']}.",
+                file=sys.stderr,
+            )
         print(f"\n{result['role_advisory']}\n")
         print("=" * 60)
 
@@ -5757,7 +7139,7 @@ def _render_bci_validate_table(payload: Dict[str, Any]) -> None:
 
 def _command_bci_generate(args: argparse.Namespace) -> int:
     """Generate a behavior-conditioned LLM response."""
-    from .llm_provider import LLMConfig, ProviderType
+    from .llm import LLMConfig, ProviderType
     from .bci_contracts import RoleFocus
 
     bci_service = _get_bci_service()
@@ -5842,7 +7224,7 @@ def _command_bci_generate(args: argparse.Namespace) -> int:
 
 def _command_bci_improve(args: argparse.Namespace) -> int:
     """Analyze a failed run and generate improvement suggestions."""
-    from .llm_provider import LLMConfig, ProviderType
+    from .llm import LLMConfig, ProviderType
 
     bci_service = _get_bci_service()
 
@@ -6023,6 +7405,83 @@ def _command_bci_validate_citations(args: argparse.Namespace) -> int:
         _print_json(payload)
     else:
         _render_bci_validate_table(payload)
+    return 0
+
+
+def _command_bci_inject(args: argparse.Namespace) -> int:
+    """E3 Runtime Injection: resolve context, retrieve behaviors, compose enriched prompt."""
+    from guideai.runtime_injector import RuntimeInjector
+    from guideai.runtime_context import ContextResolverInput
+
+    # Build ContextResolverInput from CLI args
+    workspace_path = args.workspace_path or os.getcwd()
+    resolver_input = ContextResolverInput(
+        workspace_path=workspace_path,
+        surface=args.surface,
+        role=args.role,
+        task=args.task,
+        pack_id=getattr(args, "pack_id", None),
+        pack_version=getattr(args, "pack_version", None),
+    )
+
+    # Build retrieval options
+    tags = args.tags if args.tags else None
+    retrieval_options = {
+        "top_k": args.top_k,
+        "strategy": args.strategy,
+        "format": args.format,
+        "citation_mode": args.citation_mode,
+        "tags": tags,
+    }
+
+    # Inject
+    try:
+        injector = RuntimeInjector()
+        result = injector.inject(resolver_input, retrieval_options)
+    except Exception as exc:
+        print(f"Error during runtime injection: {exc}", file=sys.stderr)
+        return 1
+
+    # Output
+    if args.json:
+        payload = result.to_dict()
+        output_str = json.dumps(payload, indent=2)
+    else:
+        # Human-readable output
+        lines = []
+        lines.append("=" * 60)
+        lines.append("RUNTIME INJECTION RESULT")
+        lines.append("=" * 60)
+        lines.append(f"Surface: {result.context.surface}")
+        lines.append(f"Role: {result.context.role or 'Not specified'}")
+        lines.append(f"Task Type: {result.context.task_type}")
+        lines.append(f"Workspace Profile: {result.context.workspace_profile}")
+        lines.append(f"Active Pack: {result.context.active_pack_id or 'None'}")
+        lines.append("")
+        lines.append("Behaviors Injected:")
+        for b in result.behaviors_injected:
+            lines.append(f"  - {b}")
+        lines.append("")
+        if result.overlays_included:
+            lines.append("Overlays Included:")
+            for o in result.overlays_included:
+                lines.append(f"  - {o}")
+            lines.append("")
+        lines.append(f"Token Estimate: {result.token_estimate}")
+        lines.append(f"Latency: {result.latency_ms:.1f}ms")
+        lines.append("")
+        lines.append("-" * 60)
+        lines.append("COMPOSED PROMPT:")
+        lines.append("-" * 60)
+        lines.append(result.composed_prompt)
+        output_str = "\n".join(lines)
+
+    if args.output:
+        Path(args.output).expanduser().write_text(output_str, encoding="utf-8")
+        print(f"Output written to {args.output}")
+    else:
+        print(output_str)
+
     return 0
 
 
@@ -6472,40 +7931,191 @@ def _render_reflection_table(result: Dict[str, Any]) -> None:
         print(fmt.format(*row))
 
 
-def _command_reflection(args: argparse.Namespace) -> int:
+def _render_candidates_list_table(result: Dict[str, Any]) -> None:
+    """Render a table of behavior candidates for review."""
+    candidates = result.get("candidates", [])
+    total = result.get("total", len(candidates))
+
+    if not candidates:
+        print("No behavior candidates found.")
+        return
+
+    print(f"Found {total} candidate(s):\n")
+
+    headers = ["ID", "Name", "Status", "Confidence", "Role", "Created"]
+    widths = [len(header) for header in headers]
+    rows: List[List[str]] = []
+
+    for candidate in candidates:
+        created = candidate.get("created_at", "")[:10] if candidate.get("created_at") else "-"
+        row = [
+            candidate.get("id", "")[:12],
+            candidate.get("name", candidate.get("slug", ""))[:24],
+            candidate.get("status", "proposed"),
+            f"{candidate.get('confidence', 0.0):.2f}",
+            candidate.get("role", "-")[:12],
+            created,
+        ]
+        rows.append(row)
+        widths = [max(width, len(value)) for width, value in zip(widths, row)]
+
+    fmt = " | ".join(f"{{:<{width}}}" for width in widths)
+    separator = "-+-".join("-" * width for width in widths)
+
+    print(fmt.format(*headers))
+    print(separator)
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def _command_reflection_extract(args: argparse.Namespace) -> int:
+    """Handle 'guideai reflection extract' subcommand."""
     adapter = _get_reflection_adapter()
-    trace_text = args.trace_text or ""
+    trace_text = getattr(args, "trace_text", None) or ""
     if not trace_text:
-        if not args.trace_file:
+        trace_file = getattr(args, "trace_file", None)
+        if not trace_file:
             print("Error: provide --trace or --trace-file for reflection", file=sys.stderr)
             return 2
-        trace_path = Path(args.trace_file).expanduser().resolve()
+        trace_path = Path(trace_file).expanduser().resolve()
         if not trace_path.exists():
             print(f"Error: Trace file not found: {trace_path}", file=sys.stderr)
             return 2
         trace_text = trace_path.read_text(encoding="utf-8")
 
-    min_score = max(0.0, min(1.0, args.min_score))
+    min_score = max(0.0, min(1.0, getattr(args, "min_score", 0.6)))
 
     try:
         result = adapter.reflect(
             trace_text=trace_text,
-            trace_format=args.trace_format,
-            run_id=args.run_id,
-            max_candidates=args.max_candidates,
+            trace_format=getattr(args, "trace_format", "chain_of_thought"),
+            run_id=getattr(args, "run_id", None),
+            max_candidates=getattr(args, "max_candidates", 5),
             min_quality_score=min_score,
-            include_examples=not args.no_examples,
-            preferred_tags=args.tags or None,
+            include_examples=not getattr(args, "no_examples", False),
+            preferred_tags=getattr(args, "tags", None),
         )
     except Exception as exc:  # pragma: no cover - CLI guard
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    if args.output == "table":
+    if getattr(args, "output", "json") == "table":
         _render_reflection_table(result)
     else:
         _print_json(result)
     return 0
+
+
+def _command_reflection_list(args: argparse.Namespace) -> int:
+    """Handle 'guideai reflection list' subcommand."""
+    adapter = _get_reflection_adapter()
+
+    payload: Dict[str, Any] = {
+        "limit": getattr(args, "limit", 50),
+        "offset": getattr(args, "offset", 0),
+    }
+    if getattr(args, "status", None):
+        payload["status"] = args.status
+    if getattr(args, "role", None):
+        payload["role"] = args.role
+    if getattr(args, "min_confidence", None) is not None:
+        payload["min_confidence"] = args.min_confidence
+
+    try:
+        result = adapter.list_candidates(payload)
+    except Exception as exc:  # pragma: no cover - CLI guard
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "output", "table") == "table":
+        _render_candidates_list_table(result)
+    else:
+        _print_json(result)
+    return 0
+
+
+def _command_reflection_approve(args: argparse.Namespace) -> int:
+    """Handle 'guideai reflection approve' subcommand."""
+    adapter = _get_reflection_adapter()
+
+    payload: Dict[str, Any] = {
+        "candidate_id": args.candidate_id,
+        "reviewed_by": getattr(args, "reviewed_by", DEFAULT_ACTOR_ID),
+    }
+    if getattr(args, "merge_to_handbook", False):
+        payload["merge_to_handbook"] = True
+    if getattr(args, "behavior_name", None):
+        payload["behavior_name"] = args.behavior_name
+
+    try:
+        result = adapter.approve_candidate(payload)
+    except Exception as exc:  # pragma: no cover - CLI guard
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if result.get("success"):
+        print(f"Candidate {args.candidate_id} approved successfully.")
+        if result.get("auto_approved"):
+            print("(Auto-approved due to high confidence >= 0.8)")
+        if result.get("merged_behavior_id"):
+            print(f"Merged to handbook as behavior: {result['merged_behavior_id']}")
+    else:
+        print(f"Warning: {result.get('message', 'Unknown error')}", file=sys.stderr)
+
+    if getattr(args, "output", "json") == "json":
+        _print_json(result)
+    return 0
+
+
+def _command_reflection_reject(args: argparse.Namespace) -> int:
+    """Handle 'guideai reflection reject' subcommand."""
+    adapter = _get_reflection_adapter()
+
+    payload: Dict[str, Any] = {
+        "candidate_id": args.candidate_id,
+        "reviewed_by": getattr(args, "reviewed_by", DEFAULT_ACTOR_ID),
+    }
+    if getattr(args, "reason", None):
+        payload["reason"] = args.reason
+
+    try:
+        result = adapter.reject_candidate(payload)
+    except Exception as exc:  # pragma: no cover - CLI guard
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if result.get("success"):
+        print(f"Candidate {args.candidate_id} rejected.")
+    else:
+        print(f"Warning: {result.get('message', 'Unknown error')}", file=sys.stderr)
+
+    if getattr(args, "output", "json") == "json":
+        _print_json(result)
+    return 0
+
+
+def _command_reflection(args: argparse.Namespace) -> int:
+    """Dispatch reflection subcommands."""
+    subcommand = getattr(args, "reflection_command", None)
+
+    if subcommand == "extract":
+        return _command_reflection_extract(args)
+    elif subcommand == "list":
+        return _command_reflection_list(args)
+    elif subcommand == "approve":
+        return _command_reflection_approve(args)
+    elif subcommand == "reject":
+        return _command_reflection_reject(args)
+    else:
+        # No subcommand: show help
+        print("Usage: guideai reflection <command>")
+        print("\nCommands:")
+        print("  extract    Analyze traces and propose reusable behavior candidates")
+        print("  list       List behavior candidates for review")
+        print("  approve    Approve a behavior candidate")
+        print("  reject     Reject a behavior candidate")
+        print("\nRun 'guideai reflection <command> --help' for details.")
+        return 0
 
 
 def _command_workflow_create_template(args: argparse.Namespace) -> int:
@@ -8326,7 +9936,7 @@ def _command_architect_pickup(args: argparse.Namespace) -> int:
     from guideai.multi_tenant.board_contracts import CreateWorkItemRequest, WorkItemType, WorkItemPriority
     from guideai.multi_tenant.organization_service import OrganizationService
     from guideai.action_contracts import Actor
-    from guideai.llm_provider import LLMConfig, ProviderType, get_provider, LLMRequest, LLMMessage
+    from guideai.llm import LLMClient, LLMConfig, ProviderType
     from datetime import datetime
     from pathlib import Path
     import os
@@ -8418,7 +10028,7 @@ def _command_architect_pickup(args: argparse.Namespace) -> int:
     # 1.1 Load Architect Agent Playbook
     print("\n📖 Loading AGENT_ARCHITECT.md playbook...")
     project_root = Path(__file__).parent.parent
-    architect_playbook_path = project_root / "agents" / "AGENT_ARCHITECT.md"
+    architect_playbook_path = project_root / "docs" / "agents" / "AGENT_ARCHITECT.md"
     architect_playbook = ""
     if architect_playbook_path.exists():
         architect_playbook = architect_playbook_path.read_text(encoding="utf-8")
@@ -8569,7 +10179,7 @@ def _command_architect_pickup(args: argparse.Namespace) -> int:
         max_tokens=8000,
         temperature=0.2,  # Low temperature for precise technical analysis
     )
-    llm_provider = get_provider(config)
+    llm_client = LLMClient(config)
     print(f"   ✓ Using model: {llm_model}")
 
     # Build the architect prompt
@@ -8632,14 +10242,10 @@ Output ONLY the ADR markdown content, starting with the # ADR header.
     print("-" * 70)
 
     try:
-        request = LLMRequest(
-            messages=[
-                LLMMessage(role="system", content=architect_playbook),
-                LLMMessage(role="user", content=architect_prompt),
-            ],
-            max_tokens=8192,
-            temperature=0.4,
-        )
+        messages = [
+            {"role": "system", "content": architect_playbook},
+            {"role": "user", "content": architect_prompt},
+        ]
 
         # Stream callback to print chunks as they arrive
         char_count = [0]  # Use list to allow mutation in closure
@@ -8647,15 +10253,11 @@ Output ONLY the ADR markdown content, starting with the # ADR header.
             print(chunk, end="", flush=True)
             char_count[0] += len(chunk)
 
-        # Use streaming if available (AnthropicProvider has generate_stream)
-        if hasattr(llm_provider, 'generate_stream'):
-            response = llm_provider.generate_stream(request, callback=stream_callback)
-        else:
-            # Fallback to non-streaming
-            print("   (Streaming not available, waiting for complete response...)")
-            response = llm_provider.generate(request)
-            print(response.content)
-            char_count[0] = len(response.content)
+        # Use streaming
+        response = llm_client.stream_sync(
+            messages, callback=stream_callback,
+            max_tokens=8192, temperature=0.4,
+        )
 
         adr_content = response.content
         print("\n" + "-" * 70)
@@ -8728,14 +10330,12 @@ Extract 3-6 concrete tasks from the implementation plan in the ADR.
 
     print("\n📤 Extracting work items from ADR...")
     try:
-        extract_request = LLMRequest(
-            messages=[
-                LLMMessage(role="user", content=extraction_prompt),
-            ],
-            max_tokens=2048,
-            temperature=0.2,
+        extract_messages = [
+            {"role": "user", "content": extraction_prompt},
+        ]
+        extract_response = llm_client.call(
+            extract_messages, max_tokens=2048, temperature=0.2,
         )
-        extract_response = llm_provider.generate(extract_request)
         extraction_result = extract_response.content
         # Parse JSON from response (handle markdown code blocks)
         json_match = re.search(r'\{[\s\S]*\}', extraction_result)
@@ -9100,6 +10700,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _command_bci_generate(args)
         elif args.bci_command == "improve":
             return _command_bci_improve(args)
+        elif args.bci_command == "inject":
+            return _command_bci_inject(args)
     elif args.command == "audit":
         if args.audit_command == "verify":
             return _command_audit_verify(args)
@@ -9141,10 +10743,2202 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _command_wi_clarify(args)
         elif args.wi_command == "approve-gate":
             return _command_wi_approve_gate(args)
+    elif args.command == "config":
+        if args.config_command == "show":
+            return _command_config_show(args)
+        elif args.config_command == "set":
+            return _command_config_set(args)
+        elif args.config_command == "path":
+            return _command_config_path(args)
+
+    elif args.command == "context":
+        if args.context_command == "current":
+            return _command_context_current(args)
+        elif args.context_command == "list":
+            return _command_context_list(args)
+        elif args.context_command == "use":
+            return _command_context_use(args)
+        elif args.context_command == "add":
+            return _command_context_add(args)
+        elif args.context_command == "remove":
+            return _command_context_remove(args)
+
+    elif args.command == "items":
+        if args.items_command == "migrate":
+            return _command_items_migrate(args)
+
+    elif args.command == "db":
+        if args.db_command == "migrate":
+            return _command_db_migrate(args)
+        elif args.db_command == "status":
+            return _command_db_status(args)
+
+    elif args.command == "knowledge-pack":
+        if args.knowledge_pack_command == "build":
+            return _command_knowledge_pack_build(args)
+        elif args.knowledge_pack_command == "validate":
+            return _command_knowledge_pack_validate(args)
+        elif args.knowledge_pack_command == "inspect":
+            return _command_knowledge_pack_inspect(args)
+        elif args.knowledge_pack_command == "list":
+            return _command_knowledge_pack_list(args)
+
+    elif args.command == "flags":
+        if args.flags_command == "list":
+            return _command_flags_list(args)
+        elif args.flags_command == "get":
+            return _command_flags_get(args)
+        elif args.flags_command == "set":
+            return _command_flags_set(args)
+
+    elif args.command == "pack":
+        if args.pack_command == "bootstrap":
+            return _command_pack_bootstrap(args)
+        elif args.pack_command == "rollback":
+            return _command_pack_rollback(args)
+        elif args.pack_command == "status":
+            return _command_pack_status(args)
+
+    elif args.command == "init":
+        return _command_init(args)
+
+    elif args.command == "bootstrap":
+        return _command_bootstrap(args)
+
+    elif args.command == "mcp-server":
+        mcp_cmd = getattr(args, "mcp_command", None)
+        if mcp_cmd == "init":
+            return _command_mcp_init(args)
+        if mcp_cmd == "doctor":
+            return _command_mcp_doctor(args)
+        return _command_mcp_server(args)
+
+    elif args.command == "open":
+        return _command_open(args)
+
+    elif args.command == "infra":
+        return _command_infra(args)
+
+    elif args.command == "doctor":
+        return _command_doctor(args)
 
     # If no command matched or no subcommand provided
     print("Error: No command specified or command not recognized", file=sys.stderr)
     return 1
+
+
+# ==============================================================================
+# Knowledge Pack CLI Commands
+# ==============================================================================
+
+
+def _command_knowledge_pack_build(args: argparse.Namespace) -> int:
+    """Build a knowledge pack from registered sources."""
+    from guideai.knowledge_pack.builder import PackBuilder, PackBuildConfig
+    from guideai.knowledge_pack.source_registry import SourceRegistryService
+
+    try:
+        registry = SourceRegistryService()
+        builder = PackBuilder(
+            registry=registry,
+            primer_template_path=args.primer_template,
+        )
+
+        config = PackBuildConfig(
+            pack_id=args.pack_id,
+            version=args.version,
+            profile=args.profile,
+            token_budget=args.token_budget,
+        )
+
+        artifact = builder.build(config)
+
+        # Optionally write to output directory
+        if args.output_dir:
+            import os
+
+            os.makedirs(args.output_dir, exist_ok=True)
+            manifest_path = os.path.join(args.output_dir, f"{artifact.pack_id}_{artifact.version}_manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write(artifact.manifest.model_dump_json(indent=2))
+            print(f"✅ Wrote manifest to {manifest_path}", file=sys.stderr)
+
+        output = {
+            "pack_id": artifact.pack_id,
+            "version": artifact.version,
+            "profile": artifact.profile,
+            "token_budget_used": artifact.token_budget_used,
+            "overlay_count": len(artifact.manifest.overlays),
+            "source_count": len(artifact.manifest.sources),
+            "primer_hash": artifact.manifest.primer_hash,
+            "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+        }
+
+        if args.format == "table":
+            print(f"Pack ID:        {output['pack_id']}")
+            print(f"Version:        {output['version']}")
+            print(f"Profile:        {output['profile']}")
+            print(f"Token Budget:   {output['token_budget_used']}")
+            print(f"Overlays:       {output['overlay_count']}")
+            print(f"Sources:        {output['source_count']}")
+            print(f"Primer Hash:    {output['primer_hash'][:16]}...")
+        else:
+            print(json.dumps(output, indent=2, default=str))
+        return 0
+
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _command_knowledge_pack_validate(args: argparse.Namespace) -> int:
+    """Validate a knowledge pack manifest file."""
+    from guideai.knowledge_pack.validator import ManifestValidator, ValidationIssue, ValidationSeverity
+    from guideai.knowledge_pack.schema import KnowledgePackManifest
+
+    try:
+        with open(args.manifest_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+
+        manifest = KnowledgePackManifest.model_validate(raw_data)
+        validator = ManifestValidator()
+        issues = validator.validate(manifest)
+
+        errors = [i for i in issues if i.severity == ValidationSeverity.ERROR]
+        warnings = [i for i in issues if i.severity == ValidationSeverity.WARNING]
+
+        if args.format == "table":
+            if not issues:
+                print("✅ Manifest is valid with no issues")
+            else:
+                print(f"{'ERROR' if errors else 'WARNING'}: Found {len(errors)} error(s), {len(warnings)} warning(s)")
+                for issue in issues:
+                    icon = "❌" if issue.severity == ValidationSeverity.ERROR else "⚠️"
+                    print(f"  {icon} [{issue.code}] {issue.message}")
+                    if issue.path:
+                        print(f"     at path: {issue.path}")
+        else:
+            output = {
+                "valid": len(errors) == 0 and (not args.strict or len(warnings) == 0),
+                "error_count": len(errors),
+                "warning_count": len(warnings),
+                "issues": [
+                    {
+                        "severity": i.severity.value,
+                        "code": i.code,
+                        "message": i.message,
+                        "path": i.path,
+                    }
+                    for i in issues
+                ],
+            }
+            print(json.dumps(output, indent=2))
+
+        # Exit code: 1 if errors or (strict mode and warnings)
+        if errors or (args.strict and warnings):
+            return 1
+        return 0
+
+    except json.JSONDecodeError as exc:
+        print(f"Error: Invalid JSON in manifest file: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError:
+        print(f"Error: Manifest file not found: {args.manifest_path}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _command_knowledge_pack_inspect(args: argparse.Namespace) -> int:
+    """Inspect an existing knowledge pack."""
+    from guideai.knowledge_pack.source_registry import SourceRegistryService
+
+    try:
+        registry = SourceRegistryService()
+
+        # Get pack info - this would typically query a storage layer
+        # For now we provide a basic implementation querying registry
+        pack_id = args.pack_id
+        version = args.version
+
+        if not pack_id:
+            print("Error: --pack-id is required", file=sys.stderr)
+            return 1
+
+        # Query sources for this pack
+        sources = registry.list_sources(scope=pack_id, limit=100)
+
+        output: Dict[str, Any] = {
+            "pack_id": pack_id,
+            "version": version or "latest",
+            "source_count": len(sources),
+        }
+
+        if args.show_sources:
+            output["sources"] = [
+                {
+                    "source_id": s.source_id,
+                    "source_type": s.source_type.value,
+                    "ref": s.ref,
+                    "scope": s.scope,
+                    "version_hash": s.version_hash,
+                }
+                for s in sources
+            ]
+
+        if args.show_overlays:
+            # Would need to query overlay metadata from pack storage
+            output["overlay_summary"] = {
+                "note": "Overlay breakdown requires built pack. Use 'build' then 'inspect' on output."
+            }
+
+        if args.format == "table":
+            print(f"Pack ID:      {output['pack_id']}")
+            print(f"Version:      {output['version']}")
+            print(f"Sources:      {output['source_count']}")
+            if args.show_sources and "sources" in output:
+                print("\nSources:")
+                for s in output["sources"]:
+                    print(f"  - {s['source_type']}: {s['ref']} ({s['scope']})")
+        else:
+            print(json.dumps(output, indent=2, default=str))
+
+        return 0
+
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _command_knowledge_pack_list(args: argparse.Namespace) -> int:
+    """List available knowledge packs."""
+    from guideai.knowledge_pack.source_registry import SourceRegistryService
+
+    try:
+        registry = SourceRegistryService()
+
+        # Get unique scopes (pack_ids) from sources
+        # In a full implementation, this would query a packs table
+        sources = registry.list_sources(limit=args.limit * 10)  # Over-fetch to dedupe
+
+        # Group by scope to get pack summary
+        packs: Dict[str, Dict[str, Any]] = {}
+        for source in sources:
+            scope = source.scope or "default"
+            if args.pack_id and scope != args.pack_id:
+                continue
+            if scope not in packs:
+                packs[scope] = {
+                    "pack_id": scope,
+                    "source_count": 0,
+                    "latest_update": source.updated_at,
+                }
+            packs[scope]["source_count"] += 1
+            if source.updated_at and (
+                not packs[scope]["latest_update"]
+                or source.updated_at > packs[scope]["latest_update"]
+            ):
+                packs[scope]["latest_update"] = source.updated_at
+
+        results = list(packs.values())[: args.limit]
+
+        if args.format == "table":
+            if not results:
+                print("No knowledge packs found")
+            else:
+                print(f"{'Pack ID':<30} {'Sources':<10} {'Last Updated':<25}")
+                print("-" * 65)
+                for pack in results:
+                    updated = pack["latest_update"].isoformat() if pack["latest_update"] else "N/A"
+                    print(f"{pack['pack_id']:<30} {pack['source_count']:<10} {updated:<25}")
+        else:
+            output = [
+                {
+                    "pack_id": p["pack_id"],
+                    "source_count": p["source_count"],
+                    "latest_update": p["latest_update"].isoformat() if p["latest_update"] else None,
+                }
+                for p in results
+            ]
+            print(json.dumps(output, indent=2))
+
+        return 0
+
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+# ==============================================================================
+# Feature Flags CLI Commands (T4.4.1)
+# ==============================================================================
+
+def _command_flags_list(args: argparse.Namespace) -> int:
+    """List all registered feature flags."""
+    from guideai.feature_flags import FeatureFlagService
+
+    svc = FeatureFlagService()
+    flags = svc.list_flags()
+
+    if args.format == "json":
+        print(json.dumps([f.to_dict() for f in flags], indent=2))
+    else:
+        if not flags:
+            print("No feature flags registered")
+        else:
+            print(f"{'Name':<42} {'Type':<12} {'Enabled':<9} {'%':<5} {'Users'}")
+            print("-" * 85)
+            for f in flags:
+                users = ",".join(f.user_list[:3])
+                if len(f.user_list) > 3:
+                    users += f"… (+{len(f.user_list) - 3})"
+                print(f"{f.name:<42} {f.flag_type.value:<12} {str(f.enabled):<9} {f.percentage:<5} {users}")
+    return 0
+
+
+def _command_flags_get(args: argparse.Namespace) -> int:
+    """Get a single feature flag."""
+    from guideai.feature_flags import FeatureFlagService
+
+    svc = FeatureFlagService()
+    flag = svc.get_flag(args.flag_name)
+
+    if flag is None:
+        print(f"Flag not found: {args.flag_name}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps(flag.to_dict(), indent=2))
+    else:
+        print(f"Name:        {flag.name}")
+        print(f"Type:        {flag.flag_type.value}")
+        print(f"Enabled:     {flag.enabled}")
+        print(f"Percentage:  {flag.percentage}")
+        print(f"User list:   {flag.user_list}")
+        print(f"Description: {flag.description}")
+        if flag.metadata:
+            print(f"Metadata:    {json.dumps(flag.metadata)}")
+    return 0
+
+
+def _command_flags_set(args: argparse.Namespace) -> int:
+    """Update a feature flag."""
+    from guideai.feature_flags import FeatureFlagService
+
+    svc = FeatureFlagService()
+
+    kwargs: Dict[str, Any] = {}
+    if args.enabled is not None:
+        kwargs["enabled"] = args.enabled
+    if args.percentage is not None:
+        kwargs["percentage"] = args.percentage
+    if args.user_list is not None:
+        kwargs["user_list"] = args.user_list
+
+    if not kwargs:
+        print("No changes specified. Use --enabled, --percentage, or --user-list.", file=sys.stderr)
+        return 1
+
+    flag = svc.set_flag(args.flag_name, **kwargs)
+
+    if args.format == "json":
+        print(json.dumps(flag.to_dict(), indent=2))
+    else:
+        print(f"Updated flag '{flag.name}': enabled={flag.enabled}, type={flag.flag_type.value}, percentage={flag.percentage}")
+    return 0
+
+
+# ==============================================================================
+# Pack CLI Commands (bootstrap / rollback / status)
+# ==============================================================================
+
+
+def _command_pack_bootstrap(args: argparse.Namespace) -> int:
+    """Bootstrap a knowledge pack for an existing workspace."""
+    from guideai.bootstrap.pack_migration import PackMigrationService
+    from guideai.bootstrap.profile import WorkspaceProfile
+
+    profile = WorkspaceProfile(args.profile) if args.profile else None
+
+    svc = PackMigrationService()
+    result = svc.bootstrap(
+        workspace_path=args.workspace,
+        profile=profile,
+        force=args.force,
+    )
+
+    if args.format == "json":
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print(f"Workspace: {result.workspace_path}")
+        print(f"Storage:   {result.storage.backend.value}")
+        if result.profile:
+            print(f"Profile:   {result.profile.value}")
+        print(f"Pack:      {result.pack_id}@{result.pack_version}")
+        print(f"Activated: {'yes' if result.activated else 'no'}")
+        if result.files_written:
+            print(f"Files:     {', '.join(result.files_written)}")
+        if result.notes:
+            print("\nNotes:")
+            for note in result.notes:
+                print(f"  - {note}")
+    return 0
+
+
+def _command_pack_rollback(args: argparse.Namespace) -> int:
+    """Deactivate the active pack and restore pre-pack behaviour."""
+    from guideai.bootstrap.pack_migration import PackMigrationService
+
+    svc = PackMigrationService()
+    result = svc.rollback(workspace_path=args.workspace)
+
+    if args.format == "json":
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print(f"Workspace: {result.workspace_path}")
+        if result.previous_pack_id:
+            print(f"Previous:  {result.previous_pack_id}")
+        print(f"Rolled back: {'yes' if result.deactivated else 'no'}")
+        if result.notes:
+            for note in result.notes:
+                print(f"  - {note}")
+    return 0
+
+
+def _command_pack_status(args: argparse.Namespace) -> int:
+    """Show workspace storage and pack activation status."""
+    from guideai.bootstrap.storage_detector import detect_storage_backend
+
+    storage = detect_storage_backend(args.workspace)
+
+    if args.format == "json":
+        print(json.dumps(storage.to_dict(), indent=2))
+    else:
+        print(f"Storage backend:   {storage.backend.value}")
+        if storage.path_or_dsn:
+            print(f"Path/DSN:          {storage.path_or_dsn}")
+        print(f"Feature flags:     {'present' if storage.has_feature_flags_table else 'not found'}")
+        print(f"Activations table: {'present' if storage.has_activations_table else 'not found'}")
+        print(f"Can migrate:       {'yes' if storage.can_migrate else 'no'}")
+        if storage.reason:
+            print(f"Note:              {storage.reason}")
+    return 0
+
+
+# ==============================================================================
+# Config CLI Commands
+# ==============================================================================
+
+
+def _command_config_show(args: argparse.Namespace) -> int:
+    """Display the fully resolved configuration."""
+    from guideai.config.loader import load_config
+
+    cfg = load_config()
+    data = cfg.model_dump()
+
+    if getattr(args, "format", "yaml") == "json":
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        print(yaml.dump(data, default_flow_style=False, sort_keys=False))
+    return 0
+
+
+def _command_config_set(args: argparse.Namespace) -> int:
+    """Set a config value in the user config file."""
+    from guideai.config.loader import set_config_value
+
+    try:
+        cfg = set_config_value(args.key, args.value)
+        print(f"✅ Set {args.key} = {args.value}")
+        print(f"   Config saved to ~/.guideai/config.yaml")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _command_config_path(args: argparse.Namespace) -> int:
+    """Print the user config file path."""
+    from guideai.config.loader import USER_CONFIG_PATH
+
+    print(str(USER_CONFIG_PATH))
+    return 0
+
+
+# ==============================================================================
+# Context CLI Commands
+# ==============================================================================
+
+
+def _command_context_current(args: argparse.Namespace) -> int:
+    """Show the active context."""
+    from guideai.context import get_current_context, get_context_indicator
+
+    name, cfg = get_current_context()
+    indicator = get_context_indicator()
+
+    print(f"Current context: {name} {indicator}")
+    print(f"  Backend: {cfg.storage.backend}")
+
+    if cfg.storage.backend == "postgres":
+        dsn = cfg.storage.postgres.dsn
+        # Mask password
+        if "@" in dsn:
+            prefix, rest = dsn.split("@", 1)
+            if ":" in prefix:
+                proto_user = prefix.rsplit(":", 1)[0]
+                dsn = f"{proto_user}:****@{rest}"
+        print(f"  DSN: {dsn}")
+    elif cfg.storage.backend == "sqlite":
+        print(f"  Path: {cfg.storage.sqlite.path}")
+
+    return 0
+
+
+def _command_context_list(args: argparse.Namespace) -> int:
+    """List all available contexts."""
+    from guideai.context import list_contexts
+
+    contexts = list_contexts()
+    output_format = getattr(args, "format", "table")
+
+    if output_format == "json":
+        import json
+        data = [
+            {
+                "name": c.name,
+                "is_current": c.is_current,
+                "storage_backend": c.storage_backend,
+                "storage_location": c.storage_location,
+                "port": c.port,
+                "is_valid": c.is_valid,
+                "validation_error": c.validation_error,
+                "has_port_conflict": c.has_port_conflict,
+                "conflict_with": c.conflict_with,
+            }
+            for c in contexts
+        ]
+        print(json.dumps(data, indent=2))
+        return 0
+
+    # Table format
+    if not contexts:
+        print("No contexts configured.")
+        print("Run 'guideai context add <name>' to create one.")
+        return 0
+
+    print("\nGUIDEAI CONTEXTS")
+    print("=" * 70)
+
+    for ctx in contexts:
+        # Current indicator
+        marker = "→" if ctx.is_current else " "
+
+        # Status icons
+        status_parts = []
+        if not ctx.is_valid:
+            status_parts.append(f"⚠️ {ctx.validation_error}")
+        if ctx.has_port_conflict:
+            status_parts.append(f"⚡ port conflict with '{ctx.conflict_with}'")
+
+        status = " | ".join(status_parts) if status_parts else "✓"
+
+        print(f"\n{marker} {ctx.name}")
+        print(f"    Backend:  {ctx.storage_backend}")
+        print(f"    Location: {ctx.storage_location}")
+        if ctx.port:
+            print(f"    Port:     {ctx.port}")
+        print(f"    Status:   {status}")
+
+    print("\n" + "=" * 70)
+    current = next((c.name for c in contexts if c.is_current), None)
+    print(f"Current: {current or '(none)'}")
+    print(f"Use 'guideai context use <name>' to switch contexts.")
+
+    return 0
+
+
+def _command_context_use(args: argparse.Namespace) -> int:
+    """Switch to a named context."""
+    from guideai.context import use_context, get_context_indicator
+
+    success, message = use_context(args.name)
+
+    if success:
+        indicator = get_context_indicator()
+        print(f"✅ {message}")
+        print(f"   Context indicator: {indicator}")
+        return 0
+    else:
+        print(f"❌ {message}", file=sys.stderr)
+        return 1
+
+
+def _command_context_add(args: argparse.Namespace) -> int:
+    """Create a new named context."""
+    from guideai.context import add_context
+
+    success, message = add_context(
+        name=args.name,
+        storage_backend=args.backend,
+        dsn=getattr(args, "dsn", None),
+        sqlite_path=getattr(args, "sqlite_path", None),
+    )
+
+    if success:
+        print(f"✅ {message}")
+        print(f"   Use 'guideai context use {args.name}' to switch to it.")
+        return 0
+    else:
+        print(f"❌ {message}", file=sys.stderr)
+        return 1
+
+
+def _command_context_remove(args: argparse.Namespace) -> int:
+    """Remove a named context."""
+    from guideai.context import remove_context
+
+    success, message = remove_context(args.name)
+
+    if success:
+        print(f"✅ {message}")
+        return 0
+    else:
+        print(f"❌ {message}", file=sys.stderr)
+        return 1
+
+
+# ==============================================================================
+# Items CLI Commands
+# ==============================================================================
+
+
+def _command_items_migrate(args: argparse.Namespace) -> int:
+    """Migrate work items from one context to another."""
+    import json
+    from guideai.migration import (
+        MigrationEngine,
+        FilterExpression,
+        ConflictResolution,
+        format_migration_summary,
+        format_items_table,
+        default_progress,
+        quiet_progress,
+    )
+    from guideai.multi_tenant.board_contracts import WorkItemType, WorkItemStatus
+
+    # Build filter expression from args
+    filter_parts = []
+    if args.filter:
+        filter_parts.append(args.filter)
+    if args.project:
+        filter_parts.append(f"project={args.project}")
+    if args.board:
+        filter_parts.append(f"board={args.board}")
+    if hasattr(args, 'type') and args.type:
+        filter_parts.append(f"type={args.type}")
+    if args.status:
+        filter_parts.append(f"status={args.status}")
+
+    filter_expr_str = ",".join(filter_parts) if filter_parts else None
+    filter_expr = FilterExpression.parse(filter_expr_str)
+
+    # Map conflict resolution
+    conflict_map = {
+        "skip": ConflictResolution.SKIP,
+        "overwrite": ConflictResolution.OVERWRITE,
+        "rename": ConflictResolution.RENAME,
+        "fail": ConflictResolution.FAIL,
+    }
+    conflict_resolution = conflict_map.get(args.on_conflict, ConflictResolution.SKIP)
+
+    # Create engine
+    progress_cb = quiet_progress if args.quiet else default_progress
+    engine = MigrationEngine(
+        source_context=args.source,
+        target_context=args.target,
+        dry_run=args.dry_run,
+        conflict_resolution=conflict_resolution,
+        progress_callback=progress_cb,
+    )
+
+    # Validate contexts
+    valid, errors = engine.validate_contexts()
+    if not valid:
+        for error in errors:
+            print(f"❌ {error}", file=sys.stderr)
+        return 1
+
+    # Preview items to migrate
+    if not args.quiet:
+        print(f"\n📋 Migration Preview")
+        print(f"   Source: {args.source}")
+        print(f"   Target: {args.target}")
+        if filter_expr_str:
+            print(f"   Filter: {filter_expr_str}")
+        print()
+
+    try:
+        items = engine.list_source_items(filter_expr, org_id=args.org)
+    except Exception as e:
+        print(f"❌ Failed to list items from source: {e}", file=sys.stderr)
+        return 1
+
+    if not items:
+        print("No items match the specified criteria.")
+        return 0
+
+    # Show preview
+    if not args.quiet:
+        print(f"Found {len(items)} item(s) to migrate:")
+        print(format_items_table(items))
+        print()
+
+    # Confirm unless --yes
+    if not args.yes and not args.dry_run:
+        try:
+            confirm = input(f"Proceed with migration? [y/N] ").strip().lower()
+            if confirm not in ("y", "yes"):
+                print("Migration cancelled.")
+                return 0
+        except (KeyboardInterrupt, EOFError):
+            print("\nMigration cancelled.")
+            return 0
+
+    # Execute migration
+    if args.dry_run:
+        print("\n🔍 DRY RUN - No changes will be made\n")
+
+    try:
+        report = engine.migrate(
+            filter_expr=filter_expr,
+            org_id=args.org,
+            migrate_boards=not args.no_boards,
+        )
+    except Exception as e:
+        print(f"❌ Migration failed: {e}", file=sys.stderr)
+        return 1
+
+    # Print summary
+    if not args.quiet:
+        print(format_migration_summary(report))
+
+    # Save report to file if requested
+    if args.output:
+        try:
+            with open(args.output, "w") as f:
+                json.dump(report.to_dict(), f, indent=2)
+            print(f"\n📄 Report saved to: {args.output}")
+        except Exception as e:
+            print(f"⚠️  Failed to save report: {e}", file=sys.stderr)
+
+    # Return code based on results
+    if report.failed > 0:
+        return 1
+    return 0
+
+
+# ==============================================================================
+# DB CLI Commands
+# ==============================================================================
+
+
+def _command_db_migrate(args: argparse.Namespace) -> int:
+    """Apply pending SQLite migrations."""
+    from guideai.config.loader import load_config
+    from guideai.storage.sqlite_pool import SQLitePool
+    from guideai.storage.sqlite_migrations import run_migrations
+
+    cfg = load_config()
+    if cfg.storage.backend != "sqlite":
+        print(f"Error: db migrate only works with SQLite backend (current: {cfg.storage.backend})", file=sys.stderr)
+        return 1
+
+    pool = SQLitePool(dsn=cfg.storage.sqlite.path)
+    try:
+        applied = run_migrations(pool)
+        if applied:
+            for version, name in applied:
+                print(f"  ✅ Applied migration {version:03d}: {name}")
+            print(f"\n{len(applied)} migration(s) applied.")
+        else:
+            print("Database is up to date — no pending migrations.")
+    finally:
+        pool.close()
+    return 0
+
+
+def _command_db_status(args: argparse.Namespace) -> int:
+    """Show applied and pending migrations."""
+    from guideai.config.loader import load_config
+    from guideai.storage.sqlite_pool import SQLitePool
+    from guideai.storage.sqlite_migrations import discover_migrations
+
+    cfg = load_config()
+    if cfg.storage.backend != "sqlite":
+        print(f"Error: db status only works with SQLite backend (current: {cfg.storage.backend})", file=sys.stderr)
+        return 1
+
+    pool = SQLitePool(dsn=cfg.storage.sqlite.path)
+    try:
+        applied_versions = set(pool.get_applied_migrations())
+        all_migrations = discover_migrations()
+
+        print(f"Database: {pool.db_path}")
+        print(f"Backend:  sqlite\n")
+
+        if not all_migrations:
+            print("No migrations found.")
+            return 0
+
+        for version, name, _sql in all_migrations:
+            status = "✅ applied" if version in applied_versions else "⬜ pending"
+            print(f"  {version:03d}  {name:30s}  {status}")
+
+        applied_count = sum(1 for v, _, _ in all_migrations if v in applied_versions)
+        pending_count = len(all_migrations) - applied_count
+        print(f"\n{applied_count} applied, {pending_count} pending.")
+    finally:
+        pool.close()
+    return 0
+
+
+# ==============================================================================
+# Init (Project Scaffolding) CLI Command
+# ==============================================================================
+
+
+_PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+
+
+def _validate_project_name(name: str) -> str:
+    """Validate project name: alphanumeric, hyphens, underscores. No leading dash."""
+    name = name.strip()
+    if not name:
+        raise ValueError("Project name cannot be empty")
+    if not _PROJECT_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid project name '{name}'. "
+            "Use alphanumeric characters, hyphens, and underscores only."
+        )
+    return name
+
+
+def _prompt(label: str, default: str, choices: Optional[List[str]] = None) -> str:
+    """Interactive prompt with default value and optional choices."""
+    if choices:
+        choices_str = "/".join(choices)
+        raw = input(f"  {label} [{choices_str}] (default: {default}): ").strip()
+    else:
+        raw = input(f"  {label} (default: {default}): ").strip()
+    return raw if raw else default
+
+
+def _render_config_yaml(
+    project_name: str,
+    storage_backend: str,
+    auth_mode: str,
+    postgres_dsn: str = "",
+    workspace_profile: str = "solo-dev",
+) -> str:
+    """Render a .guideai/config.yaml from the selected options."""
+    import yaml
+
+    config: Dict[str, Any] = {
+        "version": 1,
+        "project": {"name": project_name, "workspace_profile": workspace_profile},
+        "server": {"host": "0.0.0.0", "port": 8765},
+        "storage": {"backend": storage_backend},
+        "auth": {"mode": auth_mode},
+        "mcp": {"transport": "stdio"},
+        "infra": {"managed_by": "auto"},
+        "logging": {"level": "INFO", "format": "json"},
+    }
+
+    if storage_backend == "sqlite":
+        config["storage"]["sqlite"] = {"path": ".guideai/data/guideai.db"}
+    elif storage_backend == "postgres":
+        config["storage"]["postgres"] = {
+            "dsn": postgres_dsn or "postgresql://guideai:guideai_dev@localhost:5432/guideai"
+        }
+
+    header = (
+        "# GuideAI Project Configuration\n"
+        "# Generated by `guideai init`\n"
+        "# Docs: https://docs.guideai.dev/config\n\n"
+    )
+    return header + yaml.dump(config, default_flow_style=False, sort_keys=False)
+
+
+def _render_agents_md(project_name: str) -> str:
+    """Render a starter AGENTS.md from the bundled template."""
+    from datetime import date
+
+    template_path = Path(__file__).parent / "templates" / "AGENTS.md.starter"
+    if template_path.exists():
+        content = template_path.read_text(encoding="utf-8")
+        return content.replace("{{ date }}", date.today().isoformat())
+    # Inline fallback if template file is missing
+    return (
+        f"# Agent Handbook — {project_name}\n\n"
+        "> Retrieve behaviors before starting any task. "
+        "Propose new behaviors when patterns repeat 3+ times.\n\n"
+        "## Behaviors\n\n"
+        "_Add project-specific behaviors here._\n"
+    )
+
+
+def _command_init(args: argparse.Namespace) -> int:
+    """Scaffold a new GuideAI project in the current directory."""
+    from guideai.bootstrap.detector import WorkspaceDetector
+    from guideai.bootstrap.service import BootstrapService
+    from guideai.bootstrap.profile import WorkspaceProfile
+
+    guideai_dir = Path(".guideai")
+    template = getattr(args, "template", "full")
+    non_interactive = getattr(args, "non_interactive", False)
+    detect_only = getattr(args, "detect_only", False)
+    skip_pack = getattr(args, "skip_pack", False)
+    cli_profile = getattr(args, "profile", None)
+
+    # ── Workspace detection ────────────────────────────────────────────────
+    detector = WorkspaceDetector()
+    detection = detector.detect(Path.cwd())
+
+    if detect_only:
+        print("\n🔍 Workspace Detection Result\n")
+        print(f"  Profile:    {detection.profile.value}")
+        print(f"  Confidence: {detection.confidence:.0%}")
+        if detection.is_ambiguous and detection.runner_up:
+            print(f"  Runner-up:  {detection.runner_up.value} (ambiguous)")
+        print("\n  Signals:")
+        for sig in detection.signals:
+            marker = "✅" if sig.detected else "  "
+            print(f"    {marker} {sig.signal_name}: {sig.evidence}")
+        print()
+        return 0
+
+    # Determine workspace profile
+    if cli_profile:
+        workspace_profile = WorkspaceProfile(cli_profile)
+    elif non_interactive:
+        workspace_profile = detection.profile
+    else:
+        # Interactive: show detection and let user confirm
+        print(f"\n🔍 Detected workspace profile: {detection.profile.value} ({detection.confidence:.0%} confidence)")
+        if detection.is_ambiguous and detection.runner_up:
+            print(f"   Also considered: {detection.runner_up.value}")
+        profile_choices = [p.value for p in WorkspaceProfile]
+        chosen = _prompt("Workspace profile", detection.profile.value, profile_choices)
+        workspace_profile = WorkspaceProfile(chosen)
+
+    # ── Detect existing project ────────────────────────────────────────────
+    if guideai_dir.exists():
+        if non_interactive:
+            print("⚠️  .guideai/ already exists. Use interactive mode to merge.", file=sys.stderr)
+            return 1
+        answer = input("  .guideai/ already exists. Overwrite config? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return 0
+
+    # ── Collect options ────────────────────────────────────────────────────
+    default_name = Path.cwd().name
+    cli_name = getattr(args, "name", None)
+    cli_storage = getattr(args, "storage", None)
+    cli_auth = getattr(args, "auth", None)
+
+    if non_interactive or cli_name:
+        # Non-interactive: use flags or defaults
+        project_name = cli_name or default_name
+        storage_backend = cli_storage or "sqlite"
+        auth_mode = cli_auth or "local"
+        gen_ide = template == "full"
+        gen_agents = template == "full"
+        postgres_dsn = ""
+    else:
+        # Interactive wizard
+        print("\n🚀 GuideAI Project Setup\n")
+
+        raw_name = _prompt("Project name", default_name)
+        try:
+            project_name = _validate_project_name(raw_name)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        storage_backend = _prompt("Storage backend", "sqlite", ["sqlite", "postgres"])
+        if storage_backend not in ("sqlite", "postgres"):
+            print(f"Error: Invalid storage backend '{storage_backend}'", file=sys.stderr)
+            return 1
+
+        postgres_dsn = ""
+        if storage_backend == "postgres":
+            postgres_dsn = _prompt(
+                "PostgreSQL DSN",
+                "postgresql://guideai:guideai_dev@localhost:5432/guideai",
+            )
+
+        auth_mode = _prompt("Auth mode", "local", ["local", "cloud"])
+        if auth_mode not in ("local", "cloud"):
+            print(f"Error: Invalid auth mode '{auth_mode}'", file=sys.stderr)
+            return 1
+
+        gen_ide_raw = _prompt("Generate IDE configs? (.vscode/mcp.json, etc.)", "y", ["y", "n"])
+        gen_ide = gen_ide_raw.lower() in ("y", "yes")
+
+        gen_agents_raw = _prompt("Generate AGENTS.md?", "y", ["y", "n"])
+        gen_agents = gen_agents_raw.lower() in ("y", "yes")
+
+    # Validate project name
+    try:
+        project_name = _validate_project_name(project_name)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    # ── Scaffold ───────────────────────────────────────────────────────────
+    print(f"\n📁 Scaffolding project: {project_name}\n")
+
+    # .guideai/config.yaml
+    guideai_dir.mkdir(parents=True, exist_ok=True)
+    config_path = guideai_dir / "config.yaml"
+    config_content = _render_config_yaml(
+        project_name, storage_backend, auth_mode, postgres_dsn,
+        workspace_profile=workspace_profile.value,
+    )
+    config_path.write_text(config_content, encoding="utf-8")
+    print(f"  ✅ Created .guideai/config.yaml")
+
+    # .guideai/data/ directory (and empty db placeholder for sqlite)
+    data_dir = guideai_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if storage_backend == "sqlite":
+        db_path = data_dir / "guideai.db"
+        if not db_path.exists():
+            # Create an empty file; actual schema applied by `guideai db migrate`
+            db_path.touch()
+            print(f"  ✅ Created .guideai/data/guideai.db (run `guideai db migrate` to apply schema)")
+        else:
+            print(f"  ⏭️  .guideai/data/guideai.db already exists, skipping")
+
+    # AGENTS.md (profile-scoped primer)
+    if gen_agents:
+        agents_path = Path("AGENTS.md")
+        if agents_path.exists():
+            print(f"  ⏭️  AGENTS.md already exists, skipping")
+        else:
+            # Use BootstrapService for profile-scoped primer
+            bootstrap_svc = BootstrapService()
+            agents_content = bootstrap_svc.get_primer_template(workspace_profile)
+            # Substitute date placeholder
+            from datetime import date
+            agents_content = agents_content.replace("{{ date }}", date.today().isoformat())
+            agents_path.write_text(agents_content, encoding="utf-8")
+            print(f"  ✅ Created AGENTS.md (profile: {workspace_profile.value})")
+
+    # IDE MCP configs (reuse D3 logic from _command_mcp_init)
+    if gen_ide:
+        _generate_ide_configs()
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    print(f"\n🎉 Project '{project_name}' initialized!\n")
+    print(f"  Workspace profile: {workspace_profile.value}")
+    print("\nNext steps:")
+    print(f"  1. Review .guideai/config.yaml")
+    if storage_backend == "sqlite":
+        print(f"  2. Run `guideai db migrate` to create database tables")
+    print(f"  3. Run `guideai mcp-server` to start the MCP server")
+    if gen_agents:
+        print(f"  4. Customize AGENTS.md with project-specific behaviors")
+    print()
+    return 0
+
+
+def _generate_ide_configs() -> None:
+    """Generate MCP client configuration files (shared by init and mcp-server init)."""
+    for rel_path, config_data in _build_ide_mcp_configs():
+        target = Path(rel_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            print(f"  ⏭️  {rel_path} already exists, skipping")
+            continue
+        target.write_text(json.dumps(config_data, indent=2) + "\n")
+        print(f"  ✅ Created {rel_path}")
+
+    codex_targets = [
+        Path.home() / ".codex" / "config.toml",
+        Path(".codex") / "config.toml",
+    ]
+    for codex_config_path in codex_targets:
+        try:
+            status = _upsert_codex_mcp_server_config(codex_config_path)
+        except OSError as exc:
+            print(
+                f"  ⚠️  Failed to update {codex_config_path}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+        if status == "created":
+            print(f"  ✅ Created {codex_config_path}")
+        elif status == "updated":
+            print(f"  ✅ Updated {codex_config_path}")
+        else:
+            print(f"  ⏭️  {codex_config_path} already up to date")
+
+
+# ==============================================================================
+# Bootstrap Commands (workspace profiling - MCP parity)
+# ==============================================================================
+
+
+def _command_bootstrap(args: argparse.Namespace) -> int:
+    """Handle bootstrap command group."""
+    bootstrap_cmd = getattr(args, "bootstrap_command", None)
+
+    if bootstrap_cmd is None:
+        print("Usage: guideai bootstrap {detect,status,init}", file=sys.stderr)
+        return 1
+
+    if bootstrap_cmd == "detect":
+        return _command_bootstrap_detect(args)
+    elif bootstrap_cmd == "status":
+        return _command_bootstrap_status(args)
+    elif bootstrap_cmd == "init":
+        return _command_bootstrap_init(args)
+    else:
+        print(f"Unknown bootstrap command: {bootstrap_cmd}", file=sys.stderr)
+        return 1
+
+
+def _command_bootstrap_detect(args: argparse.Namespace) -> int:
+    """Detect workspace profile by analyzing project structure."""
+    from guideai.bootstrap.detector import WorkspaceDetector
+
+    workspace_path = Path(getattr(args, "path", ".")).resolve()
+    output_format = getattr(args, "format", "table")
+
+    if not workspace_path.exists():
+        print(f"Error: Path does not exist: {workspace_path}", file=sys.stderr)
+        return 1
+
+    detector = WorkspaceDetector()
+    detection = detector.detect(workspace_path)
+
+    if output_format == "json":
+        result = {
+            "profile": detection.profile.value,
+            "confidence": round(detection.confidence, 4),
+            "is_ambiguous": detection.is_ambiguous,
+            "runner_up": detection.runner_up.value if detection.runner_up else None,
+            "signals": [
+                {
+                    "signal_name": s.signal_name,
+                    "detected": s.detected,
+                    "evidence": s.evidence,
+                }
+                for s in detection.signals
+            ],
+        }
+        print(json.dumps(result, indent=2))
+    else:
+        # Table format
+        print("\n🔍 Workspace Detection Result\n")
+        print(f"  Profile:    {detection.profile.value}")
+        print(f"  Confidence: {detection.confidence:.0%}")
+        if detection.is_ambiguous and detection.runner_up:
+            print(f"  Runner-up:  {detection.runner_up.value} (ambiguous)")
+        print("\n  Signals:")
+        for sig in detection.signals:
+            marker = "✅" if sig.detected else "  "
+            print(f"    {marker} {sig.signal_name}: {sig.evidence}")
+        print()
+
+    return 0
+
+
+def _command_bootstrap_status(args: argparse.Namespace) -> int:
+    """Show bootstrap status for workspace."""
+    workspace_path = Path(getattr(args, "path", ".")).resolve()
+    output_format = getattr(args, "format", "table")
+
+    if not workspace_path.exists():
+        print(f"Error: Path does not exist: {workspace_path}", file=sys.stderr)
+        return 1
+
+    agents_md = workspace_path / "AGENTS.md"
+    guideai_dir = workspace_path / ".guideai"
+    manifest_path = guideai_dir / "pack-manifest.json"
+    config_path = guideai_dir / "config.yaml"
+
+    is_bootstrapped = agents_md.exists() or guideai_dir.exists()
+
+    # Try to read profile from config
+    profile = None
+    if config_path.exists():
+        try:
+            import yaml
+            with open(config_path) as f:
+                config = yaml.safe_load(f)
+                profile = config.get("workspace_profile")
+        except Exception:
+            pass
+
+    # Try to read pack info from manifest
+    pack_id = None
+    pack_version = None
+    last_updated = None
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+                pack_id = manifest.get("pack_id")
+                pack_version = manifest.get("version")
+                last_updated = manifest.get("installed_at")
+        except Exception:
+            pass
+
+    # Detect profile from workspace signals if not found in config
+    if is_bootstrapped and profile is None:
+        from guideai.bootstrap.detector import WorkspaceDetector
+        detector = WorkspaceDetector()
+        detection = detector.detect(workspace_path)
+        profile = detection.profile.value
+
+    # Get last_updated from file timestamps if not from manifest
+    if last_updated is None:
+        from datetime import datetime
+        timestamps = []
+        for f in [agents_md, guideai_dir / "runtime-primer.md", manifest_path]:
+            if f.exists():
+                timestamps.append(f.stat().st_mtime)
+        if timestamps:
+            last_updated = datetime.fromtimestamp(max(timestamps)).isoformat()
+
+    if output_format == "json":
+        result = {
+            "is_bootstrapped": is_bootstrapped,
+            "profile": profile,
+            "pack_id": pack_id,
+            "pack_version": pack_version,
+            "agents_md_exists": agents_md.exists(),
+            "guideai_dir_exists": guideai_dir.exists(),
+            "last_updated": last_updated,
+        }
+        print(json.dumps(result, indent=2))
+    else:
+        # Table format
+        print("\n📊 Bootstrap Status\n")
+        status_icon = "✅" if is_bootstrapped else "❌"
+        print(f"  Status:     {status_icon} {'Bootstrapped' if is_bootstrapped else 'Not bootstrapped'}")
+        print(f"  Profile:    {profile or 'N/A'}")
+        print(f"  AGENTS.md:  {'✅ exists' if agents_md.exists() else '❌ missing'}")
+        print(f"  .guideai/:  {'✅ exists' if guideai_dir.exists() else '❌ missing'}")
+        if pack_id:
+            print(f"  Pack:       {pack_id} v{pack_version or '?'}")
+        if last_updated:
+            print(f"  Updated:    {last_updated}")
+        print()
+
+    return 0
+
+
+def _command_bootstrap_init(args: argparse.Namespace) -> int:
+    """Initialize workspace with GuideAI (MCP-parity wrapper for BootstrapService)."""
+    from guideai.bootstrap.service import BootstrapService
+    from guideai.bootstrap.profile import WorkspaceProfile
+
+    workspace_path = Path(getattr(args, "path", ".")).resolve()
+    output_format = getattr(args, "format", "table")
+    cli_profile = getattr(args, "profile", None)
+    skip_primer = getattr(args, "skip_primer", False)
+    skip_pack = getattr(args, "skip_pack", False)
+    force = getattr(args, "force", False)
+
+    if not workspace_path.exists():
+        print(f"Error: Path does not exist: {workspace_path}", file=sys.stderr)
+        return 1
+
+    # Parse profile override
+    profile_override = None
+    if cli_profile:
+        try:
+            profile_override = WorkspaceProfile(cli_profile)
+        except ValueError:
+            print(f"Error: Invalid profile '{cli_profile}'", file=sys.stderr)
+            return 1
+
+    service = BootstrapService()
+    result = service.bootstrap(
+        workspace_path,
+        profile=profile_override,
+        skip_primer=skip_primer,
+        skip_pack=skip_pack,
+    )
+
+    if output_format == "json":
+        output = result.to_dict()
+        output["success"] = True
+        print(json.dumps(output, indent=2))
+    else:
+        # Table format
+        print(f"\n✅ Bootstrap Complete\n")
+        print(f"  Profile:  {result.profile.value}")
+        print(f"  Pack ID:  {result.pack_id or 'none'}")
+        if result.files_written:
+            print("\n  Files written:")
+            for f in result.files_written:
+                print(f"    • {f}")
+        if result.notes:
+            print("\n  Notes:")
+            for note in result.notes:
+                print(f"    • {note}")
+        print()
+
+    return 0
+
+
+# ==============================================================================
+# Infrastructure Management (provider-agnostic)
+# ==============================================================================
+
+_PROFILE_BLUEPRINTS: dict[str, str] = {
+    "minimal": "postgres.timescale.test",
+    "standard": "local-test-suite",
+    "full": "production",
+}
+
+_PROFILE_COMPOSE_FILES: dict[str, list[str]] = {
+    "minimal": ["docker-compose.postgres.yml"],
+    "standard": ["docker-compose.postgres.yml"],
+    "full": ["docker-compose.postgres.yml", "docker-compose.test.yml"],
+}
+
+
+def _detect_infra_provider() -> str:
+    """Auto-detect the best available infrastructure provider.
+
+    Priority: amprealize (if installed) → docker compose → none.
+    """
+    import shutil
+
+    if shutil.which("amprealize"):
+        return "amprealize"
+
+    if shutil.which("docker") or shutil.which("podman"):
+        return "docker-compose"
+
+    return "none"
+
+
+def _resolve_provider(args: argparse.Namespace) -> str:
+    """Resolve which infra provider to use.
+
+    Priority: CLI --provider flag → config managed_by → auto-detect.
+    """
+    cli_override = getattr(args, "provider", None)
+    if cli_override and cli_override != "auto":
+        return cli_override
+
+    from guideai.config.loader import load_config
+
+    cfg = load_config()
+    configured = cfg.infra.managed_by
+
+    if configured != "auto":
+        return configured
+
+    return _detect_infra_provider()
+
+
+def _run_amprealize(amprealize_args: list[str]) -> int:
+    """Delegate to the amprealize CLI."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("amprealize")
+    if exe is None:
+        print(
+            "Error: amprealize CLI not found.\n"
+            "Install it with: pip install amprealize[cli]",
+            file=sys.stderr,
+        )
+        return 1
+    result = subprocess.run([exe, *amprealize_args])
+    return result.returncode
+
+
+def _find_compose_executable() -> list[str] | None:
+    """Find a working compose command.
+
+    Returns the base command list (e.g. ``["docker", "compose"]`` or
+    ``["podman-compose"]``) or *None* if nothing is available.
+    """
+    import shutil
+    import subprocess
+
+    for engine in ("docker", "podman"):
+        exe = shutil.which(engine)
+        if exe:
+            try:
+                subprocess.run(
+                    [exe, "compose", "version"],
+                    capture_output=True,
+                    timeout=10,
+                )
+                return [exe, "compose"]
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+
+    for legacy in ("docker-compose", "podman-compose"):
+        exe = shutil.which(legacy)
+        if exe:
+            return [exe]
+
+    return None
+
+
+def _run_compose(
+    compose_args: list[str],
+    *,
+    compose_files: list[str] | None = None,
+    project_name: str = "guideai",
+    profiles: list[str] | None = None,
+) -> int:
+    """Execute a docker/podman compose command."""
+    import subprocess
+    from pathlib import Path
+
+    cmd = _find_compose_executable()
+    if cmd is None:
+        print(
+            "Error: No compose tool found.\n"
+            "Install Docker Desktop, Podman, or docker-compose.",
+            file=sys.stderr,
+        )
+        return 1
+
+    infra_dir = Path(__file__).resolve().parent.parent / "infra"
+
+    full_cmd = list(cmd)
+    full_cmd.extend(["--project-name", project_name])
+
+    if compose_files:
+        for cf in compose_files:
+            full_cmd.extend(["-f", str(infra_dir / cf)])
+    else:
+        full_cmd.extend(["-f", str(infra_dir / "docker-compose.postgres.yml")])
+
+    if profiles:
+        for p in profiles:
+            full_cmd.extend(["--profile", p])
+
+    full_cmd.extend(compose_args)
+
+    result = subprocess.run(full_cmd)
+    return result.returncode
+
+
+def _infra_via_amprealize(action: str, args: argparse.Namespace) -> int:
+    """Handle infra actions through the amprealize provider."""
+    if action == "up":
+        profile = getattr(args, "profile", "standard")
+        blueprint = _PROFILE_BLUEPRINTS.get(profile, "local-test-suite")
+        print(f"🚀 Starting infrastructure via amprealize (profile: {profile})...")
+        return _run_amprealize(["up", "--blueprint", blueprint])
+
+    if action == "down":
+        print("🛑 Stopping infrastructure (amprealize)...")
+        return _run_amprealize(["stop"])
+
+    if action == "status":
+        return _run_amprealize(["list"])
+
+    if action == "resources":
+        return _run_amprealize(["resources"])
+
+    if action == "reset":
+        confirm = input(
+            "⚠️  This will DESTROY all infrastructure data and recreate from scratch.\n"
+            "Type 'yes' to confirm: "
+        )
+        if confirm.strip().lower() != "yes":
+            print("Aborted.")
+            return 0
+        print("♻️  Resetting infrastructure (amprealize)...")
+        return _run_amprealize(["fresh"])
+
+    print(f"Unknown infra action: {action}", file=sys.stderr)
+    return 1
+
+
+def _infra_via_compose(action: str, args: argparse.Namespace) -> int:
+    """Handle infra actions through docker/podman compose."""
+    from guideai.config.loader import load_config
+
+    cfg = load_config()
+    compose_cfg = cfg.infra.compose
+    project_name = compose_cfg.project_name
+    profiles = compose_cfg.profiles or None
+
+    if action == "up":
+        profile = getattr(args, "profile", "standard")
+        files = _PROFILE_COMPOSE_FILES.get(profile, ["docker-compose.postgres.yml"])
+
+        if compose_cfg.file:
+            files = [compose_cfg.file]
+
+        print(f"🚀 Starting infrastructure via compose (profile: {profile})...")
+        return _run_compose(
+            ["up", "-d", "--wait"],
+            compose_files=files,
+            project_name=project_name,
+            profiles=profiles,
+        )
+
+    if action == "down":
+        print("🛑 Stopping infrastructure (compose)...")
+        return _run_compose(
+            ["down"],
+            project_name=project_name,
+            profiles=profiles,
+        )
+
+    if action == "status":
+        return _run_compose(
+            ["ps", "--format", "table"],
+            project_name=project_name,
+            profiles=profiles,
+        )
+
+    if action == "resources":
+        return _run_compose(
+            ["top"],
+            project_name=project_name,
+            profiles=profiles,
+        )
+
+    if action == "reset":
+        confirm = input(
+            "⚠️  This will DESTROY all infrastructure data and recreate from scratch.\n"
+            "Type 'yes' to confirm: "
+        )
+        if confirm.strip().lower() != "yes":
+            print("Aborted.")
+            return 0
+        print("♻️  Resetting infrastructure (compose)...")
+        rc = _run_compose(
+            ["down", "-v", "--remove-orphans"],
+            project_name=project_name,
+            profiles=profiles,
+        )
+        if rc != 0:
+            return rc
+        return _run_compose(
+            ["up", "-d", "--wait"],
+            project_name=project_name,
+            profiles=profiles,
+        )
+
+    print(f"Unknown infra action: {action}", file=sys.stderr)
+    return 1
+
+
+def _infra_via_external(action: str, _args: argparse.Namespace) -> int:
+    """Handle infra actions when provider is external/none."""
+    if action == "status":
+        print("ℹ️  Infrastructure is externally managed. No status available.")
+        return 0
+    print(
+        f"ℹ️  Infrastructure provider is set to external/none.\n"
+        f"   The '{action}' command is not available.\n"
+        f"   Manage your infrastructure directly or switch provider:\n"
+        f"     guideai infra configure",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _command_infra_configure() -> int:
+    """Interactively select and persist an infrastructure provider."""
+    from guideai.config.loader import set_config_value
+
+    print("\n🔧 Infrastructure Provider Configuration\n")
+    print("  Choose how guideai manages local infrastructure:\n")
+    choices = [
+        ("auto", "Auto-detect best available (recommended)"),
+        ("amprealize", "Amprealize — full orchestration with blueprints"),
+        ("docker-compose", "Docker/Podman Compose — lightweight, direct compose files"),
+        ("external", "External — you manage infrastructure yourself"),
+        ("none", "None — disable infrastructure management"),
+    ]
+    for i, (key, desc) in enumerate(choices, 1):
+        print(f"    {i}) {key:17s} {desc}")
+
+    print()
+    while True:
+        raw = input("  Select [1-5] (default: 1): ").strip()
+        if raw == "":
+            selection = 0
+            break
+        try:
+            selection = int(raw) - 1
+            if 0 <= selection < len(choices):
+                break
+        except ValueError:
+            pass
+        print("  Invalid choice. Enter 1-5.")
+
+    provider, desc = choices[selection]
+    set_config_value("infra.managed_by", provider)
+    print(f"\n  ✅ Infrastructure provider set to: {provider}")
+    print(f"     ({desc})")
+    print(f"     Saved to ~/.guideai/config.yaml\n")
+    return 0
+
+
+def _command_infra(args: argparse.Namespace) -> int:
+    """Provider-agnostic infrastructure management."""
+    action = getattr(args, "infra_action", None)
+
+    if action is None:
+        print(
+            "Usage: guideai infra {up,down,status,resources,reset,configure}\n"
+            "       guideai infra --provider <provider> <action>",
+            file=sys.stderr,
+        )
+        return 1
+
+    if action == "configure":
+        return _command_infra_configure()
+
+    provider = _resolve_provider(args)
+
+    if action == "status":
+        print(f"📦 Infrastructure provider: {provider}\n")
+
+    if provider == "amprealize":
+        return _infra_via_amprealize(action, args)
+    elif provider == "docker-compose":
+        return _infra_via_compose(action, args)
+    elif provider in ("external", "none"):
+        return _infra_via_external(action, args)
+    else:
+        print(f"Unknown provider: {provider}", file=sys.stderr)
+        return 1
+
+
+# ==============================================================================
+# Diagnostics (guideai doctor)
+# ==============================================================================
+
+
+def _command_doctor(args: argparse.Namespace) -> int:
+    """Run diagnostics to verify GuideAI installation health."""
+    verbose = getattr(args, "verbose", False)
+    fix = getattr(args, "fix", False)
+    output_json = getattr(args, "json", False)
+
+    checks: list[dict[str, Any]] = []
+    all_passed = True
+
+    def add_check(name: str, passed: bool, message: str, fix_hint: str | None = None) -> None:
+        nonlocal all_passed
+        if not passed:
+            all_passed = False
+        checks.append({
+            "name": name,
+            "passed": passed,
+            "message": message,
+            "fix_hint": fix_hint,
+        })
+
+    # ── Check 1: Python version ────────────────────────────────────────────
+    py_version = sys.version_info
+    py_ok = py_version >= (3, 10)
+    add_check(
+        "Python version",
+        py_ok,
+        f"Python {py_version.major}.{py_version.minor}.{py_version.micro}",
+        "Upgrade to Python 3.10+" if not py_ok else None,
+    )
+
+    # ── Check 2: GuideAI package installed ─────────────────────────────────
+    try:
+        import guideai
+        guideai_version = getattr(guideai, "__version__", "unknown")
+        add_check("GuideAI package", True, f"Version {guideai_version}")
+    except ImportError:
+        add_check(
+            "GuideAI package",
+            False,
+            "Not installed",
+            "pip install guideai",
+        )
+
+    # ── Check 3: Config file exists ────────────────────────────────────────
+    user_config = Path.home() / ".guideai" / "config.yaml"
+    project_config = Path(".guideai") / "config.yaml"
+    config_exists = user_config.exists() or project_config.exists()
+    config_path = project_config if project_config.exists() else user_config if user_config.exists() else None
+
+    if config_exists:
+        add_check("Config file", True, f"Found at {config_path}")
+    else:
+        add_check(
+            "Config file",
+            False,
+            "No config found",
+            "Run `guideai init` to create one",
+        )
+        if fix:
+            print("  🔧 Running `guideai init --non-interactive`...")
+            _command_init(argparse.Namespace(
+                name=None, storage=None, auth=None,
+                template="minimal", non_interactive=True
+            ))
+            config_exists = project_config.exists()
+            checks[-1]["passed"] = config_exists
+            checks[-1]["message"] = f"Created {project_config}" if config_exists else "Fix failed"
+
+    # ── Check 4: Config is valid YAML ──────────────────────────────────────
+    config_valid = False
+    config_data = None
+    if config_path and config_path.exists():
+        try:
+            config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            config_valid = isinstance(config_data, dict)
+            add_check("Config syntax", True, "Valid YAML")
+        except yaml.YAMLError as e:
+            add_check("Config syntax", False, f"Invalid YAML: {e}", "Fix syntax errors in config file")
+    else:
+        add_check("Config syntax", False, "No config to validate", "Create config first")
+
+    # ── Check 5: Storage backend ───────────────────────────────────────────
+    storage_ok = False
+    storage_backend = "unknown"
+    if config_data:
+        storage_cfg = config_data.get("storage", {})
+        storage_backend = storage_cfg.get("backend", "sqlite")
+
+        if storage_backend == "sqlite":
+            sqlite_path = storage_cfg.get("sqlite", {}).get("path")
+            if sqlite_path:
+                db_path = Path(sqlite_path).expanduser()
+            else:
+                db_path = Path(".guideai") / "data" / "guideai.db"
+
+            if db_path.exists():
+                storage_ok = True
+                add_check("Storage backend", True, f"SQLite at {db_path}")
+            else:
+                add_check(
+                    "Storage backend",
+                    False,
+                    f"SQLite file not found: {db_path}",
+                    "Run `guideai db migrate` to create database",
+                )
+                if fix:
+                    print("  🔧 Creating SQLite database...")
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
+                    db_path.touch()
+                    checks[-1]["passed"] = True
+                    checks[-1]["message"] = f"Created {db_path}"
+
+        elif storage_backend == "postgres":
+            postgres_cfg = storage_cfg.get("postgres", {})
+            dsn = postgres_cfg.get("dsn", "")
+            if dsn:
+                try:
+                    import psycopg
+                    with psycopg.connect(dsn, connect_timeout=5) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT 1")
+                    storage_ok = True
+                    add_check("Storage backend", True, f"PostgreSQL connected")
+                except ImportError:
+                    add_check(
+                        "Storage backend",
+                        False,
+                        "psycopg not installed",
+                        "pip install 'psycopg[binary]'",
+                    )
+                except Exception as e:
+                    add_check(
+                        "Storage backend",
+                        False,
+                        f"PostgreSQL connection failed: {e}",
+                        "Check DSN and ensure database is running",
+                    )
+            else:
+                add_check("Storage backend", False, "No PostgreSQL DSN configured", "Set storage.postgres.dsn in config")
+    else:
+        add_check("Storage backend", False, "Cannot check (no config)", None)
+
+    # ── Check 6: MCP server dependencies ───────────────────────────────────
+    mcp_deps_ok = True
+    missing_deps = []
+    for pkg in ["mcp", "pydantic", "httpx"]:
+        try:
+            __import__(pkg)
+        except ImportError:
+            mcp_deps_ok = False
+            missing_deps.append(pkg)
+
+    if mcp_deps_ok:
+        add_check("MCP dependencies", True, "All required packages installed")
+    else:
+        add_check(
+            "MCP dependencies",
+            False,
+            f"Missing: {', '.join(missing_deps)}",
+            f"pip install {' '.join(missing_deps)}",
+        )
+
+    # ── Check 7: Container runtime (for amprealize) ────────────────────────
+    container_runtime = None
+    for runtime in ["podman", "docker"]:
+        try:
+            result = subprocess.run(
+                [runtime, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                container_runtime = runtime
+                version_line = result.stdout.strip().split("\n")[0]
+                break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    if container_runtime:
+        add_check("Container runtime", True, f"{container_runtime}: {version_line}")
+    else:
+        add_check(
+            "Container runtime",
+            False,
+            "No container runtime found",
+            "Install Podman or Docker for infrastructure management",
+        )
+
+    # ── Check 8: Network connectivity (cloud auth) ─────────────────────────
+    auth_mode = "local"
+    if config_data:
+        auth_mode = config_data.get("auth", {}).get("mode", "local")
+
+    if auth_mode == "cloud":
+        try:
+            req = urllib.request.Request("https://api.guideai.dev/health", method="HEAD")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status in (200, 204):
+                    add_check("Cloud connectivity", True, "GuideAI API reachable")
+                else:
+                    add_check("Cloud connectivity", False, f"Unexpected status: {resp.status}", None)
+        except Exception as e:
+            add_check(
+                "Cloud connectivity",
+                False,
+                f"Cannot reach GuideAI API: {e}",
+                "Check network connection and firewall settings",
+            )
+    else:
+        add_check("Cloud connectivity", True, "Skipped (local auth mode)")
+
+    # ── Check 9: Data directories ──────────────────────────────────────────
+    data_dirs = [
+        Path.home() / ".guideai",
+        Path.home() / ".guideai" / "data",
+        Path.home() / ".guideai" / "telemetry",
+    ]
+    missing_dirs = [d for d in data_dirs if not d.exists()]
+    if not missing_dirs:
+        add_check("Data directories", True, "All directories exist")
+    else:
+        add_check(
+            "Data directories",
+            False,
+            f"Missing: {', '.join(str(d) for d in missing_dirs)}",
+            "Directories will be created automatically on first use",
+        )
+        if fix:
+            print("  🔧 Creating missing directories...")
+            for d in missing_dirs:
+                d.mkdir(parents=True, exist_ok=True)
+            checks[-1]["passed"] = True
+            checks[-1]["message"] = "Created missing directories"
+
+    # ── Output results ─────────────────────────────────────────────────────
+    if output_json:
+        result = {
+            "passed": all_passed,
+            "checks": checks,
+            "summary": {
+                "total": len(checks),
+                "passed": sum(1 for c in checks if c["passed"]),
+                "failed": sum(1 for c in checks if not c["passed"]),
+            },
+        }
+        print(json.dumps(result, indent=2))
+    else:
+        print("\n🩺 GuideAI Doctor\n")
+        for check in checks:
+            icon = "✅" if check["passed"] else "❌"
+            print(f"  {icon} {check['name']}: {check['message']}")
+            if verbose and check.get("fix_hint") and not check["passed"]:
+                print(f"     💡 Fix: {check['fix_hint']}")
+
+        print()
+        passed_count = sum(1 for c in checks if c["passed"])
+        total_count = len(checks)
+        if all_passed:
+            print(f"✨ All {total_count} checks passed! GuideAI is healthy.\n")
+        else:
+            failed_count = total_count - passed_count
+            print(f"⚠️  {failed_count}/{total_count} checks failed.")
+            print("   Run with --verbose to see fix suggestions, or --fix to auto-repair.\n")
+
+    return 0 if all_passed else 1
+
+
+# ==============================================================================
+# Dashboard Launcher (guideai open)
+# ==============================================================================
+
+_PID_FILE = Path.home() / ".guideai" / "data" / "server.pid"
+_DEEP_LINK_ROUTES: dict[str, str] = {
+    "behaviors": "/behaviors",
+    "runs": "/runs",
+    "boards": "/boards",
+    "settings": "/settings",
+}
+
+
+def _read_pid() -> int | None:
+    """Read the saved server PID, or None if missing/stale."""
+    if not _PID_FILE.exists():
+        return None
+    try:
+        pid = int(_PID_FILE.read_text().strip())
+    except (ValueError, OSError):
+        return None
+    # Check if process is actually alive
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        # Process doesn't exist — stale PID file
+        _PID_FILE.unlink(missing_ok=True)
+        return None
+    return pid
+
+
+def _write_pid(pid: int) -> None:
+    """Write a PID to the PID file."""
+    _PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PID_FILE.write_text(str(pid))
+
+
+def _remove_pid() -> None:
+    """Remove the PID file."""
+    _PID_FILE.unlink(missing_ok=True)
+
+
+def _wait_for_server(host: str, port: int, timeout: float = 10.0) -> bool:
+    """Poll the /health endpoint until it responds or timeout expires."""
+    import time
+    import urllib.request
+    import urllib.error
+
+    url = f"http://{host}:{port}/health"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError, TimeoutError):
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _is_port_in_use(host: str, port: int) -> bool:
+    """Check if a port is already bound."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex((host, port)) == 0
+
+
+def _command_open_stop() -> int:
+    """Stop a running GuideAI server."""
+    import signal
+
+    pid = _read_pid()
+    if pid is None:
+        print("No running GuideAI server found.")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"✅ Stopped GuideAI server (PID {pid})")
+    except OSError as exc:
+        print(f"Error stopping server (PID {pid}): {exc}", file=sys.stderr)
+        return 1
+    finally:
+        _remove_pid()
+    return 0
+
+
+def _command_open(args: argparse.Namespace) -> int:
+    """Launch the GuideAI dashboard, starting the server if needed."""
+    import subprocess
+
+    from guideai.config.loader import load_config
+
+    # Handle --stop
+    if getattr(args, "stop", False):
+        return _command_open_stop()
+
+    cfg = load_config()
+    host = cfg.server.host
+    port = getattr(args, "port", None) or cfg.server.port
+    # For browser URLs, replace 0.0.0.0 with localhost
+    browse_host = "127.0.0.1" if host == "0.0.0.0" else host
+
+    # Build the target URL
+    base_url = f"http://{browse_host}:{port}"
+    page = getattr(args, "page", None)
+    if page and page in _DEEP_LINK_ROUTES:
+        target_url = base_url + _DEEP_LINK_ROUTES[page]
+    else:
+        target_url = base_url
+
+    no_browser = getattr(args, "no_browser", False)
+
+    # 1. Check if server is already running (via PID or port probe)
+    existing_pid = _read_pid()
+    server_running = existing_pid is not None
+
+    if not server_running and _is_port_in_use(browse_host, port):
+        # Something else is using the port
+        print(
+            f"Error: Port {port} is already in use by another process.\n"
+            f"Choose a different port with --port or stop the conflicting process.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # 2. Start server if not running
+    if not server_running:
+        print(f"🚀 Starting GuideAI server on {host}:{port}...")
+        # Find python executable (same one running this CLI)
+        python_path = sys.executable
+        server_proc = subprocess.Popen(
+            [
+                python_path,
+                "-m",
+                "uvicorn",
+                "guideai.api:app",
+                "--host",
+                host,
+                "--port",
+                str(port),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _write_pid(server_proc.pid)
+
+        # Wait for health check
+        if not _wait_for_server(browse_host, port):
+            print(
+                f"Error: Server failed to start within 10 seconds.\n"
+                f"Check logs or try: {python_path} -m uvicorn guideai.api:app --host {host} --port {port}",
+                file=sys.stderr,
+            )
+            _remove_pid()
+            return 1
+
+        print(f"  ✅ Server running (PID {server_proc.pid})")
+    else:
+        print(f"✅ Server already running (PID {existing_pid})")
+
+    # 3. Open browser or print URL
+    if no_browser:
+        print(f"\n🔗 {target_url}")
+        print(f"   (use --stop to shut down the server)")
+    else:
+        print(f"🌐 Opening {target_url}")
+        webbrowser.open(target_url)
+
+    return 0
+
+
+# ==============================================================================
+# MCP Server CLI Commands
+# ==============================================================================
+
+
+def _command_mcp_server(args: argparse.Namespace) -> int:
+    """Start the GuideAI MCP server."""
+    import asyncio as _asyncio
+    from guideai.config.loader import load_config
+
+    cfg = load_config()
+
+    # CLI overrides for transport / port / log-level
+    transport = getattr(args, "transport", None) or cfg.mcp.transport
+    port = getattr(args, "port", None) or cfg.server.port
+    log_level = getattr(args, "log_level", None) or cfg.logging.level
+
+    # Apply log-level override via env before MCPServer reads it
+    os.environ.setdefault("MCP_LOG_LEVEL", log_level)
+
+    if transport == "sse":
+        os.environ["MCP_TRANSPORT"] = "sse"
+        os.environ["MCP_SSE_PORT"] = str(port)
+
+    print(f"GuideAI MCP Server", file=sys.stderr)
+    print(f"  Transport : {transport}", file=sys.stderr)
+    if transport == "sse":
+        print(f"  Port      : {port}", file=sys.stderr)
+    print(f"  Log level : {log_level}", file=sys.stderr)
+    print(f"  Config    : {cfg.version}", file=sys.stderr)
+    print(file=sys.stderr)
+
+    from guideai.mcp_server import main as mcp_main
+
+    _asyncio.run(mcp_main())
+    return 0
+
+
+def _command_mcp_init(args: argparse.Namespace) -> int:
+    """Generate MCP configuration files for supported local clients."""
+    _generate_ide_configs()
+    return 0
+
+
+def _command_mcp_doctor(args: argparse.Namespace) -> int:
+    """Smoke-test MCP startup and tool discovery."""
+
+    try:
+        summary = _run_mcp_smoke_test(timeout=float(getattr(args, "timeout", 10.0)))
+    except Exception as exc:
+        print(f"✗ MCP smoke test failed: {exc}", file=sys.stderr)
+        return 1
+
+    print("✓ MCP smoke test passed")
+    print(f"  Server    : {summary['server_name']}")
+    print(f"  Protocol  : {summary['protocol_version']}")
+    print(f"  Tools     : {summary['tool_count']}")
+    print(f"  Sample    : {', '.join(summary['sample_tools'])}")
+    return 0
 
 
 # ==============================================================================
@@ -9405,6 +13199,14 @@ def _command_wi_approve_gate(args: argparse.Namespace) -> int:
         return 1
 
     return 0
+
+
+def main_mcp_server() -> int:
+    """Convenience entry point for ``guideai-mcp-server`` console script.
+
+    Delegates to ``guideai mcp-server``, forwarding any extra CLI args.
+    """
+    return main(["mcp-server"] + sys.argv[1:])
 
 
 if __name__ == "__main__":

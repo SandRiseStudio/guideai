@@ -51,6 +51,10 @@ paths = [
     '''\.agents/skills/.*''',
     '''\.claude/skills/.*''',
     '''\.cline/skills/.*''',
+
+    # MCP tool manifests (JSON schemas + examples; placeholders not live secrets)
+    '''mcp/tools/.*\.json$''',
+    '''guideai/mcp_tool_manifests/.*\.json$''',
 ]
 
 # Commits known to contain resolved false positives

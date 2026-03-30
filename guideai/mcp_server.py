@@ -33,11 +33,14 @@ Protocol:
     - Logging: stderr (structured JSON logs)
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import re
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import signal
 import subprocess
 import sys
@@ -45,17 +48,34 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, TYPE_CHECKING, Union
 
-# MCP protocol types
+from .mcp_tools_dir import get_mcp_tools_directory
 
-from .action_service import ActionService
-from .action_service_postgres import PostgresActionService
-from .bci_service import BCIService
-from .behavior_service import BehaviorService
-from .workflow_service import WorkflowService
-from .storage.postgres_pool import PostgresPool
-from .utils.dsn import apply_host_overrides
+# Heavy service modules are imported lazily (inside methods that need them)
+# to keep MCP server startup fast (~0.5s instead of ~9s).
+if TYPE_CHECKING:
+    from .action_service import ActionService
+    from .action_service_postgres import PostgresActionService
+    from .bci_service import BCIService
+    from .behavior_service import BehaviorService
+    from .workflow_service import WorkflowService
+    from .storage.postgres_pool import PostgresPool
+    from .utils.dsn import apply_host_overrides
+    from .knowledge_pack.activation_service import ActivationService
+
+
+def _ensure_dsn_param(dsn: str, key: str, value: str) -> str:
+    """Ensure a DSN query parameter is present (without overriding existing values)."""
+    try:
+        parsed = urlparse(dsn)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if key in query:
+            return dsn
+        query[key] = value
+        return urlunparse(parsed._replace(query=urlencode(query)))
+    except Exception:
+        return dsn
 
 
 # ============================================================================
@@ -276,6 +296,9 @@ class MCPServiceRegistry:
         # Config services
         self._credential_store: Optional[Any] = None
 
+        # Research service
+        self._research_service: Optional[Any] = None
+
         # Shared connection pools for PostgreSQL services
         # Note: Services create their own PostgresPool instances, but PostgresPool
         # internally caches engines by DSN, so multiple services with the same DSN
@@ -290,6 +313,8 @@ class MCPServiceRegistry:
         Services create their own PostgresPool instances, but the internal
         _POOL_CACHE ensures they share the same SQLAlchemy engine.
         """
+        from .storage.postgres_pool import PostgresPool  # lazy
+
         if dsn not in self._pools:
             self._pools[dsn] = PostgresPool(dsn=dsn, service_name=service_name)
             self._logger.info(f"Created PostgresPool for {service_name}")
@@ -301,6 +326,8 @@ class MCPServiceRegistry:
         Validates database connectivity and provides clear error diagnostics
         including DSN comparison when connections fail.
         """
+        from .utils.dsn import apply_host_overrides  # lazy
+
         dsn_map = {
             "GUIDEAI_BEHAVIOR_PG_DSN": "behavior",
             "GUIDEAI_WORKFLOW_PG_DSN": "workflow",
@@ -371,6 +398,8 @@ class MCPServiceRegistry:
 
     def behavior_service(self) -> BehaviorService:
         if self._behavior_service is None:
+            from .behavior_service import BehaviorService  # lazy
+
             service = BehaviorService()
             dsn_repr = getattr(service, "_dsn", "<hidden>")
             self._logger.info(
@@ -383,6 +412,8 @@ class MCPServiceRegistry:
     def bci_service(self) -> BCIService:
         """Get or create BCIService singleton for MCP."""
         if self._bci_service is None:
+            from .bci_service import BCIService  # lazy
+
             service = BCIService()
             self._logger.info("Initialized BCIService for MCP")
             self._bci_service = service
@@ -390,6 +421,8 @@ class MCPServiceRegistry:
 
     def workflow_service(self) -> WorkflowService:
         if self._workflow_service is None:
+            from .workflow_service import WorkflowService  # lazy
+
             service = WorkflowService(
                 dsn=None,
                 behavior_service=self.behavior_service(),
@@ -404,8 +437,11 @@ class MCPServiceRegistry:
 
     def action_service(self) -> Union[PostgresActionService, ActionService]:
         if self._action_service is None:
+            from .utils.dsn import apply_host_overrides  # lazy
+
             dsn = apply_host_overrides(os.environ.get("GUIDEAI_ACTION_PG_DSN"), "ACTION")
             if dsn:
+                from .action_service_postgres import PostgresActionService  # lazy
                 from .telemetry import TelemetryClient
 
                 service: Union[PostgresActionService, ActionService] = PostgresActionService(
@@ -416,6 +452,8 @@ class MCPServiceRegistry:
                 )
             else:
                 # Fallback to in-memory for development
+                from .action_service import ActionService  # lazy
+
                 service = ActionService()
                 self._logger.warning(
                     "Using in-memory ActionService (GUIDEAI_ACTION_PG_DSN not set)"
@@ -427,6 +465,7 @@ class MCPServiceRegistry:
         """Get or create TraceAnalysisService singleton for MCP."""
         if self._trace_analysis_service is None:
             from .trace_analysis_service import TraceAnalysisService
+            from .utils.dsn import apply_host_overrides  # lazy
 
             dsn = apply_host_overrides(os.environ.get("GUIDEAI_TRACE_ANALYSIS_PG_DSN"), "TRACE_ANALYSIS")
             if dsn:
@@ -483,6 +522,8 @@ class MCPServiceRegistry:
     def metrics_service(self) -> Any:
         """Get or create MetricsService singleton for MCP."""
         if self._metrics_service is None:
+            from .utils.dsn import apply_host_overrides  # lazy
+
             dsn = apply_host_overrides(os.environ.get("GUIDEAI_METRICS_PG_DSN"), "METRICS")
             if dsn:
                 try:
@@ -549,6 +590,7 @@ class MCPServiceRegistry:
         """Get or create AuditLogService singleton for MCP."""
         if self._audit_log_service is None:
             from .services.audit_log_service import AuditLogService
+            from .utils.dsn import apply_host_overrides  # lazy
 
             # AuditLogService uses PostgreSQL hot tier; resolves DSN from GUIDEAI_AUDIT_PG_DSN env var
             # Also uses S3 for warm tier (WORM storage) and OpenSearch for indexing
@@ -591,7 +633,8 @@ class MCPServiceRegistry:
         """
         if self._consent_service is None:
             from .auth.consent_service import ConsentService
-            from .storage.postgres_pool import PostgresPool
+            from .storage.postgres_pool import PostgresPool  # lazy
+            from .utils.dsn import apply_host_overrides  # lazy
 
             dsn = apply_host_overrides(
                 os.environ.get("GUIDEAI_CONSENT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
@@ -688,6 +731,8 @@ class MCPServiceRegistry:
         otherwise falls back to in-memory implementation.
         """
         if self._collaboration_service is None:
+            from .utils.dsn import apply_host_overrides  # lazy
+
             dsn = apply_host_overrides(os.environ.get("GUIDEAI_COLLABORATION_PG_DSN"), "COLLABORATION")
             if dsn:
                 from .collaboration_service_postgres import PostgresCollaborationService
@@ -709,6 +754,8 @@ class MCPServiceRegistry:
         otherwise falls back to in-memory implementation.
         """
         if self._reflection_service is None:
+            from .utils.dsn import apply_host_overrides  # lazy
+
             dsn = apply_host_overrides(os.environ.get("GUIDEAI_REFLECTION_PG_DSN"), "REFLECTION")
             if dsn:
                 from .reflection_service_postgres import PostgresReflectionService
@@ -777,6 +824,7 @@ class MCPServiceRegistry:
         """Get or create OrganizationService singleton for MCP."""
         if self._organization_service is None:
             from .multi_tenant.organization_service import OrganizationService
+            from .utils.dsn import apply_host_overrides  # lazy
 
             dsn = apply_host_overrides(
                 os.environ.get("GUIDEAI_ORG_PG_DSN") or os.environ.get("GUIDEAI_MULTI_TENANT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
@@ -796,6 +844,7 @@ class MCPServiceRegistry:
         """Get or create BoardService singleton for MCP."""
         if self._board_service is None:
             from .services.board_service import BoardService
+            from .utils.dsn import apply_host_overrides  # lazy
 
             dsn = apply_host_overrides(
                 os.environ.get("GUIDEAI_BOARD_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
@@ -819,6 +868,7 @@ class MCPServiceRegistry:
         if self._agent_registry_service is None:
             from .agent_registry_service import AgentRegistryService
             from .telemetry import TelemetryClient
+            from .utils.dsn import apply_host_overrides  # lazy
 
             dsn = apply_host_overrides(
                 os.environ.get("GUIDEAI_AGENT_REGISTRY_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
@@ -860,6 +910,7 @@ class MCPServiceRegistry:
         if self._credential_store is None:
             from .work_item_execution_service import CredentialStore
             from .auth.llm_credential_repository import LLMCredentialRepository
+            from .utils.dsn import apply_host_overrides  # lazy
 
             # CredentialStore needs LLMCredentialRepository for BYOK credentials
             # Get DSN from environment for database access
@@ -881,6 +932,31 @@ class MCPServiceRegistry:
             self._credential_store = store
         return self._credential_store
 
+    def research_service(self) -> Any:
+        """Get or create ResearchService singleton for MCP.
+
+        Used by research.* tools for AI paper evaluation, search, and retrieval.
+        Uses PostgreSQL when GUIDEAI_RESEARCH_PG_DSN or GUIDEAI_PG_DSN is set,
+        falls back to SQLite for local storage.
+        """
+        if self._research_service is None:
+            from .research_service import ResearchService
+            from .utils.dsn import apply_host_overrides  # lazy
+
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_RESEARCH_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "RESEARCH"
+            )
+            if dsn:
+                pool = self._get_pool(dsn, "research")
+                service = ResearchService(pool=pool)
+                self._logger.info("Initialized ResearchService for MCP (PostgreSQL backend)")
+            else:
+                service = ResearchService()
+                self._logger.info("Initialized ResearchService for MCP (SQLite backend)")
+            self._research_service = service
+        return self._research_service
+
     def work_item_execution_service(self) -> Any:
         """Get or create WorkItemExecutionService singleton for MCP.
 
@@ -893,6 +969,7 @@ class MCPServiceRegistry:
         """
         if self._work_item_execution_service is None:
             from .execution_wiring import wire_execution_service
+            from .utils.dsn import apply_host_overrides  # lazy
 
             # WorkItemExecutionService needs PostgreSQL for execution state
             dsn = apply_host_overrides(
@@ -948,7 +1025,7 @@ class MCPServer:
         # Keep backward compatibility with line-delimited JSON used by older/manual clients.
         self._stdio_framing: Literal["unknown", "newline", "content-length"] = "unknown"
 
-        # Initialize rate limiter for abuse prevention (MCP_SERVER_DESIGN.md §9)
+        # Initialize rate limiter for abuse prevention (docs/contracts/MCP_SERVER_DESIGN.md §9)
         from .mcp_rate_limiter import MCPRateLimiter, DistributedRateLimiter
         self._rate_limiter = MCPRateLimiter()
         self._distributed_rate_limiter = DistributedRateLimiter()  # Phase 5: Redis-backed
@@ -962,14 +1039,18 @@ class MCPServer:
         self._idle_check_task: Optional[asyncio.Task[Any]] = None
         self._graceful_shutdown_timeout = float(os.environ.get("MCP_SHUTDOWN_TIMEOUT", "30"))  # 30s default
 
-        # Pre-warm connection pools for faster first requests
-        self._logger.info("Pre-warming PostgreSQL connection pools...")
-        self._services.prewarm_pools()
+        # Optional pre-warm. Disabled by default to avoid startup hangs when DB/network is slow.
+        self._prewarm_pools_on_startup = os.environ.get("MCP_PREWARM_POOLS", "false").lower() == "true"
+        if self._prewarm_pools_on_startup:
+            self._logger.info("Pre-warming PostgreSQL connection pools...")
+            self._services.prewarm_pools()
+        else:
+            self._logger.info("Skipping PostgreSQL pool prewarm on startup (MCP_PREWARM_POOLS=false)")
 
         # Initialize PostgreSQL device flow store for shared auth state
         self._postgres_device_store = None
         try:
-            auth_dsn = os.environ.get("GUIDEAI_ORG_PG_DSN") or os.environ.get("GUIDEAI_MULTI_TENANT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
+            auth_dsn = os.environ.get("GUIDEAI_AUTH_PG_DSN") or os.environ.get("GUIDEAI_ORG_PG_DSN") or os.environ.get("GUIDEAI_MULTI_TENANT_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN")
             if auth_dsn:
                 from .auth.postgres_device_flow import PostgresDeviceFlowStore
                 # Ensure auth schema is used
@@ -978,7 +1059,9 @@ class MCPServer:
                         auth_dsn = f"{auth_dsn}&options=-c%20search_path%3Dauth"
                     else:
                         auth_dsn = f"{auth_dsn}?options=-c%20search_path%3Dauth"
-                auth_pool = PostgresPool(dsn=auth_dsn, service_name="device_auth")
+                auth_dsn = _ensure_dsn_param(auth_dsn, "connect_timeout", os.environ.get("MCP_DB_CONNECT_TIMEOUT_SECONDS", "3"))
+                from .storage.postgres_pool import PostgresPool as _PgPool  # lazy
+                auth_pool = _PgPool(dsn=auth_dsn, service_name="device_auth")
                 self._postgres_device_store = PostgresDeviceFlowStore(pool=auth_pool)
                 self._logger.info("PostgreSQL device flow store initialized for shared auth state")
             else:
@@ -991,15 +1074,23 @@ class MCPServer:
         try:
             from .mcp_device_flow import MCPDeviceFlowHandler, MCPDeviceFlowService
 
-            # Initialize service with AgentAuthService integration and PostgreSQL store
+            # Initialize service with optional AgentAuthService integration and PostgreSQL store.
+            # Eager agent auth service init can trigger DB work, so keep it opt-in.
+            eager_agent_auth = os.environ.get("MCP_EAGER_AGENT_AUTH_SERVICE", "false").lower() == "true"
+            agent_auth_service = self._services.agent_auth_service() if eager_agent_auth else None
             device_flow_service = MCPDeviceFlowService(
-                agent_auth_service=self._services.agent_auth_service(),
+                agent_auth_service=agent_auth_service,
                 postgres_store=self._postgres_device_store,
             )
             self._device_flow_handler = MCPDeviceFlowHandler(service=device_flow_service)
 
-            # Try to restore session from stored tokens (keychain/file)
-            self._try_restore_session_from_tokens()
+            # Session restore can touch DB/keychain and block in constrained environments.
+            # Keep it opt-in so public auth/context tools return promptly.
+            self._restore_session_on_startup = os.environ.get("MCP_RESTORE_SESSION_ON_STARTUP", "false").lower() == "true"
+            if self._restore_session_on_startup:
+                self._try_restore_session_from_tokens()
+            else:
+                self._logger.info("Skipping session restore on startup (MCP_RESTORE_SESSION_ON_STARTUP=false)")
         except ImportError as e:
             self._logger.error(f"Failed to import device flow handler: {e}")
             self._device_flow_handler = None
@@ -1013,17 +1104,12 @@ class MCPServer:
         except ImportError as e:
             self._logger.error(f"Failed to import task handler: {e}")
             self._task_handler = None
-
-        # Initialize Amprealize adapter
-        try:
-            from .adapters import MCPAmprealizeAdapter
-
-            self._amprealize_adapter = MCPAmprealizeAdapter(
-                service=self._services.amprealize_service()
-            )
         except Exception as e:
-            self._logger.error(f"Failed to initialize Amprealize adapter: {e}")
-            self._amprealize_adapter = None
+            self._logger.warning(f"TaskService unavailable (non-fatal): {e}")
+            self._task_handler = None
+
+        # Initialize Amprealize adapter lazily to avoid heavy adapters.py import chain
+        self._amprealize_adapter = None  # lazy: created on first use via _get_amprealize_adapter()
 
         # Tool registry - now using lazy loader for <128 tool limit compliance
         self._tools: Dict[str, Dict[str, Any]] = {}
@@ -1069,6 +1155,18 @@ class MCPServer:
             f"GuideAI MCP Server initialized with {len(self._tools)} active tools "
             f"(lazy_loading={'enabled' if self._lazy_loading_enabled else 'disabled'})"
         )
+
+    def _get_amprealize_adapter(self) -> Any:
+        """Lazy-init the Amprealize adapter to avoid loading adapters.py at startup."""
+        if self._amprealize_adapter is None:
+            try:
+                from .adapters import MCPAmprealizeAdapter
+                self._amprealize_adapter = MCPAmprealizeAdapter(
+                    service=self._services.amprealize_service()
+                )
+            except Exception as e:
+                self._logger.error(f"Failed to initialize Amprealize adapter: {e}")
+        return self._amprealize_adapter
 
     def _setup_logging(self) -> None:
         """Configure structured logging to stderr."""
@@ -1270,12 +1368,11 @@ class MCPServer:
         return obj
 
     def _load_tool_manifests(self) -> None:
-        """Load MCP tool manifests from mcp/tools/ directory."""
-        # Find mcp/tools directory relative to this file
-        mcp_tools_dir = Path(__file__).parent.parent / "mcp" / "tools"
+        """Load MCP tool manifests from the monorepo or bundled wheel directory."""
+        mcp_tools_dir = get_mcp_tools_directory()
 
-        if not mcp_tools_dir.exists():
-            self._logger.warning(f"MCP tools directory not found: {mcp_tools_dir}")
+        if not mcp_tools_dir:
+            self._logger.warning("MCP tools directory not found (monorepo mcp/tools or bundled manifests)")
             return
 
         # Load all .json tool manifests
@@ -1408,6 +1505,10 @@ class MCPServer:
             return self._handle_tools_list(request_id)
         elif method == "tools/call":
             return await self._handle_tools_call(request_id, params)
+        elif method in ("resources/list", "resources/templates/list"):
+            return self._success_response(request_id, {"resources": []})
+        elif method == "prompts/list":
+            return self._success_response(request_id, {"prompts": []})
         elif method == "ping":
             return self._success_response(request_id, {"status": "ok"})
         elif method == "health":
@@ -1441,12 +1542,7 @@ class MCPServer:
             },
             "capabilities": {
                 "tools": {
-                    "listChanged": False,  # Tool list is static for now
-                },
-                "experimental": {
-                    "batchRequests": True,  # Support batch requests
-                    "rateLimiting": True,  # Rate limiting enabled
-                    "lazyToolLoading": self._lazy_loading_enabled,  # Dynamic tool groups
+                    "listChanged": False,
                 },
             },
         }
@@ -1524,7 +1620,7 @@ class MCPServer:
                 "Missing required parameter: name",
             )
 
-        # Apply rate limiting (MCP_SERVER_DESIGN.md §9)
+        # Apply rate limiting (docs/contracts/MCP_SERVER_DESIGN.md §9)
         client_id = self._client_id or f"anonymous:{id(self)}"
         self._logger.debug(f"[{trace_id}] RATE_LIMIT_CHECK: client={client_id}, tool={tool_name}")
         rate_result = self._rate_limiter.check(client_id, tool_name)
@@ -1606,8 +1702,9 @@ class MCPServer:
         We need to restore the first underscore to a dot for namespace.action format.
         """
         # First check if we have the original name stored in the tool manifest
-        if normalized_name in self._tools:
-            tool_def = self._tools[normalized_name]
+        tools = getattr(self, "_tools", {}) or {}
+        if normalized_name in tools:
+            tool_def = tools[normalized_name]
             if "_original_name" in tool_def:
                 return tool_def["_original_name"]
 
@@ -1636,10 +1733,12 @@ class MCPServer:
         # ====================================================================
         # Authentication Check (Phase 1: MCP_AUTH_IMPLEMENTATION_PLAN.md)
         # ====================================================================
+        session_context = getattr(self, "_session_context", None)
+
         # Check if tool requires authentication
         if internal_tool_name not in PUBLIC_TOOLS:
             self._logger.debug(f"[{trace_id}] AUTH_CHECK: tool requires authentication")
-            if not self._session_context.is_authenticated:
+            if session_context is not None and not session_context.is_authenticated:
                 self._logger.warning(f"[{trace_id}] AUTH_FAIL: Unauthenticated call to {internal_tool_name}")
                 return self._error_response(
                     request_id,
@@ -1652,13 +1751,17 @@ class MCPServer:
             # Scope Authorization (Phase 3: MCP_AUTH_IMPLEMENTATION_PLAN.md)
             # ====================================================================
             # Check if user/SP has required scopes for this tool
-            required_scopes = self._tool_scopes.get(internal_tool_name, [])
+            tool_scopes = getattr(self, "_tool_scopes", {}) or {}
+            required_scopes = tool_scopes.get(internal_tool_name, [])
             if required_scopes:
-                missing = self._session_context.missing_scopes(required_scopes)
+                if session_context is None:
+                    missing = set(required_scopes)
+                else:
+                    missing = session_context.missing_scopes(required_scopes)
                 if missing:
                     self._logger.warning(
                         f"Access denied to {internal_tool_name}: "
-                        f"identity={self._session_context.identity}, "
+                        f"identity={getattr(session_context, 'identity', None)}, "
                         f"missing_scopes={missing}"
                     )
                     return self._error_response(
@@ -1668,7 +1771,7 @@ class MCPServer:
                         data={
                             "tool": internal_tool_name,
                             "required_scopes": required_scopes,
-                            "granted_scopes": list(self._session_context.granted_scopes),
+                            "granted_scopes": list(getattr(session_context, "granted_scopes", set())),
                             "missing_scopes": list(missing),
                         }
                     )
@@ -1681,33 +1784,35 @@ class MCPServer:
 
             # Determine subscription tier (default to FREE, could be looked up from org)
             tier = SubscriptionTier.FREE
-            if self._session_context.org_id:
+            if session_context and session_context.org_id:
                 # TODO: Look up org subscription tier from database
                 # For now, use PRO if authenticated with an org
                 tier = SubscriptionTier.PRO
 
-            tenant_rate_result = await self._distributed_rate_limiter.check_tenant_limit(
-                org_id=self._session_context.org_id,
-                user_id=self._session_context.user_id,
-                service_principal_id=self._session_context.service_principal_id,
+            distributed_rate_limiter = getattr(self, "_distributed_rate_limiter", None)
+            if distributed_rate_limiter is not None and session_context is not None:
+                tenant_rate_result = await distributed_rate_limiter.check_tenant_limit(
+                    org_id=session_context.org_id,
+                    user_id=session_context.user_id,
+                    service_principal_id=session_context.service_principal_id,
                 tier=tier,
                 tool_name=internal_tool_name,
-            )
+                )
 
-            if not tenant_rate_result.allowed:
-                self._logger.warning(
-                    f"Tenant rate limit exceeded: org={self._session_context.org_id}, "
-                    f"user={self._session_context.user_id}, tier={tier.value}, "
-                    f"limit_type={tenant_rate_result.limit_type}, "
-                    f"retry_after={tenant_rate_result.retry_after}"
-                )
-                return self._error_response(
-                    request_id,
-                    self.RATE_LIMITED,
-                    f"Rate limit exceeded ({tenant_rate_result.limit_type}). "
-                    f"Retry after {tenant_rate_result.retry_after} seconds.",
-                    data=tenant_rate_result.to_dict(),
-                )
+                if not tenant_rate_result.allowed:
+                    self._logger.warning(
+                        f"Tenant rate limit exceeded: org={session_context.org_id}, "
+                        f"user={session_context.user_id}, tier={tier.value}, "
+                        f"limit_type={tenant_rate_result.limit_type}, "
+                        f"retry_after={tenant_rate_result.retry_after}"
+                    )
+                    return self._error_response(
+                        request_id,
+                        self.RATE_LIMITED,
+                        f"Rate limit exceeded ({tenant_rate_result.limit_type}). "
+                        f"Retry after {tenant_rate_result.retry_after} seconds.",
+                        data=tenant_rate_result.to_dict(),
+                    )
 
         # ====================================================================
         # Route tool group management tools (Lazy Loading)
@@ -1771,6 +1876,11 @@ class MCPServer:
             if internal_tool_name in ("auth.deviceLogin", "auth.devicePoll") and result.get("status") == "authorized":
                 self._populate_session_from_device_flow(result)
                 self._logger.info(f"Session populated from device flow: user_id={self._session_context.user_id}")
+
+            # Update session context on successful token refresh
+            if internal_tool_name in ("auth.refreshToken", "auth.refresh") and result.get("status") == "refreshed":
+                self._update_session_from_refresh(result)
+                self._logger.info(f"Session updated from token refresh: user_id={self._session_context.user_id}, new_expires_at={self._session_context.expires_at}")
 
             # Wrap result in MCP content format
             mcp_result = {
@@ -1874,7 +1984,8 @@ class MCPServer:
 
         # Route Amprealize tools
         if internal_tool_name.startswith("amprealize."):
-            if not self._amprealize_adapter:
+            _amp = self._get_amprealize_adapter()
+            if not _amp:
                 return self._error_response(
                     request_id,
                     self.INTERNAL_ERROR,
@@ -1883,7 +1994,7 @@ class MCPServer:
 
             try:
                 if internal_tool_name == "amprealize.plan":
-                    result = self._amprealize_adapter.plan(
+                    result = _amp.plan(
                         blueprint_id=tool_params["blueprint_id"],
                         environment=tool_params.get("environment", "development"),
                         checklist_id=tool_params.get("checklist_id"),
@@ -1893,32 +2004,32 @@ class MCPServer:
                         variables=tool_params.get("variables"),
                     )
                 elif internal_tool_name == "amprealize.apply":
-                    result = self._amprealize_adapter.apply(
+                    result = _amp.apply(
                         plan_id=tool_params.get("plan_id"),
                         manifest_file=tool_params.get("manifest_file"),
                         watch=tool_params.get("watch", False),
                         resume=tool_params.get("resume", False),
                     )
                 elif internal_tool_name == "amprealize.status":
-                    result = self._amprealize_adapter.status(
+                    result = _amp.status(
                         run_id=tool_params["run_id"]
                     )
                 elif internal_tool_name == "amprealize.destroy":
-                    result = self._amprealize_adapter.destroy(
+                    result = _amp.destroy(
                         run_id=tool_params["run_id"],
                         cascade=tool_params.get("cascade", True),
                         reason=tool_params.get("reason", "MANUAL"),
                     )
                 elif internal_tool_name == "amprealize.listBlueprints":
-                    result = self._amprealize_adapter.list_blueprints(
+                    result = _amp.list_blueprints(
                         source=tool_params.get("source", "all"),
                     )
                 elif internal_tool_name == "amprealize.listEnvironments":
-                    result = self._amprealize_adapter.list_environments(
+                    result = _amp.list_environments(
                         phase=tool_params.get("phase", "all"),
                     )
                 elif internal_tool_name == "amprealize.configure":
-                    result = self._amprealize_adapter.configure(
+                    result = _amp.configure(
                         config_dir=tool_params.get("config_dir"),
                         include_blueprints=tool_params.get("include_blueprints", False),
                         blueprints=tool_params.get("blueprints"),
@@ -2096,6 +2207,15 @@ class MCPServer:
                             "Missing required parameter: behavior_id",
                         )
                     result = adapter.get(tool_params)
+                elif internal_tool_name == "behaviors.getForTask":
+                    task_description = tool_params.get("task_description")
+                    if not task_description:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: task_description",
+                        )
+                    result = adapter.get_for_task(tool_params)
                 elif internal_tool_name == "behaviors.update":
                     behavior_id = tool_params.get("behavior_id")
                     version = tool_params.get("version")
@@ -2615,6 +2735,8 @@ class MCPServer:
                     result = bci_handlers.bci_generate(tool_params)
                 elif internal_tool_name == "bci.improve":
                     result = bci_handlers.bci_improve(tool_params)
+                elif internal_tool_name == "bci.inject":
+                    result = bci_handlers.bci_inject(tool_params)
                 else:
                     return self._error_response(
                         request_id,
@@ -2940,6 +3062,12 @@ class MCPServer:
 
                 if internal_tool_name == "reflection.extract":
                     result = adapter.extract(tool_params or {})
+                elif internal_tool_name == "reflection.listCandidates":
+                    result = adapter.list_candidates(tool_params or {})
+                elif internal_tool_name == "reflection.approveCandidate":
+                    result = adapter.approve_candidate(tool_params or {})
+                elif internal_tool_name == "reflection.rejectCandidate":
+                    result = adapter.reject_candidate(tool_params or {})
                 else:
                     return self._error_response(
                         request_id,
@@ -3717,6 +3845,145 @@ class MCPServer:
                 )
 
         # Handle boards.* tools (board management)
+        if internal_tool_name.startswith("board."):
+            try:
+                from .services.board_service import Actor, BoardService
+                from .multi_tenant.board_contracts import (
+                    CreateLabelRequest,
+                    LabelColor,
+                    UpdateLabelRequest,
+                )
+
+                # Use service registry when available; allow lightweight test instances
+                # created via MCPServer.__new__ to instantiate directly.
+                if hasattr(self, "_services") and self._services is not None:
+                    board_service = self._services.board_service()
+                else:
+                    board_service = BoardService()
+
+                actor_payload = tool_params.get("actor") or {}
+                actor = Actor(
+                    id=actor_payload.get("id") or tool_params.get("user_id") or "mcp-user",
+                    role=actor_payload.get("type") or tool_params.get("actor_role") or "user",
+                    surface=tool_params.get("actor_surface") or "mcp",
+                )
+                org_id = tool_params.get("org_id")
+
+                if internal_tool_name == "board.listLabels":
+                    project_id = tool_params.get("project_id")
+                    if not project_id:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: project_id",
+                        )
+
+                    labels_response = board_service.list_labels(
+                        project_id=project_id,
+                        org_id=org_id,
+                        limit=tool_params.get("limit", 100),
+                        offset=tool_params.get("offset", 0),
+                    )
+                    result = {
+                        "labels": [label.model_dump(mode="json") for label in labels_response.labels],
+                        "total": labels_response.total,
+                    }
+
+                elif internal_tool_name == "board.createLabel":
+                    project_id = tool_params.get("project_id")
+                    name = tool_params.get("name")
+                    if not project_id or not name:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameters: project_id, name",
+                        )
+
+                    request = CreateLabelRequest(
+                        name=name,
+                        color=LabelColor(tool_params.get("color", "gray")),
+                        description=tool_params.get("description"),
+                    )
+                    label = board_service.create_label(project_id, request, actor, org_id=org_id)
+                    result = {
+                        "success": True,
+                        "label": label.model_dump(mode="json"),
+                    }
+
+                elif internal_tool_name == "board.updateLabel":
+                    label_id = tool_params.get("label_id")
+                    if not label_id:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: label_id",
+                        )
+
+                    color = tool_params.get("color")
+                    request = UpdateLabelRequest(
+                        name=tool_params.get("name"),
+                        color=LabelColor(color) if color is not None else None,
+                        description=tool_params.get("description"),
+                    )
+                    label = board_service.update_label(label_id, request, actor, org_id=org_id)
+                    result = {
+                        "success": True,
+                        "label": label.model_dump(mode="json"),
+                    }
+
+                elif internal_tool_name == "board.deleteLabel":
+                    label_id = tool_params.get("label_id")
+                    if not label_id:
+                        return self._error_response(
+                            request_id,
+                            self.INVALID_PARAMS,
+                            "Missing required parameter: label_id",
+                        )
+
+                    delete_result = board_service.delete_label(label_id, actor, org_id=org_id)
+                    result = {
+                        "success": True,
+                        "deleted_id": delete_result.deleted_id,
+                    }
+
+                else:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown board tool: {internal_tool_name}",
+                    )
+
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except KeyError as exc:
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    f"Missing required field: {exc}",
+                )
+            except ValueError as exc:
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    str(exc),
+                )
+            except Exception as e:
+                self._logger.error(f"Board tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Board tool execution failed: {str(e)}",
+                )
+
         if internal_tool_name.startswith("boards."):
             try:
                 from .mcp.handlers.board_handlers import BOARD_HANDLERS
@@ -3755,6 +4022,40 @@ class MCPServer:
                     f"Boards tool execution failed: {str(e)}",
                 )
 
+        if internal_tool_name.startswith("columns."):
+            try:
+                from .mcp.handlers.board_handlers import COLUMN_HANDLERS
+
+                handler = COLUMN_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown columns tool: {internal_tool_name}",
+                    )
+
+                board_service = self._services.board_service()
+                result = await asyncio.to_thread(handler, board_service, tool_params)
+
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Columns tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Columns tool execution failed: {str(e)}",
+                )
+
         # Handle workItems.* tools (work item management and execution)
         if internal_tool_name.startswith("workItems."):
             # Execution tools (workItems.execute, executionStatus, etc.)
@@ -3775,8 +4076,12 @@ class MCPServer:
                     # Get the work item execution service
                     work_item_execution_service = self._services.work_item_execution_service()
 
-                    # Create handlers
-                    handlers = create_work_item_execution_handlers(work_item_execution_service)
+                    # Create handlers (pass board_service for display-ID resolution)
+                    board_svc = self._services.board_service()
+                    handlers = create_work_item_execution_handlers(
+                        work_item_execution_service,
+                        board_service=board_svc,
+                    )
                     handler = handlers.get(internal_tool_name)
 
                     if not handler:
@@ -3974,6 +4279,90 @@ class MCPServer:
                     f"Config tool execution failed: {str(e)}",
                 )
 
+        # Handle bootstrap.* tools (workspace profiling and initialization)
+        if internal_tool_name.startswith("bootstrap."):
+            try:
+                from .mcp.handlers.bootstrap_handlers import BOOTSTRAP_HANDLERS
+
+                handler = BOOTSTRAP_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown bootstrap tool: {internal_tool_name}",
+                    )
+
+                # Call the sync handler in a thread to avoid blocking
+                result = await asyncio.to_thread(handler, tool_params)
+
+                # Wrap result in MCP content format
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except KeyError as exc:
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    f"Missing required field: {exc}",
+                )
+            except ValueError as exc:
+                return self._error_response(
+                    request_id,
+                    self.INVALID_PARAMS,
+                    str(exc),
+                )
+            except Exception as e:
+                self._logger.error(f"Bootstrap tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Bootstrap tool execution failed: {str(e)}",
+                )
+
+        # Handle research.* tools (AI paper evaluation)
+        if internal_tool_name.startswith("research."):
+            try:
+                from .mcp.handlers.research_handlers import RESEARCH_HANDLERS
+
+                handler = RESEARCH_HANDLERS.get(internal_tool_name)
+                if not handler:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown research tool: {internal_tool_name}",
+                    )
+
+                service = self._services.research_service()
+                enriched_params = self._inject_session_context(tool_params)
+                result = await handler(service=service, params=enriched_params)
+
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2, default=str),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Research tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Research tool execution failed: {str(e)}",
+                )
+
         # Unknown tool prefix
         self._logger.warning(f"[{trace_id}] UNKNOWN_TOOL: No handler for {internal_tool_name}")
         return self._error_response(
@@ -4136,6 +4525,47 @@ class MCPServer:
     # Session Management (Phase 1 & 2: MCP_AUTH_IMPLEMENTATION_PLAN.md)
     # ========================================================================
 
+    def _resolve_user_id(self, email_or_id: Optional[str]) -> Optional[str]:
+        """Resolve an email address to the canonical user ID from auth.users.
+
+        If the input looks like an email, queries auth.users to find the
+        corresponding user ID. Returns the original value if no match is found
+        or if it doesn't look like an email.
+        """
+        if not email_or_id or "@" not in email_or_id:
+            return email_or_id
+        try:
+            import os
+            from .storage.postgres_pool import PostgresPool
+
+            auth_dsn = (
+                os.environ.get("GUIDEAI_ORG_PG_DSN")
+                or os.environ.get("GUIDEAI_AUTH_PG_DSN")
+                or os.environ.get("GUIDEAI_PG_DSN")
+            )
+            if not auth_dsn:
+                return email_or_id
+
+            pool = PostgresPool(dsn=auth_dsn, service_name="resolve_user")
+            with pool.connection() as conn:
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "SELECT id FROM auth.users WHERE email = %s LIMIT 1",
+                        (email_or_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        self._logger.debug(
+                            f"Resolved email {email_or_id} -> user_id {row[0]}"
+                        )
+                        return row[0]
+                finally:
+                    cur.close()
+        except Exception as exc:
+            self._logger.warning(f"Failed to resolve user_id from email: {exc}")
+        return email_or_id
+
     def _populate_session_from_device_flow(self, result: Dict[str, Any]) -> None:
         """Populate session context from successful device flow authorization.
 
@@ -4143,7 +4573,8 @@ class MCPServer:
         """
         from datetime import datetime, timedelta
 
-        self._session_context.user_id = result.get("user_id")
+        raw_user_id = result.get("user_id") or result.get("email")
+        self._session_context.user_id = self._resolve_user_id(raw_user_id)
         self._session_context.org_id = result.get("org_id")
         self._session_context.granted_scopes = set(result.get("scopes", []))
         self._session_context.auth_method = "device_flow"
@@ -4162,6 +4593,48 @@ class MCPServer:
 
         # Populate authorization context (orgs, projects, admin status)
         self._populate_authorization_context()
+
+    def _update_session_from_refresh(self, result: Dict[str, Any]) -> None:
+        """Update session context after successful token refresh.
+
+        Called after auth.refreshToken returns status='refreshed'.
+        Updates the expiration time, scopes, and populates user info if needed.
+
+        This handles the case where the MCP server restarted and the session
+        wasn't restored - the refresh can re-establish the session context.
+        """
+        from datetime import datetime, timedelta
+
+        # Update expiration from new token
+        expires_in = result.get("expires_in", 3600)
+        self._session_context.expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+
+        # Update scopes if provided (they may have changed)
+        if result.get("scopes"):
+            self._session_context.granted_scopes = set(result["scopes"])
+
+        # If session wasn't already authenticated (e.g., server restarted),
+        # populate user info from the refresh response
+        if not self._session_context.user_id:
+            raw_user_id = result.get("user_id") or result.get("email")
+            if raw_user_id:
+                self._session_context.user_id = self._resolve_user_id(raw_user_id)
+                self._session_context.auth_method = "device_flow"
+                # Populate authorization context (orgs, projects, admin status)
+                self._populate_authorization_context()
+                self._logger.info(
+                    f"Session re-established from refresh: user={self._session_context.user_id}"
+                )
+
+        # Ensure auth_method is set (may have been "none" if session wasn't populated)
+        if self._session_context.auth_method == "none":
+            self._session_context.auth_method = "device_flow"
+
+        self._logger.info(
+            f"Session refreshed: user={self._session_context.user_id}, "
+            f"new_expires_at={self._session_context.expires_at}, "
+            f"scopes={self._session_context.granted_scopes}"
+        )
 
     def _try_restore_session_from_tokens(self) -> None:
         """Try to restore session from stored tokens on startup.
@@ -4192,6 +4665,7 @@ class MCPServer:
                         auth_dsn = f"{auth_dsn}&options=-c%20search_path%3Dauth"
                     else:
                         auth_dsn = f"{auth_dsn}?options=-c%20search_path%3Dauth"
+                auth_dsn = _ensure_dsn_param(auth_dsn, "connect_timeout", os.environ.get("MCP_DB_CONNECT_TIMEOUT_SECONDS", "3"))
 
                 pool = PostgresPool(dsn=auth_dsn, service_name="session_restore")
                 with pool.connection() as conn:
@@ -4216,7 +4690,7 @@ class MCPServer:
                             access_token, scopes, approver, expires_at = row
 
                             # Populate session context
-                            self._session_context.user_id = approver
+                            self._session_context.user_id = self._resolve_user_id(approver)
                             self._session_context.granted_scopes = set(scopes) if scopes else set()
                             self._session_context.auth_method = "device_flow"
                             self._session_context.expires_at = expires_at.replace(tzinfo=None) if expires_at else datetime.utcnow() + timedelta(hours=1)
@@ -4297,7 +4771,7 @@ class MCPServer:
             self._session_context.accessible_org_ids = {org.id for org in user_orgs}
 
             # Get projects user can access (calls list_projects without org_id)
-            # This returns personal projects + org projects
+            # This returns user-owned projects + org projects
             from .mcp.handlers.project_handlers import handle_list_projects
             result = handle_list_projects(
                 project_service=org_service,
@@ -4940,7 +5414,7 @@ class MCPServer:
         try:
             if tool_name == "context.getContext":
                 # Return current context (no auth check needed beyond session)
-                return self._get_current_context()
+                return self._get_current_context(params)
 
             elif tool_name == "context.setOrg":
                 org_id = params.get("org_id")
@@ -4980,9 +5454,22 @@ class MCPServer:
                 "error_code": "SERVER_ERROR",
             }
 
-    def _get_current_context(self) -> Dict[str, Any]:
-        """Get the current session context state."""
-        return {
+    def _get_current_context(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Get the current session context state.
+
+        Parameters
+        ----------
+        params:
+            Optional parameters including workspace_id for knowledge pack lookup.
+
+        Returns
+        -------
+        Dict containing session context plus active knowledge pack if available.
+        """
+        params = params or {}
+        workspace_id = params.get("workspace_id")
+
+        result = {
             "user_id": self._session_context.user_id,
             "service_principal_id": self._session_context.service_principal_id,
             "org_id": self._session_context.org_id,
@@ -4991,7 +5478,29 @@ class MCPServer:
             "roles": list(self._session_context.roles) if self._session_context.roles else [],
             "scopes": list(self._session_context.granted_scopes) if self._session_context.granted_scopes else [],
             "is_authenticated": self._session_context.is_authenticated,
+            "workspace_id": workspace_id,
+            "active_pack": None,
         }
+
+        # Look up active knowledge pack for workspace
+        if workspace_id:
+            try:
+                from guideai.knowledge_pack.activation_service import ActivationService
+                activation_service = ActivationService()
+                active = activation_service.get_active_pack(workspace_id)
+                if active:
+                    result["active_pack"] = {
+                        "pack_id": active.pack_id,
+                        "pack_version": active.pack_version,
+                        "profile": active.profile,
+                        "activated_at": active.activated_at.isoformat() if active.activated_at else None,
+                        "activated_by": active.activated_by,
+                    }
+            except Exception as e:
+                # Log but don't fail context retrieval
+                self._logger.warning(f"Failed to get active pack for workspace {workspace_id}: {e}")
+
+        return result
 
     async def _set_org_context(self, org_id: str) -> Dict[str, Any]:
         """
@@ -5084,7 +5593,7 @@ class MCPServer:
         Switch to a different project context.
 
         For org-owned projects, verifies the project belongs to the current org
-        (if one is set) and user has access. For personal projects, verifies ownership.
+        (if one is set) and user has access. For user-owned projects, verifies ownership.
         """
         identity = self._session_context.user_id or self._session_context.service_principal_id
 
@@ -5140,7 +5649,7 @@ class MCPServer:
                                 "error_code": "ACCESS_DENIED",
                             }
                 else:
-                    # Personal project - verify ownership or collaboration
+                    # User-owned project - verify ownership or collaboration
                     if hasattr(project, 'owner_id') and project.owner_id != identity:
                         # TODO: Check collaborators when that feature is implemented
                         self._logger.debug(
@@ -5572,13 +6081,33 @@ class MCPServer:
         # Start idle connection cleanup task
         self._idle_check_task = asyncio.create_task(self._idle_connection_monitor())
 
-        try:
-            # Read requests from stdin, write responses to stdout
+        # Use a dedicated single thread + asyncio.Queue for stdin reading.
+        # This prevents the old pattern where asyncio.wait_for + run_in_executor
+        # spawns multiple threads competing for the stdin buffer lock.
+        stdin_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+        def _stdin_reader_thread() -> None:
+            """Dedicated thread that reads stdin and pushes messages into the queue."""
             while not self._shutdown_requested:
-                # Read one line (JSON-RPC request) with timeout for shutdown check
+                try:
+                    msg = self._read_stdin_message_blocking()
+                    loop.call_soon_threadsafe(stdin_queue.put_nowait, msg)
+                    if msg is None:
+                        break  # EOF
+                except Exception:
+                    loop.call_soon_threadsafe(stdin_queue.put_nowait, None)
+                    break
+
+        import threading as _threading
+        reader_thread = _threading.Thread(target=_stdin_reader_thread, daemon=True, name="mcp-stdin-reader")
+        reader_thread.start()
+
+        try:
+            # Read requests from stdin via the dedicated reader queue
+            while not self._shutdown_requested:
                 try:
                     request_line = await asyncio.wait_for(
-                        loop.run_in_executor(None, self._read_stdin_message_blocking),
+                        stdin_queue.get(),
                         timeout=1.0  # Check shutdown flag every second
                     )
                 except asyncio.TimeoutError:
