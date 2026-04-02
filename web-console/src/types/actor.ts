@@ -57,7 +57,7 @@ export const ACTOR_PRESENCE_LABELS: Record<ActorPresenceState, string> = {
 };
 
 export const ACTOR_PRESENCE_ACCENTS: Record<ActorPresenceState, string> = {
-  available: 'var(--color-success)',
+  available: 'var(--color-success-vivid)',
   working: 'var(--color-accent)',
   finished_recently: 'var(--color-accent-tertiary)',
   paused: 'var(--color-warning)',

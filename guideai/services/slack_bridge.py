@@ -269,13 +269,19 @@ class SlackBridgeService:
     def _discover_bound_conversations(self) -> List[str]:
         """Discover conversation IDs with active Slack bindings.
 
-        This is a best-effort scan — in production the binding table
-        is queried at startup.
+        Queries the binding table at startup so the outbound relay covers
+        all pre-existing channel↔conversation mappings.
         """
-        # We don't have a list_all_bindings method, but the ConversationService
-        # has get_external_binding and list_external_bindings (by conv).
-        # For now return empty — the API layer will subscribe per-binding.
-        return []
+        if self._conversation is None:
+            return []
+        try:
+            bindings = self._conversation.list_all_active_bindings(
+                ExternalProvider.SLACK
+            )
+            return [b.conversation_id for b in bindings]
+        except Exception:
+            logger.exception("Failed to discover bound conversations at startup")
+            return []
 
     # ------------------------------------------------------------------
     # Slack request verification (security-critical)

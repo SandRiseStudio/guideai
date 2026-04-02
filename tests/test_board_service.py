@@ -692,6 +692,40 @@ class TestTaskLifecycle:
         assert assigned.assignee_id == "user-dev-001"
         assert assigned.assignee_type == AssigneeType.USER
 
+    def test_assign_goal_to_user(
+        self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
+    ):
+        """Assigning a goal must not fail assignment_history CHECK (legacy rows used epic, not goal)."""
+        board = service.create_board(
+            CreateBoardRequest(
+                project_id=test_project_id,
+                name="Goal Assign Board",
+                create_default_columns=True,
+            ),
+            actor,
+            org_id=test_org_id,
+        )
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Assignable Goal",
+            ),
+            actor,
+            org_id=test_org_id,
+        )
+        assigned = service.assign_work_item(
+            goal.item_id,
+            AssignWorkItemRequest(
+                assignee_id="user-dev-001",
+                assignee_type=AssigneeType.USER,
+            ),
+            actor,
+            org_id=test_org_id,
+        )
+        assert assigned.assignee_id == "user-dev-001"
+        assert assigned.assignee_type == AssigneeType.USER
+
     def test_assign_task_to_agent(
         self, service: BoardService, actor: Actor, agent_actor: Actor,
         test_org_id: str, test_project_id: str

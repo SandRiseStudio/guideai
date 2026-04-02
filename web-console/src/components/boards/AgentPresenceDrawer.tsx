@@ -20,6 +20,8 @@ export interface AgentPresenceDrawerProps {
   open: boolean;
   onClose: () => void;
   onParticipantClick?: (participant: BoardParticipant) => void;
+  /** Opens unified project / team chat (pinned above member list). */
+  onProjectRoom?: () => void;
   onManage?: () => void;
 }
 
@@ -39,6 +41,7 @@ export const AgentPresenceDrawer: React.FC<AgentPresenceDrawerProps> = ({
   open,
   onClose,
   onParticipantClick,
+  onProjectRoom,
   onManage,
 }) => {
   const drawerRef = useRef<HTMLDivElement>(null);
@@ -102,7 +105,7 @@ export const AgentPresenceDrawer: React.FC<AgentPresenceDrawerProps> = ({
     <div
       className="agent-presence-drawer-scrim"
       onClick={handleScrimClick}
-      aria-hidden="true"
+      role="presentation"
     >
       <aside
         ref={drawerRef}
@@ -110,6 +113,7 @@ export const AgentPresenceDrawer: React.FC<AgentPresenceDrawerProps> = ({
         role="dialog"
         aria-modal="true"
         aria-labelledby="presence-drawer-title"
+        onClick={(e) => e.stopPropagation()}
       >
         <div className="presence-drawer-header">
           <h2 id="presence-drawer-title" className="presence-drawer-title">
@@ -119,7 +123,7 @@ export const AgentPresenceDrawer: React.FC<AgentPresenceDrawerProps> = ({
             type="button"
             className="presence-drawer-close pressable"
             onClick={onClose}
-            aria-label="Close agent drawer"
+            aria-label="Close members sheet"
             data-haptic="light"
           >
             ✕
@@ -127,6 +131,25 @@ export const AgentPresenceDrawer: React.FC<AgentPresenceDrawerProps> = ({
         </div>
 
         <div className="presence-drawer-body">
+          {onProjectRoom && (
+            <div className="presence-drawer-project-room">
+              <button
+                type="button"
+                className="presence-drawer-project-room-btn pressable"
+                onClick={() => {
+                  onProjectRoom();
+                  onClose();
+                }}
+                data-haptic="light"
+              >
+                <span className="presence-drawer-project-room-icon" aria-hidden="true">#</span>
+                <span className="presence-drawer-project-room-copy">
+                  <span className="presence-drawer-project-room-title">Project room</span>
+                  <span className="presence-drawer-project-room-sub">Team chat for this project</span>
+                </span>
+              </button>
+            </div>
+          )}
           <DrawerSection title="People" participants={humans} onParticipantClick={onParticipantClick} />
           <DrawerSection title="Agents" participants={agents} onParticipantClick={onParticipantClick} />
         </div>

@@ -25,6 +25,8 @@ import { AmprealizePanel } from './panels/AmprealizePanel';
 import { ActionTimelinePanel } from './panels/ActionTimelinePanel';
 import { BehaviorAccuracyPanel } from './panels/BehaviorAccuracyPanel';
 import { GuideAIChatPanel } from './panels/GuideAIChatPanel';
+import { ConversationPanel } from './panels/ConversationPanel';
+import { ConversationTreeDataProvider } from './providers/ConversationTreeDataProvider';
 import { McpStatusBarProvider } from './providers/McpStatusBarProvider';
 import { OnboardingPanel } from './panels/OnboardingPanel';
 
@@ -101,11 +103,17 @@ export function activate(context: vscode.ExtensionContext) {
 	const settingsSyncProvider = new SettingsSyncProvider(context);
 	context.subscriptions.push(vscode.workspace.registerFileSystemProvider('guideai-settings', settingsSyncProvider, { isCaseSensitive: true }));
 
+	// Initialize conversation tree provider (GUIDEAI-568, Phase 9)
+	const guideaiConfig = vscode.workspace.getConfiguration('guideai');
+	const conversationBaseUrl: string = guideaiConfig.get('serverUrl') || 'http://localhost:8080';
+	const conversationTreeProvider = new ConversationTreeDataProvider({ baseUrl: conversationBaseUrl });
+
 	// Register tree views
 	const executionTrackerView = vscode.window.registerTreeDataProvider('guideai.executionTracker', executionTrackerProvider);
 	const complianceTrackerView = vscode.window.registerTreeDataProvider('guideai.complianceTracker', complianceTrackerProvider);
 	const actionTrackerView = vscode.window.registerTreeDataProvider('guideai.actionTracker', actionTrackerProvider);
 	const costTrackerView = vscode.window.registerTreeDataProvider('guideai.costTracker', costTrackerProvider);
+	const conversationsView = vscode.window.registerTreeDataProvider('guideai.conversations', conversationTreeProvider);
 
 	// Register commands
 	const commands = [
@@ -429,6 +437,31 @@ export function activate(context: vscode.ExtensionContext) {
 			BehaviorAccuracyPanel.createOrShow(client, context.extensionUri);
 		}),
 
+		// Conversation Commands (GUIDEAI-568, Phase 9 - behavior_integrate_vscode_extension)
+		vscode.commands.registerCommand('guideai.openConversation', async (conversationId?: string, conversationTitle?: string) => {
+			const session = await vscode.authentication.getSession('guideai', ['read', 'write'], { createIfNone: false });
+			const authToken = session?.accessToken;
+			const userId = session?.account.id || 'anonymous';
+			const config = { baseUrl: conversationBaseUrl, userId, authToken };
+
+			if (conversationId) {
+				ConversationPanel.createOrShow(context.extensionUri, conversationId, conversationTitle || 'Conversation', config);
+			} else {
+				// Prompt user to pick or create a conversation
+				const id = await vscode.window.showInputBox({
+					prompt: 'Enter Conversation ID (or leave blank to open last active)',
+					placeHolder: 'e.g. conv_abc123'
+				});
+				if (id !== undefined) {
+					ConversationPanel.createOrShow(context.extensionUri, id || 'default', conversationTitle || 'Conversation', config);
+				}
+			}
+		}),
+
+		vscode.commands.registerCommand('guideai.refreshConversations', () => {
+			conversationTreeProvider.refresh();
+		}),
+
 		vscode.commands.registerCommand('guideai.submitBehaviorFeedback', async () => {
 			// Quick feedback submission
 			const behaviorId = await vscode.window.showInputBox({
@@ -475,10 +508,12 @@ export function activate(context: vscode.ExtensionContext) {
 		complianceTrackerProvider,
 		actionTrackerProvider,
 		costTrackerProvider,
+		conversationTreeProvider,
 		executionTrackerView,
 		complianceTrackerView,
 		actionTrackerView,
 		costTrackerView,
+		conversationsView,
 		mcpStatusBarProvider,
 		...commands
 	);

@@ -1,7 +1,7 @@
 .sidebar-nav-panel {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
   min-height: 100%;
   padding-right: var(--space-1);
 }
@@ -9,14 +9,14 @@
 .sidebar-nav-tree {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 
 .sidebar-section {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  padding: 10px;
+  gap: var(--space-1);
+  padding: 8px;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-2xl);
   background: rgba(255, 255, 255, 0.52);
@@ -169,10 +169,10 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
+  gap: var(--space-2);
   width: 100%;
-  min-height: 48px;
-  padding: 10px 12px;
+  min-height: 36px;
+  padding: 6px 10px;
   overflow: hidden;
   border: 1px solid transparent;
   border-radius: 12px;
@@ -215,8 +215,8 @@
 }
 
 .sidebar-nav-item.nested {
-  min-height: 38px;
-  padding: 8px 10px 8px 18px;
+  min-height: 30px;
+  padding: 4px 8px 4px 16px;
   border-radius: 10px;
   background: transparent;
 }
@@ -334,8 +334,8 @@
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  min-height: 48px;
-  padding: 10px 12px;
+  min-height: 36px;
+  padding: 6px 10px;
   border: 1px solid transparent;
   border-radius: 12px;
   background: transparent;

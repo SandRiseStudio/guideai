@@ -346,6 +346,11 @@ export function useBoard(boardId?: string) {
    the data every few seconds without any visual loading indicators.
    ───────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * Must stay ≤ the deployed API's `GET /v1/work-items` `limit` max (see board_api_v2).
+ * Use 100 so older gateways/builds that still cap at le=100 do not return 422 and break the board.
+ * After every surface allows 250+, you can raise this to reduce pagination on very large boards.
+ */
 const ITEMS_PAGE_SIZE = 100;
 
 /** Stable empty array to avoid reference changes when data is null */
@@ -468,6 +473,8 @@ async function fetchAllWorkItems(
     let offset = (MAX_PARALLEL_PAGES + 1) * ITEMS_PAGE_SIZE;
     let more = true;
     while (more) {
+      // Small pause between pages to avoid tripping API rate limits on large boards.
+      await sleep(120);
       const page = await fetchPage(offset);
       if (page.items.length === 0) break;
       all = all.concat(page.items);
@@ -1012,6 +1019,7 @@ export function useAssignWorkItem(boardId?: string) {
   const queryClient = useQueryClient();
 
   return useMutation({
+    mutationKey: ['board-item-mutate', boardId],
     mutationFn: async (input: { itemId: string; assigneeId: string; assigneeType: 'user' | 'agent'; reason?: string }): Promise<WorkItem> => {
       await razeLog('INFO', 'Work item assign requested', {
         board_id: boardId ?? null,
@@ -1088,6 +1096,7 @@ export function useUnassignWorkItem(boardId?: string) {
   const queryClient = useQueryClient();
 
   return useMutation({
+    mutationKey: ['board-item-mutate', boardId],
     mutationFn: async (input: { itemId: string; reason?: string }): Promise<WorkItem> => {
       await razeLog('INFO', 'Work item unassign requested', {
         board_id: boardId ?? null,

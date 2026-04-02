@@ -9,12 +9,14 @@
 .agent-presence-drawer-scrim {
   position: fixed;
   inset: 0;
-  z-index: var(--z-overlay);
-  background: rgba(15, 23, 42, 0.12);
-  backdrop-filter: blur(2px);
+  z-index: calc(var(--z-overlay) + 8);
+  background: rgba(15, 23, 42, 0.14);
+  backdrop-filter: blur(4px);
   display: flex;
-  justify-content: flex-end;
-  animation: presence-drawer-scrim-in var(--duration-normal) var(--ease-out-expo) both;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 var(--space-3) calc(var(--space-3) + env(safe-area-inset-bottom, 0px));
+  animation: presence-drawer-scrim-in var(--collab-motion-sheet-enter, 280ms) var(--ease-out-expo) both;
 }
 
 @keyframes presence-drawer-scrim-in {
@@ -25,20 +27,90 @@
 /* ── Drawer panel ─────────────────────────────────────────────────────────── */
 
 .agent-presence-drawer {
-  width: min(380px, 90vw);
-  height: 100vh;
+  width: min(420px, 100%);
+  max-height: min(72vh, 640px);
   display: flex;
   flex-direction: column;
-  background: rgba(247, 251, 254, 0.94);
+  background: rgba(247, 251, 254, 0.96);
   backdrop-filter: blur(24px) saturate(140%);
-  border-left: 1px solid rgba(15, 23, 42, 0.08);
-  animation: presence-drawer-slide-in 250ms var(--ease-out-expo) both;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: var(--radius-xl, 20px) var(--radius-xl, 20px) 0 0;
+  box-shadow: 0 -12px 48px -16px rgba(15, 23, 42, 0.18);
+  animation: presence-drawer-sheet-in var(--collab-motion-sheet-enter, 280ms) var(--ease-out-expo) both;
   overflow: hidden;
 }
 
-@keyframes presence-drawer-slide-in {
-  from { transform: translateX(100%); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
+@keyframes presence-drawer-sheet-in {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.presence-drawer-project-room {
+  margin-bottom: var(--space-4);
+}
+
+.presence-drawer-project-room-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  background: rgba(255, 255, 255, 0.72);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    transform var(--collab-motion-micro-max, 140ms) var(--ease-out-expo),
+    border-color var(--duration-fast) var(--ease-out-expo),
+    background var(--duration-fast) var(--ease-out-expo);
+}
+
+.presence-drawer-project-room-btn:hover {
+  background: var(--color-bg-hover);
+  border-color: rgba(15, 23, 42, 0.12);
+}
+
+.presence-drawer-project-room-btn:active {
+  transform: scale(0.98);
+}
+
+.presence-drawer-project-room-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  background: rgba(59, 130, 246, 0.12);
+  color: var(--color-accent, #3b82f6);
+  font-size: 1.1rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.presence-drawer-project-room-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.presence-drawer-project-room-title {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+}
+
+.presence-drawer-project-room-sub {
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
 }
 
 /* ── Header ───────────────────────────────────────────────────────────────── */

@@ -73,8 +73,8 @@ describe('AgentPresenceDrawer', () => {
     );
     expect(screen.getByText('People')).toBeInTheDocument();
     expect(screen.getByText('Agents')).toBeInTheDocument();
-    expect(screen.getByText('Nick Sanders')).toBeInTheDocument();
-    expect(screen.getByText('Worker')).toBeInTheDocument();
+    expect(screen.getAllByText('Nick Sanders').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Worker').length).toBeGreaterThanOrEqual(1);
   });
 
   it('hides empty sections', () => {
@@ -123,6 +123,19 @@ describe('AgentPresenceDrawer', () => {
     expect(screen.queryByText('Manage agents')).not.toBeInTheDocument();
   });
 
+  it('renders Project room when onProjectRoom is provided', () => {
+    const onProjectRoom = vi.fn();
+    render(
+      <AgentPresenceDrawer
+        participants={[makeAgent('1', 'available')]}
+        open={true}
+        onClose={vi.fn()}
+        onProjectRoom={onProjectRoom}
+      />,
+    );
+    expect(screen.getByText('Project room')).toBeInTheDocument();
+  });
+
   it('calls onManage when Manage agents is clicked', async () => {
     const user = userEvent.setup();
     const onManage = vi.fn();
@@ -148,7 +161,7 @@ describe('AgentPresenceDrawer', () => {
         onClose={onClose}
       />,
     );
-    await user.click(screen.getByLabelText('Close agent drawer'));
+    await user.click(screen.getByLabelText('Close members sheet'));
     expect(onClose).toHaveBeenCalledOnce();
   });
 });

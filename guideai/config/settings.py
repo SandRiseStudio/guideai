@@ -491,6 +491,42 @@ class CostOptimizationConfig(BaseSettings):
     )
 
 
+class MessagingRetentionConfig(BaseSettings):
+    """Message retention policy configuration (GUIDEAI-567, Phase 8).
+
+    Tiered retention:
+      Active  (0 – archive_days):          Postgres hot storage, full API access
+      Archive (archive_days – cold_days):  Postgres warm storage, read-only
+      Cold    (cold_days+, enterprise):    S3/GCS export + delete from Postgres
+    """
+
+    # Days before messages are moved to archive phase (default: 90 days)
+    archive_after_days: int = 90
+    # Days before archived conversations are exported to cold storage (default: 365)
+    cold_after_days: int = 365
+    # Whether cold export is enabled (enterprise only)
+    cold_export_enabled: bool = False
+    # S3 key prefix for cold exports (e.g. "conversations/cold/")
+    cold_export_prefix: str = "conversations/cold/"
+    # Cron schedule for nightly archive job (UTC) — seconds between runs
+    archive_job_interval_seconds: int = 86400  # 24 hours
+    # Seconds between cold export job runs
+    cold_export_job_interval_seconds: int = 604800  # 7 days
+    # Maximum conversations to process per archive run (prevents long-running locks)
+    archive_batch_size: int = 500
+    # Maximum conversations to export per cold run
+    cold_export_batch_size: int = 100
+
+    model_config = SettingsConfigDict(
+        env_prefix="MESSAGING_RETENTION_",
+        case_sensitive=False,
+        extra="allow",
+    )
+
+    def is_cold_export_configured(self, storage_bucket: Optional[str]) -> bool:
+        return self.cold_export_enabled and bool(storage_bucket)
+
+
 class SlackConfig(BaseSettings):
     """Slack integration configuration for the conversation bridge.
 
@@ -545,6 +581,7 @@ class Settings(BaseSettings):
     cost: CostOptimizationConfig = Field(default_factory=CostOptimizationConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     opensearch: OpenSearchConfig = Field(default_factory=OpenSearchConfig)
+    messaging_retention: MessagingRetentionConfig = Field(default_factory=MessagingRetentionConfig)
 
     # Legacy database DSN strings (backward compatibility)
     # These all use the consolidated guideai-db on port 5432 with schema-based routing

@@ -86,6 +86,10 @@
 				{
 					"id": "guideai.behaviorAccuracy",
 					"name": "Behavior Accuracy"
+				},
+				{
+					"id": "guideai.conversations",
+					"name": "Conversations"
 				}
 			]
 		},
@@ -228,6 +232,16 @@
 				"command": "guideai.refreshBehaviorAccuracy",
 				"title": "Refresh Behavior Accuracy",
 				"icon": "$(refresh)"
+			},
+			{
+				"command": "guideai.openConversation",
+				"title": "GuideAI: Open Conversation",
+				"icon": "$(comment-discussion)"
+			},
+			{
+				"command": "guideai.refreshConversations",
+				"title": "Refresh Conversations",
+				"icon": "$(refresh)"
 			}
 		],
 		"menus": {
@@ -246,6 +260,16 @@
 					"command": "guideai.actionTracker.clearFilters",
 					"when": "view == guideai.actionTracker",
 					"group": "1_filters"
+				},
+				{
+					"command": "guideai.refreshConversations",
+					"when": "view == guideai.conversations",
+					"group": "navigation"
+				},
+				{
+					"command": "guideai.openConversation",
+					"when": "view == guideai.conversations",
+					"group": "navigation"
 				},
 				{
 					"command": "guideai.refreshCostTracker",
@@ -459,6 +483,12 @@
 				"command": "guideai.quickActions",
 				"key": "ctrl+shift+alt+g",
 				"mac": "cmd+shift+alt+g"
+			},
+			{
+				"command": "guideai.openConversation",
+				"key": "ctrl+shift+m",
+				"mac": "cmd+shift+m",
+				"when": "editorTextFocus || !inputFocus"
 			}
 		]
 	},

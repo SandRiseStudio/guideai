@@ -80,6 +80,19 @@ def _short_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
+def _history_assignable_type(item_type: WorkItemType) -> str:
+    """Value stored in assignment_history.assignable_type.
+
+    Older DBs enforce CHECK (... 'epic','story',... ) without 'goal'. The work_items row uses
+    unified types (goal/feature/...); for audit rows we map goal -> epic so assign/unassign
+    succeeds before/whether migration 20260402_widen_assignment is applied.
+    """
+    v = item_type.value
+    if v == "goal":
+        return "epic"
+    return v
+
+
 def _parse_jsonb(value: Any, default: Any = None) -> Any:
     """Parse JSONB field that may already be decoded by psycopg2."""
     if value is None:
@@ -2159,18 +2172,27 @@ class BoardService:
                        (history_id, project_id, assignable_id, assignable_type, assignee_id, assignee_type,
                         action, performed_by, performed_at, previous_assignee_id, previous_assignee_type, reason, org_id)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (_short_id("ahist"), item.project_id, item_id, item.item_type.value,
+                    (_short_id("ahist"), item.project_id, item_id, _history_assignable_type(item.item_type),
                      request.assignee_id, request.assignee_type.value,
                      AssignmentAction.REASSIGNED.value if previous_assignee else AssignmentAction.ASSIGNED.value,
                      actor.id, timestamp, previous_assignee, previous_type.value if previous_type else None,
                      request.reason, org_id),
                 )
 
-        self._pool.run_transaction(
-            operation="work_item.assign", service_prefix="board",
-            actor=_actor_payload(actor), metadata={"item_id": item_id},
-            executor=_execute, telemetry=self._telemetry,
-        )
+        try:
+            self._pool.run_transaction(
+                operation="work_item.assign", service_prefix="board",
+                actor=_actor_payload(actor), metadata={"item_id": item_id},
+                executor=_execute, telemetry=self._telemetry,
+            )
+        except BoardServiceError:
+            raise
+        except Exception as exc:
+            logger.exception("assign_work_item transaction failed item_id=%s", item_id)
+            raise BoardServiceError(
+                "Could not persist assignment. For OAuth-sized user IDs or widened columns, run: "
+                f"`alembic upgrade head` (includes 20260402_widen_assignment). Database error: {exc}"
+            ) from exc
 
         updated = self.get_work_item(item_id, org_id=org_id)
         self._emit_event(BoardEvent(
@@ -2203,17 +2225,26 @@ class BoardService:
                            (history_id, project_id, assignable_id, assignable_type, assignee_id, assignee_type,
                             action, performed_by, performed_at, previous_assignee_id, previous_assignee_type, reason, org_id)
                            VALUES (%s, %s, %s, %s, NULL, NULL, %s, %s, %s, %s, %s, %s, %s)""",
-                        (_short_id("ahist"), item.project_id, item_id, item.item_type.value,
+                        (_short_id("ahist"), item.project_id, item_id, _history_assignable_type(item.item_type),
                          AssignmentAction.UNASSIGNED.value, actor.id, timestamp,
                          item.assignee_id, item.assignee_type.value if item.assignee_type else None,
                          reason, org_id),
                     )
 
-        self._pool.run_transaction(
-            operation="work_item.unassign", service_prefix="board",
-            actor=_actor_payload(actor), metadata={"item_id": item_id},
-            executor=_execute, telemetry=self._telemetry,
-        )
+        try:
+            self._pool.run_transaction(
+                operation="work_item.unassign", service_prefix="board",
+                actor=_actor_payload(actor), metadata={"item_id": item_id},
+                executor=_execute, telemetry=self._telemetry,
+            )
+        except BoardServiceError:
+            raise
+        except Exception as exc:
+            logger.exception("unassign_work_item transaction failed item_id=%s", item_id)
+            raise BoardServiceError(
+                "Could not persist unassignment. Run `alembic upgrade head` if you see varchar length errors. "
+                f"Database error: {exc}"
+            ) from exc
 
         updated = self.get_work_item(item_id, org_id=org_id)
         self._emit_event(BoardEvent(

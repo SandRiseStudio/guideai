@@ -1534,6 +1534,53 @@ class ConversationService:
             telemetry=self._telemetry,
         )
 
+    def list_all_active_bindings(
+        self,
+        provider: ExternalProvider,
+        *,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[ExternalBinding]:
+        """List all active external bindings for a given provider (across all conversations).
+
+        Used at startup to discover which conversations need outbound relay subscriptions.
+        """
+
+        def _query(conn: Any) -> List[ExternalBinding]:
+            _set_messaging_search_path(conn, org_id, user_id)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, conversation_id, provider, external_channel_id,
+                       external_workspace_id, config, is_active, bound_at, bound_by
+                FROM messaging.external_bindings
+                WHERE provider = %s AND is_active = TRUE
+                ORDER BY bound_at
+                """,
+                (provider.value,),
+            )
+            results = []
+            for row in cur.fetchall():
+                results.append(ExternalBinding(
+                    id=row[0],
+                    conversation_id=row[1],
+                    provider=ExternalProvider(row[2]),
+                    external_channel_id=row[3],
+                    external_workspace_id=row[4],
+                    config=_parse_jsonb(row[5], {}),
+                    is_active=row[6],
+                    bound_at=row[7],
+                    bound_by=row[8],
+                ))
+            return results
+
+        return self._pool.run_query(
+            operation="external_binding.list_all",
+            service_prefix="messaging",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
     def deactivate_external_binding(
         self,
         binding_id: str,
@@ -1601,6 +1648,299 @@ class ConversationService:
             operation="external_binding.get_by_conversation",
             service_prefix="messaging",
             executor=_query,
+            telemetry=self._telemetry,
+        )
+
+    # =========================================================================
+    # Retention & archival (GUIDEAI-609, Phase 8)
+    # =========================================================================
+
+    def archive_messages_older_than(
+        self,
+        archive_after_days: int,
+        *,
+        batch_size: int = 500,
+        org_id: Optional[str] = None,
+    ) -> int:
+        """Mark messages older than *archive_after_days* as archived.
+
+        Respects compliance hold on conversations (metadata->>compliance_hold = 'true').
+        Returns the number of messages archived.
+        """
+
+        def _execute(conn: Any) -> int:
+            _set_messaging_search_path(conn, org_id, None)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE messaging.messages m
+                SET archived_at = NOW()
+                WHERE m.archived_at IS NULL
+                  AND m.is_deleted = FALSE
+                  AND m.created_at < NOW() - (%s || ' days')::INTERVAL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messaging.conversations c
+                      WHERE c.id = m.conversation_id
+                        AND (c.metadata->>'compliance_hold')::boolean IS TRUE
+                  )
+                RETURNING m.id
+                """,
+                (str(archive_after_days),),
+            )
+            rows = cur.fetchall()
+            count = len(rows)
+            conn.commit()
+            return count
+
+        return self._pool.run_transaction(
+            operation="retention.archive_messages",
+            service_prefix="messaging",
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
+
+    def list_cold_eligible_conversations(
+        self,
+        cold_after_days: int,
+        *,
+        batch_size: int = 100,
+        org_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List conversations where all messages are archived and older than *cold_after_days*.
+
+        Returns lightweight conversation dicts (id, project_id, archived_at) suitable
+        for cold export processing.
+        """
+
+        def _query(conn: Any) -> List[Dict[str, Any]]:
+            _set_messaging_search_path(conn, org_id, None)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT c.id, c.project_id, c.title, c.scope,
+                       MAX(m.archived_at) AS last_archived_at,
+                       COUNT(m.id) AS message_count
+                FROM messaging.conversations c
+                JOIN messaging.messages m ON m.conversation_id = c.id
+                WHERE m.archived_at IS NOT NULL
+                  AND m.archived_at < NOW() - (%s || ' days')::INTERVAL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messaging.messages m2
+                      WHERE m2.conversation_id = c.id
+                        AND m2.archived_at IS NULL
+                        AND m2.is_deleted = FALSE
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messaging.conversations c2
+                      WHERE c2.id = c.id
+                        AND (c2.metadata->>'compliance_hold')::boolean IS TRUE
+                  )
+                GROUP BY c.id, c.project_id, c.title, c.scope
+                ORDER BY last_archived_at ASC
+                LIMIT %s
+                """,
+                (str(cold_after_days), batch_size),
+            )
+            cols = [desc[0] for desc in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        return self._pool.run_query(
+            operation="retention.list_cold_eligible",
+            service_prefix="messaging",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
+    def get_conversation_messages_for_export(
+        self,
+        conversation_id: str,
+        *,
+        org_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch all messages for a conversation as plain dicts (for cold export JSONL)."""
+
+        def _query(conn: Any) -> List[Dict[str, Any]]:
+            _set_messaging_search_path(conn, org_id, None)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, conversation_id, sender_id, sender_type, content,
+                       message_type, structured_payload, parent_id, run_id,
+                       behavior_id, work_item_id, is_edited, edited_at,
+                       is_deleted, deleted_at, metadata, created_at, archived_at
+                FROM messaging.messages
+                WHERE conversation_id = %s
+                ORDER BY created_at ASC
+                """,
+                (conversation_id,),
+            )
+            cols = [desc[0] for desc in cur.description]
+            rows = []
+            for row in cur.fetchall():
+                d = dict(zip(cols, row))
+                # Serialize datetimes to ISO strings for JSON export
+                for k in ("edited_at", "deleted_at", "created_at", "archived_at"):
+                    if d.get(k) is not None:
+                        d[k] = d[k].isoformat()
+                rows.append(d)
+            return rows
+
+        return self._pool.run_query(
+            operation="retention.get_messages_for_export",
+            service_prefix="messaging",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
+    def delete_conversation_for_cold_export(
+        self,
+        conversation_id: str,
+        *,
+        org_id: Optional[str] = None,
+    ) -> int:
+        """Hard-delete a conversation and all its messages after cold export.
+
+        This is irreversible — only call after the S3 export is confirmed.
+        Returns the number of messages deleted.
+        """
+
+        def _execute(conn: Any) -> int:
+            _set_messaging_search_path(conn, org_id, None)
+            cur = conn.cursor()
+            # Delete messages first (FK cascade would handle this too, but be explicit)
+            cur.execute(
+                "DELETE FROM messaging.messages WHERE conversation_id = %s RETURNING id",
+                (conversation_id,),
+            )
+            count = len(cur.fetchall())
+            cur.execute(
+                "DELETE FROM messaging.conversations WHERE id = %s",
+                (conversation_id,),
+            )
+            conn.commit()
+            return count
+
+        return self._pool.run_transaction(
+            operation="retention.delete_cold_conversation",
+            service_prefix="messaging",
+            executor=_execute,
+            telemetry=self._telemetry,
+        )
+
+    def get_conversation_stats(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return aggregated conversation analytics (GUIDEAI-612).
+
+        Includes: total conversations, total messages, active conversations
+        (messages in last 7 days), messages by type, messages by sender type,
+        and archive rate.
+        """
+
+        def _query(conn: Any) -> Dict[str, Any]:
+            _set_messaging_search_path(conn, org_id, None)
+            cur = conn.cursor()
+
+            project_filter = "AND c.project_id = %s" if project_id else ""
+            params: tuple = (project_id,) if project_id else ()
+
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(DISTINCT c.id) AS total_conversations,
+                    COUNT(DISTINCT CASE WHEN c.is_archived = FALSE THEN c.id END) AS active_conversations,
+                    COUNT(DISTINCT CASE WHEN c.is_archived = TRUE THEN c.id END) AS archived_conversations,
+                    COUNT(m.id) AS total_messages,
+                    COUNT(CASE WHEN m.archived_at IS NOT NULL THEN 1 END) AS archived_messages,
+                    COUNT(CASE WHEN m.created_at >= NOW() - INTERVAL '7 days' THEN 1 END) AS messages_last_7_days,
+                    COUNT(CASE WHEN m.created_at >= NOW() - INTERVAL '24 hours' THEN 1 END) AS messages_last_24h,
+                    COUNT(CASE WHEN m.sender_type = 'agent' THEN 1 END) AS agent_messages,
+                    COUNT(CASE WHEN m.sender_type = 'user' THEN 1 END) AS user_messages,
+                    COUNT(CASE WHEN m.sender_type = 'system' THEN 1 END) AS system_messages
+                FROM messaging.conversations c
+                LEFT JOIN messaging.messages m
+                    ON m.conversation_id = c.id AND m.is_deleted = FALSE
+                WHERE 1=1 {project_filter}
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            cols = [desc[0] for desc in cur.description]
+            return dict(zip(cols, row)) if row else {}
+
+        return self._pool.run_query(
+            operation="analytics.conversation_stats",
+            service_prefix="messaging",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
+    def get_project_retention_config(
+        self,
+        project_id: str,
+        *,
+        org_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch per-project retention override from projects.settings JSONB.
+
+        Returns a dict with retention_days (int) or None if no project found.
+        """
+
+        def _query(conn: Any) -> Optional[Dict[str, Any]]:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, settings->>'retention_days' AS retention_days
+                FROM projects
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (project_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "project_id": row[0],
+                "retention_days": int(row[1]) if row[1] else None,
+            }
+
+        return self._pool.run_query(
+            operation="retention.get_project_config",
+            service_prefix="messaging",
+            executor=_query,
+            telemetry=self._telemetry,
+        )
+
+    def set_project_retention_config(
+        self,
+        project_id: str,
+        retention_days: int,
+        *,
+        org_id: Optional[str] = None,
+    ) -> None:
+        """Set per-project retention override in projects.settings JSONB."""
+
+        def _execute(conn: Any) -> None:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE projects
+                SET settings = COALESCE(settings, '{}'::jsonb) ||
+                               jsonb_build_object('retention_days', %s::text)
+                WHERE id = %s
+                """,
+                (str(retention_days), project_id),
+            )
+            conn.commit()
+
+        self._pool.run_transaction(
+            operation="retention.set_project_config",
+            service_prefix="messaging",
+            executor=_execute,
             telemetry=self._telemetry,
         )
 

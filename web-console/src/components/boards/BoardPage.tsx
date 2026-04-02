@@ -23,6 +23,7 @@ import {
   type WorkItemPriority,
   type WorkItemType,
   useAssignWorkItem,
+  useUnassignWorkItem,
   useBoard,
   useBoardProgressRollups,
   useCreateWorkItem,
@@ -52,10 +53,12 @@ import { AgentAssignmentDrawer } from './AgentAssignmentDrawer';
 import { useAgentPresence } from '../../hooks/useAgentPresence';
 import { type BoardParticipant } from './boardParticipants';
 import { useCollabStore } from '../../store/collabStore';
-import { ConversationPanel } from '../conversations/ConversationPanel';
-import { FloatingChatWindow } from '../conversations/FloatingChatWindow';
+import { InlineAssigneePopover } from './InlineAssigneePopover';
+import {
+  UnifiedConversationWindow,
+  type UnifiedConversationInitialTarget,
+} from '../conversations/UnifiedConversationWindow';
 import { useGetOrCreateDirectConversation } from '../../api/conversations';
-import type { Conversation } from '../../lib/collab-client';
 import './BoardPage.css';
 
 function getColumnAccentIndex(index: number): number {
@@ -394,6 +397,16 @@ interface WorkItemCardProps {
   isBeingDragged?: boolean;
   /** When true, this card just landed after drop */
   isJustDropped?: boolean;
+  /** Inline assignment: all assignable humans */
+  assignableHumans?: AssigneeProfile[];
+  /** Inline assignment: all assignable agents */
+  assignableAgents?: AssigneeProfile[];
+  /** Inline assignment: callback to assign */
+  onAssign?: (itemId: string, profile: AssigneeProfile) => void;
+  /** Inline assignment: callback to unassign */
+  onUnassign?: (itemId: string) => void;
+  /** Inline assignment: whether mutation is in flight */
+  isAssignPending?: boolean;
 }
 
 const WorkItemCard = memo(function WorkItemCard({
@@ -424,12 +437,66 @@ const WorkItemCard = memo(function WorkItemCard({
   diffState,
   isBeingDragged,
   isJustDropped,
+  assignableHumans: cardAssignableHumans,
+  assignableAgents: cardAssignableAgents,
+  onAssign,
+  onUnassign,
+  isAssignPending,
 }: WorkItemCardProps) {
   const label = item.item_type === 'task' ? 'Task' : item.item_type === 'feature' ? 'Feature' : item.item_type === 'bug' ? 'Bug' : 'Goal';
   const labelIcon = typeIcon(item.item_type);
   const draggingRef = React.useRef(false);
   const [compactIdCopied, setCompactIdCopied] = React.useState(false);
   const compactCopyResetRef = React.useRef<number | null>(null);
+
+  // ── Inline assignment popover state ──────────────────────────────────
+  const [assignPopoverOpen, setAssignPopoverOpen] = useState(false);
+  const [justAssigned, setJustAssigned] = useState(false);
+  const justAssignedTimerRef = useRef<number | null>(null);
+
+  const handleAssignPillClick = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!onAssign) return;
+      setAssignPopoverOpen((prev) => !prev);
+    },
+    [onAssign],
+  );
+
+  const handleAssignPillMouseDown = useCallback((e: React.MouseEvent) => {
+    // Prevent drag from starting on the pill
+    e.stopPropagation();
+  }, []);
+
+  const handleInlineAssign = useCallback(
+    (profile: AssigneeProfile) => {
+      if (!onAssign) return;
+      onAssign(item.item_id, profile);
+      // Flash animation
+      if (justAssignedTimerRef.current) window.clearTimeout(justAssignedTimerRef.current);
+      setJustAssigned(true);
+      justAssignedTimerRef.current = window.setTimeout(() => {
+        setJustAssigned(false);
+        justAssignedTimerRef.current = null;
+      }, 600);
+    },
+    [item.item_id, onAssign],
+  );
+
+  const handleInlineUnassign = useCallback(() => {
+    if (!onUnassign) return;
+    onUnassign(item.item_id);
+  }, [item.item_id, onUnassign]);
+
+  const handlePopoverClose = useCallback(() => {
+    setAssignPopoverOpen(false);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (justAssignedTimerRef.current) window.clearTimeout(justAssignedTimerRef.current);
+    };
+  }, []);
   const assignee = useMemo(() => {
     if (!item.assignee_id || !item.assignee_type) return null;
     const key = assigneeKey(item.assignee_type, item.assignee_id);
@@ -733,10 +800,24 @@ const WorkItemCard = memo(function WorkItemCard({
       )}
       <div className="work-item-assignment" aria-label={`Assignee: ${assigneeLabel}`}>
         <div
+          data-inline-assignee-control
           className={`work-item-assignee-pill ${
             item.assignee_type ? `assignee-pill-${item.assignee_type}` : 'assignee-pill-unassigned'
-          }${isOrphanedAssignment ? ' assignee-pill-orphaned' : ''}`}
-          title={isOrphanedAssignment ? 'Agent no longer exists. Please re-assign.' : undefined}
+          }${isOrphanedAssignment ? ' assignee-pill-orphaned' : ''}${onAssign ? ' assignee-pill-interactive' : ''}${assignPopoverOpen ? ' assignee-pill-open' : ''}${justAssigned ? ' assignee-pill-just-assigned' : ''}`}
+          title={isOrphanedAssignment ? 'Agent no longer exists. Please re-assign.' : onAssign ? 'Click to assign' : undefined}
+          role={onAssign ? 'button' : undefined}
+          tabIndex={onAssign ? 0 : undefined}
+          aria-haspopup={onAssign ? 'dialog' : undefined}
+          aria-expanded={onAssign ? assignPopoverOpen : undefined}
+          onMouseDown={onAssign ? handleAssignPillMouseDown : undefined}
+          onClick={onAssign ? handleAssignPillClick : undefined}
+          onKeyDown={onAssign ? (e: React.KeyboardEvent) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              e.stopPropagation();
+              setAssignPopoverOpen((prev) => !prev);
+            }
+          } : undefined}
         >
           <span className="assignee-pill-avatar">
             {assigneeActor ? (
@@ -802,7 +883,22 @@ const WorkItemCard = memo(function WorkItemCard({
             </span>
           </span>
         </button>
-        <span className={`compact-meta-assignee ${isOrphanedAssignment ? 'compact-meta-assignee-orphaned' : ''}`} title={isOrphanedAssignment ? 'Agent no longer exists' : assigneeLabel}>
+        <span
+          data-inline-assignee-control
+          className={`compact-meta-assignee ${isOrphanedAssignment ? 'compact-meta-assignee-orphaned' : ''}${onAssign ? ' compact-meta-assignee-interactive' : ''}`}
+          title={isOrphanedAssignment ? 'Agent no longer exists' : assigneeLabel}
+          role={onAssign ? 'button' : undefined}
+          tabIndex={onAssign ? 0 : undefined}
+          onMouseDown={onAssign ? handleAssignPillMouseDown : undefined}
+          onClick={onAssign ? handleAssignPillClick : undefined}
+          onKeyDown={onAssign ? (e: React.KeyboardEvent) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              e.stopPropagation();
+              setAssignPopoverOpen((prev) => !prev);
+            }
+          } : undefined}
+        >
           <span className="compact-meta-avatar">
             {assigneeActor ? (
               <ActorAvatar actor={assigneeActor} size="sm" surfaceType="chip" decorative />
@@ -815,6 +911,21 @@ const WorkItemCard = memo(function WorkItemCard({
           <span className="compact-meta-name">{assigneeLabel}</span>
         </span>
       </div>
+      {/* Popover lives here (not inside .work-item-assignment) so it stays visible when
+          compact density or summarized goals hide the assignment row via CSS. */}
+      {assignPopoverOpen && onAssign ? (
+        <div className="work-item-inline-assignee-popover">
+          <InlineAssigneePopover
+            assignableHumans={cardAssignableHumans ?? []}
+            assignableAgents={cardAssignableAgents ?? []}
+            currentAssignee={assignee}
+            onAssign={handleInlineAssign}
+            onUnassign={handleInlineUnassign}
+            onClose={handlePopoverClose}
+            isPending={isAssignPending}
+          />
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -1525,6 +1636,30 @@ const ColumnLane = memo(function ColumnLane({
   itemsLoading,
   itemDiffMap,
 }: ColumnLaneProps) {
+  // ── Inline assignment hooks ──────────────────────────────────────────
+  const assignItemMutation = useAssignWorkItem(boardId);
+  const unassignItemMutation = useUnassignWorkItem(boardId);
+
+  const handleCardAssign = useCallback(
+    (itemId: string, profile: AssigneeProfile) => {
+      assignItemMutation.mutate({
+        itemId,
+        assigneeId: profile.id,
+        assigneeType: profile.type as 'user' | 'agent',
+      });
+    },
+    [assignItemMutation],
+  );
+
+  const handleCardUnassign = useCallback(
+    (itemId: string) => {
+      unassignItemMutation.mutate({ itemId });
+    },
+    [unassignItemMutation],
+  );
+
+  const isAssignPending = assignItemMutation.isPending || unassignItemMutation.isPending;
+
   const [isOver, setIsOver] = useState(false);
   const isOverRef = useRef(false);
   const dragDepthRef = useRef(0);
@@ -2089,16 +2224,26 @@ const ColumnLane = memo(function ColumnLane({
           diffState={itemDiffMap?.get(item.item_id)}
           isBeingDragged={item.item_id === draggedItemId}
           isJustDropped={item.item_id === justDroppedItemId}
+          assignableHumans={assignableHumans}
+          assignableAgents={assignableAgents}
+          onAssign={handleCardAssign}
+          onUnassign={handleCardUnassign}
+          isAssignPending={isAssignPending}
         />
       </div>
     ),
     [
+      assignableAgents,
+      assignableHumans,
       assigneeIndex,
       childTaskCountByParent,
       draggedItemId,
       justDroppedItemId,
       executionByItemId,
       executionAvailable,
+      handleCardAssign,
+      handleCardUnassign,
+      isAssignPending,
       isCancelPending,
       isItemDimmed,
       isStartPending,
@@ -2635,17 +2780,40 @@ export function BoardPage(): React.JSX.Element {
 
   // Agent presence rail state
   const { presences: agentPresences } = useAgentPresence(projectAgents, projectId ?? undefined);
-  const [presenceDrawerOpen, setPresenceDrawerOpen] = useState(false);
+  const [membersSheetOpen, setMembersSheetOpen] = useState(false);
   const [assignmentDrawerOpen, setAssignmentDrawerOpen] = useState(false);
-  const [conversationPanelOpen, setConversationPanelOpen] = useState(false);
 
-  // Floating DM chat state
-  const [floatingChat, setFloatingChat] = useState<{
-    conversation: Conversation;
-    participant: BoardParticipant;
-    minimized: boolean;
+  const collabDockLauncherRef = useRef<HTMLButtonElement>(null);
+
+  const [unifiedChat, setUnifiedChat] = useState<{
+    initialTarget: UnifiedConversationInitialTarget;
+    key: number;
+    dmParticipantId?: string;
   } | null>(null);
   const getOrCreateDM = useGetOrCreateDirectConversation();
+
+  useEffect(() => {
+    setMembersSheetOpen(false);
+    setUnifiedChat(null);
+  }, [boardId, projectId]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey || !e.shiftKey) return;
+      if (e.key.toLowerCase() !== 'm') return;
+      e.preventDefault();
+      setUnifiedChat((prev) =>
+        prev
+          ? null
+          : {
+              initialTarget: { mode: 'firstProjectRoom' },
+              key: Date.now(),
+            },
+      );
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const createItem = useCreateWorkItem();
   const moveItem = useMoveWorkItem(boardId);
@@ -2666,24 +2834,30 @@ export function BoardPage(): React.JSX.Element {
 
   const assignableHumans = useMemo<AssigneeProfile[]>(() => {
     const currentUserId = actor?.type === 'human' ? actor.id : null;
+    const actorEmail = actor?.type === 'human' ? actor.email?.trim().toLowerCase() : undefined;
 
     const humans = participantRecords
-      .filter((participant) => participant.kind === 'human' && participant.user_id)
+      .filter((participant) => participant.kind === 'human')
       .map((participant) => {
-        const isCurrentUser = participant.user_id === currentUserId;
+        const uid = (participant.user_id ?? participant.id)?.trim();
+        if (!uid) return null;
+        const pEmail = participant.email?.trim().toLowerCase();
+        const isCurrentUser =
+          (currentUserId != null && (participant.user_id === currentUserId || participant.id === currentUserId)) ||
+          Boolean(actorEmail && pEmail && actorEmail === pEmail);
         const baseLabel = participant.display_name?.trim()
           || participant.email?.trim()
-          || `Member ${shortenId(participant.user_id ?? participant.id)}`;
+          || `Member ${shortenId(uid)}`;
         const role = participant.role ? participant.role.toLowerCase().replace(/_/g, ' ') : 'member';
         return {
-          id: participant.user_id ?? participant.id,
+          id: uid,
           type: 'user' as const,
           label: baseLabel,
           subtitle: isCurrentUser ? `${role} • you` : role,
           avatar: getInitials(baseLabel),
           actor: toActorViewModel(
             {
-              user_id: participant.user_id ?? participant.id,
+              user_id: uid,
               display_name: baseLabel,
               status: 'idle',
             },
@@ -2694,9 +2868,10 @@ export function BoardPage(): React.JSX.Element {
             },
           ),
         };
-      });
+      })
+      .filter((h): h is AssigneeProfile => h != null);
 
-    if (currentUserId && !humans.some((human) => human.id === currentUserId)) {
+    if (currentUserId && !humans.some((human) => human.actor.isCurrentUser)) {
       const fallbackLabel = actor?.displayName?.trim() || 'You';
       humans.unshift({
         id: currentUserId,
@@ -2769,13 +2944,13 @@ export function BoardPage(): React.JSX.Element {
         {
           subtitle: profile.subtitle,
           presenceState: 'available',
-          isCurrentUser: actor?.type === 'human' && actor.id === profile.id,
+          isCurrentUser: Boolean(profile.actor?.isCurrentUser),
         },
       ),
       subtitle: profile.subtitle,
       roleLabel: profile.subtitle,
       statusLine: profile.subtitle,
-      isCurrentUser: actor?.type === 'human' && actor.id === profile.id,
+      isCurrentUser: Boolean(profile.actor?.isCurrentUser),
     }));
 
     const agents: BoardParticipant[] = assignableAgents.map((profile) => ({
@@ -3352,13 +3527,11 @@ export function BoardPage(): React.JSX.Element {
   // ── Column Summary Strip helpers ──────────────────────────────────────────
   const currentUserId = useMemo(() => (actor?.type === 'human' ? actor.id : null), [actor?.id, actor?.type]);
 
-  // ── Floating DM — open chat for a participant ─────────────────────────────
+  // ── Unified messages — DM from avatar / members sheet ─────────────────────
   const handleParticipantClick = useCallback(
     (participant: BoardParticipant) => {
       if (!projectId) return;
-      // If already chatting with this participant, just restore
-      if (floatingChat?.participant.id === participant.id) {
-        setFloatingChat((prev) => prev ? { ...prev, minimized: false } : null);
+      if (unifiedChat?.dmParticipantId === participant.id) {
         return;
       }
       getOrCreateDM.mutate(
@@ -3369,17 +3542,24 @@ export function BoardPage(): React.JSX.Element {
         },
         {
           onSuccess: (result) => {
-            setFloatingChat({
-              conversation: result.conversation,
-              participant,
-              minimized: false,
+            setUnifiedChat({
+              initialTarget: { mode: 'conversation', conversationId: result.conversation.id },
+              key: Date.now(),
+              dmParticipantId: participant.id,
             });
           },
         },
       );
     },
-    [projectId, floatingChat?.participant.id, getOrCreateDM],
+    [projectId, unifiedChat?.dmParticipantId, getOrCreateDM],
   );
+
+  const openProjectRoomChat = useCallback(() => {
+    setUnifiedChat({
+      initialTarget: { mode: 'firstProjectRoom' },
+      key: Date.now(),
+    });
+  }, []);
 
   const isMyWorkActive = useMemo(
     () => Boolean(currentUserId && filters.assigneeId === currentUserId && filters.assigneeType === 'user'),
@@ -3449,16 +3629,24 @@ export function BoardPage(): React.JSX.Element {
         )}
         </div>{/* end board-sticky-chrome */}
 
-        {/* ChatHub presence card — standalone */}
+        {/* Collaboration dock — fixed bottom-center */}
         {((boardParticipants && boardParticipants.length > 0) || connectionState) && (
-          <div className="board-chathub-card">
-            <span className="board-chathub-label">{boardParticipants.length} {boardParticipants.length === 1 ? 'member' : 'members'}</span>
-            <ChatHub
-              participants={boardParticipants ?? []}
-              onOpen={() => setConversationPanelOpen(true)}
-              onParticipantClick={handleParticipantClick}
-              connectionState={connectionState}
-            />
+          <div
+            className={`board-collab-dock-wrap${draggedItemId ? ' board-collab-dock-wrap--passive' : ''}`}
+          >
+            <div
+              className={`board-chathub-card${draggedItemId ? '' : ' board-chathub-card--floaty'}${membersSheetOpen || Boolean(unifiedChat) ? ' board-chathub-card--active' : ''}`}
+            >
+              <ChatHub
+                participants={boardParticipants ?? []}
+                memberCount={boardParticipants.length}
+                onOpenMembersSheet={() => setMembersSheetOpen(true)}
+                onParticipantClick={handleParticipantClick}
+                membersLauncherRef={collabDockLauncherRef}
+                connectionState={connectionState}
+                active={membersSheetOpen || Boolean(unifiedChat)}
+              />
+            </div>
           </div>
         )}
 
@@ -3644,10 +3832,15 @@ export function BoardPage(): React.JSX.Element {
 
         <AgentPresenceDrawer
           participants={boardParticipants}
-          open={presenceDrawerOpen}
-          onClose={() => setPresenceDrawerOpen(false)}
+          open={membersSheetOpen}
+          onClose={() => setMembersSheetOpen(false)}
+          onProjectRoom={openProjectRoomChat}
+          onParticipantClick={(p) => {
+            setMembersSheetOpen(false);
+            handleParticipantClick(p);
+          }}
           onManage={() => {
-            setPresenceDrawerOpen(false);
+            setMembersSheetOpen(false);
             setAssignmentDrawerOpen(true);
           }}
         />
@@ -3660,29 +3853,17 @@ export function BoardPage(): React.JSX.Element {
           onClose={() => setAssignmentDrawerOpen(false)}
         />
 
-        {conversationPanelOpen && (
-          <ConversationPanel
-            projectId={projectId ?? ''}
-            orgId={project?.org_id ?? null}
-            onRequestClose={() => setConversationPanelOpen(false)}
-          />
-        )}
-
-        {/* Floating DM chat window */}
-        {floatingChat && (
-          <div className="conversation-floating-anchor">
-            <FloatingChatWindow
-              conversation={floatingChat.conversation}
-              targetParticipant={floatingChat.participant}
+        {unifiedChat && (
+          <div
+            className={`board-collab-chat-anchor${draggedItemId ? ' board-collab-chat-anchor--passive' : ''}`}
+          >
+            <UnifiedConversationWindow
+              projectId={projectId ?? ''}
+              orgId={project?.org_id ?? null}
               currentUserId={currentUserId ?? undefined}
-              minimized={floatingChat.minimized}
-              onMinimize={() =>
-                setFloatingChat((prev) => prev ? { ...prev, minimized: true } : null)
-              }
-              onRestore={() =>
-                setFloatingChat((prev) => prev ? { ...prev, minimized: false } : null)
-              }
-              onClose={() => setFloatingChat(null)}
+              initialTarget={unifiedChat.initialTarget}
+              initialTargetKey={unifiedChat.key}
+              onClose={() => setUnifiedChat(null)}
             />
           </div>
         )}

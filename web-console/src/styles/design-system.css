@@ -37,6 +37,8 @@
   --color-accent-soft: rgba(16, 152, 173, 0.12);
 
   --color-success: #16834f;
+  /* Brighter green for small presence / online indicators (avatar dots, etc.) */
+  --color-success-vivid: #4ade80;
   --color-warning: #c98517;
   --color-error: #d74b45;
   --color-info: #2f8ab8;

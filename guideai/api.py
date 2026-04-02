@@ -8038,9 +8038,107 @@ def create_app(
             register_conversation_ws(app, conversation_event_hub, conversation_service)
 
             app.state.conversation_event_hub = conversation_event_hub
+            app.state.conversation_service = conversation_service
             logger.info("Conversation routes + WS/SSE registered at /api/v1/conversations/*")
         except Exception as exc:
             logger.warning("Conversation routes unavailable: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Slack Bridge (Phase 7 — GUIDEAI-566)
+    # ------------------------------------------------------------------
+    if conversation_dsn and hasattr(app.state, "conversation_service"):
+        try:
+            from guideai.config.settings import SlackConfig
+            from guideai.services.slack_bridge import SlackBridgeService
+            from guideai.services.slack_bridge_api import create_slack_bridge_routes
+
+            slack_config = SlackConfig()
+            if slack_config.is_configured():
+                slack_bridge = SlackBridgeService(
+                    config=slack_config,
+                    conversation_service=app.state.conversation_service,
+                    event_hub=app.state.conversation_event_hub,
+                )
+                slack_routes = create_slack_bridge_routes(
+                    slack_bridge=slack_bridge,
+                    tags=["integrations", "slack"],
+                )
+                app.include_router(slack_routes, prefix="/api")
+                app.state.slack_bridge = slack_bridge
+
+                @app.on_event("startup")
+                async def _start_slack_bridge() -> None:
+                    await slack_bridge.start_outbound_subscription()
+                    logger.info("Slack bridge outbound subscription started")
+
+                @app.on_event("shutdown")
+                async def _stop_slack_bridge() -> None:
+                    await slack_bridge.close()
+                    logger.info("Slack bridge closed")
+
+                logger.info("Slack bridge routes registered at /api/v1/integrations/slack/*")
+            else:
+                logger.info(
+                    "Slack bridge not configured (SLACK_BOT_TOKEN / SLACK_SIGNING_SECRET unset)"
+                )
+        except Exception as exc:
+            logger.warning("Slack bridge unavailable: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Conversation Retention Worker + Analytics (Phase 8 — GUIDEAI-567)
+    # ------------------------------------------------------------------
+    if conversation_dsn and hasattr(app.state, "conversation_service"):
+        try:
+            from guideai.config.settings import MessagingRetentionConfig
+            from guideai.services.retention_worker import RetentionWorker
+            from guideai.services.conversation_analytics_api import (
+                create_conversation_analytics_routes,
+            )
+
+            retention_config = MessagingRetentionConfig()
+
+            # Try to set up S3 storage for cold export (enterprise only)
+            _retention_storage = None
+            if retention_config.cold_export_enabled:
+                try:
+                    from guideai.storage.s3_storage import S3Storage
+                    _retention_storage = S3Storage()
+                except Exception as _s3_exc:
+                    logger.warning("Cold export S3 storage unavailable: %s", _s3_exc)
+
+            retention_worker = RetentionWorker(
+                conversation_service=app.state.conversation_service,
+                retention_config=retention_config,
+                storage=_retention_storage,
+            )
+            app.state.retention_worker = retention_worker
+
+            # Register analytics + retention policy routes
+            analytics_routes = create_conversation_analytics_routes(
+                conversation_service=app.state.conversation_service,
+                retention_worker=retention_worker,
+                tags=["conversations", "analytics"],
+            )
+            app.include_router(analytics_routes, prefix="/api")
+
+            @app.on_event("startup")
+            async def _start_retention_worker() -> None:
+                await retention_worker.start()
+                logger.info("Retention worker started")
+
+            @app.on_event("shutdown")
+            async def _stop_retention_worker() -> None:
+                await retention_worker.stop()
+                logger.info("Retention worker stopped")
+
+            logger.info(
+                "Retention worker + analytics routes registered "
+                "(archive_after=%dd, cold_export=%s)",
+                retention_config.archive_after_days,
+                "enabled" if retention_config.cold_export_enabled else "disabled",
+            )
+        except Exception as exc:
+            logger.warning("Retention worker unavailable: %s", exc)
 
     # ------------------------------------------------------------------
     # Dashboard Stats

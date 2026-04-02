@@ -563,7 +563,7 @@ def create_board_routes(
         due_after: Optional[str] = Query(None, description="Items due on or after this ISO date"),
         sort_by: Optional[str] = Query(None, description="Sort field: position, priority, created_at, updated_at, due_date, title, points"),
         order: Optional[str] = Query(None, description="Sort order: asc or desc (default asc)"),
-        limit: int = Query(50, ge=1, le=100, description="Max items to return"),
+        limit: int = Query(50, ge=1, le=250, description="Max items to return"),
         offset: int = Query(0, ge=0, description="Items to skip"),
     ) -> WorkItemListResponse:
         org_id = _get_org_id(request)
@@ -625,7 +625,7 @@ def create_board_routes(
     async def get_children(
         request: Request,
         item_id: str,
-        limit: int = Query(50, ge=1, le=100),
+        limit: int = Query(50, ge=1, le=250),
         offset: int = Query(0, ge=0),
     ) -> WorkItemListResponse:
         org_id = _get_org_id(request)
