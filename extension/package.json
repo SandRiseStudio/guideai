@@ -514,7 +514,7 @@
 		"@vscode/vsce": "^2.22.0",
 		"eslint": "^8.39.0",
 		"glob": "^8.1.0",
-		"mocha": "^10.2.0",
+		"mocha": "^11.7.5",
 		"typescript": "^5.0.4"
 	},
 	"dependencies": {
