@@ -28,6 +28,8 @@ describe('avatar parity', () => {
     expect(extensionActor.avatarVariant).toEqual({
       palette: webActor.avatarVariant.palette,
       accessory: webActor.avatarVariant.accessory,
+      persona: webActor.avatarVariant.persona,
+      hairStyle: webActor.avatarVariant.hairStyle,
       eyeShape: webActor.avatarVariant.eyeShape,
       mouthShape: webActor.avatarVariant.mouthShape,
       shellShape: webActor.avatarVariant.shellShape,

@@ -26,6 +26,7 @@ from guideai.action_service import ActionService
 from guideai.adapters import (
     CLIAgentAuthServiceAdapter,
     CLIAgentOrchestratorAdapter,
+    CLIConversationServiceAdapter,
     CLITaskAssignmentAdapter,
     CLIActionServiceAdapter,
     CLIBehaviorServiceAdapter,
@@ -111,6 +112,8 @@ _DEVICE_FLOW_MANAGER: DeviceFlowManager | None = None
 _TOKEN_STORE: TokenStore | None = None
 _AGENT_ORCHESTRATOR_SERVICE: AgentOrchestratorService | None = None
 _AGENT_ORCHESTRATOR_ADAPTER: CLIAgentOrchestratorAdapter | None = None
+_CONVERSATION_SERVICE: Any = None
+_CONVERSATION_ADAPTER: CLIConversationServiceAdapter | None = None
 
 
 def _create_telemetry_client(default_actor: Dict[str, str]) -> TelemetryClient:
@@ -842,6 +845,18 @@ def _get_agent_orchestrator_adapter() -> CLIAgentOrchestratorAdapter:
     if _AGENT_ORCHESTRATOR_ADAPTER is None:
         _AGENT_ORCHESTRATOR_ADAPTER = CLIAgentOrchestratorAdapter(_AGENT_ORCHESTRATOR_SERVICE)
     return _AGENT_ORCHESTRATOR_ADAPTER
+
+
+def _get_conversation_adapter() -> CLIConversationServiceAdapter:
+    """Get or create CLIConversationServiceAdapter singleton."""
+
+    global _CONVERSATION_SERVICE, _CONVERSATION_ADAPTER
+    if _CONVERSATION_SERVICE is None:
+        from guideai.services.conversation_service import ConversationService
+        _CONVERSATION_SERVICE = ConversationService()
+    if _CONVERSATION_ADAPTER is None:
+        _CONVERSATION_ADAPTER = CLIConversationServiceAdapter(_CONVERSATION_SERVICE)
+    return _CONVERSATION_ADAPTER
 
 
 def _get_token_store(*, allow_plaintext: Optional[bool] = None) -> TokenStore:
@@ -4259,6 +4274,198 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     infra_sub.add_parser("reset", help="Destroy and recreate all infrastructure (destructive)")
     infra_sub.add_parser("configure", help="Interactively select infrastructure provider")
 
+    # ── conversation ───────────────────────────────────────────────────────
+    conversation_parser = subparsers.add_parser(
+        "conversation",
+        help="Manage conversations and messages",
+    )
+    conv_subparsers = conversation_parser.add_subparsers(dest="conversation_command")
+
+    # conversation list
+    conv_list_parser = conv_subparsers.add_parser(
+        "list", help="List conversations in a project",
+    )
+    conv_list_parser.add_argument("--project-id", required=True, help="Project ID")
+    conv_list_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID")
+    conv_list_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_list_parser.add_argument(
+        "--scope", choices=["project_room", "agent_dm"], default=None,
+        help="Filter by conversation scope",
+    )
+    conv_list_parser.add_argument(
+        "--include-archived", action="store_true", default=False,
+        help="Include archived conversations",
+    )
+    conv_list_parser.add_argument("--limit", type=int, default=50, help="Max results")
+    conv_list_parser.add_argument("--offset", type=int, default=0, help="Offset for pagination")
+    conv_list_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", help="Output format",
+    )
+
+    # conversation get
+    conv_get_parser = conv_subparsers.add_parser(
+        "get", help="Get conversation details",
+    )
+    conv_get_parser.add_argument("conversation_id", help="Conversation ID")
+    conv_get_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID")
+    conv_get_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_get_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", help="Output format",
+    )
+
+    # conversation create
+    conv_create_parser = conv_subparsers.add_parser(
+        "create", help="Create a new conversation",
+    )
+    conv_create_parser.add_argument("--project-id", required=True, help="Project ID")
+    conv_create_parser.add_argument(
+        "--scope", choices=["project_room", "agent_dm"], default="agent_dm",
+        help="Conversation scope",
+    )
+    conv_create_parser.add_argument("--title", default=None, help="Conversation title")
+    conv_create_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="Creator user ID")
+    conv_create_parser.add_argument(
+        "--participants", nargs="*", default=None,
+        help="Additional participant IDs",
+    )
+    conv_create_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_create_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", help="Output format",
+    )
+
+    # conversation archive
+    conv_archive_parser = conv_subparsers.add_parser(
+        "archive", help="Archive a conversation",
+    )
+    conv_archive_parser.add_argument("conversation_id", help="Conversation ID")
+    conv_archive_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID")
+    conv_archive_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_archive_parser.add_argument(
+        "--format", choices=["table", "json"], default="json", help="Output format",
+    )
+
+    # conversation send
+    conv_send_parser = conv_subparsers.add_parser(
+        "send", help="Send a message to a conversation",
+    )
+    conv_send_parser.add_argument("conversation_id", help="Conversation ID")
+    conv_send_parser.add_argument("content", help="Message content")
+    conv_send_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="Sender user ID")
+    conv_send_parser.add_argument(
+        "--type", dest="message_type", default="text",
+        choices=["text", "status_card", "blocker_card", "progress_card", "code_block", "run_summary", "system"],
+        help="Message type",
+    )
+    conv_send_parser.add_argument("--parent-id", default=None, help="Parent message ID (thread reply)")
+    conv_send_parser.add_argument("--run-id", default=None, help="Associated run ID")
+    conv_send_parser.add_argument("--behavior-id", default=None, help="Associated behavior ID")
+    conv_send_parser.add_argument("--work-item-id", default=None, help="Associated work item ID")
+    conv_send_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_send_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", help="Output format",
+    )
+
+    # conversation messages
+    conv_messages_parser = conv_subparsers.add_parser(
+        "messages", help="List messages in a conversation",
+    )
+    conv_messages_parser.add_argument("conversation_id", help="Conversation ID")
+    conv_messages_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID")
+    conv_messages_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_messages_parser.add_argument("--parent-id", default=None, help="Filter by parent (thread)")
+    conv_messages_parser.add_argument("--limit", type=int, default=50, help="Max results")
+    conv_messages_parser.add_argument("--offset", type=int, default=0, help="Offset for pagination")
+    conv_messages_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", help="Output format",
+    )
+
+    # conversation search
+    conv_search_parser = conv_subparsers.add_parser(
+        "search", help="Search messages in a conversation",
+    )
+    conv_search_parser.add_argument("conversation_id", help="Conversation ID")
+    conv_search_parser.add_argument("query", help="Search query text")
+    conv_search_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID")
+    conv_search_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_search_parser.add_argument("--limit", type=int, default=20, help="Max results")
+    conv_search_parser.add_argument("--offset", type=int, default=0, help="Offset for pagination")
+    conv_search_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", help="Output format",
+    )
+
+    # conversation react
+    conv_react_parser = conv_subparsers.add_parser(
+        "react", help="Add or remove a reaction on a message",
+    )
+    conv_react_parser.add_argument("message_id", help="Message ID")
+    conv_react_parser.add_argument("emoji", help="Emoji to react with (e.g. thumbsup, heart)")
+    conv_react_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID")
+    conv_react_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_react_parser.add_argument(
+        "--remove", action="store_true", default=False,
+        help="Remove the reaction instead of adding",
+    )
+    conv_react_parser.add_argument(
+        "--format", choices=["table", "json"], default="json", help="Output format",
+    )
+
+    # conversation edit
+    conv_edit_parser = conv_subparsers.add_parser(
+        "edit", help="Edit a message (within 5-minute window)",
+    )
+    conv_edit_parser.add_argument("message_id", help="Message ID to edit")
+    conv_edit_parser.add_argument("content", help="New message content")
+    conv_edit_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="Editor user ID")
+    conv_edit_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_edit_parser.add_argument(
+        "--format", choices=["table", "json"], default="table", help="Output format",
+    )
+
+    # conversation delete
+    conv_delete_parser = conv_subparsers.add_parser(
+        "delete", help="Delete a message",
+    )
+    conv_delete_parser.add_argument("message_id", help="Message ID to delete")
+    conv_delete_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="Deleter user ID")
+    conv_delete_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_delete_parser.add_argument(
+        "--format", choices=["table", "json"], default="json", help="Output format",
+    )
+
+    # conversation get-message
+    conv_getmsg_parser = conv_subparsers.add_parser(
+        "get-message", help="Get a single message by ID",
+    )
+    conv_getmsg_parser.add_argument("message_id", help="Message ID")
+    conv_getmsg_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID")
+    conv_getmsg_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_getmsg_parser.add_argument(
+        "--format", choices=["table", "json"], default="json", help="Output format",
+    )
+
+    # conversation pin
+    conv_pin_parser = conv_subparsers.add_parser(
+        "pin", help="Pin a message in a conversation",
+    )
+    conv_pin_parser.add_argument("conversation_id", help="Conversation ID")
+    conv_pin_parser.add_argument("message_id", help="Message ID to pin")
+    conv_pin_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID (owner/admin)")
+    conv_pin_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_pin_parser.add_argument(
+        "--format", choices=["table", "json"], default="json", help="Output format",
+    )
+
+    # conversation unpin
+    conv_unpin_parser = conv_subparsers.add_parser(
+        "unpin", help="Unpin the pinned message in a conversation",
+    )
+    conv_unpin_parser.add_argument("conversation_id", help="Conversation ID")
+    conv_unpin_parser.add_argument("--user-id", default=DEFAULT_ACTOR_ID, help="User ID (owner/admin)")
+    conv_unpin_parser.add_argument("--org-id", default=None, help="Organization ID")
+    conv_unpin_parser.add_argument(
+        "--format", choices=["table", "json"], default="json", help="Output format",
+    )
+
     # ── doctor ─────────────────────────────────────────────────────────────
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -4347,6 +4554,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.exit(1)
     if args.command == "flags" and not getattr(args, "flags_command", None):
         flags_parser.print_help()
+        parser.exit(1)
+    if args.command == "conversation" and not getattr(args, "conversation_command", None):
+        conversation_parser.print_help()
         parser.exit(1)
     # mcp-server has no required subcommand — bare invocation starts the server
     return args
@@ -10822,6 +11032,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.command == "doctor":
         return _command_doctor(args)
 
+    elif args.command == "conversation":
+        if args.conversation_command == "list":
+            return _command_conversation_list(args)
+        elif args.conversation_command == "get":
+            return _command_conversation_get(args)
+        elif args.conversation_command == "create":
+            return _command_conversation_create(args)
+        elif args.conversation_command == "archive":
+            return _command_conversation_archive(args)
+        elif args.conversation_command == "send":
+            return _command_conversation_send(args)
+        elif args.conversation_command == "messages":
+            return _command_conversation_messages(args)
+        elif args.conversation_command == "search":
+            return _command_conversation_search(args)
+        elif args.conversation_command == "react":
+            return _command_conversation_react(args)
+        elif args.conversation_command == "edit":
+            return _command_conversation_edit(args)
+        elif args.conversation_command == "delete":
+            return _command_conversation_delete(args)
+        elif args.conversation_command == "get-message":
+            return _command_conversation_get_message(args)
+        elif args.conversation_command == "pin":
+            return _command_conversation_pin(args)
+        elif args.conversation_command == "unpin":
+            return _command_conversation_unpin(args)
+
     # If no command matched or no subcommand provided
     print("Error: No command specified or command not recognized", file=sys.stderr)
     return 1
@@ -12107,7 +12345,7 @@ def _command_bootstrap_init(args: argparse.Namespace) -> int:
 
 _PROFILE_BLUEPRINTS: dict[str, str] = {
     "minimal": "postgres.timescale.test",
-    "standard": "local-test-suite",
+    "standard": "local-dev",
     "full": "production",
 }
 
@@ -12246,7 +12484,7 @@ def _infra_via_amprealize(action: str, args: argparse.Namespace) -> int:
     """Handle infra actions through the amprealize provider."""
     if action == "up":
         profile = getattr(args, "profile", "standard")
-        blueprint = _PROFILE_BLUEPRINTS.get(profile, "local-test-suite")
+        blueprint = _PROFILE_BLUEPRINTS.get(profile, "local-dev")
         print(f"🚀 Starting infrastructure via amprealize (profile: {profile})...")
         return _run_amprealize(["up", "--blueprint", blueprint])
 
@@ -12429,6 +12667,382 @@ def _command_infra(args: argparse.Namespace) -> int:
     else:
         print(f"Unknown provider: {provider}", file=sys.stderr)
         return 1
+
+
+# ==============================================================================
+# Conversation CLI Commands
+# ==============================================================================
+
+
+def _render_conversations_table(data: Dict[str, Any]) -> None:
+    """Render a table of conversations."""
+    convs = data.get("conversations", [])
+    if not convs:
+        print("No conversations found.")
+        return
+    total = data.get("total", len(convs))
+    print(f"\nConversations ({len(convs)} of {total}):\n")
+    header = f"{'ID':<38} {'Scope':<14} {'Title':<30} {'Participants':<13} {'Archived':<9} {'Updated'}"
+    print(header)
+    print("-" * len(header))
+    for c in convs:
+        title = (c.get("title") or "(untitled)")[:30]
+        updated = (c.get("updated_at") or "")[:19]
+        print(
+            f"{c['id']:<38} {c.get('scope', ''):<14} {title:<30} "
+            f"{c.get('participant_count', 0):<13} {str(c.get('is_archived', False)):<9} {updated}"
+        )
+
+
+def _render_conversation_detail(data: Dict[str, Any]) -> None:
+    """Render a single conversation's details."""
+    print(f"\nConversation: {data['id']}")
+    print(f"  Project:      {data.get('project_id', '')}")
+    print(f"  Scope:        {data.get('scope', '')}")
+    print(f"  Title:        {data.get('title') or '(untitled)'}")
+    print(f"  Created by:   {data.get('created_by', '')}")
+    print(f"  Participants: {data.get('participant_count', 0)}")
+    print(f"  Archived:     {data.get('is_archived', False)}")
+    print(f"  Created:      {(data.get('created_at') or '')[:19]}")
+    print(f"  Updated:      {(data.get('updated_at') or '')[:19]}")
+    if data.get("pinned_message_id"):
+        print(f"  Pinned msg:   {data['pinned_message_id']}")
+
+
+def _render_messages_table(data: Dict[str, Any]) -> None:
+    """Render a table of messages."""
+    msgs = data.get("messages", [])
+    if not msgs:
+        print("No messages found.")
+        return
+    total = data.get("total", len(msgs))
+    has_more = data.get("has_more", False)
+    print(f"\nMessages ({len(msgs)} of {total}, more={has_more}):\n")
+    header = f"{'ID':<38} {'Sender':<20} {'Type':<14} {'Replies':<8} {'Time':<20} {'Content'}"
+    print(header)
+    print("-" * min(len(header) + 40, 160))
+    for m in msgs:
+        content = (m.get("content") or "")[:50].replace("\n", " ")
+        created = (m.get("created_at") or "")[:19]
+        reactions_str = ""
+        if m.get("reactions"):
+            emojis = [r["emoji"] for r in m["reactions"]]
+            reactions_str = f" [{', '.join(emojis)}]"
+        print(
+            f"{m['id']:<38} {m.get('sender_id', '')[:20]:<20} "
+            f"{m.get('message_type', 'text'):<14} {m.get('reply_count', 0):<8} "
+            f"{created:<20} {content}{reactions_str}"
+        )
+
+
+def _render_message_detail(data: Dict[str, Any]) -> None:
+    """Render a single message detail."""
+    print(f"\nMessage: {data['id']}")
+    print(f"  Conversation: {data.get('conversation_id', '')}")
+    print(f"  Sender:       {data.get('sender_id', '')} ({data.get('sender_type', '')})")
+    print(f"  Type:         {data.get('message_type', 'text')}")
+    print(f"  Created:      {(data.get('created_at') or '')[:19]}")
+    if data.get("is_edited"):
+        print(f"  Edited:       {(data.get('edited_at') or '')[:19]}")
+    if data.get("parent_id"):
+        print(f"  Thread:       reply to {data['parent_id']}")
+    if data.get("run_id"):
+        print(f"  Run:          {data['run_id']}")
+    if data.get("behavior_id"):
+        print(f"  Behavior:     {data['behavior_id']}")
+    if data.get("work_item_id"):
+        print(f"  Work Item:    {data['work_item_id']}")
+    print(f"  Replies:      {data.get('reply_count', 0)}")
+    if data.get("reactions"):
+        emojis = [f"{r['emoji']} ({r['actor_id']})" for r in data["reactions"]]
+        print(f"  Reactions:    {', '.join(emojis)}")
+    print(f"\n  {data.get('content') or '(no content)'}")
+
+
+def _render_search_results_table(data: Dict[str, Any]) -> None:
+    """Render search results."""
+    results = data.get("results", [])
+    if not results:
+        print("No results found.")
+        return
+    total = data.get("total", len(results))
+    print(f"\nSearch Results ({len(results)} of {total}):\n")
+    header = f"{'Rank':<8} {'ID':<38} {'Sender':<20} {'Content'}"
+    print(header)
+    print("-" * min(len(header) + 40, 140))
+    for r in results:
+        msg = r.get("message", {})
+        rank = r.get("rank", 0.0)
+        content = (r.get("headline") or msg.get("content") or "")[:60].replace("\n", " ")
+        print(
+            f"{rank:<8.3f} {msg.get('id', ''):<38} "
+            f"{msg.get('sender_id', '')[:20]:<20} {content}"
+        )
+
+
+def _command_conversation_list(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.list_conversations(
+            project_id=args.project_id,
+            user_id=args.user_id,
+            org_id=args.org_id,
+            scope=args.scope,
+            include_archived=args.include_archived,
+            limit=args.limit,
+            offset=args.offset,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        _render_conversations_table(result)
+    return 0
+
+
+def _command_conversation_get(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.get_conversation(
+            args.conversation_id,
+            org_id=args.org_id,
+            user_id=args.user_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        _render_conversation_detail(result)
+    return 0
+
+
+def _command_conversation_create(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.create_conversation(
+            project_id=args.project_id,
+            scope=args.scope,
+            title=args.title,
+            created_by=args.user_id,
+            participant_ids=args.participants,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        _render_conversation_detail(result)
+    return 0
+
+
+def _command_conversation_archive(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.archive_conversation(
+            args.conversation_id,
+            user_id=args.user_id,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        print(f"Conversation {args.conversation_id} archived.")
+    return 0
+
+
+def _command_conversation_send(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.send_message(
+            args.conversation_id,
+            sender_id=args.user_id,
+            content=args.content,
+            message_type=args.message_type,
+            parent_id=args.parent_id,
+            run_id=args.run_id,
+            behavior_id=args.behavior_id,
+            work_item_id=args.work_item_id,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        _render_message_detail(result)
+    return 0
+
+
+def _command_conversation_messages(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.list_messages(
+            args.conversation_id,
+            user_id=args.user_id,
+            org_id=args.org_id,
+            parent_id=args.parent_id,
+            limit=args.limit,
+            offset=args.offset,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        _render_messages_table(result)
+    return 0
+
+
+def _command_conversation_search(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.search_messages(
+            args.conversation_id,
+            query=args.query,
+            user_id=args.user_id,
+            org_id=args.org_id,
+            limit=args.limit,
+            offset=args.offset,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        _render_search_results_table(result)
+    return 0
+
+
+def _command_conversation_react(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        if args.remove:
+            result = adapter.remove_reaction(
+                args.message_id,
+                actor_id=args.user_id,
+                emoji=args.emoji,
+                org_id=args.org_id,
+            )
+        else:
+            result = adapter.add_reaction(
+                args.message_id,
+                actor_id=args.user_id,
+                emoji=args.emoji,
+                org_id=args.org_id,
+            )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    _print_json(result)
+    return 0
+
+
+def _command_conversation_edit(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.edit_message(
+            args.message_id,
+            new_content=args.content,
+            editor_id=args.user_id,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        _render_message_detail(result)
+    return 0
+
+
+def _command_conversation_delete(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.delete_message(
+            args.message_id,
+            deleter_id=args.user_id,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        _print_json(result)
+    else:
+        print(f"Message {args.message_id} deleted.")
+    return 0
+
+
+def _command_conversation_get_message(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.get_message(
+            args.message_id,
+            user_id=args.user_id,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    _print_json(result)
+    return 0
+
+
+def _command_conversation_pin(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.pin_message(
+            args.conversation_id,
+            args.message_id,
+            user_id=args.user_id,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    _print_json(result)
+    return 0
+
+
+def _command_conversation_unpin(args: argparse.Namespace) -> int:
+    adapter = _get_conversation_adapter()
+    try:
+        result = adapter.unpin_message(
+            args.conversation_id,
+            user_id=args.user_id,
+            org_id=args.org_id,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    _print_json(result)
+    return 0
 
 
 # ==============================================================================

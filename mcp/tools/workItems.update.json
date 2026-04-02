@@ -91,7 +91,7 @@
       },
       "parent_id": {
         "type": "string",
-        "description": "New parent work item ID to reparent this item under a different goal/feature"
+        "description": "New parent work item ID or display ID (e.g. 'GUIDEAI-42') to reparent this item under a different goal/feature"
       },
       "cascade_to_children": {
         "type": "boolean",

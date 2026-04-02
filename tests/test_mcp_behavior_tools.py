@@ -31,14 +31,11 @@ from guideai.mcp_server import MCPServer
 @pytest.fixture
 def clean_behavior_db():
     """Clean behavior database before each test."""
-    dsn = os.getenv("GUIDEAI_BEHAVIOR_PG_DSN", "postgresql://guideai_behavior:behavior_test_pass@localhost:6433/guideai_behavior")
-    conn = psycopg2.connect(dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE behaviors, behavior_versions CASCADE;")
-        conn.commit()
-    finally:
-        conn.close()
+    dsn = os.getenv("GUIDEAI_BEHAVIOR_PG_DSN")
+    if not dsn:
+        pytest.skip("GUIDEAI_BEHAVIOR_PG_DSN not set")
+    from conftest import safe_truncate
+    safe_truncate(dsn, ["behaviors", "behavior_versions"])
 
 
 @pytest.fixture

@@ -36,7 +36,6 @@
           "position": { "type": "integer" },
           "labels": { "type": "array", "items": { "type": "string" } },
           "points": { "type": "integer" },
-          "story_points": { "type": "integer" },
           "estimated_hours": { "type": "number" },
           "actual_hours": { "type": "number" },
           "start_date": { "type": "string" },

@@ -253,52 +253,52 @@ fi
 
 # Database connection defaults - amprealize mode overrides these via environments.yaml
 export GUIDEAI_PG_HOST_BEHAVIOR="${GUIDEAI_PG_HOST_BEHAVIOR:-localhost}"
-export GUIDEAI_PG_PORT_BEHAVIOR="${GUIDEAI_PG_PORT_BEHAVIOR:-5433}"
-export GUIDEAI_PG_USER_BEHAVIOR="${GUIDEAI_PG_USER_BEHAVIOR:-behavior}"
-export GUIDEAI_PG_PASS_BEHAVIOR="${GUIDEAI_PG_PASS_BEHAVIOR:-behavior_dev}"
-export GUIDEAI_PG_DB_BEHAVIOR="${GUIDEAI_PG_DB_BEHAVIOR:-behavior}"
+export GUIDEAI_PG_PORT_BEHAVIOR="${GUIDEAI_PG_PORT_BEHAVIOR:-6433}"
+export GUIDEAI_PG_USER_BEHAVIOR="${GUIDEAI_PG_USER_BEHAVIOR:-behavior_test}"
+export GUIDEAI_PG_PASS_BEHAVIOR="${GUIDEAI_PG_PASS_BEHAVIOR:-behavior_test_pass}"
+export GUIDEAI_PG_DB_BEHAVIOR="${GUIDEAI_PG_DB_BEHAVIOR:-behavior_test}"
 
 export GUIDEAI_PG_HOST_WORKFLOW="${GUIDEAI_PG_HOST_WORKFLOW:-localhost}"
-export GUIDEAI_PG_PORT_WORKFLOW="${GUIDEAI_PG_PORT_WORKFLOW:-5434}"
-export GUIDEAI_PG_USER_WORKFLOW="${GUIDEAI_PG_USER_WORKFLOW:-workflow}"
-export GUIDEAI_PG_PASS_WORKFLOW="${GUIDEAI_PG_PASS_WORKFLOW:-workflow_dev}"
-export GUIDEAI_PG_DB_WORKFLOW="${GUIDEAI_PG_DB_WORKFLOW:-workflow}"
+export GUIDEAI_PG_PORT_WORKFLOW="${GUIDEAI_PG_PORT_WORKFLOW:-6434}"
+export GUIDEAI_PG_USER_WORKFLOW="${GUIDEAI_PG_USER_WORKFLOW:-workflow_test}"
+export GUIDEAI_PG_PASS_WORKFLOW="${GUIDEAI_PG_PASS_WORKFLOW:-workflow_test_pass}"
+export GUIDEAI_PG_DB_WORKFLOW="${GUIDEAI_PG_DB_WORKFLOW:-workflow_test}"
 
 export GUIDEAI_PG_HOST_ACTION="${GUIDEAI_PG_HOST_ACTION:-localhost}"
-export GUIDEAI_PG_PORT_ACTION="${GUIDEAI_PG_PORT_ACTION:-5435}"
-export GUIDEAI_PG_USER_ACTION="${GUIDEAI_PG_USER_ACTION:-action}"
-export GUIDEAI_PG_PASS_ACTION="${GUIDEAI_PG_PASS_ACTION:-action_dev}"
-export GUIDEAI_PG_DB_ACTION="${GUIDEAI_PG_DB_ACTION:-action}"
+export GUIDEAI_PG_PORT_ACTION="${GUIDEAI_PG_PORT_ACTION:-6435}"
+export GUIDEAI_PG_USER_ACTION="${GUIDEAI_PG_USER_ACTION:-action_test}"
+export GUIDEAI_PG_PASS_ACTION="${GUIDEAI_PG_PASS_ACTION:-action_test_pass}"
+export GUIDEAI_PG_DB_ACTION="${GUIDEAI_PG_DB_ACTION:-action_test}"
 
 export GUIDEAI_PG_HOST_RUN="${GUIDEAI_PG_HOST_RUN:-localhost}"
-export GUIDEAI_PG_PORT_RUN="${GUIDEAI_PG_PORT_RUN:-5436}"
-export GUIDEAI_PG_USER_RUN="${GUIDEAI_PG_USER_RUN:-run}"
-export GUIDEAI_PG_PASS_RUN="${GUIDEAI_PG_PASS_RUN:-run_dev}"
-export GUIDEAI_PG_DB_RUN="${GUIDEAI_PG_DB_RUN:-run}"
+export GUIDEAI_PG_PORT_RUN="${GUIDEAI_PG_PORT_RUN:-6436}"
+export GUIDEAI_PG_USER_RUN="${GUIDEAI_PG_USER_RUN:-run_test}"
+export GUIDEAI_PG_PASS_RUN="${GUIDEAI_PG_PASS_RUN:-run_test_pass}"
+export GUIDEAI_PG_DB_RUN="${GUIDEAI_PG_DB_RUN:-run_test}"
 
 export GUIDEAI_PG_HOST_COMPLIANCE="${GUIDEAI_PG_HOST_COMPLIANCE:-localhost}"
-export GUIDEAI_PG_PORT_COMPLIANCE="${GUIDEAI_PG_PORT_COMPLIANCE:-5437}"
-export GUIDEAI_PG_USER_COMPLIANCE="${GUIDEAI_PG_USER_COMPLIANCE:-compliance}"
-export GUIDEAI_PG_PASS_COMPLIANCE="${GUIDEAI_PG_PASS_COMPLIANCE:-compliance_dev}"
-export GUIDEAI_PG_DB_COMPLIANCE="${GUIDEAI_PG_DB_COMPLIANCE:-compliance}"
+export GUIDEAI_PG_PORT_COMPLIANCE="${GUIDEAI_PG_PORT_COMPLIANCE:-6437}"
+export GUIDEAI_PG_USER_COMPLIANCE="${GUIDEAI_PG_USER_COMPLIANCE:-compliance_test}"
+export GUIDEAI_PG_PASS_COMPLIANCE="${GUIDEAI_PG_PASS_COMPLIANCE:-compliance_test_pass}"
+export GUIDEAI_PG_DB_COMPLIANCE="${GUIDEAI_PG_DB_COMPLIANCE:-compliance_test}"
 
 export GUIDEAI_PG_HOST_TELEMETRY="${GUIDEAI_PG_HOST_TELEMETRY:-localhost}"
-export GUIDEAI_PG_PORT_TELEMETRY="${GUIDEAI_PG_PORT_TELEMETRY:-5432}"
-export GUIDEAI_PG_USER_TELEMETRY="${GUIDEAI_PG_USER_TELEMETRY:-telemetry}"
-export GUIDEAI_PG_PASS_TELEMETRY="${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}"
-export GUIDEAI_PG_DB_TELEMETRY="${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+export GUIDEAI_PG_PORT_TELEMETRY="${GUIDEAI_PG_PORT_TELEMETRY:-6432}"
+export GUIDEAI_PG_USER_TELEMETRY="${GUIDEAI_PG_USER_TELEMETRY:-telemetry_test}"
+export GUIDEAI_PG_PASS_TELEMETRY="${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_test_pass}"
+export GUIDEAI_PG_DB_TELEMETRY="${GUIDEAI_PG_DB_TELEMETRY:-telemetry_test}"
 
 export GUIDEAI_PG_HOST_METRICS="${GUIDEAI_PG_HOST_METRICS:-localhost}"
-export GUIDEAI_PG_PORT_METRICS="${GUIDEAI_PG_PORT_METRICS:-5439}"
-export GUIDEAI_PG_USER_METRICS="${GUIDEAI_PG_USER_METRICS:-guideai_metrics_user}"
-export GUIDEAI_PG_PASS_METRICS="${GUIDEAI_PG_PASS_METRICS:-local_metrics_dev_pw}"
-export GUIDEAI_PG_DB_METRICS="${GUIDEAI_PG_DB_METRICS:-guideai_metrics}"
+export GUIDEAI_PG_PORT_METRICS="${GUIDEAI_PG_PORT_METRICS:-6439}"
+export GUIDEAI_PG_USER_METRICS="${GUIDEAI_PG_USER_METRICS:-guideai_metrics_test}"
+export GUIDEAI_PG_PASS_METRICS="${GUIDEAI_PG_PASS_METRICS:-metrics_test_pass}"
+export GUIDEAI_PG_DB_METRICS="${GUIDEAI_PG_DB_METRICS:-guideai_metrics_test}"
 
 export GUIDEAI_PG_HOST_AUTH="${GUIDEAI_PG_HOST_AUTH:-localhost}"
-export GUIDEAI_PG_PORT_AUTH="${GUIDEAI_PG_PORT_AUTH:-5440}"
-export GUIDEAI_PG_USER_AUTH="${GUIDEAI_PG_USER_AUTH:-guideai_auth}"
-export GUIDEAI_PG_PASS_AUTH="${GUIDEAI_PG_PASS_AUTH:-dev_auth_pass}"
-export GUIDEAI_PG_DB_AUTH="${GUIDEAI_PG_DB_AUTH:-guideai_auth}"
+export GUIDEAI_PG_PORT_AUTH="${GUIDEAI_PG_PORT_AUTH:-6440}"
+export GUIDEAI_PG_USER_AUTH="${GUIDEAI_PG_USER_AUTH:-guideai_auth_test}"
+export GUIDEAI_PG_PASS_AUTH="${GUIDEAI_PG_PASS_AUTH:-auth_test_pass}"
+export GUIDEAI_PG_DB_AUTH="${GUIDEAI_PG_DB_AUTH:-guideai_auth_test}"
 
 # Blueprint port variables (used by local-test-suite.yaml)
 # These map to the same ports as GUIDEAI_PG_PORT_* but with the naming the blueprint expects
@@ -339,7 +339,33 @@ export GUIDEAI_AGENTAUTH_PG_DSN="${GUIDEAI_AGENTAUTH_PG_DSN:-$GUIDEAI_TELEMETRY_
 export DATABASE__POSTGRES_URL="${DATABASE__POSTGRES_URL:-$GUIDEAI_AGENTAUTH_PG_DSN}"
 export GUIDEAI_TASK_PG_DSN="${GUIDEAI_TASK_PG_DSN:-$GUIDEAI_TELEMETRY_PG_DSN}"
 
-# API Server config
+# ── Safety check: reject production/dev database names in test DSNs ──
+# This prevents test fixtures from accidentally truncating real data.
+# Blocks: unified prod names (guideai, telemetry) AND legacy dev names
+# (behavior, workflow, action, run, compliance). Test DBs should use
+# _test suffix (e.g. behavior_test, guideai_test).
+PRODUCTION_DB_NAMES="guideai|telemetry|behavior|workflow|action|run|compliance"
+DSN_SAFETY_FAILED=0
+for dsn_var in GUIDEAI_BEHAVIOR_PG_DSN GUIDEAI_WORKFLOW_PG_DSN GUIDEAI_ACTION_PG_DSN \
+               GUIDEAI_RUN_PG_DSN GUIDEAI_COMPLIANCE_PG_DSN GUIDEAI_TELEMETRY_PG_DSN \
+               GUIDEAI_METRICS_PG_DSN GUIDEAI_AUTH_PG_DSN GUIDEAI_TRACE_ANALYSIS_PG_DSN \
+               GUIDEAI_AGENTAUTH_PG_DSN GUIDEAI_TASK_PG_DSN; do
+    dsn_value="${!dsn_var}"
+    if [ -n "$dsn_value" ]; then
+        # Extract database name from DSN path (after last / before ? or end)
+        db_name=$(echo "$dsn_value" | sed -n 's|.*://[^/]*/\([^?]*\).*|\1|p')
+        if echo "$db_name" | grep -qxE "${PRODUCTION_DB_NAMES}"; then
+            print_error "SAFETY: ${dsn_var} targets production database '${db_name}'. Tests would destroy real data!"
+            print_error "  DSN: ${dsn_value%%:*}://***@${dsn_value#*@}"
+            print_error "  Fix: Set GUIDEAI_PG_DB to a test-specific name (e.g. guideai_test)"
+            DSN_SAFETY_FAILED=1
+        fi
+    fi
+done
+if [ "$DSN_SAFETY_FAILED" -eq 1 ] && [ "${GUIDEAI_TEST_SAFETY_OVERRIDE:-0}" != "1" ]; then
+    print_error "Aborting. Set GUIDEAI_TEST_SAFETY_OVERRIDE=1 to bypass (NOT recommended)."
+    exit 1
+fi
 API_SERVER_HOST="${GUIDEAI_API_SERVER_HOST:-localhost}"
 API_SERVER_PORT="${GUIDEAI_API_SERVER_PORT:-8000}"
 API_SERVER_LOG_DIR="${GUIDEAI_API_SERVER_LOG_DIR:-$REPO_ROOT/.tmp}"

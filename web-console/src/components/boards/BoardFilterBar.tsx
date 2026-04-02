@@ -13,6 +13,7 @@ import type { WorkItemPriority, WorkItemType } from '../../api/boards';
 import { ActorAvatar } from '../actors/ActorAvatar';
 import type { AssigneeProfile } from './WorkItemDrawer';
 import type { SortField, BoardFilterState } from './useBoardFilters';
+
 import './BoardFilterBar.css';
 
 // ---------------------------------------------------------------------------
@@ -99,10 +100,14 @@ interface BoardFilterBarProps {
   viewMode: ViewMode;
   onViewChange: (mode: ViewMode) => void;
   onSettings: () => void;
+  /* My Work filter */
+  isMyWorkActive?: boolean;
+  onToggleMyWork?: () => void;
   /* Refresh props */
   onRefresh?: () => void;
   isRefreshing?: boolean;
   lastSyncedAt?: Date | null;
+
 }
 
 // ---------------------------------------------------------------------------
@@ -124,30 +129,25 @@ export const BoardFilterBar = memo(function BoardFilterBar({
   viewMode,
   onViewChange,
   onSettings,
+  isMyWorkActive = false,
+  onToggleMyWork,
   onRefresh,
   isRefreshing = false,
   lastSyncedAt,
+
 }: BoardFilterBarProps) {
   const { filters, sort, hasActiveFilters, activeFilterCount, setFilter, setSort, toggleSort, clearFilters } = filterState;
   const searchRef = useRef<HTMLInputElement>(null);
-  const [assigneeOpen, setAssigneeOpen] = useState(false);
-  const [labelsOpen, setLabelsOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [sortOpen, setSortOpen] = useState(false);
-  const [dueOpen, setDueOpen] = useState(false);
-  const assigneeRef = useRef<HTMLDivElement>(null);
-  const labelsRef = useRef<HTMLDivElement>(null);
+  const filtersRef = useRef<HTMLDivElement>(null);
   const sortRef = useRef<HTMLDivElement>(null);
-  const dueRef = useRef<HTMLDivElement>(null);
-  const assigneeTriggerRef = useRef<HTMLButtonElement>(null);
-  const labelsTriggerRef = useRef<HTMLButtonElement>(null);
+  const filtersTriggerRef = useRef<HTMLButtonElement>(null);
   const sortTriggerRef = useRef<HTMLButtonElement>(null);
-  const dueTriggerRef = useRef<HTMLButtonElement>(null);
 
   const closeAllPopovers = useCallback((focusTarget?: HTMLElement | null) => {
-    setAssigneeOpen(false);
-    setLabelsOpen(false);
+    setFiltersOpen(false);
     setSortOpen(false);
-    setDueOpen(false);
     if (focusTarget) {
       window.requestAnimationFrame(() => focusTarget.focus());
     }
@@ -156,25 +156,19 @@ export const BoardFilterBar = memo(function BoardFilterBar({
   // Close popover on outside click
   useEffect(() => {
     function handleClick(e: MouseEvent) {
-      if (assigneeOpen && assigneeRef.current && !assigneeRef.current.contains(e.target as Node)) {
-        setAssigneeOpen(false);
-      }
-      if (labelsOpen && labelsRef.current && !labelsRef.current.contains(e.target as Node)) {
-        setLabelsOpen(false);
+      if (filtersOpen && filtersRef.current && !filtersRef.current.contains(e.target as Node)) {
+        setFiltersOpen(false);
       }
       if (sortOpen && sortRef.current && !sortRef.current.contains(e.target as Node)) {
         setSortOpen(false);
       }
-      if (dueOpen && dueRef.current && !dueRef.current.contains(e.target as Node)) {
-        setDueOpen(false);
-      }
     }
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [assigneeOpen, labelsOpen, sortOpen, dueOpen]);
+  }, [filtersOpen, sortOpen]);
 
   useEffect(() => {
-    if (!assigneeOpen && !labelsOpen && !sortOpen && !dueOpen) return;
+    if (!filtersOpen && !sortOpen) return;
 
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
@@ -184,31 +178,18 @@ export const BoardFilterBar = memo(function BoardFilterBar({
         closeAllPopovers(sortTriggerRef.current);
         return;
       }
-      if (dueOpen) {
-        closeAllPopovers(dueTriggerRef.current);
-        return;
-      }
-      if (labelsOpen) {
-        closeAllPopovers(labelsTriggerRef.current);
-        return;
-      }
-      if (assigneeOpen) {
-        closeAllPopovers(assigneeTriggerRef.current);
+      if (filtersOpen) {
+        closeAllPopovers(filtersTriggerRef.current);
       }
     };
 
     document.addEventListener('keydown', handleEscape);
     return () => document.removeEventListener('keydown', handleEscape);
-  }, [assigneeOpen, closeAllPopovers, dueOpen, labelsOpen, sortOpen]);
+  }, [closeAllPopovers, filtersOpen, sortOpen]);
 
-  // Cmd/Ctrl+K or / to focus search
+  // / to focus search (⌘K reserved for shell command palette)
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault();
-        searchRef.current?.focus();
-        return;
-      }
       if (e.key === '/' && !isInputFocused()) {
         e.preventDefault();
         searchRef.current?.focus();
@@ -243,10 +224,9 @@ export const BoardFilterBar = memo(function BoardFilterBar({
     setFilter('priorities', next);
   }, [filters.priorities, setFilter]);
 
-  // Assignee toggle
+  // Assignee toggle (no auto-close in combined popover)
   const toggleAssignee = useCallback((id: string) => {
     setFilter('assigneeId', filters.assigneeId === id ? null : id);
-    setAssigneeOpen(false);
   }, [filters.assigneeId, setFilter]);
 
   // Label toggle
@@ -268,44 +248,34 @@ export const BoardFilterBar = memo(function BoardFilterBar({
     setSortOpen(false);
   }, [setSort, sort.field, toggleSort]);
 
-  // Due date preset
+  // Due date preset (no auto-close in combined popover)
   const handleDuePreset = useCallback((preset: typeof DUE_PRESETS[number]) => {
     const range = preset.getRange();
     setFilter('dueAfter', range.after);
     setFilter('dueBefore', range.before);
-    setDueOpen(false);
   }, [setFilter]);
 
   const clearDueDates = useCallback(() => {
     setFilter('dueAfter', null);
     setFilter('dueBefore', null);
-    setDueOpen(false);
   }, [setFilter]);
 
-  // Assignee display label
-  const assigneeLabel = useMemo(() => {
-    if (!filters.assigneeId) return 'Assignee';
-    if (filters.assigneeId === '__unassigned__') return 'Unassigned';
-    const all = [...assignableHumans, ...assignableAgents];
-    const match = all.find((p) => p.id === filters.assigneeId);
-    return match?.label ?? 'Assignee';
-  }, [filters.assigneeId, assignableHumans, assignableAgents]);
-
-  // Active due label
-  const dueLabel = useMemo(() => {
-    if (filters.dueAfter && filters.dueBefore) return `${filters.dueAfter} → ${filters.dueBefore}`;
-    if (filters.dueAfter) return `After ${filters.dueAfter}`;
-    if (filters.dueBefore) return `Before ${filters.dueBefore}`;
-    return 'Due Date';
-  }, [filters.dueAfter, filters.dueBefore]);
-
   const hasDueFilter = Boolean(filters.dueAfter || filters.dueBefore);
+
+  // Combined filters count for the unified Filters chip
+  const combinedFiltersCount = useMemo(() => {
+    let count = 0;
+    if (filters.assigneeId) count += 1;
+    if (filters.labels.length > 0) count += filters.labels.length;
+    if (hasDueFilter) count += 1;
+    return count;
+  }, [filters.assigneeId, filters.labels.length, hasDueFilter]);
 
   const currentSortLabel = SORT_OPTIONS.find((o) => o.value === sort.field)?.label ?? 'Position';
 
   return (
     <div className={`board-filter-bar animate-fade-in-up ${collapsed ? 'board-filter-bar-collapsed' : ''}`} role="toolbar" aria-label="Board toolbar">
-      {/* ── Row 1: chrome — navigation + title + density + settings ────── */}
+      {/* ── Single command bar row ─────────────────────────────────────── */}
       <div className="board-toolbar-chrome">
         <div className="board-toolbar-left">
           <button
@@ -320,6 +290,54 @@ export const BoardFilterBar = memo(function BoardFilterBar({
         </div>
 
         <div className="board-toolbar-right">
+          {/* Compact search */}
+          <label className="board-filter-search-wrapper">
+            <span className="board-filter-search-icon" aria-hidden="true">⌕</span>
+            <input
+              ref={searchRef}
+              className="board-filter-search"
+              value={filters.query}
+              onChange={(e) => setFilter('query', e.target.value)}
+              onKeyDown={handleSearchKeyDown}
+              placeholder="Search…"
+              autoComplete="off"
+              spellCheck={false}
+              aria-label="Search work items"
+            />
+            {!filters.query && (
+              <span className="board-filter-search-shortcut" aria-hidden="true">/</span>
+            )}
+            {filters.query && (
+              <button
+                type="button"
+                className="board-filter-search-clear pressable"
+                onClick={() => setFilter('query', '')}
+                aria-label="Clear search"
+              >
+                ×
+              </button>
+            )}
+          </label>
+
+          {/* My Work quick-toggle */}
+          {onToggleMyWork && (
+            <button
+              type="button"
+              className={`board-mywork-chip pressable ${isMyWorkActive ? 'active' : ''}`}
+              onClick={onToggleMyWork}
+              data-haptic="light"
+              aria-pressed={isMyWorkActive}
+              title={isMyWorkActive ? 'Show all items' : 'Show only my items'}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="5" r="3" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+              <span className="board-mywork-label">My Work</span>
+            </button>
+          )}
+
+          {/* View toggle */}
           <div
             className="board-view-segmented"
             role="group"
@@ -349,6 +367,24 @@ export const BoardFilterBar = memo(function BoardFilterBar({
               <span className="board-view-option-label">Outline</span>
             </button>
           </div>
+
+          {/* Filter expand trigger */}
+          <button
+            type="button"
+            className={`board-filter-expand-trigger pressable ${hasActiveFilters ? 'active' : ''}`}
+            onClick={onToggleExpand}
+            data-haptic="light"
+            aria-label={`Toggle filters${activeFilterCount > 0 ? ` (${activeFilterCount} active)` : ''}`}
+            aria-expanded={!collapsed}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M2 4h12M4 8h8M6 12h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            {activeFilterCount > 0 && (
+              <span className="board-filter-expand-badge">{activeFilterCount}</span>
+            )}
+          </button>
+
           {onRefresh && (
             <button
               type="button"
@@ -381,58 +417,12 @@ export const BoardFilterBar = memo(function BoardFilterBar({
         </div>
       </div>
 
-      {/* ── Row 2: filters — search + pills + dropdowns + sort ─────────── */}
-      <div className="board-toolbar-filters">
-      {/* Search */}
-      <label className="board-filter-search-wrapper">
-        <span className="board-filter-search-icon" aria-hidden="true">⌕</span>
-        <input
-          ref={searchRef}
-          className="board-filter-search"
-          value={filters.query}
-          onChange={(e) => setFilter('query', e.target.value)}
-          onKeyDown={handleSearchKeyDown}
-          placeholder="Search…"
-          autoComplete="off"
-          spellCheck={false}
-          aria-label="Search work items"
-        />
-        {!filters.query && (
-          <span className="board-filter-search-shortcut" aria-hidden="true">⌘K</span>
-        )}
-        {filters.query && (
-          <button
-            type="button"
-            className="board-filter-search-clear pressable"
-            onClick={() => setFilter('query', '')}
-            aria-label="Clear search"
-          >
-            ×
-          </button>
-        )}
-      </label>
+      {/* ── Expandable filter panel ────────────────────────────────────── */}
+      <div className={`board-toolbar-filters ${collapsed ? 'board-toolbar-filters-hidden' : ''}`}>
+      <div className="board-filter-advanced">
 
-      {/* Collapsed: show toggle + active count */}
-      {collapsed && (
-        <button
-          type="button"
-          className={`board-filter-expand-trigger pressable ${hasActiveFilters ? 'active' : ''}`}
-          onClick={onToggleExpand}
-          data-haptic="light"
-          aria-label={`Show all filters${activeFilterCount > 0 ? ` (${activeFilterCount} active)` : ''}`}
-        >
-          Filters
-          {activeFilterCount > 0 && (
-            <span className="board-filter-expand-badge">{activeFilterCount}</span>
-          )}
-          <span className="board-filter-dropdown-arrow" aria-hidden="true">▾</span>
-        </button>
-      )}
-
-      {/* Advanced filters — hidden when collapsed */}
-      <div className={`board-filter-advanced ${collapsed ? 'board-filter-advanced-hidden' : ''}`}>
       {/* Type pills */}
-      <div className="board-filter-group" role="group" aria-label="Filter by type">
+      <div className="board-filter-group board-filter-group-emphasis board-filter-group-type" role="group" aria-label="Filter by type">
         <span className="board-filter-label">Type</span>
         <div className="board-filter-pills">
           {TYPE_OPTIONS.map((opt) => (
@@ -452,7 +442,7 @@ export const BoardFilterBar = memo(function BoardFilterBar({
       </div>
 
       {/* Priority pills */}
-      <div className="board-filter-group" role="group" aria-label="Filter by priority">
+      <div className="board-filter-group board-filter-group-emphasis board-filter-group-priority" role="group" aria-label="Filter by priority">
         <span className="board-filter-label">Priority</span>
         <div className="board-filter-pills">
           {PRIORITY_OPTIONS.map((opt) => (
@@ -471,189 +461,178 @@ export const BoardFilterBar = memo(function BoardFilterBar({
         </div>
       </div>
 
-      {/* Assignee dropdown */}
-      <div className="board-filter-dropdown-wrapper" ref={assigneeRef}>
+      {/* Combined Filters dropdown (Assignee + Labels + Due Date) */}
+      <div className="board-filter-dropdown-wrapper board-filter-group-emphasis board-filter-group-filters" ref={filtersRef}>
         <button
-          ref={assigneeTriggerRef}
+          ref={filtersTriggerRef}
           type="button"
-          className={`board-filter-dropdown-trigger pressable ${filters.assigneeId ? 'active' : ''}`}
-          onClick={() => setAssigneeOpen((p) => !p)}
+          className={`board-filter-dropdown-trigger pressable ${combinedFiltersCount > 0 ? 'active' : ''}`}
+          onClick={() => setFiltersOpen((p) => !p)}
           data-haptic="light"
-          aria-expanded={assigneeOpen}
-          aria-haspopup="listbox"
+          aria-expanded={filtersOpen}
+          aria-haspopup="dialog"
         >
-          {assigneeLabel}
-          <span className="board-filter-dropdown-arrow" aria-hidden="true">{assigneeOpen ? '▴' : '▾'}</span>
+          {combinedFiltersCount > 0 ? `Filters (${combinedFiltersCount})` : 'Filters'}
+          <span className="board-filter-dropdown-arrow" aria-hidden="true">{filtersOpen ? '▴' : '▾'}</span>
         </button>
-        {assigneeOpen && (
-          <div className="board-filter-popover" role="listbox" aria-label="Assignee options">
-            <button
-              type="button"
-              className={`board-filter-popover-option pressable ${filters.assigneeId === '__unassigned__' ? 'selected' : ''}`}
-              onClick={() => toggleAssignee('__unassigned__')}
-            >
-              <span className="board-filter-popover-avatar">—</span>
-              <span>Unassigned</span>
-            </button>
-            {assignableHumans.length > 0 && (
-              <div className="board-filter-popover-section-label">People</div>
-            )}
-            {assignableHumans.map((person) => (
-              <button
-                key={person.id}
-                type="button"
-                className={`board-filter-popover-option pressable ${filters.assigneeId === person.id ? 'selected' : ''}`}
-                onClick={() => toggleAssignee(person.id)}
-              >
-                <span className="board-filter-popover-avatar">
-                  {person.actor ? (
-                    <ActorAvatar actor={person.actor} size="sm" surfaceType="chip" decorative />
-                  ) : (
-                    person.avatar
-                  )}
-                </span>
-                <span className="board-filter-popover-name">
-                  {person.label}
-                  {person.subtitle ? <span className="board-filter-popover-subtitle">{person.subtitle}</span> : null}
-                </span>
-              </button>
-            ))}
-            {assignableAgents.length > 0 && (
-              <div className="board-filter-popover-section-label">Agents</div>
-            )}
-            {assignableAgents.map((agent) => (
-              <button
-                key={agent.id}
-                type="button"
-                className={`board-filter-popover-option pressable ${filters.assigneeId === agent.id ? 'selected' : ''}`}
-                onClick={() => toggleAssignee(agent.id)}
-              >
-                <span className="board-filter-popover-avatar">
-                  {agent.actor ? (
-                    <ActorAvatar actor={agent.actor} size="sm" surfaceType="chip" decorative />
-                  ) : (
-                    agent.avatar
-                  )}
-                </span>
-                <span className="board-filter-popover-name">
-                  {agent.label}
-                  {agent.subtitle ? <span className="board-filter-popover-subtitle">{agent.subtitle}</span> : null}
-                </span>
-              </button>
-            ))}
-            {filters.assigneeId && (
+        {filtersOpen && (
+          <div className="board-filter-popover board-filter-combined-popover" role="dialog" aria-label="Filter options">
+            {/* Assignee section */}
+            <div className="board-filter-section">
+              <div className="board-filter-section-header">Assignee</div>
               <button
                 type="button"
-                className="board-filter-popover-clear pressable"
-                onClick={() => { setFilter('assigneeId', null); setAssigneeOpen(false); }}
+                className={`board-filter-popover-option pressable ${filters.assigneeId === '__unassigned__' ? 'selected' : ''}`}
+                onClick={() => toggleAssignee('__unassigned__')}
               >
-                Clear assignee filter
+                <span className="board-filter-popover-avatar">—</span>
+                <span>Unassigned</span>
               </button>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Labels dropdown */}
-      {allLabels.length > 0 && (
-        <div className="board-filter-dropdown-wrapper" ref={labelsRef}>
-          <button
-            ref={labelsTriggerRef}
-            type="button"
-            className={`board-filter-dropdown-trigger pressable ${filters.labels.length > 0 ? 'active' : ''}`}
-            onClick={() => setLabelsOpen((p) => !p)}
-            data-haptic="light"
-            aria-expanded={labelsOpen}
-            aria-haspopup="listbox"
-          >
-            {filters.labels.length > 0 ? `Labels (${filters.labels.length})` : 'Labels'}
-            <span className="board-filter-dropdown-arrow" aria-hidden="true">{labelsOpen ? '▴' : '▾'}</span>
-          </button>
-          {labelsOpen && (
-            <div className="board-filter-popover" role="listbox" aria-label="Label options">
-              {allLabels.map((label) => (
+              {assignableHumans.length > 0 && (
+                <div className="board-filter-popover-section-label">People</div>
+              )}
+              {assignableHumans.map((person) => (
                 <button
-                  key={label}
+                  key={person.id}
                   type="button"
-                  className={`board-filter-popover-option pressable ${filters.labels.includes(label) ? 'selected' : ''}`}
-                  onClick={() => toggleLabel(label)}
+                  className={`board-filter-popover-option pressable ${filters.assigneeId === person.id ? 'selected' : ''}`}
+                  onClick={() => toggleAssignee(person.id)}
                 >
-                  <span className="board-filter-check" aria-hidden="true">
-                    {filters.labels.includes(label) ? '✓' : ''}
+                  <span className="board-filter-popover-avatar">
+                    {person.actor ? (
+                      <ActorAvatar actor={person.actor} size="sm" surfaceType="chip" decorative />
+                    ) : (
+                      person.avatar
+                    )}
                   </span>
-                  <span>{label}</span>
+                  <span className="board-filter-popover-name">
+                    {person.label}
+                    {person.subtitle ? <span className="board-filter-popover-subtitle">{person.subtitle}</span> : null}
+                  </span>
                 </button>
               ))}
-              {filters.labels.length > 0 && (
+              {assignableAgents.length > 0 && (
+                <div className="board-filter-popover-section-label">Agents</div>
+              )}
+              {assignableAgents.map((agent) => (
+                <button
+                  key={agent.id}
+                  type="button"
+                  className={`board-filter-popover-option pressable ${filters.assigneeId === agent.id ? 'selected' : ''}`}
+                  onClick={() => toggleAssignee(agent.id)}
+                >
+                  <span className="board-filter-popover-avatar">
+                    {agent.actor ? (
+                      <ActorAvatar actor={agent.actor} size="sm" surfaceType="chip" decorative />
+                    ) : (
+                      agent.avatar
+                    )}
+                  </span>
+                  <span className="board-filter-popover-name">
+                    {agent.label}
+                    {agent.subtitle ? <span className="board-filter-popover-subtitle">{agent.subtitle}</span> : null}
+                  </span>
+                </button>
+              ))}
+              {filters.assigneeId && (
                 <button
                   type="button"
-                  className="board-filter-popover-clear pressable"
-                  onClick={() => { setFilter('labels', []); setLabelsOpen(false); }}
+                  className="board-filter-section-clear pressable"
+                  onClick={() => setFilter('assigneeId', null)}
                 >
-                  Clear label filters
+                  Clear assignee
                 </button>
               )}
             </div>
-          )}
-        </div>
-      )}
 
-      {/* Due date dropdown */}
-      <div className="board-filter-dropdown-wrapper" ref={dueRef}>
-        <button
-          ref={dueTriggerRef}
-          type="button"
-          className={`board-filter-dropdown-trigger pressable ${hasDueFilter ? 'active' : ''}`}
-          onClick={() => setDueOpen((p) => !p)}
-          data-haptic="light"
-          aria-expanded={dueOpen}
-          aria-haspopup="dialog"
-        >
-          {dueLabel}
-          <span className="board-filter-dropdown-arrow" aria-hidden="true">{dueOpen ? '▴' : '▾'}</span>
-        </button>
-        {dueOpen && (
-          <div className="board-filter-popover board-filter-due-popover" role="dialog" aria-label="Due date filter">
-            <div className="board-filter-due-presets">
-              {DUE_PRESETS.map((preset) => (
+            {/* Due Date section */}
+            <div className="board-filter-section">
+              <div className="board-filter-section-header">Due Date</div>
+              <div className="board-filter-due-presets">
+                {DUE_PRESETS.map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    className="board-filter-due-preset pressable"
+                    onClick={() => handleDuePreset(preset)}
+                    data-haptic="light"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <div className="board-filter-due-inputs">
+                <label className="board-filter-due-field">
+                  <span className="board-filter-label">After</span>
+                  <input
+                    type="date"
+                    className="board-filter-date-input"
+                    value={filters.dueAfter ?? ''}
+                    onChange={(e) => setFilter('dueAfter', e.target.value || null)}
+                  />
+                </label>
+                <label className="board-filter-due-field">
+                  <span className="board-filter-label">Before</span>
+                  <input
+                    type="date"
+                    className="board-filter-date-input"
+                    value={filters.dueBefore ?? ''}
+                    onChange={(e) => setFilter('dueBefore', e.target.value || null)}
+                  />
+                </label>
+              </div>
+              {hasDueFilter && (
                 <button
-                  key={preset.label}
                   type="button"
-                  className="board-filter-due-preset pressable"
-                  onClick={() => handleDuePreset(preset)}
-                  data-haptic="light"
+                  className="board-filter-section-clear pressable"
+                  onClick={clearDueDates}
                 >
-                  {preset.label}
+                  Clear dates
                 </button>
-              ))}
+              )}
             </div>
-            <div className="board-filter-due-inputs">
-              <label className="board-filter-due-field">
-                <span className="board-filter-label">After</span>
-                <input
-                  type="date"
-                  className="board-filter-date-input"
-                  value={filters.dueAfter ?? ''}
-                  onChange={(e) => setFilter('dueAfter', e.target.value || null)}
-                />
-              </label>
-              <label className="board-filter-due-field">
-                <span className="board-filter-label">Before</span>
-                <input
-                  type="date"
-                  className="board-filter-date-input"
-                  value={filters.dueBefore ?? ''}
-                  onChange={(e) => setFilter('dueBefore', e.target.value || null)}
-                />
-              </label>
-            </div>
-            {hasDueFilter && (
+
+            {/* Labels section */}
+            {allLabels.length > 0 && (
+              <div className="board-filter-section">
+                <div className="board-filter-section-header">Labels</div>
+                {allLabels.map((label) => (
+                  <button
+                    key={label}
+                    type="button"
+                    className={`board-filter-popover-option pressable ${filters.labels.includes(label) ? 'selected' : ''}`}
+                    onClick={() => toggleLabel(label)}
+                  >
+                    <span className="board-filter-check" aria-hidden="true">
+                      {filters.labels.includes(label) ? '✓' : ''}
+                    </span>
+                    <span>{label}</span>
+                  </button>
+                ))}
+                {filters.labels.length > 0 && (
+                  <button
+                    type="button"
+                    className="board-filter-section-clear pressable"
+                    onClick={() => setFilter('labels', [])}
+                  >
+                    Clear labels
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Clear all filters in popover */}
+            {combinedFiltersCount > 0 && (
               <button
                 type="button"
                 className="board-filter-popover-clear pressable"
-                onClick={clearDueDates}
+                onClick={() => {
+                  setFilter('assigneeId', null);
+                  setFilter('labels', []);
+                  clearDueDates();
+                }}
               >
-                Clear date filter
+                Clear all filters
               </button>
             )}
           </div>
@@ -661,7 +640,7 @@ export const BoardFilterBar = memo(function BoardFilterBar({
       </div>
 
       {/* Sort control */}
-      <div className="board-filter-sort-wrapper" ref={sortRef}>
+      <div className="board-filter-sort-wrapper board-filter-group-emphasis board-filter-group-sort" ref={sortRef}>
         <button
           ref={sortTriggerRef}
           type="button"
@@ -729,6 +708,7 @@ export const BoardFilterBar = memo(function BoardFilterBar({
         </div>
       )}
       </div>{/* end board-filter-advanced */}
+
       </div>{/* end board-toolbar-filters */}
     </div>
   );

@@ -82,6 +82,23 @@ GuideAI works across multiple surfaces: **Web Console**, **CLI**, **VS Code Exte
 
 ---
 
+## Gateway (Nginx :8080)
+
+All client traffic (Web Console, CLI, VS Code, MCP) enters through **nginx on port 8080**, which acts as the single edge gateway:
+
+| Concern | Implementation |
+|---------|---------------|
+| **TLS termination** | `NGINX_SSL_CERT` / `NGINX_SSL_KEY` env vars (optional; plain HTTP in dev) |
+| **Header stripping** | `X-Tenant-Id` and `X-User-Id` are stripped at all proxy locations to prevent spoofing |
+| **Rate limiting** | 100 req/s for API, 10 req/s for WebSocket |
+| **Auth middleware** | `AuthMiddleware` → `TenantMiddleware` stack on the FastAPI app; toggle with `GUIDEAI_AUTH_ENABLED` |
+| **CORS** | Driven by `GUIDEAI_CORS_ORIGINS` env var |
+| **Web Console proxy** | Static files served directly by nginx |
+
+See [docs/GATEWAY_ARCHITECTURE.md](docs/GATEWAY_ARCHITECTURE.md) for the full gateway design.
+
+---
+
 ## Project Structure
 
 ```

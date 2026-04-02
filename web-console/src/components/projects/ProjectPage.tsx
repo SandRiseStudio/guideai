@@ -9,13 +9,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { ConsoleSidebar } from '../ConsoleSidebar';
-import { WorkspaceShell } from '../workspace/WorkspaceShell';
+import { useShellTitle } from '../workspace/useShell';
 import { useProject } from '../../api/dashboard';
 import { useBoards, useCreateBoard } from '../../api/boards';
 import { useProjectAgents } from '../../api/agentRegistry';
 import { useAgentPresence } from '../../hooks/useAgentPresence';
 import { ProjectAgentPresenceSummary } from './ProjectAgentPresenceSummary';
+import { ProjectSettingsContent } from './ProjectSettingsPage';
 import './ProjectPage.css';
 
 function getRelativeTime(dateString?: string): string {
@@ -96,6 +96,13 @@ export function ProjectPage(): React.JSX.Element {
   }, [boards]);
 
   const primaryBoardId = useMemo(() => sortedBoards[0]?.board_id, [sortedBoards]);
+
+  const activeTab = searchParams.get('tab') === 'settings' ? 'settings' : 'overview';
+  const setTab = useCallback((tab: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (tab === 'overview') { next.delete('tab'); } else { next.set('tab', tab); }
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   const openCreate = useCallback(() => {
     previousFocusRef.current = document.activeElement as HTMLElement | null;
@@ -207,24 +214,17 @@ export function ProjectPage(): React.JSX.Element {
     return project?.name ? project.name : 'Project';
   }, [project?.name, projectLoading]);
 
+  useShellTitle(title);
+
   if (!projectId) {
     return (
-      <WorkspaceShell
-        sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-        documentTitle="Project"
-      >
         <div className="project-page">
           <div className="project-error animate-fade-in-up">Missing project ID.</div>
         </div>
-      </WorkspaceShell>
     );
   }
 
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-      documentTitle={title}
-    >
       <div className="project-page" onKeyDown={handleKeyDown}>
         <header className="project-header">
           <div className="project-header-left">
@@ -245,7 +245,7 @@ export function ProjectPage(): React.JSX.Element {
           </div>
 
           <div className="project-header-right">
-            {primaryBoardId && (
+            {activeTab === 'overview' && primaryBoardId && (
               <button
                 type="button"
                 className="project-primary pressable"
@@ -255,36 +255,51 @@ export function ProjectPage(): React.JSX.Element {
                 Open board
               </button>
             )}
-            <button
-              type="button"
-              className="project-new-board pressable"
-              onClick={openCreate}
-              data-haptic="light"
-            >
-              Create Board
-            </button>
-            <button
-              type="button"
-              className="project-settings pressable"
-              onClick={() => navigate(`/projects/${projectId}/settings`)}
-              data-haptic="light"
-              aria-label="Open project settings"
-              title="Open project settings"
-            >
-              ⚙️
-            </button>
+            {activeTab === 'overview' && (
+              <button
+                type="button"
+                className="project-new-board pressable"
+                onClick={openCreate}
+                data-haptic="light"
+              >
+                Create Board
+              </button>
+            )}
           </div>
         </header>
 
-        <ProjectAgentPresenceSummary presences={agentPresences} summary={agentSummary} />
+        <nav className="project-tabs" role="tablist" aria-label="Project sections">
+          <button
+            type="button"
+            role="tab"
+            className={`project-tab${activeTab === 'overview' ? ' active' : ''}`}
+            aria-selected={activeTab === 'overview'}
+            onClick={() => setTab('overview')}
+          >
+            Overview
+          </button>
+          <button
+            type="button"
+            role="tab"
+            className={`project-tab${activeTab === 'settings' ? ' active' : ''}`}
+            aria-selected={activeTab === 'settings'}
+            onClick={() => setTab('settings')}
+          >
+            Settings
+          </button>
+        </nav>
 
-        <section className="project-boards" aria-label="Boards">
-          <div className="project-boards-header">
-            <h2 className="project-boards-title">Boards</h2>
-            <p className="project-boards-hint">
-              Tip: drag cards between columns, or use the Move menu for keyboard-friendly control.
-            </p>
-          </div>
+        {activeTab === 'overview' && (
+          <>
+            <ProjectAgentPresenceSummary presences={agentPresences} summary={agentSummary} />
+
+            <section className="project-boards" aria-label="Boards">
+              <div className="project-boards-header">
+                <h2 className="project-boards-title">Boards</h2>
+                <p className="project-boards-hint">
+                  Tip: drag cards between columns, or use the Move menu for keyboard-friendly control.
+                </p>
+              </div>
 
           <div className="boards-grid" role="list">
             {boardsLoading ? (
@@ -411,7 +426,12 @@ export function ProjectPage(): React.JSX.Element {
             </div>
           </div>
         )}
+          </>
+        )}
+
+        {activeTab === 'settings' && projectId && (
+          <ProjectSettingsContent projectId={projectId} />
+        )}
       </div>
-    </WorkspaceShell>
   );
 }

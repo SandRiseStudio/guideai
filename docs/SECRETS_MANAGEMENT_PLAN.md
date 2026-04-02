@@ -29,6 +29,7 @@
 - Secrets never written to telemetry payloads or audit logs (fields marked as redacted, hashed).
 - Configuration updates require dual-approval workflow (Strategist + Compliance) logged via ActionService.
 - Rotation runbook stored in `docs/runbooks/secret_rotation.md` with step-by-step instructions.
+- **Gateway header stripping**: Nginx strips client-supplied `X-Tenant-Id` and `X-User-Id` at all proxy locations to prevent identity spoofing. Only `AuthMiddleware` and `TenantMiddleware` may set these headers after token validation. See `docs/GATEWAY_ARCHITECTURE.md`.
 
 ## Source Control Guardrails
 - Pre-commit hook (`.pre-commit-config.yaml`) runs Gitleaks with redaction and whitespace fixers; developers must run `pre-commit install` before committing.

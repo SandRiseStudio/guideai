@@ -5,7 +5,7 @@ This provider integrates with GitHub's OAuth 2.0 device authorization flow,
 allowing users to authenticate via https://github.com/login/device.
 
 Configuration (environment variables or .env.github-oauth):
-    OAUTH_GITHUB_CLIENT_ID: OAuth app client ID (e.g., Ov23lix7WmdKsvRWXvsS)
+    OAUTH_GITHUB_CLIENT_ID: OAuth app client ID (from .env.github-oauth)
     OAUTH_GITHUB_CLIENT_SECRET: OAuth app client secret
     OAUTH_GITHUB_ENABLED: Set to 'true' to enable this provider (default: false)
 

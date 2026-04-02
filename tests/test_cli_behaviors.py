@@ -31,13 +31,10 @@ def reset_cli_state(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     cli._reset_action_state_for_testing()
 
     # Clean PostgreSQL tables if using PostgreSQL backend
-    if psycopg2 and test_behavior_dsn and test_behavior_dsn.startswith("postgresql://"):
+    if test_behavior_dsn and test_behavior_dsn.startswith("postgresql://"):
         try:
-            conn = psycopg2.connect(test_behavior_dsn)
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute("TRUNCATE behavior_versions, behaviors RESTART IDENTITY CASCADE;")
-            conn.close()
+            from conftest import safe_truncate
+            safe_truncate(test_behavior_dsn, ["behavior_versions", "behaviors"])
         except Exception:
             # If truncation fails, tests may see stale data but will continue
             pass

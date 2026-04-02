@@ -41,19 +41,12 @@ def mock_behavior_service():
 @pytest.fixture(autouse=True)
 def clean_workflow_db(postgres_dsn_workflow):
     """Clean workflow tables between tests to prevent state bleed."""
-    from guideai.storage.postgres_pool import PostgresPool
+    from conftest import safe_truncate
     from guideai.storage.redis_cache import get_cache
 
-    pool = PostgresPool(dsn=postgres_dsn_workflow)
+    safe_truncate(postgres_dsn_workflow, ["workflow_runs", "workflow_template_versions", "workflow_templates"])
+
     cache = get_cache()
-
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE workflow_runs CASCADE")
-            cur.execute("TRUNCATE TABLE workflow_template_versions CASCADE")
-            cur.execute("TRUNCATE TABLE workflow_templates CASCADE")
-        conn.commit()
-
     cache.invalidate_service("workflow")
     yield
     cache.invalidate_service("workflow")

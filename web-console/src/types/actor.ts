@@ -22,7 +22,9 @@ export interface AvatarPalette {
 export interface ActorAvatarVariant {
   paletteId: string;
   palette: AvatarPalette;
-  accessory: 'none' | 'visor' | 'headband' | 'badge' | 'antenna';
+  accessory: 'none' | 'visor' | 'headband' | 'badge' | 'antenna' | 'glasses' | 'cap' | 'earring';
+  persona: 'human' | 'robot' | 'cat' | 'dog' | 'fox' | 'owl';
+  hairStyle: 'none' | 'buzz' | 'part' | 'waves' | 'curl' | 'coily' | 'bun' | 'spikes';
   eyeShape: 'dot' | 'bar' | 'wide';
   mouthShape: 'flat' | 'smile' | 'focus';
   shellShape: 'round' | 'squircle';

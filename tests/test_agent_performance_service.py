@@ -44,21 +44,11 @@ from guideai.agent_performance_contracts import (
 
 def _truncate_tables(dsn: str) -> None:
     """Remove all data from agent performance tables."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("""
-                TRUNCATE TABLE agent_performance_alerts,
-                              agent_performance_daily,
-                              agent_performance_thresholds,
-                              agent_performance_snapshots
-                RESTART IDENTITY CASCADE;
-            """)
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, [
+        "agent_performance_alerts", "agent_performance_daily",
+        "agent_performance_thresholds", "agent_performance_snapshots",
+    ])
 
 
 @pytest.fixture

@@ -25,7 +25,7 @@
       },
       "parent_id": {
         "type": "string",
-        "description": "Filter by parent work item ID (returns direct children of this item)"
+        "description": "Filter by parent work item ID or display ID (e.g. 'GUIDEAI-42'). Returns direct children of this item"
       },
       "org_id": {
         "type": "string",

@@ -12,8 +12,8 @@
       },
       "assignable_type": {
         "type": "string",
-        "enum": ["feature", "task", "story"],
-        "description": "Type of the assignable item. Use feature/task. Legacy value 'story' is accepted."
+        "enum": ["feature", "task"],
+        "description": "Type of the assignable item (feature or task)"
       },
       "required_behaviors": {
         "type": "array",
@@ -131,8 +131,8 @@
       },
       "assignable_type": {
         "type": "string",
-        "enum": ["feature", "task", "story"],
-        "description": "The requested assignable type. 'story' is a legacy alias for 'feature'."
+        "enum": ["feature", "task"],
+        "description": "The requested assignable type"
       },
       "required_behaviors": {
         "type": "array",

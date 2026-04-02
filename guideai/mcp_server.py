@@ -299,6 +299,18 @@ class MCPServiceRegistry:
         # Research service
         self._research_service: Optional[Any] = None
 
+        # Conversation/messaging service
+        self._conversation_service: Optional[Any] = None
+
+        # Conversation reply service (context-aware replies via ContextComposer)
+        self._conversation_reply_service: Optional[Any] = None
+
+        # LLM client singleton
+        self._llm_client: Optional[Any] = None
+
+        # ContextComposer singleton
+        self._context_composer: Optional[Any] = None
+
         # Shared connection pools for PostgreSQL services
         # Note: Services create their own PostgresPool instances, but PostgresPool
         # internally caches engines by DSN, so multiple services with the same DSN
@@ -956,6 +968,92 @@ class MCPServiceRegistry:
                 self._logger.info("Initialized ResearchService for MCP (SQLite backend)")
             self._research_service = service
         return self._research_service
+
+    def conversation_service(self) -> Any:
+        """Get or create ConversationService singleton for MCP.
+
+        Provides conversation and messaging operations (GUIDEAI-573).
+        """
+        if self._conversation_service is None:
+            from .services.conversation_service import ConversationService
+            from .utils.dsn import apply_host_overrides  # lazy
+
+            dsn = apply_host_overrides(
+                os.environ.get("GUIDEAI_MESSAGING_PG_DSN") or os.environ.get("GUIDEAI_PG_DSN"),
+                "MESSAGING"
+            )
+            if dsn:
+                service = ConversationService(dsn=dsn)
+                self._logger.info("Initialized ConversationService for MCP (PostgreSQL backend)")
+            else:
+                service = ConversationService(
+                    dsn="postgresql://guideai:guideai_dev@localhost:5432/guideai"
+                )
+                self._logger.warning("Using default ConversationService DSN (GUIDEAI_MESSAGING_PG_DSN not set)")
+            self._conversation_service = service
+        return self._conversation_service
+
+    def llm_client(self) -> Any:
+        """Get or create LLMClient singleton for MCP.
+
+        Unified LLM client for all provider interactions.
+        Supports sync and async modes with cost/token tracking.
+        """
+        if self._llm_client is None:
+            from .llm.client import LLMClient
+
+            # Create credential resolver from credential store if available
+            credential_resolver = None
+            if self._credential_store is not None:
+                def _resolver(provider: str, project_id: str = None, org_id: str = None) -> Optional[str]:
+                    store = self._credential_store
+                    # Try provider-specific key first
+                    key = store.get(f"{provider.upper()}_API_KEY")
+                    if key:
+                        return key
+                    # Fall back to generic API key
+                    return store.get("OPENAI_API_KEY") or store.get("ANTHROPIC_API_KEY")
+                credential_resolver = _resolver
+
+            client = LLMClient(credential_resolver=credential_resolver)
+            self._logger.info("Initialized LLMClient for MCP")
+            self._llm_client = client
+        return self._llm_client
+
+    def context_composer(self) -> Any:
+        """Get or create ContextComposer singleton for MCP.
+
+        Assembles context from six data sources (conversation history, user profile,
+        behavior guidance, work items, runs, external references) with token budget.
+        """
+        if self._context_composer is None:
+            from .context_composer import ContextComposer
+
+            composer = ContextComposer(
+                telemetry=self.telemetry_client(),
+            )
+            self._logger.info("Initialized ContextComposer for MCP")
+            self._context_composer = composer
+        return self._context_composer
+
+    def conversation_reply_service(self) -> Any:
+        """Get or create ConversationReplyService singleton for MCP.
+
+        Orchestrates context-aware agent replies in conversations using ContextComposer.
+        Implements GUIDEAI-581 integration of ContextComposer with conversation replies.
+        """
+        if self._conversation_reply_service is None:
+            from .services.conversation_reply_service import ConversationReplyService
+
+            service = ConversationReplyService(
+                context_composer=self.context_composer(),
+                conversation_service=self.conversation_service(),
+                llm_client=self.llm_client(),
+                telemetry=self.telemetry_client(),
+            )
+            self._logger.info("Initialized ConversationReplyService for MCP")
+            self._conversation_reply_service = service
+        return self._conversation_reply_service
 
     def work_item_execution_service(self) -> Any:
         """Get or create WorkItemExecutionService singleton for MCP.
@@ -4363,6 +4461,57 @@ class MCPServer:
                     f"Research tool execution failed: {str(e)}",
                 )
 
+        # Handle conversations.* and messages.* tools (messaging system)
+        if internal_tool_name.startswith("conversations.") or internal_tool_name.startswith("messages."):
+            try:
+                from .mcp.handlers.conversation_handlers import (
+                    ASYNC_MESSAGE_HANDLERS,
+                    CONVERSATION_HANDLERS,
+                    MESSAGE_HANDLERS,
+                )
+
+                all_sync_handlers = {**CONVERSATION_HANDLERS, **MESSAGE_HANDLERS}
+                conversation_service = self._services.conversation_service()
+                enriched_params = self._inject_session_context(tool_params)
+
+                # Check for async handlers first (e.g., messages.generateReply)
+                if internal_tool_name in ASYNC_MESSAGE_HANDLERS:
+                    handler = ASYNC_MESSAGE_HANDLERS[internal_tool_name]
+                    reply_service = self._services.conversation_reply_service()
+                    result = await handler(
+                        conversation_service,
+                        enriched_params,
+                        reply_service=reply_service,
+                    )
+                elif internal_tool_name in all_sync_handlers:
+                    handler = all_sync_handlers[internal_tool_name]
+                    result = await asyncio.to_thread(handler, conversation_service, enriched_params)
+                else:
+                    return self._error_response(
+                        request_id,
+                        self.METHOD_NOT_FOUND,
+                        f"Unknown conversation/messaging tool: {internal_tool_name}",
+                    )
+
+                mcp_result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(result, indent=2, default=str),
+                        }
+                    ]
+                }
+
+                return self._success_response(request_id, mcp_result)
+
+            except Exception as e:
+                self._logger.error(f"Conversation tool execution failed: {e}", exc_info=True)
+                return self._error_response(
+                    request_id,
+                    self.INTERNAL_ERROR,
+                    f"Conversation tool execution failed: {str(e)}",
+                )
+
         # Unknown tool prefix
         self._logger.warning(f"[{trace_id}] UNKNOWN_TOOL: No handler for {internal_tool_name}")
         return self._error_response(
@@ -5469,15 +5618,43 @@ class MCPServer:
         params = params or {}
         workspace_id = params.get("workspace_id")
 
+        # Resolve human-friendly names for org/project (both optional)
+        org_name = None
+        project_name = None
+        try:
+            svc = self._services.organization_service()
+            if svc:
+                if self._session_context.org_id:
+                    try:
+                        org = svc.get(self._session_context.org_id)
+                        org_name = org.name if org else None
+                    except Exception as e:
+                        self._logger.debug(f"Could not resolve org name: {e}")
+                if self._session_context.project_id:
+                    try:
+                        proj = svc.get_project(self._session_context.project_id)
+                        project_name = proj.name if proj else None
+                    except Exception as e:
+                        self._logger.debug(f"Could not resolve project name: {e}")
+        except Exception:
+            pass  # Service unavailable — names stay None
+
         result = {
             "user_id": self._session_context.user_id,
             "service_principal_id": self._session_context.service_principal_id,
+            "email": self._session_context.email,
             "org_id": self._session_context.org_id,
+            "org_name": org_name,
             "project_id": self._session_context.project_id,
+            "project_name": project_name,
             "auth_method": self._session_context.auth_method,
             "roles": list(self._session_context.roles) if self._session_context.roles else [],
             "scopes": list(self._session_context.granted_scopes) if self._session_context.granted_scopes else [],
             "is_authenticated": self._session_context.is_authenticated,
+            "is_admin": self._session_context.is_admin,
+            "accessible_org_ids": list(self._session_context.accessible_org_ids) if self._session_context.accessible_org_ids else [],
+            "accessible_project_ids": list(self._session_context.accessible_project_ids) if self._session_context.accessible_project_ids else [],
+            "authenticated_at": self._session_context.authenticated_at.isoformat() if self._session_context.authenticated_at else None,
             "workspace_id": workspace_id,
             "active_pack": None,
         }

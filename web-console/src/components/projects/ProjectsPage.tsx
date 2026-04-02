@@ -8,8 +8,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { WorkspaceShell } from '../workspace/WorkspaceShell';
-import { ConsoleSidebar } from '../ConsoleSidebar';
+import { useShellTitle } from '../workspace/useShell';
 import { useProjects, type Project } from '../../api/dashboard';
 import { CREATE_PROJECT_CTA, NEW_PROJECT_CTA, SCOPE_LABEL } from '../../copy/scopeLabels';
 import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
@@ -112,11 +111,9 @@ export function ProjectsPage(): React.JSX.Element {
   const showProjectsLoading = projectsLoading || (projectsFetching && scopedProjects.length === 0);
   const showProjectsError = projectsError && scopedProjects.length === 0;
 
+  useShellTitle('Projects');
+
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-      documentTitle="Projects"
-    >
       <div className="projects-page">
         <header className="projects-header">
           <div className="projects-header-left">
@@ -234,6 +231,5 @@ export function ProjectsPage(): React.JSX.Element {
           )}
         </section>
       </div>
-    </WorkspaceShell>
   );
 }

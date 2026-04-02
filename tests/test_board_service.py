@@ -4,7 +4,7 @@ Unit and integration tests for BoardService (Agile board system).
 Tests verify:
 - Board CRUD operations
 - Column management
-- Epic, Story, and Task lifecycle
+- Goal, Feature, and Task lifecycle (unified WorkItem API)
 - Sprint management
 - Work item status transitions
 - Assignment tracking (user and agent)
@@ -23,6 +23,7 @@ import json
 import pytest
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Generator, Any, Dict
 
 # Mark all tests in this module as requiring postgres service
@@ -37,8 +38,6 @@ from guideai.services.board_service import (
     Actor,
     BoardServiceError,
     BoardNotFoundError,
-    EpicNotFoundError,
-    StoryNotFoundError,
     TaskNotFoundError,
     WorkItemTransitionError,
 )
@@ -47,20 +46,16 @@ from guideai.multi_tenant.board_contracts import (
     UpdateBoardRequest,
     CreateColumnRequest,
     UpdateColumnRequest,
-    CreateEpicRequest,
-    UpdateEpicRequest,
-    CreateStoryRequest,
-    UpdateStoryRequest,
-    CreateTaskRequest,
-    UpdateTaskRequest,
+    CreateWorkItemRequest,
+    UpdateWorkItemRequest,
+    AssignWorkItemRequest,
     CreateSprintRequest,
     UpdateSprintRequest,
     BoardSettings,
     BoardVisibility,
     WorkItemStatus,
-    EpicStatus,
     WorkItemPriority,
-    TaskType,
+    AssigneeType,
     WorkItemType,
 )
 
@@ -71,54 +66,20 @@ from guideai.multi_tenant.board_contracts import (
 
 def _truncate_board_tables(dsn: str) -> None:
     """Truncate all board-related tables for test isolation."""
-    try:
-        import psycopg2  # type: ignore[import-not-found]
-        HAS_PSYCOPG2 = True
-    except ImportError:
-        HAS_PSYCOPG2 = False
+    from conftest import safe_truncate
 
-    if not HAS_PSYCOPG2:
-        pytest.skip("psycopg2 required for table truncation")
+    # Current board schema tables
+    safe_truncate(dsn, [
+        "sprint_stories", "sprints", "assignment_history",
+        "work_item_comments", "work_items", "columns",
+        "labels", "boards", "project_counters",
+    ], schema="board")
 
-    candidate_tables = [
-        # Current board schema tables
-        "board.sprint_stories",
-        "board.sprints",
-        "board.assignment_history",
-        "board.work_item_comments",
-        "board.work_items",
-        "board.columns",
-        "board.labels",
-        "board.boards",
-        "board.project_counters",
-        # Legacy table names (for compatibility with older test DB snapshots)
-        "sprint_stories",
-        "sprints",
-        "assignment_history",
-        "board_tasks",
-        "stories",
-        "epics",
-        "board_columns",
-        "boards",
-    ]
-
-    with psycopg2.connect(dsn) as conn:
-        with conn.cursor() as cur:
-            # Truncate only tables that exist in this environment.
-            existing_tables: list[str] = []
-            for table_name in candidate_tables:
-                cur.execute("SELECT to_regclass(%s)", (table_name,))
-                result = cur.fetchone()
-                relation_name = result[0] if result else None
-                if relation_name:
-                    existing_tables.append(relation_name)
-
-            if existing_tables:
-                # Truncate in order to respect foreign key constraints.
-                cur.execute(
-                    "TRUNCATE " + ", ".join(existing_tables) + " RESTART IDENTITY CASCADE"
-                )
-        conn.commit()
+    # Legacy table names (for compatibility with older test DB snapshots)
+    safe_truncate(dsn, [
+        "sprint_stories", "sprints", "assignment_history",
+        "board_tasks", "stories", "epics", "board_columns", "boards",
+    ])
 
 
 def _ensure_board_test_references(dsn: str) -> None:
@@ -158,11 +119,11 @@ def _ensure_board_test_references(dsn: str) -> None:
 
             cur.execute(
                 """
-                INSERT INTO auth.projects (project_id, org_id, name, created_by)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO auth.projects (project_id, org_id, name, created_by, owner_id)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (project_id) DO NOTHING
                 """,
-                (project_id, org_id, "Test Project", user_id),
+                (project_id, org_id, "Test Project", user_id, user_id),
             )
 
             # Ensure sprint_story bridge table exists for legacy sprint tests.
@@ -256,7 +217,7 @@ class TestBoardCRUD:
     def test_create_board_with_default_columns(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
-        """Create board with default columns (Backlog, To Do, In Progress, In Review, Done)."""
+        """Create board with default columns using MINIMAL template (Backlog, In Progress, Done)."""
         request = CreateBoardRequest(
             project_id=test_project_id,
             name="Kanban Board",
@@ -272,17 +233,16 @@ class TestBoardCRUD:
             board.board_id, include_columns=True, org_id=test_org_id
         )
         assert hasattr(board_with_cols, 'columns')
-        assert len(board_with_cols.columns) == 4
+        assert len(board_with_cols.columns) == 3
 
-        # Verify column names and order
+        # Verify column names and order (MINIMAL template)
         column_names = [col.name for col in board_with_cols.columns]
-        assert column_names == ["Backlog", "In Progress", "In Review", "Done"]
+        assert column_names == ["Backlog", "In Progress", "Done"]
 
         # Verify status mappings
         expected_statuses = [
             WorkItemStatus.BACKLOG,
             WorkItemStatus.IN_PROGRESS,
-            WorkItemStatus.IN_REVIEW,
             WorkItemStatus.DONE,
         ]
         for i, col in enumerate(board_with_cols.columns):
@@ -452,87 +412,93 @@ class TestColumnManagement:
 
 
 # =============================================================================
-# Epic Tests
+# Goal Tests (formerly Epic)
 # =============================================================================
 
-class TestEpicLifecycle:
-    """Test epic create, read, update operations."""
+class TestGoalLifecycle:
+    """Test goal create, read, update operations."""
 
-    def test_create_epic(
+    def test_create_goal(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
-        """Create an epic."""
+        """Create a goal."""
         board = service.create_board(
-            CreateBoardRequest(project_id=test_project_id, name="Epic Board"),
+            CreateBoardRequest(project_id=test_project_id, name="Goal Board"),
             actor,
             org_id=test_org_id,
         )
 
-        epic_req = CreateEpicRequest(
+        goal_req = CreateWorkItemRequest(
+            item_type=WorkItemType.GOAL,
             project_id=test_project_id,
             board_id=board.board_id,
-            name="User Authentication",
+            title="User Authentication",
             description="Implement OAuth2 authentication flow",
             priority=WorkItemPriority.HIGH,
         )
-        epic = service.create_epic(epic_req, actor, org_id=test_org_id)
+        goal = service.create_work_item(goal_req, actor, org_id=test_org_id)
 
-        uuid.UUID(epic.epic_id)
-        assert epic.name == "User Authentication"
-        assert epic.status == EpicStatus.DRAFT
-        assert epic.priority == WorkItemPriority.HIGH
+        uuid.UUID(goal.item_id)
+        assert goal.title == "User Authentication"
+        assert goal.status == WorkItemStatus.BACKLOG
+        assert goal.priority == WorkItemPriority.HIGH
 
-    def test_epic_status_transitions(
+    def test_goal_status_transitions(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
-        """Test epic status transitions: draft -> active -> completed."""
+        """Test goal status transitions: backlog -> in_progress -> done."""
         board = service.create_board(
             CreateBoardRequest(project_id=test_project_id, name="Status Test Board"),
             actor,
             org_id=test_org_id,
         )
 
-        epic = service.create_epic(
-            CreateEpicRequest(project_id=test_project_id, board_id=board.board_id, name="Status Test Epic"),
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                project_id=test_project_id,
+                board_id=board.board_id,
+                title="Status Test Goal",
+            ),
             actor,
             org_id=test_org_id,
         )
-        assert epic.status == EpicStatus.DRAFT
+        assert goal.status == WorkItemStatus.BACKLOG
 
-        # Transition to active
-        updated = service.update_epic(
-            epic.epic_id,
-            UpdateEpicRequest(status=EpicStatus.ACTIVE),
+        # Transition to in_progress
+        updated = service.update_work_item(
+            goal.item_id,
+            UpdateWorkItemRequest(status=WorkItemStatus.IN_PROGRESS),
             actor,
             org_id=test_org_id,
         )
-        assert updated.status == EpicStatus.ACTIVE
+        assert updated.status == WorkItemStatus.IN_PROGRESS
 
-        # Transition to completed
-        completed = service.update_epic(
-            epic.epic_id,
-            UpdateEpicRequest(status=EpicStatus.COMPLETED),
+        # Transition to done
+        completed = service.update_work_item(
+            goal.item_id,
+            UpdateWorkItemRequest(status=WorkItemStatus.DONE),
             actor,
             org_id=test_org_id,
         )
-        assert completed.status == EpicStatus.COMPLETED
+        assert completed.status == WorkItemStatus.DONE
 
 
 # =============================================================================
-# Story Tests
+# Feature Tests (formerly Story)
 # =============================================================================
 
-class TestStoryLifecycle:
-    """Test story create, read, update operations."""
+class TestFeatureLifecycle:
+    """Test feature create, read, update operations."""
 
-    def test_create_story_under_epic(
+    def test_create_feature_under_goal(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
-        """Create a story under an epic."""
+        """Create a feature under a goal."""
         board = service.create_board(
             CreateBoardRequest(
                 project_id=test_project_id,
-                name="Story Board",
+                name="Feature Board",
                 create_default_columns=True,
             ),
             actor,
@@ -543,37 +509,43 @@ class TestStoryLifecycle:
         )
         backlog_col = next(c for c in board_with_cols.columns if c.name == "Backlog")
 
-        epic = service.create_epic(
-            CreateEpicRequest(board_id=board.board_id, title="Parent Epic"),
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Parent Goal",
+            ),
             actor,
             org_id=test_org_id,
         )
 
-        story_req = CreateStoryRequest(
-            epic_id=epic.epic_id,
+        feature_req = CreateWorkItemRequest(
+            item_type=WorkItemType.FEATURE,
+            board_id=board.board_id,
+            parent_id=goal.item_id,
             column_id=backlog_col.column_id,
             title="Login Page",
             description="Create login page with email/password",
-            story_points=5,
+            points=5,
             priority=WorkItemPriority.MEDIUM,
         )
-        story = service.create_story(story_req, actor, org_id=test_org_id)
+        feature = service.create_work_item(feature_req, actor, org_id=test_org_id)
 
-        uuid.UUID(story.story_id)
-        assert story.epic_id == epic.epic_id
-        assert story.title == "Login Page"
-        if story.story_points is not None:
-            assert story.story_points == 5
-        assert story.status == WorkItemStatus.BACKLOG
+        uuid.UUID(feature.item_id)
+        assert feature.parent_id == goal.item_id
+        assert feature.title == "Login Page"
+        if feature.points is not None:
+            assert feature.points == 5
+        assert feature.status == WorkItemStatus.BACKLOG
 
-    def test_move_story_between_columns(
+    def test_move_feature_between_columns(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
-        """Move a story from one column to another."""
+        """Move a feature from one column to another."""
         board = service.create_board(
             CreateBoardRequest(
                 project_id=test_project_id,
-                name="Move Story Board",
+                name="Move Feature Board",
                 create_default_columns=True,
             ),
             actor,
@@ -585,28 +557,37 @@ class TestStoryLifecycle:
         backlog_col = next(c for c in board_with_cols.columns if c.name == "Backlog")
         in_progress_col = next(c for c in board_with_cols.columns if c.name == "In Progress")
 
-        epic = service.create_epic(
-            CreateEpicRequest(board_id=board.board_id, title="Move Epic"),
-            actor,
-            org_id=test_org_id,
-        )
-
-        story = service.create_story(
-            CreateStoryRequest(
-                epic_id=epic.epic_id,
-                column_id=backlog_col.column_id,
-                title="Movable Story",
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Move Goal",
             ),
             actor,
             org_id=test_org_id,
         )
-        assert story.column_id == backlog_col.column_id
-        assert story.status == WorkItemStatus.BACKLOG
 
-        # Move to In Progress
-        moved = service.update_story(
-            story.story_id,
-            UpdateStoryRequest(column_id=in_progress_col.column_id),
+        feature = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.FEATURE,
+                board_id=board.board_id,
+                parent_id=goal.item_id,
+                column_id=backlog_col.column_id,
+                title="Movable Feature",
+            ),
+            actor,
+            org_id=test_org_id,
+        )
+        assert feature.column_id == backlog_col.column_id
+        assert feature.status == WorkItemStatus.BACKLOG
+
+        # Move to In Progress (explicitly set status since column→status sync is not yet implemented)
+        moved = service.update_work_item(
+            feature.item_id,
+            UpdateWorkItemRequest(
+                column_id=in_progress_col.column_id,
+                status=WorkItemStatus.IN_PROGRESS,
+            ),
             actor,
             org_id=test_org_id,
         )
@@ -621,10 +602,10 @@ class TestStoryLifecycle:
 class TestTaskLifecycle:
     """Test task create, read, update operations."""
 
-    def test_create_task_under_story(
+    def test_create_task_under_feature(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
-        """Create a task under a story."""
+        """Create a task under a feature."""
         board = service.create_board(
             CreateBoardRequest(
                 project_id=test_project_id,
@@ -639,34 +620,42 @@ class TestTaskLifecycle:
         )
         backlog_col = next(c for c in board_with_cols.columns if c.name == "Backlog")
 
-        epic = service.create_epic(
-            CreateEpicRequest(board_id=board.board_id, title="Task Epic"),
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Task Goal",
+            ),
             actor,
             org_id=test_org_id,
         )
-        story = service.create_story(
-            CreateStoryRequest(
-                epic_id=epic.epic_id,
+        feature = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.FEATURE,
+                board_id=board.board_id,
+                parent_id=goal.item_id,
                 column_id=backlog_col.column_id,
-                title="Task Story",
+                title="Task Feature",
             ),
             actor,
             org_id=test_org_id,
         )
 
-        task_req = CreateTaskRequest(
-            story_id=story.story_id,
+        task_req = CreateWorkItemRequest(
+            item_type=WorkItemType.TASK,
+            board_id=board.board_id,
+            parent_id=feature.item_id,
             title="Write unit tests",
             description="Add pytest tests for login endpoint",
-            task_type=TaskType.CODING,
-            estimated_hours=2.0,
+            estimated_hours=Decimal("2.0"),
+            metadata={"task_type": "coding"},
         )
-        task = service.create_task(task_req, actor, org_id=test_org_id)
+        task = service.create_work_item(task_req, actor, org_id=test_org_id)
 
-        uuid.UUID(task.task_id)
-        assert task.story_id == story.story_id
+        uuid.UUID(task.item_id)
+        assert task.parent_id == feature.item_id
         assert task.title == "Write unit tests"
-        assert task.task_type == TaskType.CODING
+        assert task.metadata.get("task_type") == "coding"
         if task.estimated_hours is not None:
             assert float(task.estimated_hours) == 2.0
         assert task.status == WorkItemStatus.BACKLOG
@@ -675,59 +664,71 @@ class TestTaskLifecycle:
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
         """Assign a task to a user."""
-        board, story = self._create_board_with_story(
+        board, feature = self._create_board_with_feature(
             service, actor, test_org_id, test_project_id
         )
 
-        task = service.create_task(
-            CreateTaskRequest(story_id=story.story_id, title="Assignable Task"),
+        task = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.TASK,
+                board_id=board.board_id,
+                parent_id=feature.item_id,
+                title="Assignable Task",
+            ),
             actor,
             org_id=test_org_id,
         )
 
         # Assign to user
-        assigned = service.update_task(
-            task.task_id,
-            UpdateTaskRequest(
-                assignee_user_id="user-dev-001",
+        assigned = service.assign_work_item(
+            task.item_id,
+            AssignWorkItemRequest(
+                assignee_id="user-dev-001",
+                assignee_type=AssigneeType.USER,
             ),
             actor,
             org_id=test_org_id,
         )
-        assert assigned.assignee_user_id == "user-dev-001"
-        assert assigned.assignee_agent_id is None
+        assert assigned.assignee_id == "user-dev-001"
+        assert assigned.assignee_type == AssigneeType.USER
 
     def test_assign_task_to_agent(
         self, service: BoardService, actor: Actor, agent_actor: Actor,
         test_org_id: str, test_project_id: str
     ):
         """Assign a task to an agent."""
-        board, story = self._create_board_with_story(
+        board, feature = self._create_board_with_feature(
             service, actor, test_org_id, test_project_id
         )
 
-        task = service.create_task(
-            CreateTaskRequest(story_id=story.story_id, title="Agent Task"),
+        task = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.TASK,
+                board_id=board.board_id,
+                parent_id=feature.item_id,
+                title="Agent Task",
+            ),
             actor,
             org_id=test_org_id,
         )
 
         # Assign to agent
-        assigned = service.update_task(
-            task.task_id,
-            UpdateTaskRequest(
-                assignee_agent_id="agent-copilot-001",
+        assigned = service.assign_work_item(
+            task.item_id,
+            AssignWorkItemRequest(
+                assignee_id="agent-copilot-001",
+                assignee_type=AssigneeType.AGENT,
             ),
             actor,
             org_id=test_org_id,
         )
-        assert assigned.assignee_agent_id == "agent-copilot-001"
-        assert assigned.assignee_user_id is None
+        assert assigned.assignee_id == "agent-copilot-001"
+        assert assigned.assignee_type == AssigneeType.AGENT
 
-    def _create_board_with_story(
+    def _create_board_with_feature(
         self, service: BoardService, actor: Actor, org_id: str, project_id: str
     ):
-        """Helper to create a board with an epic and story."""
+        """Helper to create a board with a goal and feature."""
         board = service.create_board(
             CreateBoardRequest(
                 project_id=project_id,
@@ -742,21 +743,27 @@ class TestTaskLifecycle:
         )
         backlog_col = next(c for c in board_with_cols.columns if c.name == "Backlog")
 
-        epic = service.create_epic(
-            CreateEpicRequest(board_id=board.board_id, title="Helper Epic"),
-            actor,
-            org_id=org_id,
-        )
-        story = service.create_story(
-            CreateStoryRequest(
-                epic_id=epic.epic_id,
-                column_id=backlog_col.column_id,
-                title="Helper Story",
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Helper Goal",
             ),
             actor,
             org_id=org_id,
         )
-        return board, story
+        feature = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.FEATURE,
+                board_id=board.board_id,
+                parent_id=goal.item_id,
+                column_id=backlog_col.column_id,
+                title="Helper Feature",
+            ),
+            actor,
+            org_id=org_id,
+        )
+        return board, feature
 
 
 class TestSprintManagement:
@@ -792,11 +799,11 @@ class TestSprintManagement:
     def test_add_story_to_sprint(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
-        """Add a story to a sprint."""
+        """Add a feature to a sprint."""
         board = service.create_board(
             CreateBoardRequest(
                 project_id=test_project_id,
-                name="Sprint Story Board",
+                name="Sprint Feature Board",
                 create_default_columns=True,
             ),
             actor,
@@ -807,17 +814,23 @@ class TestSprintManagement:
         )
         backlog_col = next(c for c in board_with_cols.columns if c.name == "Backlog")
 
-        epic = service.create_epic(
-            CreateEpicRequest(board_id=board.board_id, title="Sprint Epic"),
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Sprint Goal",
+            ),
             actor,
             org_id=test_org_id,
         )
-        story = service.create_story(
-            CreateStoryRequest(
-                epic_id=epic.epic_id,
+        feature = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.FEATURE,
+                board_id=board.board_id,
+                parent_id=goal.item_id,
                 column_id=backlog_col.column_id,
-                title="Sprint Story",
-                story_points=3,
+                title="Sprint Feature",
+                points=3,
             ),
             actor,
             org_id=test_org_id,
@@ -834,17 +847,17 @@ class TestSprintManagement:
             org_id=test_org_id,
         )
 
-        # Add story to sprint
+        # Add feature to sprint (method still named add_story_to_sprint pending rename)
         service.add_story_to_sprint(
-            sprint.sprint_id, story.story_id, actor, org_id=test_org_id
+            sprint.sprint_id, feature.item_id, actor, org_id=test_org_id
         )
 
-        # Verify story is in sprint
+        # Verify feature is in sprint
         sprint_stories = service.list_sprint_stories(
             sprint.sprint_id, org_id=test_org_id
         )
         assert len(sprint_stories) == 1
-        assert sprint_stories[0].story_id == story.story_id
+        assert sprint_stories[0].story_id == feature.item_id
 
 
 # =============================================================================
@@ -918,9 +931,9 @@ class TestBoardVisibility:
 # =============================================================================
 
 class TestWorkItemProgressRollups:
-    """Validate status bucket and work-left rollups for epic/story hierarchies."""
+    """Validate status bucket and work-left rollups for goal/feature hierarchies."""
 
-    def test_epic_rollup_buckets_and_remaining(
+    def test_goal_rollup_buckets_and_remaining(
         self, service: BoardService, actor: Actor, test_org_id: str, test_project_id: str
     ):
         board = service.create_board(
@@ -931,32 +944,42 @@ class TestWorkItemProgressRollups:
         board_with_cols = service.get_board(board.board_id, include_columns=True, org_id=test_org_id)
         backlog_col = next(c for c in board_with_cols.columns if c.name == "Backlog")
 
-        epic = service.create_epic(
-            CreateEpicRequest(board_id=board.board_id, title="Progress Epic"),
-            actor,
-            org_id=test_org_id,
-        )
-        story = service.create_story(
-            CreateStoryRequest(
-                epic_id=epic.epic_id,
-                column_id=backlog_col.column_id,
-                title="Progress Story",
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Progress Goal",
             ),
             actor,
             org_id=test_org_id,
         )
-        task_done = service.create_task(
-            CreateTaskRequest(
-                story_id=story.story_id,
+        feature = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.FEATURE,
+                board_id=board.board_id,
+                parent_id=goal.item_id,
+                column_id=backlog_col.column_id,
+                title="Progress Feature",
+            ),
+            actor,
+            org_id=test_org_id,
+        )
+        task_done = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.TASK,
+                board_id=board.board_id,
+                parent_id=feature.item_id,
                 column_id=backlog_col.column_id,
                 title="Done Task",
             ),
             actor,
             org_id=test_org_id,
         )
-        task_in_progress = service.create_task(
-            CreateTaskRequest(
-                story_id=story.story_id,
+        task_in_progress = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.TASK,
+                board_id=board.board_id,
+                parent_id=feature.item_id,
                 column_id=backlog_col.column_id,
                 title="In Progress Task",
             ),
@@ -964,27 +987,27 @@ class TestWorkItemProgressRollups:
             org_id=test_org_id,
         )
 
-        service.update_task(
-            task_done.task_id,
-            UpdateTaskRequest(status=WorkItemStatus.DONE),
+        service.update_work_item(
+            task_done.item_id,
+            UpdateWorkItemRequest(status=WorkItemStatus.DONE),
             actor,
             org_id=test_org_id,
         )
-        service.update_task(
-            task_in_progress.task_id,
-            UpdateTaskRequest(status=WorkItemStatus.IN_PROGRESS),
+        service.update_work_item(
+            task_in_progress.item_id,
+            UpdateWorkItemRequest(status=WorkItemStatus.IN_PROGRESS),
             actor,
             org_id=test_org_id,
         )
 
         rollup = service.get_work_item_progress_rollup(
-            epic.epic_id,
+            goal.item_id,
             include_incomplete_descendants=True,
             org_id=test_org_id,
         )
 
-        assert rollup.item_id == epic.epic_id
-        assert rollup.item_type == WorkItemType.EPIC
+        assert rollup.item_id == goal.item_id
+        assert rollup.item_type == WorkItemType.GOAL
         assert rollup.buckets.total == 3
         assert rollup.buckets.not_started == 1
         assert rollup.buckets.in_progress == 1
@@ -1004,33 +1027,39 @@ class TestWorkItemProgressRollups:
         board_with_cols = service.get_board(board.board_id, include_columns=True, org_id=test_org_id)
         backlog_col = next(c for c in board_with_cols.columns if c.name == "Backlog")
 
-        epic = service.create_epic(
-            CreateEpicRequest(board_id=board.board_id, title="Filter Epic"),
+        goal = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.GOAL,
+                board_id=board.board_id,
+                title="Filter Goal",
+            ),
             actor,
             org_id=test_org_id,
         )
-        story = service.create_story(
-            CreateStoryRequest(
-                epic_id=epic.epic_id,
+        feature = service.create_work_item(
+            CreateWorkItemRequest(
+                item_type=WorkItemType.FEATURE,
+                board_id=board.board_id,
+                parent_id=goal.item_id,
                 column_id=backlog_col.column_id,
-                title="Filter Story",
+                title="Filter Feature",
             ),
             actor,
             org_id=test_org_id,
         )
 
-        epic_rollups = service.list_board_progress_rollups(
+        goal_rollups = service.list_board_progress_rollups(
             board.board_id,
-            item_type=WorkItemType.EPIC,
+            item_type=WorkItemType.GOAL,
             org_id=test_org_id,
         )
-        story_rollups = service.list_board_progress_rollups(
+        feature_rollups = service.list_board_progress_rollups(
             board.board_id,
-            item_type=WorkItemType.STORY,
+            item_type=WorkItemType.FEATURE,
             org_id=test_org_id,
         )
 
-        assert len(epic_rollups) == 1
-        assert epic_rollups[0].item_id == epic.epic_id
-        assert len(story_rollups) == 1
-        assert story_rollups[0].item_id == story.story_id
+        assert len(goal_rollups) == 1
+        assert goal_rollups[0].item_id == goal.item_id
+        assert len(feature_rollups) == 1
+        assert feature_rollups[0].item_id == feature.item_id

@@ -313,6 +313,14 @@ def handle_list_work_items(
             pass
 
     parent_id = arguments.get("parent_id")
+    if parent_id:
+        try:
+            parent_id = _resolve_id(service, parent_id, arguments)
+        except WorkItemNotFoundError:
+            return {
+                "success": False,
+                "error": f"Parent work item '{arguments.get('parent_id')}' not found",
+            }
 
     items = service.list_work_items(
         project_id=project_id,
@@ -373,12 +381,23 @@ def handle_create_work_item(
         except ValueError:
             pass
 
+    raw_parent_id = arguments.get("parent_id")
+    parent_id = None
+    if raw_parent_id:
+        try:
+            parent_id = _resolve_id(service, raw_parent_id, arguments)
+        except WorkItemNotFoundError:
+            return {
+                "success": False,
+                "error": f"Parent work item '{raw_parent_id}' not found",
+            }
+
     request = CreateWorkItemRequest(
         item_type=item_type_enum,
         project_id=project_id,
         board_id=arguments.get("board_id"),
         column_id=arguments.get("column_id"),
-        parent_id=arguments.get("parent_id"),
+        parent_id=parent_id,
         title=title,
         description=arguments.get("description"),
         priority=priority,
@@ -509,6 +528,18 @@ def handle_update_work_item(
 
     # GWS title validation is enforced by BoardService.update_work_item()
 
+    # Resolve parent_id (supports display IDs like 'GUIDEAI-42')
+    _resolve_parent_id = None
+    raw_parent_id = arguments.get("parent_id")
+    if raw_parent_id:
+        try:
+            _resolve_parent_id = _resolve_id(service, raw_parent_id, arguments)
+        except WorkItemNotFoundError:
+            return {
+                "success": False,
+                "error": f"Parent work item '{raw_parent_id}' not found",
+            }
+
     request = UpdateWorkItemRequest(
         item_type=item_type_enum,
         title=arguments.get("title"),
@@ -525,7 +556,7 @@ def handle_update_work_item(
         behavior_id=arguments.get("behavior_id"),
         run_id=arguments.get("run_id"),
         metadata=arguments.get("metadata"),
-        parent_id=arguments.get("parent_id"),
+        parent_id=_resolve_parent_id,
     )
 
     try:

@@ -51,8 +51,8 @@ class TestMCPSuggestAgent:
                     reason="High behavior match with low workload",
                 )
             ],
-            assignable_id="story-123",
-            assignable_type="story",
+            assignable_id="feature-123",
+            assignable_type="feature",
             required_behaviors=["behavior_coding"],
             total_eligible_agents=5,
         )
@@ -60,15 +60,15 @@ class TestMCPSuggestAgent:
         # Patch the service's suggest_agent
         with patch.object(service, "suggest_agent", return_value=mock_response):
             result = adapter.suggest_agent({
-                "assignable_id": "story-123",
-                "assignable_type": "story",
+                "assignable_id": "feature-123",
+                "assignable_type": "feature",
                 "required_behaviors": ["behavior_coding"],
                 "max_suggestions": 3,
             })
 
         assert isinstance(result, dict)
         assert "suggestions" in result
-        assert result["assignable_id"] == "story-123"
+        assert result["assignable_id"] == "feature-123"
         assert len(result["suggestions"]) == 1
 
     def test_tool_manifest_exists(self):
@@ -103,7 +103,7 @@ class TestMCPSuggestAgent:
         assert props["assignable_id"]["type"] == "string"
 
         assert "assignable_type" in props
-        assert props["assignable_type"]["enum"] == ["feature", "task", "story"]
+        assert props["assignable_type"]["enum"] == ["feature", "task"]
 
         # Check optional params
         assert "required_behaviors" in props

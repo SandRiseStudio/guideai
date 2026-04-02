@@ -30,6 +30,7 @@ import { OrgSwitcher } from '../OrgSwitcher';
 import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
 import { ActorAvatar } from '../actors/ActorAvatar';
 import { toActorViewModel } from '../../utils/actorViewModel';
+import { ProfileMenu } from './ProfileMenu';
 import './WorkspaceShell.css';
 
 type ShellPresenceStatus = 'active' | 'idle' | 'away' | 'disconnected';
@@ -122,14 +123,26 @@ const Sidebar = memo(function Sidebar({ collapsed, onToggle, children }: Sidebar
           </svg>
         </button>
         {!collapsed && (
-          <span className="sidebar-title animate-fade-in-up">GuideAI</span>
+          <div className="sidebar-brand animate-fade-in-up">
+            <span className="sidebar-brand-mark" aria-hidden="true">
+              <span className="sidebar-brand-mark-core" />
+            </span>
+            <span className="sidebar-brand-copy">
+              <span className="sidebar-title">GuideAI</span>
+            </span>
+          </div>
         )}
       </div>
 
       <nav className="sidebar-nav">{children}</nav>
 
       <div className="sidebar-footer">
-        {!collapsed && <span className="sidebar-version">v0.1.0</span>}
+        <ProfileMenu compact={collapsed} dropdownPosition="top" />
+        {!collapsed && (
+          <div className="sidebar-footer-meta">
+            <span className="sidebar-version">v0.1.0</span>
+          </div>
+        )}
       </div>
     </aside>
   );
@@ -414,7 +427,6 @@ const Header = memo(function Header({ documentTitle, connectionState, presenceLi
       </div>
 
       <div className="header-right">
-        {/* Connection indicator */}
         <div className={`connection-indicator connection-${connectionState}`}>
           <span className="connection-dot" />
           <span className="connection-label">
@@ -422,7 +434,6 @@ const Header = memo(function Header({ documentTitle, connectionState, presenceLi
           </span>
         </div>
 
-        {/* Presence avatars */}
         <div className="presence-list" role="list" aria-label="Active collaborators">
           {presenceList.slice(0, 5).map((p) => (
             <PresenceAvatar
@@ -476,7 +487,6 @@ const Header = memo(function Header({ documentTitle, connectionState, presenceLi
           </button>
         )}
 
-        {/* Profile menu */}
         {isAuthenticated && (
           <div className="profile-menu" ref={profileMenuRef}>
             <button
@@ -605,9 +615,11 @@ export interface WorkspaceShellProps {
   children?: React.ReactNode;
   sidebarContent?: React.ReactNode;
   documentTitle?: string;
+  /** When 'board', the shell header slims down: no breadcrumb, no center search. */
+  mode?: 'default' | 'board';
 }
 
-export function WorkspaceShell({ children, sidebarContent, documentTitle }: WorkspaceShellProps) {
+export function WorkspaceShell({ children, sidebarContent, documentTitle, mode = 'default' }: WorkspaceShellProps) {
   const { sidebarCollapsed, connectionState, activeDocumentId, documents } = useCollabStore();
   const collabPresence = usePresenceList();
   const activeDocument = activeDocumentId ? documents.get(activeDocumentId) : null;
@@ -701,12 +713,14 @@ export function WorkspaceShell({ children, sidebarContent, documentTitle }: Work
         {sidebarContent}
       </Sidebar>
 
-      <div className="workspace-content">
-        <Header
-          documentTitle={documentTitle ?? activeDocument?.title ?? activeScopeLabel}
-          connectionState={resolvedConnectionState}
-          presenceList={livePresenceList}
-        />
+      <div className={`workspace-content${mode === 'board' ? ' board-mode' : ''}`}>
+        {mode !== 'board' && (
+          <Header
+            documentTitle={documentTitle ?? activeDocument?.title ?? activeScopeLabel}
+            connectionState={resolvedConnectionState}
+            presenceList={livePresenceList}
+          />
+        )}
         <MainContent>{children}</MainContent>
       </div>
     </div>

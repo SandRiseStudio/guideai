@@ -37,17 +37,8 @@ from guideai.agent_orchestrator_service_postgres import PostgresAgentOrchestrato
 
 def _truncate_agent_orchestrator_tables(dsn: str) -> None:
     """Remove all data from agent orchestrator tables to ensure test isolation."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(
-                "TRUNCATE agent_switch_events, agent_assignments, agent_personas RESTART IDENTITY CASCADE;"
-            )
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, ["agent_switch_events", "agent_assignments", "agent_personas"])
 
 
 @pytest.fixture

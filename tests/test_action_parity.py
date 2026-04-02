@@ -49,15 +49,8 @@ TEST_ACTOR = Actor(id="test-user", role="engineer", surface="cli")
 
 def _truncate_action_tables(dsn: str) -> None:
     """Remove all data from action tables to ensure test isolation."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE replays, actions RESTART IDENTITY CASCADE;")
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, ["replays", "actions"])
 
 
 @pytest.fixture

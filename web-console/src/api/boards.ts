@@ -412,22 +412,39 @@ function normalizePageItems(items: WorkItem[]): WorkItem[] {
 }
 
 /**
- * Fetch all work items for a board. The first page is fetched sequentially to
- * check `has_more`. If more pages exist, pages 2–10 are fired in parallel
- * (one round-trip for up to 1000 items). If the board has even more items the
- * remaining pages are fetched sequentially as a fallback.
+ * Fetch all work items for a board.
+ *
+ * Large boards can trip API rate limits if we burst too many paginated
+ * requests too quickly, so after the first page we continue sequentially and
+ * retry 429 responses with small backoff.
  */
-const MAX_PARALLEL_PAGES = 9;
+const MAX_PARALLEL_PAGES = 0;
+const WORK_ITEMS_429_RETRY_DELAYS_MS = [250, 750, 1500] as const;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function fetchAllWorkItems(
   boardId: string,
   serverParams?: Record<string, string>,
 ): Promise<WorkItem[]> {
   const fetchPage = async (offset: number) => {
-    const r = await apiClient.get<{ items: WorkItem[]; has_more?: boolean }>(
-      `/v1/work-items?${buildWorkItemsQs(boardId, ITEMS_PAGE_SIZE, offset, serverParams)}`
-    );
-    return { items: normalizePageItems(r.items ?? []), hasMore: r.has_more === true };
+    for (let attempt = 0; attempt <= WORK_ITEMS_429_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        const r = await apiClient.get<{ items: WorkItem[]; has_more?: boolean }>(
+          `/v1/work-items?${buildWorkItemsQs(boardId, ITEMS_PAGE_SIZE, offset, serverParams)}`
+        );
+        return { items: normalizePageItems(r.items ?? []), hasMore: r.has_more === true };
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 429 || attempt === WORK_ITEMS_429_RETRY_DELAYS_MS.length) {
+          throw error;
+        }
+        await sleep(WORK_ITEMS_429_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+
+    return { items: [], hasMore: false };
   };
 
   const first = await fetchPage(0);

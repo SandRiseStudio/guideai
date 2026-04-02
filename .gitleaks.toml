@@ -35,6 +35,15 @@ paths = [
     # Gitleaks ignore file itself
     '''\.gitleaksignore$''',
 
+    # Secrets baseline file (contains hashed values, not real secrets)
+    '''\.secrets\.baseline$''',
+
+    # Amprealize blueprints (env-var interpolation templates, not real secrets)
+    '''config/amprealize/blueprints/.*\.yaml$''',
+
+    # Nginx container config (env-var defaults, not real secrets)
+    '''config/nginx/.*''',
+
     # Documentation (may contain example secret patterns for illustration)
     '''docs/.*\.md$''',
     '''\.md$''',

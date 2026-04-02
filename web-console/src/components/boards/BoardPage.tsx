@@ -10,9 +10,8 @@
 
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ExecutionStatusBadge, type ExecutionListItem } from '../../lib/collab-client';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { ConsoleSidebar } from '../ConsoleSidebar';
-import { WorkspaceShell } from '../workspace/WorkspaceShell';
+import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useShellTitle, useShellMode } from '../workspace/useShell';
 import { useApiCapabilities } from '../../api/capabilities';
 import { type Agent, type AgentStatus, useProject } from '../../api/dashboard';
 import { useProjectAgents } from '../../api/agentRegistry';
@@ -46,11 +45,17 @@ import { WorkItemDrawer, type AssigneeProfile, type WorkItemPresentationMode } f
 import { copyTextToClipboard, formatWorkItemDisplayId } from './workItemId';
 import { useBoardFilters, useFilteredItems, sortItems } from './useBoardFilters';
 import { BoardFilterBar } from './BoardFilterBar';
-import { BoardAgentPresenceRail } from './BoardAgentPresenceRail';
+import { ColumnSummaryStrip } from './ColumnSummaryStrip';
 import { AgentPresenceDrawer } from './AgentPresenceDrawer';
+import { ChatHub } from './ChatHub';
 import { AgentAssignmentDrawer } from './AgentAssignmentDrawer';
 import { useAgentPresence } from '../../hooks/useAgentPresence';
-import { summarizeBoardParticipants, type BoardParticipant } from './boardParticipants';
+import { type BoardParticipant } from './boardParticipants';
+import { useCollabStore } from '../../store/collabStore';
+import { ConversationPanel } from '../conversations/ConversationPanel';
+import { FloatingChatWindow } from '../conversations/FloatingChatWindow';
+import { useGetOrCreateDirectConversation } from '../../api/conversations';
+import type { Conversation } from '../../lib/collab-client';
 import './BoardPage.css';
 
 function getColumnAccentIndex(index: number): number {
@@ -485,7 +490,17 @@ const WorkItemCard = memo(function WorkItemCard({
   const showChildCount = item.item_type === 'feature' && childTaskCount > 0;
   const childCountLabel = `${childTaskCount} task${childTaskCount === 1 ? '' : 's'}`;
   const countLabel = hierarchyCountLabel ?? (showChildCount ? childCountLabel : undefined);
+  const countSegments = useMemo(() => (countLabel ? countLabel.split(' · ').filter(Boolean) : []), [countLabel]);
   const hasRolledUpChildren = Boolean(progressRollup && progressRollup.buckets.total > 0);
+  const hasProgressRollup =
+    Boolean(progressRollup && hasRolledUpChildren && (item.item_type === 'goal' || item.item_type === 'feature'));
+  const showRollupChip = Boolean(countLabel || hasProgressRollup);
+  const progressPercentValue = hasProgressRollup && progressRollup
+    ? Math.min(100, Math.max(0, progressRollup.completion_percent))
+    : 0;
+  const progressFillWidth = hasProgressRollup
+    ? (progressPercentValue <= 0 ? '10px' : `${progressPercentValue}%`)
+    : undefined;
   const displayItemId = useMemo(() => formatWorkItemDisplayId(item, projectSlug), [item, projectSlug]);
 
   const handleOpen = useCallback(() => {
@@ -616,68 +631,64 @@ const WorkItemCard = memo(function WorkItemCard({
             </span>
             {label}
           </span>
-          {isExpandable && (
-            <button
-              type="button"
-              className={`work-item-hierarchy-toggle pressable ${isCollapsed ? 'work-item-hierarchy-toggle-collapsed' : ''}`}
-              onMouseDown={(event) => event.stopPropagation()}
-              onClick={handleToggleCollapse}
-              aria-expanded={!isCollapsed}
-              aria-label={isCollapsed ? `Expand ${label}: ${item.title}` : `Collapse ${label}: ${item.title}`}
-              data-haptic="light"
+          {showRollupChip && (
+            <span
+              className={`work-item-rollup-chip-inline${hasProgressRollup ? ' work-item-rollup-chip-inline-progress' : ''}`}
+              style={
+                hasProgressRollup && progressRollup
+                  ? ({
+                    ['--rollup-progress' as string]: `${progressPercentValue}%`,
+                    ['--rollup-progress-visual' as string]: progressFillWidth,
+                  } as React.CSSProperties)
+                  : undefined
+              }
+              aria-label={
+                hasProgressRollup && progressRollup
+                  ? `${countLabel ? `${countLabel}. ` : ''}${formatProgressPercent(progressRollup.completion_percent)} complete. ${formatRemainingSummary(progressRollup)}`
+                  : countLabel
+                    ? `${countLabel} roll up under this ${label.toLowerCase()}`
+                    : undefined
+              }
             >
-              <span className="work-item-hierarchy-toggle-icon" aria-hidden="true">▾</span>
-            </button>
-          )}
-          {countLabel && (
-            <span className="work-item-rollup-count" aria-label={`${countLabel} roll up under this ${label.toLowerCase()}`}>
-              {countLabel}
-            </span>
-          )}
-        </div>
-      </div>
-      <div className="work-item-title">{item.title}</div>
-      {summarized && progressRollup && hasRolledUpChildren && (
-        <div className="work-item-summary-line" aria-label={`${formatProgressPercent(progressRollup.completion_percent)} complete`}>
-          <div className="work-item-summary-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progressRollup.completion_percent)}>
-            <div className="work-item-summary-bar-fill" style={{ width: `${Math.min(100, Math.max(0, progressRollup.completion_percent))}%` }} />
-          </div>
-          <span className="work-item-summary-text">
-            {formatProgressPercent(progressRollup.completion_percent)}
-            {progressRollup.remaining.items_remaining > 0 && <>{' · '}{progressRollup.remaining.items_remaining} left</>}
-          </span>
-          {assignee && (
-            <span className="work-item-summary-avatar" title={assigneeLabel}>
-              {assigneeActor ? (
-                <ActorAvatar actor={assigneeActor} size="sm" surfaceType="chip" decorative />
-              ) : isAvatarImage(assigneeAvatar) ? (
-                <img className="work-item-summary-avatar-img" src={assigneeAvatar} alt="" aria-hidden="true" />
-              ) : (
-                assigneeAvatar
+              {countSegments.length > 0 && (
+                <span className="work-item-rollup-chip-inline-count">
+                  {countSegments.map((segment) => (
+                    <span
+                      key={segment}
+                      className={`work-item-rollup-chip-inline-segment ${
+                        segment.includes('feature')
+                          ? 'work-item-rollup-chip-inline-segment-feature'
+                          : segment.includes('task')
+                            ? 'work-item-rollup-chip-inline-segment-task'
+                            : ''
+                      }`}
+                    >
+                      {segment}
+                    </span>
+                  ))}
+                </span>
+              )}
+              {hasProgressRollup && progressRollup && (
+                <span className="work-item-rollup-chip-inline-percent">{formatProgressPercent(progressRollup.completion_percent)}</span>
               )}
             </span>
           )}
         </div>
-      )}
-      {progressRollup && hasRolledUpChildren && (item.item_type === 'goal' || item.item_type === 'feature') && (
-        <div className="work-item-progress-panel" aria-label="Progress rollup">
-          <div className="work-item-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progressRollup.completion_percent)}>
-            <div
-              className="work-item-progress-fill"
-              style={{ width: `${Math.min(100, Math.max(0, progressRollup.completion_percent))}%` }}
-            />
-          </div>
-          <div className="work-item-progress-meta">
-            <span className="work-item-progress-percent">{formatProgressPercent(progressRollup.completion_percent)}</span>
-            <span className="work-item-progress-left">{formatRemainingSummary(progressRollup)}</span>
-          </div>
-          <div className="work-item-progress-buckets" aria-label="Status buckets">
-            <span className="progress-bucket progress-bucket-not-started">Not started {progressRollup.buckets.not_started}</span>
-            <span className="progress-bucket progress-bucket-in-progress">In progress {progressRollup.buckets.in_progress}</span>
-            <span className="progress-bucket progress-bucket-completed">Completed {progressRollup.buckets.completed}</span>
-          </div>
-        </div>
-      )}
+        {isExpandable && (
+          <button
+            type="button"
+            className={`work-item-hierarchy-toggle pressable ${isCollapsed ? 'work-item-hierarchy-toggle-collapsed' : ''}`}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={handleToggleCollapse}
+            aria-expanded={!isCollapsed}
+            aria-label={isCollapsed ? `Expand ${label}: ${item.title}` : `Collapse ${label}: ${item.title}`}
+            data-haptic="light"
+          >
+            <span className="work-item-hierarchy-toggle-icon" aria-hidden="true">▾</span>
+          </button>
+        )}
+      </div>
+      <div className="work-item-title">{item.title}</div>
       {hierarchyHint && <div className="work-item-hierarchy-hint">{hierarchyHint}</div>}
       {showExecutionRow && (
         <div className="work-item-execution">
@@ -1474,98 +1485,7 @@ interface PendingBoardDelete {
   source: 'drag' | 'keyboard';
 }
 
-// ---------------------------------------------------------------------------
-// Column Summary Strip — at-a-glance distribution + jump-to-column
-// ---------------------------------------------------------------------------
-
-interface ColumnSummaryStripProps {
-  columns: BoardColumn[];
-  itemsByColumnId: Record<string, WorkItem[]>;
-  filterResult: { isFiltered: boolean; matchingIds: Set<string>; matchCount: number };
-  visibleColumnIds: Set<string>;
-  currentUserId: string | null;
-  isMyWorkActive: boolean;
-  onToggleMyWork: () => void;
-  onJumpToColumn: (columnId: string) => void;
-}
-
-const ColumnSummaryStrip = memo(function ColumnSummaryStrip({
-  columns,
-  itemsByColumnId,
-  filterResult,
-  visibleColumnIds,
-  currentUserId,
-  isMyWorkActive,
-  onToggleMyWork,
-  onJumpToColumn,
-}: ColumnSummaryStripProps) {
-  return (
-    <nav className="column-summary-strip" aria-label="Column summary">
-      <div className="column-summary-pills">
-        {columns.map((col, index) => {
-          const colItems = itemsByColumnId[col.column_id] ?? [];
-          const total = colItems.length;
-          const matched = filterResult.isFiltered
-            ? colItems.filter((item) => filterResult.matchingIds.has(item.item_id)).length
-            : total;
-          const isVisible = visibleColumnIds.has(col.column_id);
-          const accentIdx = getColumnAccentIndex(index);
-
-          return (
-            <button
-              key={col.column_id}
-              type="button"
-              className={`column-summary-pill column-summary-accent-${accentIdx}${isVisible ? ' column-summary-pill-active' : ''}`}
-              onClick={() => onJumpToColumn(col.column_id)}
-              aria-label={`${col.name}: ${filterResult.isFiltered ? `${matched} of ${total}` : total} items — click to scroll`}
-              title={`Jump to ${col.name}`}
-            >
-              <span className="column-summary-pill-name">{col.name}</span>
-              <span className="column-summary-pill-count">
-                {filterResult.isFiltered ? (
-                  <><span className="column-summary-pill-matched">{matched}</span>/{total}</>
-                ) : (
-                  total
-                )}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-      {currentUserId && (
-        <button
-          type="button"
-          className={`column-summary-mywork${isMyWorkActive ? ' column-summary-mywork-active' : ''}`}
-          onClick={onToggleMyWork}
-          aria-label={isMyWorkActive ? 'Show all work' : 'Show only my work'}
-          title={isMyWorkActive ? 'Show all work' : 'My work'}
-        >
-          <span className="column-summary-mywork-icon">👤</span>
-          <span className="column-summary-mywork-label">{isMyWorkActive ? 'All work' : 'My work'}</span>
-        </button>
-      )}
-    </nav>
-  );
-});
-
-function loadViewMode(boardId?: string): ViewMode {
-  if (!boardId) return 'board';
-  try {
-    const raw = localStorage.getItem(`guideai:board-view:${boardId}`);
-    if (raw === 'outline') return 'outline';
-    return 'board';
-  } catch {
-    return 'board';
-  }
-}
-
-function saveViewMode(boardId: string, mode: ViewMode) {
-  try {
-    localStorage.setItem(`guideai:board-view:${boardId}`, mode);
-  } catch {
-    // Ignore storage failures and continue with in-memory state.
-  }
-}
+// ColumnSummaryStrip extracted to ./ColumnSummaryStrip.tsx
 
 const ColumnLane = memo(function ColumnLane({
   column,
@@ -1982,27 +1902,74 @@ const ColumnLane = memo(function ColumnLane({
         // Same-column: use the reorder endpoint for reliable positioning.
         // This handles degenerate positions (all items at 0) correctly by
         // assigning sequential 0-based positions to the full ordered list.
-        const itemIds = items.map((i) => i.item_id);
-        const fromIdx = itemIds.indexOf(payload.itemId);
-        if (fromIdx < 0) return;
-        itemIds.splice(fromIdx, 1);
+        //
+        // When dragging a parent item (goal/feature), we move the entire
+        // subtree (the item + all its descendants) as a group.  This keeps
+        // the flat position-sorted order aligned with the hierarchical DOM
+        // order so that subsequent drag-and-drop operations compute the
+        // correct insertion point.
 
-        // Map the visual insertion point to the position-sorted items array.
+        // Collect all descendant IDs of the dragged item (children,
+        // grandchildren, etc.) that live in this column.
+        const draggedGroupIds = new Set<string>();
+        draggedGroupIds.add(payload.itemId);
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const it of items) {
+            if (!draggedGroupIds.has(it.item_id) && it.parent_id && draggedGroupIds.has(it.parent_id)) {
+              draggedGroupIds.add(it.item_id);
+              changed = true;
+            }
+          }
+        }
+
+        const itemIds = items.map((i) => i.item_id);
+        // Extract the group in their current relative order
+        const groupItems = itemIds.filter((id) => draggedGroupIds.has(id));
+        const remaining = itemIds.filter((id) => !draggedGroupIds.has(id));
+
+        if (remaining.length === 0) return; // only group items in column, nothing to do
+
+        // Also remove the group from withoutDragged for the visual mapping.
+        const withoutDraggedGroup = visibleIds.filter((id) => !draggedGroupIds.has(id));
+
+        // Map the visual insertion point to the remaining items array.
+        // Re-compute insertAt against the group-removed visible list.
+        let groupInsertAt = dropIdx;
+        // Adjust for group size: all visible group items before dropIdx
+        // shift the index down when removed.
+        let visGroupBefore = 0;
+        for (let g = 0; g < visibleIds.length && g < dropIdx; g++) {
+          if (draggedGroupIds.has(visibleIds[g])) visGroupBefore++;
+        }
+        groupInsertAt = dropIdx - visGroupBefore;
+        groupInsertAt = Math.max(0, Math.min(groupInsertAt, withoutDraggedGroup.length));
+
         let toIdx: number;
-        if (insertAt === 0) {
-          // Insert before the first visible item
-          const firstVisId = withoutDragged[0];
-          const firstIdx = itemIds.indexOf(firstVisId);
+        if (groupInsertAt === 0) {
+          // Insert before the first visible non-group item
+          const firstVisId = withoutDraggedGroup[0];
+          const firstIdx = remaining.indexOf(firstVisId);
           toIdx = firstIdx >= 0 ? firstIdx : 0;
         } else {
           // Insert after the item visually above the drop point
-          const aboveId = withoutDragged[insertAt - 1];
-          const aboveIdx = itemIds.indexOf(aboveId);
-          toIdx = aboveIdx >= 0 ? aboveIdx + 1 : itemIds.length;
+          const aboveId = withoutDraggedGroup[groupInsertAt - 1];
+          const aboveIdx = remaining.indexOf(aboveId);
+          toIdx = aboveIdx >= 0 ? aboveIdx + 1 : remaining.length;
         }
 
-        itemIds.splice(toIdx, 0, payload.itemId);
-        onReorderColumn(column.column_id, itemIds);
+        // Splice the entire group at the target position
+        remaining.splice(toIdx, 0, ...groupItems);
+
+        // No-op guard: if the resulting order is the same as the current
+        // position-sorted order, skip the mutation.
+        const originalOrder = items.map((i) => i.item_id);
+        if (remaining.length === originalOrder.length && remaining.every((id, i) => id === originalOrder[i])) {
+          return;
+        }
+
+        onReorderColumn(column.column_id, remaining);
       } else {
         // Cross-column: use the move endpoint to change column_id.
         // Position = insertAt so the item lands near the drop point.
@@ -2590,8 +2557,12 @@ export function BoardPage(): React.JSX.Element {
   const location = useLocation();
   const navigate = useNavigate();
   const { projectId, boardId, itemId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { actor } = useAuth();
-  const [viewMode, setViewMode] = useState<ViewMode>(() => loadViewMode(boardId));
+  const { connectionState } = useCollabStore();
+
+  // View mode synced to URL ?view=board|outline
+  const viewMode: ViewMode = searchParams.get('view') === 'outline' ? 'outline' : 'board';
   const [copyToast, setCopyToast] = useState<{ message: string; variant: 'success' | 'error' } | null>(null);
   const copyToastTimerRef = React.useRef<number | null>(null);
   const pageRef = useRef<HTMLDivElement>(null);
@@ -2607,10 +2578,6 @@ export function BoardPage(): React.JSX.Element {
         ? 'peek'
         : 'studio')
       : 'studio';
-
-  useEffect(() => {
-    setViewMode(loadViewMode(boardId));
-  }, [boardId]);
 
   // Collapse header chrome after scrolling past threshold
   useEffect(() => {
@@ -2670,6 +2637,15 @@ export function BoardPage(): React.JSX.Element {
   const { presences: agentPresences } = useAgentPresence(projectAgents, projectId ?? undefined);
   const [presenceDrawerOpen, setPresenceDrawerOpen] = useState(false);
   const [assignmentDrawerOpen, setAssignmentDrawerOpen] = useState(false);
+  const [conversationPanelOpen, setConversationPanelOpen] = useState(false);
+
+  // Floating DM chat state
+  const [floatingChat, setFloatingChat] = useState<{
+    conversation: Conversation;
+    participant: BoardParticipant;
+    minimized: boolean;
+  } | null>(null);
+  const getOrCreateDM = useGetOrCreateDirectConversation();
 
   const createItem = useCreateWorkItem();
   const moveItem = useMoveWorkItem(boardId);
@@ -2827,11 +2803,6 @@ export function BoardPage(): React.JSX.Element {
 
     return [...humans, ...agents];
   }, [actor?.id, actor?.type, assignableAgents, assignableHumans]);
-
-  const boardParticipantSummary = useMemo(
-    () => summarizeBoardParticipants(boardParticipants),
-    [boardParticipants],
-  );
 
   const assigneeIndex = useMemo(() => {
     const index = new Map<string, AssigneeProfile>();
@@ -3367,14 +3338,48 @@ export function BoardPage(): React.JSX.Element {
   const showBlockingItemsError = hasWorkItemsLoadError && !itemsLoading && items.length === 0;
 
   const setViewModeValue = useCallback((nextMode: ViewMode) => {
-    setViewMode(nextMode);
-    if (boardId) {
-      saveViewMode(boardId, nextMode);
-    }
-  }, [boardId]);
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (nextMode === 'board') {
+        next.delete('view');
+      } else {
+        next.set('view', nextMode);
+      }
+      return next;
+    }, { replace: true });
+  }, [setSearchParams]);
 
   // ── Column Summary Strip helpers ──────────────────────────────────────────
   const currentUserId = useMemo(() => (actor?.type === 'human' ? actor.id : null), [actor?.id, actor?.type]);
+
+  // ── Floating DM — open chat for a participant ─────────────────────────────
+  const handleParticipantClick = useCallback(
+    (participant: BoardParticipant) => {
+      if (!projectId) return;
+      // If already chatting with this participant, just restore
+      if (floatingChat?.participant.id === participant.id) {
+        setFloatingChat((prev) => prev ? { ...prev, minimized: false } : null);
+        return;
+      }
+      getOrCreateDM.mutate(
+        {
+          projectId,
+          targetParticipantId: participant.id,
+          actorType: participant.kind === 'agent' ? 'agent' : 'user',
+        },
+        {
+          onSuccess: (result) => {
+            setFloatingChat({
+              conversation: result.conversation,
+              participant,
+              minimized: false,
+            });
+          },
+        },
+      );
+    },
+    [projectId, floatingChat?.participant.id, getOrCreateDM],
+  );
 
   const isMyWorkActive = useMemo(
     () => Boolean(currentUserId && filters.assigneeId === currentUserId && filters.assigneeType === 'user'),
@@ -3400,24 +3405,18 @@ export function BoardPage(): React.JSX.Element {
     }
   }, []);
 
+  useShellTitle(pageTitle);
+  useShellMode('board');
+
   if (!projectId || !boardId) {
     return (
-      <WorkspaceShell
-        sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-        documentTitle="Board"
-      >
         <div className="board-page">
           <div className="board-error animate-fade-in-up">Missing project or board ID.</div>
         </div>
-      </WorkspaceShell>
     );
   }
 
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-      documentTitle={pageTitle}
-    >
       <div
         ref={pageRef}
         className={`board-page board-page-density-compact${draggedItemId || dropSettling ? ' board-page-dragging' : ''}`}
@@ -3441,6 +3440,8 @@ export function BoardPage(): React.JSX.Element {
             viewMode={viewMode}
             onViewChange={setViewModeValue}
             onSettings={() => navigate(`/projects/${projectId}/settings`)}
+            isMyWorkActive={isMyWorkActive}
+            onToggleMyWork={currentUserId ? handleToggleMyWork : undefined}
             onRefresh={refetchItems}
             isRefreshing={isRefreshing}
             lastSyncedAt={lastSyncedAt}
@@ -3448,13 +3449,17 @@ export function BoardPage(): React.JSX.Element {
         )}
         </div>{/* end board-sticky-chrome */}
 
-        {/* Project members rail */}
-        {!boardLoading && board && columns.length > 0 && boardParticipantSummary.total > 0 && (
-          <BoardAgentPresenceRail
-            participants={boardParticipants}
-            summary={boardParticipantSummary}
-            onViewAll={() => setPresenceDrawerOpen(true)}
-          />
+        {/* ChatHub presence card — standalone */}
+        {((boardParticipants && boardParticipants.length > 0) || connectionState) && (
+          <div className="board-chathub-card">
+            <span className="board-chathub-label">{boardParticipants.length} {boardParticipants.length === 1 ? 'member' : 'members'}</span>
+            <ChatHub
+              participants={boardParticipants ?? []}
+              onOpen={() => setConversationPanelOpen(true)}
+              onParticipantClick={handleParticipantClick}
+              connectionState={connectionState}
+            />
+          </div>
         )}
 
         {!boardLoading && board && columns.length > 0 && hasSupplementaryDataError && (
@@ -3502,9 +3507,6 @@ export function BoardPage(): React.JSX.Element {
             itemsByColumnId={itemsByColumnId}
             filterResult={filterResult}
             visibleColumnIds={visibleColumnIds}
-            currentUserId={currentUserId}
-            isMyWorkActive={isMyWorkActive}
-            onToggleMyWork={handleToggleMyWork}
             onJumpToColumn={handleJumpToColumn}
           />
           <div ref={boardColumnsRef} className="board-columns" aria-label="Board columns">
@@ -3638,6 +3640,8 @@ export function BoardPage(): React.JSX.Element {
           />
         )}
 
+        {/* ChatHub presence card rendered above, after board-sticky-chrome */}
+
         <AgentPresenceDrawer
           participants={boardParticipants}
           open={presenceDrawerOpen}
@@ -3656,12 +3660,38 @@ export function BoardPage(): React.JSX.Element {
           onClose={() => setAssignmentDrawerOpen(false)}
         />
 
+        {conversationPanelOpen && (
+          <ConversationPanel
+            projectId={projectId ?? ''}
+            orgId={project?.org_id ?? null}
+            onRequestClose={() => setConversationPanelOpen(false)}
+          />
+        )}
+
+        {/* Floating DM chat window */}
+        {floatingChat && (
+          <div className="conversation-floating-anchor">
+            <FloatingChatWindow
+              conversation={floatingChat.conversation}
+              targetParticipant={floatingChat.participant}
+              currentUserId={currentUserId ?? undefined}
+              minimized={floatingChat.minimized}
+              onMinimize={() =>
+                setFloatingChat((prev) => prev ? { ...prev, minimized: true } : null)
+              }
+              onRestore={() =>
+                setFloatingChat((prev) => prev ? { ...prev, minimized: false } : null)
+              }
+              onClose={() => setFloatingChat(null)}
+            />
+          </div>
+        )}
+
         {copyToast && (
           <div className={`board-copy-toast board-copy-toast-${copyToast.variant}`} role="status" aria-live="polite">
             {copyToast.message}
           </div>
         )}
       </div>
-    </WorkspaceShell>
   );
 }

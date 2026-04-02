@@ -5,9 +5,14 @@
 # Features:
 #   - 6 PostgreSQL databases (ports 6432-6437) + agent-orchestrator (6438)
 #   - Redis cache (port 6380)
+#   - GuideAI API server, Web Console, and nginx gateway
 #   - Optional Kafka streaming module (with-streaming)
 #   - Optional Prometheus/Grafana monitoring module (with-monitoring)
 #   - Staging-specific resource limits and configuration
+#
+# Application images (override defaults):
+#   GUIDEAI_API_IMAGE         - API server (default: ghcr.io/guideai/api:staging)
+#   GUIDEAI_WEB_CONSOLE_IMAGE - Web console (default: ghcr.io/guideai/web-console:staging)
 #
 # Container Runtime: Podman (podman-compose)
 #
@@ -68,6 +73,9 @@ modules:
       - postgres-compliance
       - postgres-agent-orchestrator
       - redis-staging
+      - guideai-api
+      - web-console
+      - gateway
 
   # Streaming module - optional Kafka for event streaming
   streaming:
@@ -346,6 +354,84 @@ services:
     resources:
       memory_mb: 512
       cpu_shares: 256
+    restart: unless-stopped
+
+  # ============================================================================
+  # Application Services
+  # ============================================================================
+
+  guideai-api:
+    image: "${GUIDEAI_API_IMAGE:-ghcr.io/guideai/api:staging}"
+    module: core
+    hostname: guideai-api
+    container_name: guideai-staging-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql://guideai_behavior:${GUIDEAI_PG_PASS_BEHAVIOR:-behavior_staging_pass}@postgres-behavior:5432/guideai_behavior"
+      TELEMETRY_DATABASE_URL: "postgresql://guideai_telemetry:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_staging_pass}@postgres-telemetry:5432/guideai_telemetry"
+      REDIS_URL: "redis://redis-staging:6379/0"
+      GUIDEAI_AUTH_ENABLED: "true"
+      GUIDEAI_CORS_ORIGINS: "${GUIDEAI_CORS_ORIGINS:-}"
+      GUIDEAI_LOG_LEVEL: "${GUIDEAI_LOG_LEVEL:-debug}"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - postgres-telemetry
+      - postgres-behavior
+      - redis-staging
+    resources:
+      memory_mb: 1024
+      cpu_shares: 512
+    restart: unless-stopped
+
+  web-console:
+    image: "${GUIDEAI_WEB_CONSOLE_IMAGE:-ghcr.io/guideai/web-console:staging}"
+    module: core
+    hostname: web-console
+    container_name: guideai-staging-web-console
+    environment:
+      VITE_API_BASE_URL: "${VITE_API_BASE_URL:-}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5173/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    resources:
+      memory_mb: 256
+      cpu_shares: 128
+    restart: unless-stopped
+
+  gateway:
+    image: nginx:alpine
+    module: core
+    hostname: gateway
+    container_name: guideai-staging-gateway
+    ports:
+      - "${GATEWAY_PORT:-8080}:80"
+      - "${GATEWAY_TLS_PORT:-8443}:443"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro
+      - ./config/nginx/docker-entrypoint.sh:/docker-entrypoint-custom.sh:ro
+    environment:
+      NGINX_SSL_CERT: "${NGINX_SSL_CERT:-}"
+      NGINX_SSL_KEY: "${NGINX_SSL_KEY:-}"
+      NGINX_SSL_REDIRECT: "${NGINX_SSL_REDIRECT:-false}"
+    command: ["/bin/sh", "/docker-entrypoint-custom.sh"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - guideai-api
+      - web-console
+    resources:
+      memory_mb: 256
+      cpu_shares: 128
     restart: unless-stopped
 
   # ============================================================================

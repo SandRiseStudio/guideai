@@ -1,17 +1,17 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { useProjects, type Project } from '../../api/dashboard';
-import { useProjectAgents } from '../../api/agentRegistry';
 import { useBoards } from '../../api/boards';
 import { useOrgContext } from '../../store/orgContextStore';
+import { useApiCapabilities } from '../../api/capabilities';
 import { loadProjectSortPreference, sortProjects } from '../../utils/projectSort';
 import './SidebarNav.css';
 
 const STORAGE_KEY_SECTIONS = 'guideai.sidebar.sections';
-const STORAGE_KEY_PROJECT = 'guideai.sidebar.expandedProject';
+const STORAGE_KEY_RECENT_PROJECTS = 'guideai.sidebar.recentProjects';
+const STORAGE_KEY_PINNED_PROJECTS = 'guideai.sidebar.pinnedProjects';
 
 type SectionState = {
-  home: boolean;
   projects: boolean;
   tools: boolean;
 };
@@ -37,18 +37,12 @@ interface NavItemProps {
 
 interface SidebarProjectNodeProps {
   project: Project;
-  expanded: boolean;
   isActive: boolean;
-  onToggle: (projectId: string) => void;
   onNavigate: (path: string) => void;
   pathname: string;
   onMoveFocus: (current: HTMLElement, delta: number) => void;
-  activeAgentCount: number;
+  variant?: 'pinned' | 'recent' | 'default';
 }
-
-const CountBadge = ({ count }: { count: number }) => (
-  <span className="sidebar-count-badge">{count}</span>
-);
 
 const HomeIcon = () => (
   <svg className="sidebar-nav-icon" viewBox="0 0 16 16" fill="none">
@@ -90,13 +84,6 @@ const DefaultBoardIcon = () => (
   </svg>
 );
 
-const SettingsIcon = () => (
-  <svg className="sidebar-nav-icon" viewBox="0 0 16 16" fill="none">
-    <path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z" stroke="currentColor" strokeWidth="1.5" />
-    <path d="M13.2 8.8v-1.6l-1.1-.3a4.5 4.5 0 0 0-.4-.9l.6-1-1.1-1.1-1 .6c-.3-.2-.6-.3-.9-.4L8.8 2.8H7.2l-.3 1.1c-.3.1-.6.2-.9.4l-1-.6-1.1 1.1.6 1c-.2.3-.3.6-.4.9l-1.1.3v1.6l1.1.3c.1.3.2.6.4.9l-.6 1 1.1 1.1 1-.6c.3.2.6.3.9.4l.3 1.1h1.6l.3-1.1c.3-.1.6-.2.9-.4l1 .6 1.1-1.1-.6-1c.2-.3.3-.6.4-.9l1.1-.3Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-  </svg>
-);
-
 const SearchIcon = () => (
   <svg className="sidebar-nav-icon" viewBox="0 0 16 16" fill="none">
     <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
@@ -124,21 +111,30 @@ const PlusIcon = () => (
 
 function loadSectionState(): SectionState {
   if (typeof window === 'undefined') {
-    return { home: false, projects: false, tools: true };
+    return { projects: false, tools: true };
   }
 
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY_SECTIONS);
-    if (!raw) return { home: false, projects: false, tools: true };
-    return { ...{ home: false, projects: false, tools: true }, ...(JSON.parse(raw) as Partial<SectionState>) };
+    if (!raw) return { projects: false, tools: true };
+    return { ...{ projects: false, tools: true }, ...(JSON.parse(raw) as Partial<SectionState>) };
   } catch {
-    return { home: false, projects: false, tools: true };
+    return { projects: false, tools: true };
   }
 }
 
-function loadExpandedProject(): string | null {
-  if (typeof window === 'undefined') return null;
-  return window.localStorage.getItem(STORAGE_KEY_PROJECT);
+function loadProjectIdList(storageKey: string): string[] {
+  if (typeof window === 'undefined') return [];
+
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((value): value is string => typeof value === 'string');
+  } catch {
+    return [];
+  }
 }
 
 const NavItem = memo(function NavItem({ label, icon, active, nested, onClick, trailing, onKeyDown, role, level, expanded, controls }: NavItemProps) {
@@ -156,182 +152,187 @@ const NavItem = memo(function NavItem({ label, icon, active, nested, onClick, tr
       data-sidebar-focusable="true"
     >
       <span className="sidebar-nav-item-leading">
-        {icon}
-        <span className="sidebar-nav-label">{label}</span>
+        <span className="sidebar-nav-icon-wrap">{icon}</span>
+        <span className="sidebar-nav-copy">
+          <span className="sidebar-nav-label">{label}</span>
+        </span>
       </span>
       {trailing && <span className="sidebar-nav-trailing">{trailing}</span>}
     </button>
   );
 });
 
+const GearIcon = () => (
+  <svg className="sidebar-gear-icon" viewBox="0 0 16 16" fill="none">
+    <path d="M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z" stroke="currentColor" strokeWidth="1.5" />
+    <path d="M13.2 8.8v-1.6l-1.1-.3a4.5 4.5 0 0 0-.4-.9l.6-1-1.1-1.1-1 .6c-.3-.2-.6-.3-.9-.4L8.8 2.8H7.2l-.3 1.1c-.3.1-.6.2-.9.4l-1-.6-1.1 1.1.6 1c-.2.3-.3.6-.4.9l-1.1.3v1.6l1.1.3c.1.3.2.6.4.9l-.6 1 1.1 1.1 1-.6c.3.2.6.3.9.4l.3 1.1h1.6l.3-1.1c.3-.1.6-.2.9-.4l1 .6 1.1-1.1-.6-1c.2-.3.3-.6.4-.9l1.1-.3Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+  </svg>
+);
+
+const PinDot = () => (
+  <span className="sidebar-pin-dot" aria-label="Pinned" title="Pinned">
+    <svg viewBox="0 0 8 8" width="8" height="8" fill="currentColor"><circle cx="4" cy="4" r="3" /></svg>
+  </span>
+);
+
 const SidebarProjectNode = memo(function SidebarProjectNode({
   project,
-  expanded,
   isActive,
-  onToggle,
   onNavigate,
   pathname,
   onMoveFocus,
-  activeAgentCount,
+  variant = 'default',
 }: SidebarProjectNodeProps) {
-  const { data: boards = [], isLoading } = useBoards(expanded ? project.id : undefined);
-  const projectPath = `/projects/${project.id}`;
-  const settingsPath = `/projects/${project.id}/settings`;
-  const primaryBoard = boards.find((board) => board.is_default) ?? boards[0];
-  const createBoardPath = `${projectPath}?newBoard=1`;
+  const { data: boards = [] } = useBoards(project.id);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement | null>(null);
 
-  const isProjectRoute = pathname === projectPath || pathname.startsWith(`${projectPath}/`);
-  const childGroupId = `sidebar-project-${project.id}`;
+  const defaultBoard = useMemo(() => boards.find((b) => b.is_default) ?? boards[0], [boards]);
+  const hasMultipleBoards = boards.length > 1;
 
-  const handleProjectKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+  const activeBoardId = useMemo(() => {
+    const match = pathname.match(new RegExp(`^/projects/${project.id}/boards/([^/]+)`));
+    return match?.[1] ?? null;
+  }, [pathname, project.id]);
+
+  // Close picker on click outside or Escape
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const handleClick = (event: MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(event.target as Node)) {
+        setPickerOpen(false);
+      }
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPickerOpen(false);
+    };
+    document.addEventListener('mousedown', handleClick);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handleClick);
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [pickerOpen]);
+
+  const handleProjectClick = useCallback(() => {
+    if (defaultBoard) {
+      onNavigate(`/projects/${project.id}/boards/${defaultBoard.board_id}`);
+    } else {
+      onNavigate(`/projects/${project.id}`);
+    }
+  }, [defaultBoard, onNavigate, project.id]);
+
+  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
     if (event.key === 'ArrowDown') {
       event.preventDefault();
       onMoveFocus(event.currentTarget, 1);
-      return;
-    }
-    if (event.key === 'ArrowUp') {
+    } else if (event.key === 'ArrowUp') {
       event.preventDefault();
       onMoveFocus(event.currentTarget, -1);
-      return;
     }
-    if (event.key === 'ArrowRight' && !expanded) {
-      event.preventDefault();
-      onToggle(project.id);
-      return;
-    }
-    if (event.key === 'ArrowLeft' && expanded) {
-      event.preventDefault();
-      onToggle(project.id);
-    }
-  }, [expanded, onMoveFocus, onToggle, project.id]);
+  }, [onMoveFocus]);
 
   return (
-    <div className="sidebar-project-node">
-      <NavItem
-        label={project.name}
-        icon={<ProjectIcon />}
-        active={isActive || isProjectRoute}
-        onClick={() => onToggle(project.id)}
-        onKeyDown={handleProjectKeyDown}
-        trailing={
-          <span className="sidebar-project-summary">
-            {activeAgentCount > 0 && <CountBadge count={activeAgentCount} />}
-            {boards.length > 0 && <CountBadge count={boards.length} />}
+    <div className={`sidebar-project-row ${variant === 'default' ? 'sidebar-project-row--dim' : ''}`} ref={pickerRef}>
+      <button
+        type="button"
+        className={`sidebar-nav-item project-item ${isActive ? 'active' : ''}`}
+        onClick={handleProjectClick}
+        onKeyDown={handleKeyDown}
+        aria-current={isActive ? 'page' : undefined}
+        data-sidebar-focusable="true"
+        role="treeitem"
+        aria-level={1}
+      >
+        <span className="sidebar-nav-item-leading">
+          <span className="sidebar-nav-icon-wrap"><ProjectIcon /></span>
+          <span className="sidebar-nav-copy">
+            <span className="sidebar-nav-label project-name">{project.name}</span>
+          </span>
+          {variant === 'pinned' && <PinDot />}
+        </span>
+        <span className="sidebar-nav-trailing">
+          <span
+            role="button"
+            tabIndex={0}
+            className="sidebar-project-gear"
+            aria-label={`${project.name} settings`}
+            title="Project settings"
+            onClick={(event) => {
+              event.stopPropagation();
+              onNavigate(`/projects/${project.id}?tab=settings`);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                event.stopPropagation();
+                onNavigate(`/projects/${project.id}?tab=settings`);
+              }
+            }}
+          >
+            <GearIcon />
+          </span>
+          {hasMultipleBoards && (
             <span
               role="button"
               tabIndex={0}
-              className="sidebar-project-action"
-              aria-label={`Create a board in ${project.name}`}
-              title="Create board"
+              className="sidebar-board-chevron"
+              aria-label={`Switch board in ${project.name}`}
+              aria-expanded={pickerOpen}
+              title="Switch board"
               onClick={(event) => {
                 event.stopPropagation();
-                onNavigate(createBoardPath);
+                setPickerOpen((prev) => !prev);
               }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                   event.preventDefault();
                   event.stopPropagation();
-                  onNavigate(createBoardPath);
+                  setPickerOpen((prev) => !prev);
                 }
               }}
             >
-              <PlusIcon />
+              <ChevronIcon expanded={pickerOpen} />
             </span>
-            <ChevronIcon expanded={expanded} />
-          </span>
-        }
-        role="treeitem"
-        level={1}
-        expanded={expanded}
-        controls={childGroupId}
-      />
-
-      <div id={childGroupId} className={`sidebar-project-children ${expanded ? 'expanded' : ''}`} role="group">
-        <div className="sidebar-project-children-inner">
-          <NavItem
-            label="Overview"
-            icon={<ProjectIcon />}
-            nested
-            active={pathname === projectPath}
-            onClick={() => onNavigate(projectPath)}
-            onKeyDown={(event) => {
-              if (event.key === 'ArrowDown') {
-                event.preventDefault();
-                onMoveFocus(event.currentTarget, 1);
-              } else if (event.key === 'ArrowUp') {
-                event.preventDefault();
-                onMoveFocus(event.currentTarget, -1);
-              } else if (event.key === 'ArrowLeft') {
-                event.preventDefault();
-                onToggle(project.id);
-              } else if (event.key === 'ArrowRight' && primaryBoard) {
-                event.preventDefault();
-                onNavigate(`/projects/${project.id}/boards/${primaryBoard.board_id}`);
-              }
-            }}
-            role="treeitem"
-            level={2}
-          />
-
-          {expanded && isLoading ? (
-            <div className="sidebar-project-loading" aria-hidden="true">
-              <span className="sidebar-project-skeleton animate-shimmer" />
-              <span className="sidebar-project-skeleton animate-shimmer" />
-            </div>
-          ) : (
-            boards.map((board) => {
-              const boardPath = `/projects/${project.id}/boards/${board.board_id}`;
-              const boardActive = pathname === boardPath || pathname.startsWith(`${boardPath}/items/`);
-              return (
-                <NavItem
-                  key={board.board_id}
-                  label={board.name}
-                  icon={board.is_default ? <DefaultBoardIcon /> : <BoardIcon />}
-                  nested
-                  active={boardActive}
-                  onClick={() => onNavigate(boardPath)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'ArrowDown') {
-                      event.preventDefault();
-                      onMoveFocus(event.currentTarget, 1);
-                    } else if (event.key === 'ArrowUp') {
-                      event.preventDefault();
-                      onMoveFocus(event.currentTarget, -1);
-                    } else if (event.key === 'ArrowLeft') {
-                      event.preventDefault();
-                      onToggle(project.id);
-                    }
-                  }}
-                  role="treeitem"
-                  level={2}
-                />
-              );
-            })
           )}
+        </span>
+      </button>
 
-          <NavItem
-            label="Settings"
-            icon={<SettingsIcon />}
-            nested
-            active={pathname === settingsPath}
-            onClick={() => onNavigate(settingsPath)}
-            onKeyDown={(event) => {
-              if (event.key === 'ArrowDown') {
-                event.preventDefault();
-                onMoveFocus(event.currentTarget, 1);
-              } else if (event.key === 'ArrowUp') {
-                event.preventDefault();
-                onMoveFocus(event.currentTarget, -1);
-              } else if (event.key === 'ArrowLeft') {
-                event.preventDefault();
-                onToggle(project.id);
-              }
+      {pickerOpen && hasMultipleBoards && (
+        <div className="sidebar-board-picker" role="listbox" aria-label="Select board">
+          {boards.map((board) => (
+            <button
+              key={board.board_id}
+              type="button"
+              role="option"
+              className={`sidebar-board-picker-item ${activeBoardId === board.board_id ? 'active' : ''}`}
+              aria-selected={activeBoardId === board.board_id}
+              onClick={() => {
+                onNavigate(`/projects/${project.id}/boards/${board.board_id}`);
+                setPickerOpen(false);
+              }}
+            >
+              <span className="sidebar-board-picker-icon">
+                {board.is_default ? <DefaultBoardIcon /> : <BoardIcon />}
+              </span>
+              <span className="sidebar-board-picker-name">{board.name}</span>
+              {board.is_default && <span className="sidebar-board-picker-badge">Default</span>}
+            </button>
+          ))}
+          <div className="sidebar-board-picker-divider" />
+          <button
+            type="button"
+            className="sidebar-board-picker-item sidebar-board-picker-create"
+            onClick={() => {
+              onNavigate(`/projects/${project.id}?newBoard=1`);
+              setPickerOpen(false);
             }}
-            role="treeitem"
-            level={2}
-          />
+          >
+            <span className="sidebar-board-picker-icon"><PlusIcon /></span>
+            <span className="sidebar-board-picker-name">New board</span>
+          </button>
         </div>
-      </div>
+      )}
     </div>
   );
 });
@@ -341,10 +342,11 @@ export const SidebarNav = memo(function SidebarNav({ onNavigate }: SidebarNavPro
   const containerRef = useRef<HTMLDivElement | null>(null);
   const { currentOrgId } = useOrgContext();
   const [sections, setSections] = useState<SectionState>(() => loadSectionState());
-  const [expandedProjectId, setExpandedProjectId] = useState<string | null>(() => loadExpandedProject());
+
+  const { data: capabilities } = useApiCapabilities();
+  const hasOrgs = capabilities?.routes.orgs ?? false;
 
   const { data: projects = [] } = useProjects(currentOrgId ?? undefined);
-  const { data: agents = [] } = useProjectAgents(true);
 
   const scopedProjects = useMemo(
     () => (currentOrgId ? projects : projects.filter((project) => !project.org_id)),
@@ -356,27 +358,9 @@ export const SidebarNav = memo(function SidebarNav({ onNavigate }: SidebarNavPro
     [scopedProjects]
   );
 
-  const activeAgentCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    agents.forEach((agent) => {
-      if (!agent.project_id) return;
-      if (agent.status !== 'active' && agent.status !== 'busy') return;
-      counts.set(agent.project_id, (counts.get(agent.project_id) ?? 0) + 1);
-    });
-    return counts;
-  }, [agents]);
-
   useEffect(() => {
     window.localStorage.setItem(STORAGE_KEY_SECTIONS, JSON.stringify(sections));
   }, [sections]);
-
-  useEffect(() => {
-    if (expandedProjectId) {
-      window.localStorage.setItem(STORAGE_KEY_PROJECT, expandedProjectId);
-    } else {
-      window.localStorage.removeItem(STORAGE_KEY_PROJECT);
-    }
-  }, [expandedProjectId]);
 
   const newProjectPath = useMemo(() => {
     return currentOrgId ? `/projects/new?org=${encodeURIComponent(currentOrgId)}` : '/projects/new';
@@ -384,10 +368,6 @@ export const SidebarNav = memo(function SidebarNav({ onNavigate }: SidebarNavPro
 
   const toggleSection = useCallback((section: keyof SectionState) => {
     setSections((prev) => ({ ...prev, [section]: !prev[section] }));
-  }, []);
-
-  const toggleProject = useCallback((projectId: string) => {
-    setExpandedProjectId((prev) => (prev === projectId ? null : projectId));
   }, []);
 
   const moveFocus = useCallback((current: HTMLElement, delta: number) => {
@@ -418,15 +398,57 @@ export const SidebarNav = memo(function SidebarNav({ onNavigate }: SidebarNavPro
     [pathname, sections]
   );
 
-  const activeExpandedProjectId = routeProjectId ?? expandedProjectId;
+  const projectsById = useMemo(
+    () => new Map(sortedProjects.map((project) => [project.id, project])),
+    [sortedProjects]
+  );
+
+  const pinnedProjectIds = useMemo(() => loadProjectIdList(STORAGE_KEY_PINNED_PROJECTS), []);
+  const recentProjectIds = useMemo(() => {
+    const stored = loadProjectIdList(STORAGE_KEY_RECENT_PROJECTS);
+    if (!routeProjectId) return stored;
+    return [routeProjectId, ...stored.filter((id) => id !== routeProjectId)];
+  }, [routeProjectId]);
+
+  const pinnedProjects = useMemo(
+    () => pinnedProjectIds.map((id) => projectsById.get(id)).filter((p): p is Project => Boolean(p)),
+    [pinnedProjectIds, projectsById]
+  );
+  const recentProjects = useMemo(() => {
+    const pinnedIds = new Set(pinnedProjects.map((p) => p.id));
+    return recentProjectIds
+      .map((id) => projectsById.get(id))
+      .filter((p): p is Project => p !== undefined && !pinnedIds.has(p.id))
+      .slice(0, 5);
+  }, [pinnedProjects, projectsById, recentProjectIds]);
+
+  const remainingProjects = useMemo(() => {
+    const shownIds = new Set([
+      ...pinnedProjects.map((p) => p.id),
+      ...recentProjects.map((p) => p.id),
+    ]);
+    return sortedProjects.filter((p) => !shownIds.has(p.id));
+  }, [pinnedProjects, recentProjects, sortedProjects]);
+
+  useEffect(() => {
+    if (!routeProjectId || typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(
+      STORAGE_KEY_RECENT_PROJECTS,
+      JSON.stringify(recentProjectIds.slice(0, 8))
+    );
+  }, [recentProjectIds, routeProjectId]);
 
   return (
-    <div className="sidebar-nav" role="tree" aria-label="Primary navigation" ref={containerRef}>
-      <div className="sidebar-section">
-        <button
-          type="button"
-          className="sidebar-section-header"
-          onClick={() => toggleSection('home')}
+    <div className="sidebar-nav-panel">
+      <div className="sidebar-nav-tree" role="tree" aria-label="Primary navigation" ref={containerRef}>
+        <NavItem
+          label="Dashboard"
+          icon={<HomeIcon />}
+          active={pathname === '/'}
+          onClick={() => onNavigate('/')}
           onKeyDown={(event) => {
             if (event.key === 'ArrowDown') {
               event.preventDefault();
@@ -434,29 +456,18 @@ export const SidebarNav = memo(function SidebarNav({ onNavigate }: SidebarNavPro
             } else if (event.key === 'ArrowUp') {
               event.preventDefault();
               moveFocus(event.currentTarget, -1);
-            } else if (event.key === 'ArrowLeft' && !visibleSections.home) {
-              event.preventDefault();
-              toggleSection('home');
-            } else if (event.key === 'ArrowRight' && visibleSections.home) {
-              event.preventDefault();
-              toggleSection('home');
             }
           }}
-          data-sidebar-focusable="true"
           role="treeitem"
-          aria-expanded={!visibleSections.home}
-          aria-level={1}
-        >
-          <span>Home</span>
-          <ChevronIcon expanded={!visibleSections.home} />
-        </button>
-        <div className={`sidebar-section-body ${visibleSections.home ? 'collapsed' : ''}`}>
-          <div className="sidebar-section-body-inner">
-            <NavItem
-              label="Dashboard"
-              icon={<HomeIcon />}
-              active={pathname === '/'}
-              onClick={() => onNavigate('/')}
+          level={1}
+        />
+
+        <div className="sidebar-section sidebar-section-projects">
+          <div className="sidebar-section-header sidebar-section-header-with-action">
+            <button
+              type="button"
+              className="sidebar-section-toggle"
+              onClick={() => toggleSection('projects')}
               onKeyDown={(event) => {
                 if (event.key === 'ArrowDown') {
                   event.preventDefault();
@@ -464,65 +475,180 @@ export const SidebarNav = memo(function SidebarNav({ onNavigate }: SidebarNavPro
                 } else if (event.key === 'ArrowUp') {
                   event.preventDefault();
                   moveFocus(event.currentTarget, -1);
-                } else if (event.key === 'ArrowLeft') {
+                } else if (event.key === 'ArrowLeft' && !visibleSections.projects) {
                   event.preventDefault();
-                  toggleSection('home');
+                  toggleSection('projects');
+                } else if (event.key === 'ArrowRight' && visibleSections.projects) {
+                  event.preventDefault();
+                  toggleSection('projects');
                 }
               }}
+              data-sidebar-focusable="true"
               role="treeitem"
-              level={1}
-            />
+              aria-expanded={!visibleSections.projects}
+              aria-level={1}
+            >
+              <span className="sidebar-section-title-group">
+                <span className="sidebar-section-dot" />
+                <span>Projects</span>
+              </span>
+              <ChevronIcon expanded={!visibleSections.projects} />
+            </button>
+            <button
+              type="button"
+              className="sidebar-section-action"
+              onClick={() => onNavigate(newProjectPath)}
+              aria-label="Create project"
+              title="Create project"
+            >
+              <PlusIcon />
+            </button>
+          </div>
+          <div className={`sidebar-section-body ${visibleSections.projects ? 'collapsed' : ''}`}>
+            <div className="sidebar-section-body-inner">
+              {sortedProjects.length > 1 && (
+                <NavItem
+                  label="All Projects"
+                  icon={<ProjectIcon />}
+                  active={pathname === '/projects' || pathname === '/projects/new'}
+                  onClick={() => onNavigate('/projects')}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, 1);
+                    } else if (event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, -1);
+                    }
+                  }}
+                  role="treeitem"
+                  level={1}
+                />
+              )}
+
+              {pinnedProjects.map((project) => {
+                const isProjectRoute = pathname === `/projects/${project.id}` || pathname.startsWith(`/projects/${project.id}/`);
+                return (
+                  <SidebarProjectNode
+                    key={`pinned-${project.id}`}
+                    project={project}
+                    isActive={isProjectRoute}
+                    onNavigate={onNavigate}
+                    pathname={pathname}
+                    onMoveFocus={moveFocus}
+                    variant="pinned"
+                  />
+                );
+              })}
+              {recentProjects.map((project) => {
+                const isProjectRoute = pathname === `/projects/${project.id}` || pathname.startsWith(`/projects/${project.id}/`);
+                return (
+                  <SidebarProjectNode
+                    key={`recent-${project.id}`}
+                    project={project}
+                    isActive={isProjectRoute}
+                    onNavigate={onNavigate}
+                    pathname={pathname}
+                    onMoveFocus={moveFocus}
+                    variant="recent"
+                  />
+                );
+              })}
+              {remainingProjects.map((project) => {
+                const isProjectRoute = pathname === `/projects/${project.id}` || pathname.startsWith(`/projects/${project.id}/`);
+                return (
+                  <SidebarProjectNode
+                    key={`other-${project.id}`}
+                    project={project}
+                    isActive={isProjectRoute}
+                    onNavigate={onNavigate}
+                    pathname={pathname}
+                    onMoveFocus={moveFocus}
+                  />
+                );
+              })}
+            </div>
           </div>
         </div>
-      </div>
 
-      <div className="sidebar-section">
-        <div className="sidebar-section-body">
-          <div className="sidebar-section-body-inner">
-            <NavItem
-              label="Organizations"
-              icon={<OrgIcon />}
-              active={pathname.startsWith('/orgs')}
-              onClick={() => onNavigate('/orgs')}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, 1);
-                } else if (event.key === 'ArrowUp') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, -1);
-                }
-              }}
-              role="treeitem"
-              level={1}
-            />
-            <NavItem
-              label="Agents"
-              icon={<AgentIcon />}
-              active={pathname.startsWith('/agents')}
-              onClick={() => onNavigate('/agents')}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, 1);
-                } else if (event.key === 'ArrowUp') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, -1);
-                }
-              }}
-              role="treeitem"
-              level={1}
-            />
+        {hasOrgs ? (
+          <div className="sidebar-section">
+            <div className="sidebar-section-label" aria-hidden="true">
+              <span className="sidebar-section-title-group">
+                <span className="sidebar-section-dot" />
+                <span>Manage</span>
+              </span>
+            </div>
+            <div className="sidebar-section-body">
+              <div className="sidebar-section-body-inner">
+                <NavItem
+                  label="Organizations"
+                  icon={<OrgIcon />}
+                  active={pathname.startsWith('/orgs')}
+                  onClick={() => onNavigate('/orgs')}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, 1);
+                    } else if (event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, -1);
+                    }
+                  }}
+                  role="treeitem"
+                  level={1}
+                />
+                <NavItem
+                  label="Agents"
+                  icon={<AgentIcon />}
+                  active={pathname.startsWith('/agents')}
+                  onClick={() => onNavigate('/agents')}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, 1);
+                    } else if (event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, -1);
+                    }
+                  }}
+                  role="treeitem"
+                  level={1}
+                />
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
+        ) : (
+          <div className="sidebar-section">
+            <div className="sidebar-section-body">
+              <div className="sidebar-section-body-inner">
+                <NavItem
+                  label="Agents"
+                  icon={<AgentIcon />}
+                  active={pathname.startsWith('/agents')}
+                  onClick={() => onNavigate('/agents')}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, 1);
+                    } else if (event.key === 'ArrowUp') {
+                      event.preventDefault();
+                      moveFocus(event.currentTarget, -1);
+                    }
+                  }}
+                  role="treeitem"
+                  level={1}
+                />
+              </div>
+            </div>
+          </div>
+        )}
 
-      <div className="sidebar-section sidebar-section-projects">
-        <div className="sidebar-section-header sidebar-section-header-with-action">
+        <div className="sidebar-section">
           <button
             type="button"
-            className="sidebar-section-toggle"
-            onClick={() => toggleSection('projects')}
+            className="sidebar-section-header"
+            onClick={() => toggleSection('tools')}
             onKeyDown={(event) => {
               if (event.key === 'ArrowDown') {
                 event.preventDefault();
@@ -530,135 +656,62 @@ export const SidebarNav = memo(function SidebarNav({ onNavigate }: SidebarNavPro
               } else if (event.key === 'ArrowUp') {
                 event.preventDefault();
                 moveFocus(event.currentTarget, -1);
-              } else if (event.key === 'ArrowLeft' && !visibleSections.projects) {
+              } else if (event.key === 'ArrowLeft' && !visibleSections.tools) {
                 event.preventDefault();
-                toggleSection('projects');
-              } else if (event.key === 'ArrowRight' && visibleSections.projects) {
+                toggleSection('tools');
+              } else if (event.key === 'ArrowRight' && visibleSections.tools) {
                 event.preventDefault();
-                toggleSection('projects');
+                toggleSection('tools');
               }
             }}
             data-sidebar-focusable="true"
             role="treeitem"
-            aria-expanded={!visibleSections.projects}
+            aria-expanded={!visibleSections.tools}
             aria-level={1}
           >
-            <span>Projects</span>
-            <ChevronIcon expanded={!visibleSections.projects} />
+            <span className="sidebar-section-title-group">
+              <span className="sidebar-section-dot" />
+              <span>Tools</span>
+            </span>
+            <ChevronIcon expanded={!visibleSections.tools} />
           </button>
-          <button
-            type="button"
-            className="sidebar-section-action"
-            onClick={() => onNavigate(newProjectPath)}
-            aria-label="Create project"
-            title="Create project"
-          >
-            <PlusIcon />
-          </button>
-        </div>
-        <div className={`sidebar-section-body ${visibleSections.projects ? 'collapsed' : ''}`}>
-          <div className="sidebar-section-body-inner">
-            <NavItem
-              label="All Projects"
-              icon={<ProjectIcon />}
-              active={pathname === '/projects' || pathname === '/projects/new'}
-              onClick={() => onNavigate('/projects')}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, 1);
-                } else if (event.key === 'ArrowUp') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, -1);
-                }
-              }}
-              role="treeitem"
-              level={1}
-            />
-            {sortedProjects.map((project) => {
-              const isProjectRoute = pathname === `/projects/${project.id}` || pathname.startsWith(`/projects/${project.id}/`);
-              return (
-                <SidebarProjectNode
-                  key={project.id}
-                  project={project}
-                  expanded={activeExpandedProjectId === project.id}
-                  isActive={isProjectRoute}
-                  onToggle={toggleProject}
-                  onNavigate={onNavigate}
-                  pathname={pathname}
-                  onMoveFocus={moveFocus}
-                  activeAgentCount={activeAgentCounts.get(project.id) ?? 0}
-                />
-              );
-            })}
-          </div>
-        </div>
-      </div>
-
-      <div className="sidebar-section">
-        <button
-          type="button"
-          className="sidebar-section-header"
-          onClick={() => toggleSection('tools')}
-          onKeyDown={(event) => {
-            if (event.key === 'ArrowDown') {
-              event.preventDefault();
-              moveFocus(event.currentTarget, 1);
-            } else if (event.key === 'ArrowUp') {
-              event.preventDefault();
-              moveFocus(event.currentTarget, -1);
-            } else if (event.key === 'ArrowLeft' && !visibleSections.tools) {
-              event.preventDefault();
-              toggleSection('tools');
-            } else if (event.key === 'ArrowRight' && visibleSections.tools) {
-              event.preventDefault();
-              toggleSection('tools');
-            }
-          }}
-          data-sidebar-focusable="true"
-          role="treeitem"
-          aria-expanded={!visibleSections.tools}
-          aria-level={1}
-        >
-          <span>Tools</span>
-          <ChevronIcon expanded={!visibleSections.tools} />
-        </button>
-        <div className={`sidebar-section-body ${visibleSections.tools ? 'collapsed' : ''}`}>
-          <div className="sidebar-section-body-inner">
-            <NavItem
-              label="Behavior Search"
-              icon={<SearchIcon />}
-              active={pathname === '/bci'}
-              onClick={() => onNavigate('/bci')}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, 1);
-                } else if (event.key === 'ArrowUp') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, -1);
-                }
-              }}
-              role="treeitem"
-              level={1}
-            />
-            <NavItem
-              label="Behavior Extraction"
-              icon={<SparkIcon />}
-              active={pathname === '/bci/extraction'}
-              onClick={() => onNavigate('/bci/extraction')}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, 1);
-                } else if (event.key === 'ArrowUp') {
-                  event.preventDefault();
-                  moveFocus(event.currentTarget, -1);
-                }
-              }}
-              role="treeitem"
-              level={1}
-            />
+          <div className={`sidebar-section-body ${visibleSections.tools ? 'collapsed' : ''}`}>
+            <div className="sidebar-section-body-inner">
+              <NavItem
+                label="Behavior Search"
+                icon={<SearchIcon />}
+                active={pathname === '/bci'}
+                onClick={() => onNavigate('/bci')}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    moveFocus(event.currentTarget, 1);
+                  } else if (event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    moveFocus(event.currentTarget, -1);
+                  }
+                }}
+                role="treeitem"
+                level={1}
+              />
+              <NavItem
+                label="Behavior Extraction"
+                icon={<SparkIcon />}
+                active={pathname === '/bci/extraction'}
+                onClick={() => onNavigate('/bci/extraction')}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    moveFocus(event.currentTarget, 1);
+                  } else if (event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    moveFocus(event.currentTarget, -1);
+                  }
+                }}
+                role="treeitem"
+                level={1}
+              />
+            </div>
           </div>
         </div>
       </div>

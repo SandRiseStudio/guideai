@@ -23,13 +23,25 @@
         "type": "string",
         "description": "Authenticated service principal ID (null if user auth)"
       },
+      "email": {
+        "type": "string",
+        "description": "Email address of the authenticated user (null if not available)"
+      },
       "org_id": {
         "type": "string",
-        "description": "Current organization context (null if not set)"
+        "description": "Current organization context (null if not set — orgs are optional)"
+      },
+      "org_name": {
+        "type": "string",
+        "description": "Display name of the current organization (null if no org set or name unavailable)"
       },
       "project_id": {
         "type": "string",
         "description": "Current project context (null if not set)"
+      },
+      "project_name": {
+        "type": "string",
+        "description": "Display name of the current project (null if no project set or name unavailable)"
       },
       "auth_method": {
         "type": "string",
@@ -49,6 +61,25 @@
       "is_authenticated": {
         "type": "boolean",
         "description": "Whether the session is authenticated"
+      },
+      "is_admin": {
+        "type": "boolean",
+        "description": "Whether the identity has admin privileges"
+      },
+      "accessible_org_ids": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Organization IDs the identity can access (empty if orgs not used)"
+      },
+      "accessible_project_ids": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Project IDs the identity can access"
+      },
+      "authenticated_at": {
+        "type": "string",
+        "format": "date-time",
+        "description": "When the session was authenticated (null if not authenticated)"
       },
       "active_pack": {
         "type": "object",

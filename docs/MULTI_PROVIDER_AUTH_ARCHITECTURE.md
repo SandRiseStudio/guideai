@@ -256,8 +256,8 @@ class GitHubOAuthProvider(OAuthProvider):
 
 **Configuration** (`.env` or environment):
 ```bash
-OAUTH_GITHUB_CLIENT_ID=Ov23lix7WmdKsvRWXvsS
-OAUTH_GITHUB_CLIENT_SECRET=361fef929c9da2747d1d1788997102ea46cf92e9
+OAUTH_GITHUB_CLIENT_ID=<your-github-client-id>
+OAUTH_GITHUB_CLIENT_SECRET=<your-github-client-secret>
 OAUTH_GITHUB_ENABLED=true
 ```
 

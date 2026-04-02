@@ -24,7 +24,7 @@
       },
       "parent_id": {
         "type": "string",
-        "description": "Parent work item ID (for features under goals, or tasks under features)"
+        "description": "Parent work item ID or display ID (e.g. 'GUIDEAI-42') for features under goals, or tasks under features"
       },
       "title": {
         "type": "string",

@@ -7,6 +7,7 @@
 /* ── Rail container ──────────────────────────────────────────────────────── */
 
 .board-agent-presence-rail {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -17,6 +18,8 @@
   backdrop-filter: blur(16px) saturate(136%);
   min-height: 44px;
   margin-top: var(--space-2);
+  overflow: visible;
+  z-index: 101;
 }
 
 /* ── Summary cluster (left) ──────────────────────────────────────────────── */
@@ -58,6 +61,25 @@
   overflow: visible;
 }
 
+.presence-rail-roster-group {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.presence-rail-roster-group--agents {
+  padding-left: 2px;
+}
+
+.presence-rail-roster-separator {
+  inline-size: 1px;
+  block-size: 18px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-border-subtle) 80%, transparent);
+  flex: 0 0 auto;
+}
+
 .presence-rail-avatar-button {
   position: relative;
   display: inline-flex;
@@ -72,8 +94,14 @@
               opacity var(--duration-fast) var(--ease-out-expo);
 }
 
+.presence-rail-avatar-button--agent .actor-avatar {
+  outline: 1px solid color-mix(in srgb, var(--color-accent) 18%, transparent);
+  outline-offset: 1px;
+}
+
 .presence-rail-avatar-button:hover {
   transform: translateY(-1px);
+  z-index: 102;
 }
 
 .presence-rail-avatar-button:active {

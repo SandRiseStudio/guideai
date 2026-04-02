@@ -18,8 +18,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { WorkspaceShell } from './workspace/WorkspaceShell';
-import { ConsoleSidebar } from './ConsoleSidebar';
+import { useShellTitle } from './workspace/useShell';
 import { useBoards } from '../api/boards';
 import { orgContextStore, useOrgContext } from '../store/orgContextStore';
 import {
@@ -761,9 +760,7 @@ function formatDuration(ms: number): string {
 // Dashboard Sidebar Content
 // ---------------------------------------------------------------------------
 
-const DashboardSidebar = memo(function DashboardSidebar({ onNavigate }: { onNavigate: (path: string) => void }) {
-  return <ConsoleSidebar selectedId="dashboard" onNavigate={onNavigate} />;
-});
+
 
 // ---------------------------------------------------------------------------
 // Main Dashboard Component
@@ -906,11 +903,9 @@ export function Dashboard() {
     refetchProjects();
   }, [refetchProjects]);
 
+  useShellTitle('Home');
+
   return (
-    <WorkspaceShell
-      sidebarContent={<DashboardSidebar onNavigate={handleNavigate} />}
-      documentTitle="Home"
-    >
       <div className="dashboard">
         {/* Header */}
         <header className="dashboard-header">
@@ -1190,7 +1185,6 @@ export function Dashboard() {
           </section>
         </div>
       </div>
-    </WorkspaceShell>
   );
 }
 

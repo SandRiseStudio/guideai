@@ -21,19 +21,10 @@ def clean_workflow_db():
     if not dsn:
         pytest.skip("GUIDEAI_WORKFLOW_PG_DSN not set")
 
-    from guideai.storage.postgres_pool import PostgresPool
+    from conftest import safe_truncate
     from guideai.storage.redis_cache import get_cache
 
-    # Clear database tables
-    pool = PostgresPool(dsn=dsn)
-    with pool.connection() as conn:
-        cur = conn.cursor()
-        # Delete in correct order (runs and versions reference templates)
-        cur.execute("TRUNCATE TABLE workflow_runs CASCADE")
-        cur.execute("TRUNCATE TABLE workflow_template_versions CASCADE")
-        cur.execute("TRUNCATE TABLE workflow_templates CASCADE")
-        conn.commit()
-        cur.close()
+    safe_truncate(dsn, ["workflow_runs", "workflow_template_versions", "workflow_templates"])
 
     # Clear Redis cache for workflow service
     cache = get_cache()

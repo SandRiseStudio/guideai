@@ -11,6 +11,12 @@ by PostgreSQL-backed versions.
 | `workflow_service_sqlite_backup.py` | `workflow_service.py` | In-memory service, PostgreSQL via service factory |
 | `agent_workspace_manager.py` | `guideai.workspace_agent` | Extracted to standalone `workspace-agent` gRPC service |
 
+## Archived Packages
+
+| Package | Location | Replacement | Notes |
+|---------|----------|-------------|-------|
+| `workspace-agent` | `packages/_archive/workspace-agent/` | `amprealize` | gRPC removed; `guideai/workspace_agent/` shim now wraps AmpOrchestrator |
+
 ## Why Archived?
 
 These SQLite-backed implementations were superseded by a two-tier architecture:

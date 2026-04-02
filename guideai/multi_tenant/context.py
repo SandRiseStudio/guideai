@@ -21,11 +21,11 @@ Usage:
         await ctx.deactivate()
 
 Tenant Resolution Priority (TenantMiddleware):
-    1. X-Tenant-ID header (explicit tenant selection)
-    2. X-Tenant-Slug header (resolved to ID via cache/DB)
-    3. Subdomain parsing (e.g., acme.guideai.dev -> "acme")
-    4. Path parameter (e.g., /api/v1/tenants/{tenant_slug}/...)
-    5. Auth context (organization from authenticated user's claims)
+    1. Auth context (organization from authenticated user's JWT claims)
+    2. X-Tenant-ID header (explicit tenant selection)
+    3. X-Tenant-Slug header (resolved to ID via cache/DB)
+    4. Subdomain parsing (e.g., acme.guideai.dev -> "acme")
+    5. Path parameter (e.g., /api/v1/tenants/{tenant_slug}/...)
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from __future__ import annotations
 import contextvars
 import re
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -267,6 +267,7 @@ class TenantMiddleware:
         slug_resolver: Optional[Callable[[str], Optional[str]]] = None,
         apply_limits: bool = True,
         base_domain: Optional[str] = None,  # e.g., "guideai.dev" to strip from subdomain
+        skip_paths: Optional[Set[str]] = None,
     ):
         """Initialize TenantMiddleware.
 
@@ -281,6 +282,7 @@ class TenantMiddleware:
                           If None, uses database lookup with caching.
             apply_limits: Apply tenant-specific resource limits (default: True).
             base_domain: Base domain to strip when parsing subdomains.
+            skip_paths: Paths to skip tenant resolution for (e.g., /health).
         """
         self.app = app
         self.pool = pool
@@ -291,9 +293,18 @@ class TenantMiddleware:
         self.slug_resolver = slug_resolver
         self.apply_limits = apply_limits
         self.base_domain = base_domain
+        self.skip_paths = skip_paths or set()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Skip tenant resolution for public paths
+        path = scope.get("path", "")
+        if path in self.skip_paths or any(
+            path.startswith(p.rstrip('/')) for p in self.skip_paths
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -327,16 +338,25 @@ class TenantMiddleware:
         tenant_slug: Optional[str] = None
         user_id: Optional[str] = None
 
+        # Priority 1: Auth context (from auth middleware — trusted, not spoofable)
+        if self.enable_auth_context and "state" in scope:
+            state = scope["state"]
+            auth_org_id = state.get("org_id") if isinstance(state, dict) else getattr(state, "org_id", None)
+            auth_user_id = state.get("user_id") if isinstance(state, dict) else getattr(state, "user_id", None)
+            auth_slug = state.get("tenant_slug") if isinstance(state, dict) else getattr(state, "tenant_slug", None)
+            if auth_org_id or auth_user_id:
+                return auth_org_id, auth_slug, auth_user_id
+
         headers = dict(scope.get("headers", []))
 
-        # Priority 1: X-Tenant-ID header (explicit org_id)
+        # Priority 2: X-Tenant-ID header (explicit org_id)
         if self.enable_header:
             tenant_id_header = headers.get(b"x-tenant-id")
             if tenant_id_header:
                 org_id = tenant_id_header.decode("utf-8")
                 return org_id, None, user_id
 
-            # Priority 2: X-Tenant-Slug header (needs resolution)
+            # Priority 3: X-Tenant-Slug header (needs resolution)
             slug_header = headers.get(b"x-tenant-slug")
             if slug_header:
                 tenant_slug = slug_header.decode("utf-8")
@@ -344,7 +364,7 @@ class TenantMiddleware:
                 if org_id:
                     return org_id, tenant_slug, user_id
 
-        # Priority 3: Subdomain parsing
+        # Priority 4: Subdomain parsing
         if self.enable_subdomain:
             host_header = headers.get(b"host")
             if host_header:
@@ -355,7 +375,7 @@ class TenantMiddleware:
                     if org_id:
                         return org_id, tenant_slug, user_id
 
-        # Priority 4: Path parameter
+        # Priority 5: Path parameter
         if self.enable_path:
             path = scope.get("path", "")
             tenant_slug = self._extract_path_tenant(path)
@@ -363,13 +383,6 @@ class TenantMiddleware:
                 org_id = await self._resolve_slug(tenant_slug)
                 if org_id:
                     return org_id, tenant_slug, user_id
-
-        # Priority 5: Auth context (from auth middleware)
-        if self.enable_auth_context and "state" in scope:
-            state = scope["state"]
-            org_id = getattr(state, "org_id", None)
-            user_id = getattr(state, "user_id", None)
-            tenant_slug = getattr(state, "tenant_slug", None)
 
         return org_id, tenant_slug, user_id
 

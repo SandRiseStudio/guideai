@@ -7,8 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { WorkspaceShell } from '../workspace/WorkspaceShell';
-import { ConsoleSidebar } from '../ConsoleSidebar';
+import { useShellTitle } from '../workspace/useShell';
 import { useOrganizations, useProjects } from '../../api/dashboard';
 import { useOrgContext } from '../../store/orgContextStore';
 import { useAuth } from '../../contexts/AuthContext';
@@ -758,11 +757,9 @@ export function AgentsPage(): React.JSX.Element {
   const mutationPending = assignMutation.isPending || unassignMutation.isPending;
   const bulkActionsDisabled = bulkActionPending || mutationPending || assignmentLocked;
 
+  useShellTitle('Agents');
+
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId="agents" onNavigate={(path) => navigate(path)} />}
-      documentTitle="Agents"
-    >
       <div className="agents-page">
         <header className="agents-header">
           <div className="agents-header-left">
@@ -1514,6 +1511,5 @@ export function AgentsPage(): React.JSX.Element {
           </div>
         )}
       </div>
-    </WorkspaceShell>
   );
 }

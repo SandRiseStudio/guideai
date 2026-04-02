@@ -10,8 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { WorkspaceShell } from '../workspace/WorkspaceShell';
-import { ConsoleSidebar } from '../ConsoleSidebar';
+import { useShellTitle } from '../workspace/useShell';
 import { useCreateProject } from '../../api/projects';
 import { CREATE_PROJECT_CTA, SCOPE_LABEL } from '../../copy/scopeLabels';
 import { orgContextStore, useOrgContext } from '../../store/orgContextStore';
@@ -91,11 +90,9 @@ export function NewProjectPage(): React.JSX.Element {
     navigate(nextPath, { replace: true });
   }, [currentOrgId, description, mutation, name, nameError, navigate, suggestedSlug, visibility]);
 
+  useShellTitle('New Project');
+
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId="projects-new" onNavigate={(p) => navigate(p)} />}
-      documentTitle="New Project"
-    >
       <div className="new-project-page">
         <header className="new-project-header">
           <div className="new-project-header-left">
@@ -281,6 +278,5 @@ export function NewProjectPage(): React.JSX.Element {
           </div>
         </section>
       </div>
-    </WorkspaceShell>
   );
 }

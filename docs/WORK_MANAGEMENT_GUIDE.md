@@ -144,11 +144,14 @@ amprealize fresh --skip-backup
 The API container reinstalls Python dependencies on startup. This can take 30–60 seconds. Poll the health endpoint before proceeding.
 
 ### 5.2 Health Checks
+
+> **Canonical entry point**: all client traffic should go through the gateway on `:8080` (HTTP) or `:8443` (HTTPS). Direct service ports (`:8000` API, `:5173` web console) are available in dev but non-canonical.
+
 ```bash
-# Gateway (reverse proxy)
+# Gateway (reverse proxy) — canonical entry point
 curl -sS -m 5 http://localhost:8080/health
 
-# API (backend)
+# API (direct, non-canonical in production)
 curl -sS -m 5 http://localhost:8000/health
 ```
 

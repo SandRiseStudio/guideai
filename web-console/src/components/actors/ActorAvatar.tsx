@@ -27,19 +27,31 @@ export function ActorAvatar({
   className,
   style,
   decorative = false,
-  showPresenceDot = true,
+  showPresenceDot,
   surfaceType = 'inline',
   activity,
 }: ActorAvatarProps): React.JSX.Element {
   const prefersReducedMotion = usePrefersReducedMotion();
   const resolvedActivity = activity ?? presenceToActivity(actor.presenceState, surfaceType, prefersReducedMotion);
-  const { palette, accessory, eyeShape, mouthShape, shellShape } = actor.avatarVariant;
+  const shouldShowPresenceDot = showPresenceDot ?? actor.kind !== 'human';
+  const {
+    palette,
+    accessory,
+    persona,
+    hairStyle,
+    eyeShape,
+    mouthShape,
+    shellShape,
+  } = actor.avatarVariant;
 
   return (
     <span
       className={joinClassNames(
         'actor-avatar',
         `actor-avatar--${size}`,
+        `actor-avatar--kind-${actor.kind}`,
+        `actor-avatar--persona-${persona}`,
+        `actor-avatar--hair-${hairStyle}`,
         `actor-avatar--${resolvedActivity}`,
         `actor-avatar--eye-${eyeShape}`,
         `actor-avatar--mouth-${mouthShape}`,
@@ -65,7 +77,9 @@ export function ActorAvatar({
       <span className="actor-avatar__layer actor-avatar__bg" aria-hidden="true" />
       <span className="actor-avatar__body" aria-hidden="true" />
       <span className="actor-avatar__head" aria-hidden="true">
+        <span className="actor-avatar__ears" />
         <span className="actor-avatar__hair" />
+        <span className="actor-avatar__snout" />
         <span className="actor-avatar__eye actor-avatar__eye--left" />
         <span className="actor-avatar__eye actor-avatar__eye--right" />
         <span className="actor-avatar__mouth" />
@@ -73,6 +87,7 @@ export function ActorAvatar({
       {accessory !== 'none' && (
         <span className={`actor-avatar__accessory actor-avatar__accessory--${accessory}`} aria-hidden="true" />
       )}
+      <span className="actor-avatar__kind-mark" aria-hidden="true" />
       {actor.avatarUrl ? (
         <img
           className="actor-avatar__image"
@@ -81,7 +96,7 @@ export function ActorAvatar({
           aria-hidden="true"
         />
       ) : null}
-      {showPresenceDot ? <span className="actor-avatar__dot" aria-hidden="true" /> : null}
+      {shouldShowPresenceDot ? <span className="actor-avatar__dot" aria-hidden="true" /> : null}
     </span>
   );
 }

@@ -7,11 +7,13 @@ Behaviors: behavior_align_storage_layers, behavior_unify_execution_records
 from __future__ import annotations
 
 import os
+import re
 import socket
 import sys
 import time
+import urllib.parse
 from pathlib import Path
-from typing import Generator
+from typing import Generator, List, Optional
 from unittest.mock import Mock, MagicMock
 
 import pytest
@@ -184,6 +186,126 @@ def get_postgres_dsn(service_name: str) -> str | None:
     )
 
 
+# ============================================================================
+# Production Database Safety Guard
+# ============================================================================
+# These functions prevent test fixtures from accidentally truncating production
+# data. Every TRUNCATE in tests/ must go through safe_truncate().
+
+# Database names that are known production databases and must NEVER be truncated.
+_PRODUCTION_DB_NAMES = frozenset({"guideai", "telemetry"})
+
+# Hostnames that point to production containers.
+_PRODUCTION_HOSTNAMES = frozenset({"guideai-db"})
+
+
+def _mask_dsn_password(dsn: str) -> str:
+    """Replace password in a DSN with '***' for safe logging."""
+    return re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", dsn)
+
+
+def assert_test_database(dsn: str) -> None:
+    """Validate that a DSN points to a test database, never production.
+
+    Raises RuntimeError if the DSN appears to target a production database.
+    This is the primary safety gate preventing test fixtures from wiping
+    production data via TRUNCATE.
+
+    Args:
+        dsn: PostgreSQL connection string to validate.
+
+    Raises:
+        RuntimeError: If the DSN targets a known production database.
+    """
+    # Escape hatch for intentional overrides (must be explicit opt-in)
+    if os.environ.get("GUIDEAI_TEST_SAFETY_OVERRIDE") == "1":
+        return
+
+    # Mock DSNs used by smoke/load test fixtures are always safe
+    if "mock" in dsn.lower():
+        return
+
+    parsed = urllib.parse.urlparse(dsn)
+    dbname = parsed.path.lstrip("/").split("?")[0]  # strip leading / and query params
+    hostname = parsed.hostname or ""
+
+    masked = _mask_dsn_password(dsn)
+
+    # Block known production hostnames (amprealize container names)
+    if hostname in _PRODUCTION_HOSTNAMES:
+        raise RuntimeError(
+            f"\n{'='*72}\n"
+            f"SAFETY GUARD: Refusing to use production database host!\n"
+            f"  DSN:    {masked}\n"
+            f"  Host:   {hostname}\n"
+            f"  Reason: '{hostname}' is a known production container hostname.\n"
+            f"\n"
+            f"To fix:\n"
+            f"  - Use a test-specific DSN (host=localhost, port=6433-6440)\n"
+            f"  - Or set GUIDEAI_TEST_SAFETY_OVERRIDE=1 if intentional\n"
+            f"{'='*72}"
+        )
+
+    # Block known production database names
+    if dbname in _PRODUCTION_DB_NAMES:
+        raise RuntimeError(
+            f"\n{'='*72}\n"
+            f"SAFETY GUARD: Refusing to use production database!\n"
+            f"  DSN:      {masked}\n"
+            f"  Database: {dbname}\n"
+            f"  Reason:   '{dbname}' is a known production database name.\n"
+            f"\n"
+            f"To fix:\n"
+            f"  - Rename the test database to '{dbname}_test'\n"
+            f"  - Or set GUIDEAI_TEST_SAFETY_OVERRIDE=1 if intentional\n"
+            f"{'='*72}"
+        )
+
+
+def safe_truncate(
+    dsn: str,
+    tables: List[str],
+    *,
+    schema: Optional[str] = None,
+) -> List[str]:
+    """Truncate tables in a test database with production safety checks.
+
+    This is the ONLY approved way to TRUNCATE tables in test fixtures.
+    It validates the DSN targets a test database before executing any SQL.
+
+    Args:
+        dsn: PostgreSQL connection string (must pass assert_test_database).
+        tables: List of table names to truncate.
+        schema: Optional schema prefix (e.g., 'board'). If provided, each
+                table name is prefixed with '{schema}.'.
+
+    Returns:
+        List of table names that were actually truncated (tables that exist).
+    """
+    import psycopg2
+
+    assert_test_database(dsn)
+
+    qualified = [f"{schema}.{t}" if schema else t for t in tables]
+
+    with psycopg2.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            existing = []
+            for table_name in qualified:
+                cur.execute("SELECT to_regclass(%s)", (table_name,))
+                result = cur.fetchone()
+                if result and result[0]:
+                    existing.append(result[0] if isinstance(result[0], str) else table_name)
+
+            if existing:
+                cur.execute(
+                    "TRUNCATE " + ", ".join(existing) + " RESTART IDENTITY CASCADE"
+                )
+        conn.commit()
+
+    return existing
+
+
 def check_redis_available() -> bool:
     """Check if Redis is accessible for testing."""
     try:
@@ -274,6 +396,87 @@ def check_test_environment(request):
             f"Start containers with: podman-compose -f docker-compose.test.yml up -d",
             returncode=1
         )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def validate_all_dsns():
+    """Validate every GUIDEAI_*_PG_DSN env var targets a test database.
+
+    Runs once at session start. If ANY DSN points to a known production
+    database, the entire test session is aborted immediately. This prevents
+    test fixtures from accidentally wiping production data via TRUNCATE.
+    """
+    offending: List[str] = []
+
+    for key, value in sorted(os.environ.items()):
+        if not key.startswith("GUIDEAI_") or not key.endswith("_PG_DSN"):
+            continue
+        if not value or "mock" in value.lower():
+            continue
+        try:
+            assert_test_database(value)
+        except RuntimeError as exc:
+            offending.append(f"  {key}: {_mask_dsn_password(value)}\n    → {exc}")
+
+    if offending:
+        pytest.exit(
+            f"\n{'='*72}\n"
+            f"SAFETY GUARD: Aborting test session — production DSNs detected!\n"
+            f"\n"
+            + "\n".join(offending) + "\n"
+            f"\n"
+            f"Fix: Ensure all GUIDEAI_*_PG_DSN env vars point to test databases.\n"
+            f"{'='*72}",
+            returncode=1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Transaction-rollback isolation (opt-in)
+# ---------------------------------------------------------------------------
+# Instead of TRUNCATE-based cleanup, tests decorated with
+# @pytest.mark.usefixtures("transactional_db") or that request this fixture
+# will wrap every PostgresPool.connection() call in a SAVEPOINT that is rolled
+# back after the test. This is faster and guarantees zero leftover state,
+# *provided* the test itself never calls conn.commit() (which releases SAVEPOINTs).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def transactional_db(monkeypatch):
+    """Wrap all PostgresPool connections in SAVEPOINTs that are rolled back.
+
+    Usage:
+        def test_something(transactional_db):
+            ...  # any DB writes are automatically undone after the test
+
+    Limitations:
+        - Tests must NOT call conn.commit() directly (it releases SAVEPOINTs).
+        - Not suitable for tests that verify commit/rollback/transaction behaviour.
+    """
+    import uuid
+    from contextlib import contextmanager
+    from guideai.storage.postgres_pool import PostgresPool
+
+    _original_connection = PostgresPool.connection
+    _savepoints: list = []
+
+    @contextmanager
+    def _savepoint_connection(self, *, autocommit: bool = True):
+        with _original_connection(self, autocommit=False) as conn:
+            sp_name = f"test_sp_{uuid.uuid4().hex[:12]}"
+            _savepoints.append(sp_name)
+            conn.cursor().execute(f"SAVEPOINT {sp_name}")
+            try:
+                yield conn
+            finally:
+                try:
+                    conn.cursor().execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                except Exception:
+                    pass  # connection may already be in error state
+
+    monkeypatch.setattr(PostgresPool, "connection", _savepoint_connection)
+    yield
+    # monkeypatch auto-restores the original method
 
 
 @pytest.fixture(autouse=True)

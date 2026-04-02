@@ -34,15 +34,8 @@ NONEXISTENT_BEHAVIOR_ID = "00000000-0000-0000-0000-000000000001"
 
 def _truncate_behavior_tables(dsn: str) -> None:
     """Remove all data from behavior tables to ensure test isolation."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE behavior_versions, behaviors RESTART IDENTITY CASCADE;")
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, ["behavior_versions", "behaviors"])
 
 
 @pytest.fixture

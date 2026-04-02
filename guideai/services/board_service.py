@@ -32,14 +32,9 @@ from guideai.multi_tenant.board_contracts import (
     ChecklistItem,
     CreateBoardRequest,
     CreateColumnRequest,
-    CreateEpicRequest,
     CreateLabelRequest,
     CreateWorkItemRequest,
-    CreateStoryRequest,
-    CreateTaskRequest,
     DeleteResult,
-    Epic,
-    EpicStatus,
     Label,
     LabelColor,
     LabelListResponse,
@@ -52,16 +47,10 @@ from guideai.multi_tenant.board_contracts import (
     SprintStory,
     SprintStatus,
     CreateSprintRequest,
-    Story,
-    Task,
-    TaskType,
     UpdateBoardRequest,
     UpdateColumnRequest,
-    UpdateEpicRequest,
     UpdateLabelRequest,
     UpdateSprintRequest,
-    UpdateStoryRequest,
-    UpdateTaskRequest,
     UpdateWorkItemRequest,
     WorkItem,
     WorkItemProgressRollup,
@@ -2349,305 +2338,8 @@ class BoardService:
         return DeleteResult(deleted_id=sprint_id, deleted_type="sprint")
 
     # =========================================================================
-    # Legacy API shims (epic/story/task + sprint membership)
+    # Sprint Membership
     # =========================================================================
-
-    def _epic_status_from_work_item(self, status: WorkItemStatus) -> EpicStatus:
-        if status == WorkItemStatus.DONE:
-            return EpicStatus.COMPLETED
-        return EpicStatus.ACTIVE
-
-    def _work_item_status_from_epic(self, status: EpicStatus) -> WorkItemStatus:
-        if status == EpicStatus.COMPLETED:
-            return WorkItemStatus.DONE
-        return WorkItemStatus.IN_PROGRESS
-
-    def _legacy_epic_from_work_item(self, item: WorkItem) -> Epic:
-        return Epic(
-            epic_id=item.item_id,
-            project_id=item.project_id,
-            board_id=item.board_id,
-            name=item.title,
-            description=item.description,
-            status=self._epic_status_from_work_item(item.status),
-            priority=item.priority,
-            story_points=item.points,
-            color=item.color,
-            labels=list(item.labels or []),
-            created_at=item.created_at,
-            updated_at=item.updated_at,
-            created_by=item.created_by,
-            org_id=item.org_id,
-        )
-
-    def _legacy_story_from_work_item(self, item: WorkItem) -> Story:
-        return Story(
-            story_id=item.item_id,
-            project_id=item.project_id,
-            board_id=item.board_id,
-            epic_id=item.parent_id,
-            column_id=item.column_id,
-            title=item.title,
-            description=item.description,
-            status=item.status,
-            priority=item.priority,
-            story_points=item.points,
-            labels=list(item.labels or []),
-            created_at=item.created_at,
-            updated_at=item.updated_at,
-            created_by=item.created_by,
-            org_id=item.org_id,
-        )
-
-    def _legacy_task_from_work_item(self, item: WorkItem) -> Task:
-        task_type_value = (item.metadata or {}).get("task_type")
-        task_type: TaskType | None = None
-        if isinstance(task_type_value, str):
-            try:
-                task_type = TaskType(task_type_value)
-            except Exception:
-                task_type = None
-
-        assignee_user_id: str | None = None
-        assignee_agent_id: str | None = None
-        if item.assignee_id and item.assignee_type:
-            if item.assignee_type == AssigneeType.USER:
-                assignee_user_id = item.assignee_id
-            elif item.assignee_type == AssigneeType.AGENT:
-                assignee_agent_id = item.assignee_id
-
-        return Task(
-            task_id=item.item_id,
-            project_id=item.project_id,
-            board_id=item.board_id,
-            story_id=item.parent_id,
-            column_id=item.column_id,
-            title=item.title,
-            description=item.description,
-            status=item.status,
-            priority=item.priority,
-            task_type=task_type,
-            estimated_hours=item.estimated_hours,
-            actual_hours=item.actual_hours,
-            assignee_user_id=assignee_user_id,
-            assignee_agent_id=assignee_agent_id,
-            labels=list(item.labels or []),
-            behavior_id=item.behavior_id,
-            run_id=item.run_id,
-            created_at=item.created_at,
-            updated_at=item.updated_at,
-            created_by=item.created_by,
-            org_id=item.org_id,
-        )
-
-    def _require_project_id(self, *, project_id: Optional[str], board_id: Optional[str], org_id: Optional[str]) -> str:
-        if project_id:
-            return project_id
-        if board_id:
-            board = self.get_board(board_id, include_columns=False, org_id=org_id)
-            if isinstance(board, BoardWithColumns):
-                return board.project_id
-            return board.project_id
-        raise BoardServiceError("project_id is required when board_id is not provided")
-
-    def create_epic(self, request: CreateEpicRequest, actor: Actor, *, org_id: Optional[str] = None) -> Epic:
-        project_id = self._require_project_id(
-            project_id=getattr(request, "project_id", None),
-            board_id=getattr(request, "board_id", None),
-            org_id=org_id,
-        )
-        title = getattr(request, "title", None) or getattr(request, "name", None)
-        if not title:
-            raise BoardServiceError("Epic title/name is required")
-
-        unified = CreateWorkItemRequest(
-            item_type=WorkItemType.EPIC,
-            project_id=project_id,
-            board_id=getattr(request, "board_id", None),
-            column_id=None,
-            parent_id=None,
-            title=title,
-            description=getattr(request, "description", None),
-            priority=getattr(request, "priority", WorkItemPriority.MEDIUM),
-            story_points=getattr(request, "story_points", None),
-            color=getattr(request, "color", None),
-            labels=list(getattr(request, "labels", []) or []),
-            metadata=dict(getattr(request, "metadata", {}) or {}),
-        )
-        created = self.create_work_item(unified, actor, org_id=org_id)
-        return self._legacy_epic_from_work_item(created)
-
-    def update_epic(
-        self,
-        epic_id: str,
-        request: UpdateEpicRequest,
-        actor: Actor,
-        *,
-        org_id: Optional[str] = None,
-    ) -> Epic:
-        item = self.get_work_item(epic_id, org_id=org_id)
-        if item.item_type != WorkItemType.EPIC:
-            raise EpicNotFoundError(f"Epic {epic_id} not found")
-
-        title = request.title or request.name
-        new_status: WorkItemStatus | None = None
-        if request.status is not None:
-            new_status = self._work_item_status_from_epic(request.status)
-
-        unified = UpdateWorkItemRequest(
-            title=title,
-            description=request.description,
-            status=new_status,
-            priority=request.priority,
-            story_points=request.story_points,
-            color=request.color,
-            labels=request.labels,
-            metadata=request.metadata,
-        )
-        updated = self.update_work_item(epic_id, unified, actor, org_id=org_id)
-        return self._legacy_epic_from_work_item(updated)
-
-    def create_story(self, request: CreateStoryRequest, actor: Actor, *, org_id: Optional[str] = None) -> Story:
-        if not request.epic_id:
-            raise BoardServiceError("epic_id is required")
-        epic = self.get_work_item(request.epic_id, org_id=org_id)
-        if epic.item_type != WorkItemType.EPIC:
-            raise EpicNotFoundError(f"Epic {request.epic_id} not found")
-
-        project_id = request.project_id or epic.project_id
-        board_id = request.board_id or epic.board_id
-
-        unified = CreateWorkItemRequest(
-            item_type=WorkItemType.STORY,
-            project_id=project_id,
-            board_id=board_id,
-            column_id=request.column_id,
-            parent_id=request.epic_id,
-            title=request.title,
-            description=request.description,
-            priority=request.priority,
-            story_points=request.story_points,
-            labels=list(request.labels or []),
-            metadata=dict(request.metadata or {}),
-        )
-        created = self.create_work_item(unified, actor, org_id=org_id)
-        return self._legacy_story_from_work_item(created)
-
-    def update_story(
-        self,
-        story_id: str,
-        request: UpdateStoryRequest,
-        actor: Actor,
-        *,
-        org_id: Optional[str] = None,
-    ) -> Story:
-        item = self.get_work_item(story_id, org_id=org_id)
-        if item.item_type != WorkItemType.STORY:
-            raise StoryNotFoundError(f"Story {story_id} not found")
-
-        new_status = request.status
-        if request.column_id is not None and request.status is None:
-            col = self.get_column(request.column_id, org_id=org_id)
-            new_status = col.status_mapping
-
-        unified = UpdateWorkItemRequest(
-            title=request.title,
-            description=request.description,
-            column_id=request.column_id,
-            status=new_status,
-            story_points=request.story_points,
-            priority=request.priority,
-            labels=request.labels,
-            metadata=request.metadata,
-        )
-        updated = self.update_work_item(story_id, unified, actor, org_id=org_id)
-        return self._legacy_story_from_work_item(updated)
-
-    def create_task(self, request: CreateTaskRequest, actor: Actor, *, org_id: Optional[str] = None) -> Task:
-        if not request.story_id:
-            raise BoardServiceError("story_id is required")
-        story = self.get_work_item(request.story_id, org_id=org_id)
-        if story.item_type != WorkItemType.STORY:
-            raise StoryNotFoundError(f"Story {request.story_id} not found")
-
-        project_id = request.project_id or story.project_id
-        board_id = request.board_id or story.board_id
-
-        metadata = dict(request.metadata or {})
-        if request.task_type is not None:
-            metadata["task_type"] = request.task_type.value
-
-        unified = CreateWorkItemRequest(
-            item_type=WorkItemType.TASK,
-            project_id=project_id,
-            board_id=board_id,
-            column_id=request.column_id,
-            parent_id=request.story_id,
-            title=request.title,
-            description=request.description,
-            priority=request.priority,
-            estimated_hours=request.estimated_hours,
-            labels=list(request.labels or []),
-            metadata=metadata,
-        )
-        created = self.create_work_item(unified, actor, org_id=org_id)
-        return self._legacy_task_from_work_item(created)
-
-    def update_task(
-        self,
-        task_id: str,
-        request: UpdateTaskRequest,
-        actor: Actor,
-        *,
-        org_id: Optional[str] = None,
-    ) -> Task:
-        item = self.get_work_item(task_id, org_id=org_id)
-        if item.item_type != WorkItemType.TASK:
-            raise TaskNotFoundError(f"Task {task_id} not found")
-
-        metadata = dict(request.metadata or {}) if request.metadata is not None else None
-        if request.task_type is not None:
-            if metadata is None:
-                metadata = dict(item.metadata or {})
-            metadata["task_type"] = request.task_type.value
-
-        new_status = request.status
-        if request.column_id is not None and request.status is None:
-            col = self.get_column(request.column_id, org_id=org_id)
-            new_status = col.status_mapping
-
-        unified = UpdateWorkItemRequest(
-            title=request.title,
-            description=request.description,
-            status=new_status,
-            priority=request.priority,
-            column_id=request.column_id,
-            estimated_hours=request.estimated_hours,
-            actual_hours=request.actual_hours,
-            labels=request.labels,
-            metadata=metadata,
-        )
-        updated = self.update_work_item(task_id, unified, actor, org_id=org_id)
-
-        if request.assignee_user_id and request.assignee_agent_id:
-            raise BoardServiceError("Only one of assignee_user_id or assignee_agent_id may be set")
-
-        if request.assignee_user_id is not None:
-            updated = self.assign_work_item(
-                task_id,
-                AssignWorkItemRequest(assignee_id=request.assignee_user_id, assignee_type=AssigneeType.USER),
-                actor,
-                org_id=org_id,
-            )
-        elif request.assignee_agent_id is not None:
-            updated = self.assign_work_item(
-                task_id,
-                AssignWorkItemRequest(assignee_id=request.assignee_agent_id, assignee_type=AssigneeType.AGENT),
-                actor,
-                org_id=org_id,
-            )
-
-        return self._legacy_task_from_work_item(updated)
 
     def add_story_to_sprint(
         self,
@@ -2657,10 +2349,14 @@ class BoardService:
         *,
         org_id: Optional[str] = None,
     ) -> None:
+        """Add a work item (feature) to a sprint.
+
+        Named add_story_to_sprint for backward compatibility with the
+        sprint_stories DB table. Accepts any work item ID.
+        """
         self.get_sprint(sprint_id, org_id=org_id)
-        story = self.get_work_item(story_id, org_id=org_id)
-        if story.item_type != WorkItemType.STORY:
-            raise StoryNotFoundError(f"Story {story_id} not found")
+        # Validate the work item exists
+        self.get_work_item(story_id, org_id=org_id)
 
         timestamp = _now()
 
@@ -2686,6 +2382,11 @@ class BoardService:
         )
 
     def list_sprint_stories(self, sprint_id: str, *, org_id: Optional[str] = None) -> List[SprintStory]:
+        """List work items in a sprint.
+
+        Named list_sprint_stories for backward compatibility with the
+        sprint_stories DB table.
+        """
         def _query(conn: Any) -> List[Dict]:
             self._pool.set_tenant_context(conn, org_id, None)
             with conn.cursor() as cur:

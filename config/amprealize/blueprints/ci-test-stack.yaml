@@ -211,17 +211,18 @@ services:
     ports:
       - "8080:80"
     environment:
-      GUIDEAI_STAGING_UPSTREAM_HOST: host.containers.internal
-      GUIDEAI_STAGING_UPSTREAM_PORT: "8000"
-      NGINX_TEMPLATE_VARS: "GUIDEAI_STAGING_UPSTREAM_HOST GUIDEAI_STAGING_UPSTREAM_PORT"
+      UPSTREAM_API_HOST: host.containers.internal
+      UPSTREAM_API_PORT: "8000"
+      UPSTREAM_WEB_CONSOLE_HOST: host.containers.internal
+      UPSTREAM_WEB_CONSOLE_PORT: "5173"
     volumes:
-      - "${GUIDEAI_REPO_ROOT:-/Users/nick/guideai}/deployment/config/nginx-staging.conf:/etc/nginx/nginx.conf.template:ro"
-      - "${GUIDEAI_REPO_ROOT:-/Users/nick/guideai}/deployment/scripts/nginx-entrypoint.sh:/etc/nginx/start-guideai.sh:ro"
-    command: ["/bin/sh", "/etc/nginx/start-guideai.sh"]
+      - "${GUIDEAI_REPO_ROOT:-/Users/nick/guideai}/config/nginx/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro"
+      - "${GUIDEAI_REPO_ROOT:-/Users/nick/guideai}/config/nginx/docker-entrypoint.sh:/docker-entrypoint-custom.sh:ro"
+    command: ["/bin/sh", "/docker-entrypoint-custom.sh"]
     extra_hosts:
       - "host.containers.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/nginx-health"]
       interval: 10s
       timeout: 5s
       retries: 3

@@ -1147,8 +1147,34 @@ def create_app(
             "/api/v1/device/token",  # Token endpoint
             "/api/v1/activate",  # Activation page
             "/api/v1/auth/oauth",  # OAuth flow endpoints
-        }
+        },
+        auth_required=auth_enabled,
     )
+
+    # Mount TenantMiddleware for PostgreSQL RLS (added before AuthMiddleware
+    # in code so Auth wraps Tenant in ASGI stack: Auth → Tenant → app).
+    # Auth-derived tenant takes priority; header-based sources disabled.
+    if auth_enabled:
+        _tenant_dsn = resolve_optional_postgres_dsn(
+            service="TENANT",
+            explicit_dsn=os.getenv("GUIDEAI_ORG_PG_DSN") or os.getenv("GUIDEAI_AUTH_PG_DSN"),
+            env_var="GUIDEAI_ORG_PG_DSN",
+        )
+        if _tenant_dsn:
+            from guideai.multi_tenant.context import TenantMiddleware
+            from guideai.storage.postgres_pool import PostgresPool
+            _tenant_pool = PostgresPool(dsn=_tenant_dsn)
+            app.add_middleware(
+                TenantMiddleware,
+                pool=_tenant_pool,
+                enable_header=False,  # Headers stripped by nginx; auth-derived only
+                enable_subdomain=False,
+                enable_path=False,
+                enable_auth_context=True,
+                skip_paths=auth_config.skip_paths,
+                apply_limits=True,
+            )
+
     app.add_middleware(
         AuthMiddleware,
         config=auth_config,
@@ -7962,6 +7988,61 @@ def create_app(
             logger.warning("Research routes unavailable: %s", exc)
 
     # ------------------------------------------------------------------
+    # Conversation / Messaging Routes
+    # ------------------------------------------------------------------
+    conversation_dsn = resolve_optional_postgres_dsn(
+        service="MESSAGING",
+        explicit_dsn=None,
+        env_var="GUIDEAI_MESSAGING_PG_DSN",
+    )
+    if not conversation_dsn:
+        conversation_dsn = resolve_optional_postgres_dsn(
+            service="BOARD",
+            explicit_dsn=None,
+            env_var="GUIDEAI_BOARD_PG_DSN",
+        )
+    if not conversation_dsn:
+        conversation_dsn = os.environ.get("DATABASE_URL")
+    if conversation_dsn:
+        try:
+            from guideai.storage.postgres_pool import PostgresPool as _MsgPool
+            from guideai.services.conversation_service import ConversationService
+            from guideai.services.conversation_api import create_conversation_routes
+            from guideai.conversation_event_hub import ConversationEventHub
+            from guideai.services.conversation_events_api import (
+                create_conversation_ws_routes,
+                register_conversation_ws,
+            )
+
+            msg_pool = _MsgPool(conversation_dsn, "messaging")
+            conversation_event_hub = ConversationEventHub()
+            conversation_service = ConversationService(
+                dsn=conversation_dsn,
+                pool=msg_pool,
+                event_hub=conversation_event_hub,
+            )
+            conversation_routes = create_conversation_routes(
+                conversation_service=conversation_service,
+                tags=["conversations"],
+            )
+            app.include_router(conversation_routes, prefix="/api")
+
+            # SSE routes for token streaming and conversation events
+            conversation_ws_routes = create_conversation_ws_routes(
+                conversation_event_hub=conversation_event_hub,
+                conversation_service=conversation_service,
+            )
+            app.include_router(conversation_ws_routes, prefix="/api")
+
+            # WebSocket endpoint (must be registered on app directly)
+            register_conversation_ws(app, conversation_event_hub, conversation_service)
+
+            app.state.conversation_event_hub = conversation_event_hub
+            logger.info("Conversation routes + WS/SSE registered at /api/v1/conversations/*")
+        except Exception as exc:
+            logger.warning("Conversation routes unavailable: %s", exc)
+
+    # ------------------------------------------------------------------
     # Dashboard Stats
     # ------------------------------------------------------------------
     @app.get("/api/v1/dashboard/stats")
@@ -8144,9 +8225,14 @@ def create_app(
 
     # Add CORS middleware last so it wraps everything (outermost layer)
     # This ensures CORS headers are present even on 500 errors from inner layers
+    #
+    # Origins are resolved from GUIDEAI_CORS_ORIGINS (comma-separated), with
+    # an opt-in localhost regex (default on) for dev convenience.
+    _cors_allow_origins = cors_origins if cors_origins else default_cors_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://localhost:3000"],
+        allow_origins=_cors_allow_origins,
+        allow_origin_regex=cors_origin_regex,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

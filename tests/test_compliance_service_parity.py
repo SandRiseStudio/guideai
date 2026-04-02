@@ -20,34 +20,20 @@ def cleanup_compliance_db():
     if not dsn:
         pytest.skip("GUIDEAI_COMPLIANCE_PG_DSN not set")
 
+    from conftest import safe_truncate
+
     # Clean up any existing test data before the test runs
     try:
-        conn = psycopg2.connect(dsn)
-        conn.autocommit = True  # Ensure changes commit immediately
-        cur = conn.cursor()
-        cur.execute(
-            "TRUNCATE TABLE checklists, checklist_steps RESTART IDENTITY CASCADE"
-        )
-        cur.close()
-        conn.close()
+        safe_truncate(dsn, ["checklists", "checklist_steps"])
     except Exception as e:
-        # Debug: print exception details to understand why cleanup fails
         print(f"Cleanup BEFORE test failed: {type(e).__name__}: {e}")
 
     yield
 
     # Cleanup after test completes
     try:
-        conn = psycopg2.connect(dsn)
-        conn.autocommit = True  # Ensure changes commit immediately
-        cur = conn.cursor()
-        cur.execute(
-            "TRUNCATE TABLE checklists, checklist_steps RESTART IDENTITY CASCADE"
-        )
-        cur.close()
-        conn.close()
+        safe_truncate(dsn, ["checklists", "checklist_steps"])
     except Exception as e:
-        # Debug: print exception details to understand why cleanup fails
         print(f"Cleanup AFTER test failed: {type(e).__name__}: {e}")
 
 

@@ -19,11 +19,10 @@
 
 import { lazy, Suspense, useState, useCallback } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { AuthProvider } from './auth';
 import { ProtectedRoute } from './components/ProtectedRoute';
-import { ConsoleSidebar } from './components/ConsoleSidebar';
-import { WorkspaceShell } from './components/workspace/WorkspaceShell';
+import { AppLayout } from './components/workspace/AppLayout';
 import type { ReflectionCandidate } from './api/reflection';
 import './styles/design-system.css';
 import './App.css';
@@ -59,11 +58,9 @@ const queryClient = new QueryClient({
 });
 
 /**
- * BCI Tools Layout - for BCI and Extraction routes
+ * BCI Tools Layout - for BCI and Extraction routes (notifications only)
  */
 function BCILayout() {
-  const location = useLocation();
-  const navigate = useNavigate();
   const [notifications, setNotifications] = useState<string[]>([]);
 
   const handleAutoApproved = useCallback((candidates: ReflectionCandidate[]) => {
@@ -82,37 +79,30 @@ function BCILayout() {
     }, 5000);
   }, []);
 
-  const isExtractionRoute = location.pathname === '/bci/extraction';
-
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId={isExtractionRoute ? 'extraction' : 'bci'} onNavigate={(path) => navigate(path)} />}
-      documentTitle={isExtractionRoute ? 'Behavior Extraction' : 'Behavior Search'}
-    >
-      <>
-        {notifications.length > 0 && (
-          <div className="notifications">
-            {notifications.map((notification, i) => (
-              <div key={i} className="notification">
-                {notification}
-              </div>
-            ))}
-          </div>
-        )}
-        <Routes>
-          <Route index element={<BCIResponsePanel />} />
-          <Route
-            path="extraction"
-            element={
-              <ExtractionCandidates
-                onAutoApproved={handleAutoApproved}
-                onCandidateApproved={handleCandidateApproved}
-              />
-            }
-          />
-        </Routes>
-      </>
-    </WorkspaceShell>
+    <>
+      {notifications.length > 0 && (
+        <div className="notifications">
+          {notifications.map((notification, i) => (
+            <div key={i} className="notification">
+              {notification}
+            </div>
+          ))}
+        </div>
+      )}
+      <Routes>
+        <Route index element={<BCIResponsePanel />} />
+        <Route
+          path="extraction"
+          element={
+            <ExtractionCandidates
+              onAutoApproved={handleAutoApproved}
+              onCandidateApproved={handleCandidateApproved}
+            />
+          }
+        />
+      </Routes>
+    </>
   );
 }
 
@@ -132,112 +122,32 @@ function App() {
 
 function AnimatedRoutes() {
   const location = useLocation();
-  // Only re-animate on top-level route changes (e.g. /agents → /projects),
-  // not sub-path changes within the same section (e.g. /agents/a → /agents/b).
-  const routeSegment = '/' + (location.pathname.split('/')[1] ?? '');
 
   return (
-    <div key={routeSegment} className="app-route-stage">
+    <div className="app-route-stage">
       <Routes location={location}>
               {/* Public routes */}
               <Route path="/login" element={<LoginPage />} />
               <Route path="/auth/callback" element={<OAuthCallback />} />
               <Route path="/auth/github-app/callback" element={<GitHubAppCallbackPage />} />
 
-              {/* Protected routes */}
-              <Route
-                path="/"
-                element={
-                  <ProtectedRoute>
-                    <Dashboard />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/bci/*"
-                element={
-                  <ProtectedRoute>
-                    <BCILayout />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/settings"
-                element={
-                  <ProtectedRoute>
-                    <SecuritySettings />
-                  </ProtectedRoute>
-                }
-              />
-
-              {/* Project routes */}
-              <Route
-                path="/orgs"
-                element={
-                  <ProtectedRoute>
-                    <OrganizationsPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/agents"
-                element={
-                  <ProtectedRoute>
-                    <AgentsPage />
-                  </ProtectedRoute>
-                }
-              >
-                <Route path="new" element={null} />
-                <Route path=":agentId" element={null} />
+              {/* All protected routes share one WorkspaceShell via AppLayout */}
+              <Route element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
+                <Route index element={<Dashboard />} />
+                <Route path="/bci/*" element={<BCILayout />} />
+                <Route path="/settings" element={<SecuritySettings />} />
+                <Route path="/orgs" element={<OrganizationsPage />} />
+                <Route path="/agents" element={<AgentsPage />}>
+                  <Route path="new" element={null} />
+                  <Route path=":agentId" element={null} />
+                </Route>
+                <Route path="/projects" element={<ProjectsPage />} />
+                <Route path="/projects/new" element={<NewProjectPage />} />
+                <Route path="/projects/:projectId" element={<ProjectPage />} />
+                <Route path="/projects/:projectId/settings" element={<ProjectSettingsPage />} />
+                <Route path="/projects/:projectId/boards/:boardId" element={<BoardPage />} />
+                <Route path="/projects/:projectId/boards/:boardId/items/:itemId" element={<BoardPage />} />
               </Route>
-              <Route
-                path="/projects"
-                element={
-                  <ProtectedRoute>
-                    <ProjectsPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/projects/new"
-                element={
-                  <ProtectedRoute>
-                    <NewProjectPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/projects/:projectId"
-                element={
-                  <ProtectedRoute>
-                    <ProjectPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/projects/:projectId/settings"
-                element={
-                  <ProtectedRoute>
-                    <ProjectSettingsPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/projects/:projectId/boards/:boardId"
-                element={
-                  <ProtectedRoute>
-                    <BoardPage />
-                  </ProtectedRoute>
-                }
-              />
-              <Route
-                path="/projects/:projectId/boards/:boardId/items/:itemId"
-                element={
-                  <ProtectedRoute>
-                    <BoardPage />
-                  </ProtectedRoute>
-                }
-              />
 
               {/* Catch-all */}
               <Route path="*" element={<NotFoundPage />} />

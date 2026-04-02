@@ -26,14 +26,11 @@ from guideai.mcp_server import MCPServer
 @pytest.fixture
 def clean_compliance_db():
     """Clean compliance database before each test."""
-    dsn = os.getenv("GUIDEAI_COMPLIANCE_PG_DSN", "postgresql://guideai_compliance:compliance_test_pass@localhost:6437/guideai_compliance")
-    conn = psycopg2.connect(dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE checklists CASCADE;")
-        conn.commit()
-    finally:
-        conn.close()
+    dsn = os.getenv("GUIDEAI_COMPLIANCE_PG_DSN")
+    if not dsn:
+        pytest.skip("GUIDEAI_COMPLIANCE_PG_DSN not set")
+    from conftest import safe_truncate
+    safe_truncate(dsn, ["checklists"])
 
 
 @pytest.fixture

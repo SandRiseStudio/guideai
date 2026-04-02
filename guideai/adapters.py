@@ -4884,3 +4884,280 @@ class MCPAuditServiceAdapter(BaseAuditServiceAdapter):
             batch_id,
             payload.get("public_key_path"),
         )
+
+
+# ==============================================================================
+# Conversation Service Adapters
+# ==============================================================================
+
+
+class CLIConversationServiceAdapter:
+    """CLI adapter for ConversationService.
+
+    Wraps the core ConversationService for CLI surface, returning dicts
+    suitable for JSON/table output.
+    """
+
+    def __init__(self, service: Any, surface: str = "cli") -> None:
+        self._service = service
+        self.surface = surface
+
+    # -- Conversations --------------------------------------------------------
+
+    def create_conversation(
+        self,
+        *,
+        project_id: str,
+        scope: str = "agent_dm",
+        title: Optional[str] = None,
+        created_by: str,
+        participant_ids: Optional[List[str]] = None,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from .conversation_contracts import ConversationScope
+
+        scope_enum = ConversationScope(scope)
+        conv = self._service.create_conversation(
+            project_id=project_id,
+            scope=scope_enum,
+            title=title,
+            created_by=created_by,
+            participant_ids=participant_ids,
+            org_id=org_id,
+        )
+        return conv.to_dict()
+
+    def list_conversations(
+        self,
+        *,
+        project_id: str,
+        user_id: str,
+        org_id: Optional[str] = None,
+        scope: Optional[str] = None,
+        include_archived: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        from .conversation_contracts import ConversationScope
+
+        scope_enum = ConversationScope(scope) if scope else None
+        convs, total = self._service.list_conversations(
+            project_id=project_id,
+            user_id=user_id,
+            org_id=org_id,
+            scope=scope_enum,
+            include_archived=include_archived,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "conversations": [c.to_dict() for c in convs],
+            "total": total,
+        }
+
+    def get_conversation(
+        self,
+        conversation_id: str,
+        *,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        conv = self._service.get_conversation(
+            conversation_id, org_id=org_id, user_id=user_id,
+        )
+        return conv.to_dict()
+
+    def archive_conversation(
+        self,
+        conversation_id: str,
+        *,
+        user_id: str,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._service.archive_conversation(
+            conversation_id, user_id=user_id, org_id=org_id,
+        )
+        return {"status": "archived", "conversation_id": conversation_id}
+
+    # -- Messages -------------------------------------------------------------
+
+    def send_message(
+        self,
+        conversation_id: str,
+        *,
+        sender_id: str,
+        content: Optional[str] = None,
+        message_type: str = "text",
+        parent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        behavior_id: Optional[str] = None,
+        work_item_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        from .conversation_contracts import MessageType
+
+        msg = self._service.send_message(
+            conversation_id,
+            sender_id=sender_id,
+            content=content,
+            message_type=MessageType(message_type),
+            parent_id=parent_id,
+            run_id=run_id,
+            behavior_id=behavior_id,
+            work_item_id=work_item_id,
+            org_id=org_id,
+        )
+        return msg.to_dict()
+
+    def list_messages(
+        self,
+        conversation_id: str,
+        *,
+        user_id: str,
+        org_id: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        messages, total, has_more = self._service.list_messages(
+            conversation_id,
+            user_id=user_id,
+            org_id=org_id,
+            parent_id=parent_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "messages": [m.to_dict() for m in messages],
+            "total": total,
+            "has_more": has_more,
+        }
+
+    def get_message(
+        self,
+        message_id: str,
+        *,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        msg = self._service.get_message(
+            message_id, org_id=org_id, user_id=user_id,
+        )
+        return msg.to_dict()
+
+    def edit_message(
+        self,
+        message_id: str,
+        *,
+        new_content: str,
+        editor_id: str,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        msg = self._service.edit_message(
+            message_id,
+            new_content=new_content,
+            editor_id=editor_id,
+            org_id=org_id,
+        )
+        return msg.to_dict()
+
+    def delete_message(
+        self,
+        message_id: str,
+        *,
+        deleter_id: str,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._service.delete_message(
+            message_id, deleter_id=deleter_id, org_id=org_id,
+        )
+        return {"status": "deleted", "message_id": message_id}
+
+    def search_messages(
+        self,
+        conversation_id: str,
+        *,
+        query: str,
+        user_id: str,
+        org_id: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        results, total = self._service.search_messages(
+            conversation_id,
+            query=query,
+            user_id=user_id,
+            org_id=org_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "results": [
+                {
+                    "message": msg.to_dict(),
+                    "rank": rank,
+                    "headline": headline,
+                }
+                for msg, rank, headline in results
+            ],
+            "total": total,
+        }
+
+    # -- Reactions ------------------------------------------------------------
+
+    def add_reaction(
+        self,
+        message_id: str,
+        *,
+        actor_id: str,
+        emoji: str,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        reaction = self._service.add_reaction(
+            message_id, actor_id=actor_id, emoji=emoji, org_id=org_id,
+        )
+        return reaction.to_dict()
+
+    def remove_reaction(
+        self,
+        message_id: str,
+        *,
+        actor_id: str,
+        emoji: str,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._service.remove_reaction(
+            message_id, actor_id=actor_id, emoji=emoji, org_id=org_id,
+        )
+        return {"status": "removed", "message_id": message_id, "emoji": emoji}
+
+    # -- Pin/Unpin ------------------------------------------------------------
+
+    def pin_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        user_id: str,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._service.pin_message(
+            conversation_id, message_id, user_id=user_id, org_id=org_id,
+        )
+        return {
+            "status": "pinned",
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+        }
+
+    def unpin_message(
+        self,
+        conversation_id: str,
+        *,
+        user_id: str,
+        org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._service.unpin_message(
+            conversation_id, user_id=user_id, org_id=org_id,
+        )
+        return {"status": "unpinned", "conversation_id": conversation_id}

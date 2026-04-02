@@ -55,14 +55,14 @@ services:
     ports:
       - "${GUIDEAI_PG_PORT:-5432}:5432"
     environment:
-      POSTGRES_USER: "${GUIDEAI_PG_USER:-guideai}"
+      POSTGRES_USER: "${GUIDEAI_PG_USER:-guideai_test}"
       POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS:-guideai_dev}"
-      POSTGRES_DB: "${GUIDEAI_PG_DB:-guideai}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB:-guideai_test}"
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - guideai-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U guideai -d guideai"]
+      test: ["CMD-SHELL", "pg_isready -U guideai_test -d guideai_test"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -76,13 +76,13 @@ services:
     ports:
       - "${GUIDEAI_PG_PORT_TELEMETRY:-5433}:5432"
     environment:
-      POSTGRES_USER: "${GUIDEAI_PG_USER_TELEMETRY:-telemetry}"
+      POSTGRES_USER: "${GUIDEAI_PG_USER_TELEMETRY:-telemetry_test}"
       POSTGRES_PASSWORD: "${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}"
-      POSTGRES_DB: "${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+      POSTGRES_DB: "${GUIDEAI_PG_DB_TELEMETRY:-telemetry_test}"
     volumes:
       - telemetry-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U telemetry -d telemetry"]
+      test: ["CMD-SHELL", "pg_isready -U telemetry_test -d telemetry_test"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -155,8 +155,8 @@ services:
       WORKER_ID: "${HOSTNAME:-worker-1}"
       CONSUMER_GROUP: "guideai-workers"
       # Database connections
-      DATABASE_URL: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      TELEMETRY_DATABASE_URL: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+      DATABASE_URL: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      TELEMETRY_DATABASE_URL: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry_test}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry_test}"
       # Podman API via socket proxy (AmpOrchestrator)
       PODMAN_HOST: "tcp://podman-socket-proxy:8888"
       # LLM Provider API Keys
@@ -192,11 +192,20 @@ services:
     module: console
     ports:
       - "${GATEWAY_PORT:-8080}:80"
+      - "${GATEWAY_TLS_PORT:-8443}:443"
     depends_on:
       - guideai-api
+      - web-console
     volumes:
       - "${GUIDEAI_REPO_ROOT:-.}/config/nginx/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro"
       - "${GUIDEAI_REPO_ROOT:-.}/config/nginx/docker-entrypoint.sh:/docker-entrypoint-custom.sh:ro"
+    environment:
+      # Optional TLS — set NGINX_SSL_CERT and NGINX_SSL_KEY to enable HTTPS.
+      # Mount cert/key files via additional volumes, then point these vars at
+      # the in-container paths.  NGINX_SSL_REDIRECT=true adds HTTP→HTTPS redirect.
+      NGINX_SSL_CERT: "${NGINX_SSL_CERT:-}"
+      NGINX_SSL_KEY: "${NGINX_SSL_KEY:-}"
+      NGINX_SSL_REDIRECT: "${NGINX_SSL_REDIRECT:-false}"
     command: ["/bin/sh", "/docker-entrypoint-custom.sh"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost/nginx-health >/dev/null 2>&1 || exit 1"]
@@ -231,28 +240,28 @@ services:
       # NEW: Consolidated database connection (schema-based routing)
       # =========================================================================
       # Default search_path includes all schemas for maximum compatibility
-      DATABASE_URL: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
-      TELEMETRY_DATABASE_URL: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+      DATABASE_URL: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      TELEMETRY_DATABASE_URL: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry_test}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry_test}"
       # Explicit Org DSN for OrganizationService (auth schema first)
-      GUIDEAI_ORG_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_ORG_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
 
       # =========================================================================
       # LEGACY: Per-service DSNs (for backward compatibility during migration)
       # These all point to guideai-db now with search_path including all schemas
       # =========================================================================
       # search_path includes: auth, execution, board, behavior, workflow, consent, audit, public
-      GUIDEAI_AUTH_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_BOARD_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dboard,auth,execution,behavior,workflow,consent,audit,public"
-      GUIDEAI_ACTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_RUN_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_EXECUTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_WORKFLOW_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dworkflow,auth,execution,board,behavior,consent,audit,public"
-      GUIDEAI_BEHAVIOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dbehavior,auth,execution,board,workflow,consent,audit,public"
-      GUIDEAI_COMPLIANCE_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dconsent,auth,execution,board,behavior,workflow,audit,public"
-      GUIDEAI_AGENT_ORCHESTRATOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_AGENT_REGISTRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_METRICS_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_TELEMETRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+      GUIDEAI_AUTH_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_BOARD_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dboard,auth,execution,behavior,workflow,consent,audit,public"
+      GUIDEAI_ACTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_RUN_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_EXECUTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_WORKFLOW_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dworkflow,auth,execution,board,behavior,consent,audit,public"
+      GUIDEAI_BEHAVIOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dbehavior,auth,execution,board,workflow,consent,audit,public"
+      GUIDEAI_COMPLIANCE_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dconsent,auth,execution,board,behavior,workflow,audit,public"
+      GUIDEAI_AGENT_ORCHESTRATOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_AGENT_REGISTRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_METRICS_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dauth,execution,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_TELEMETRY_PG_DSN: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry_test}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry_test}"
 
       # =========================================================================
       # OAuth settings (loaded from .env.google-oauth and .env.github-oauth)
@@ -337,12 +346,12 @@ services:
       REDIS_URL: "redis://redis:6379/0"
 
       # Consolidated DB DSNs for MCP-backed services
-      GUIDEAI_BEHAVIOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dbehavior,auth,execution,board,workflow,consent,audit,public"
-      GUIDEAI_WORKFLOW_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dworkflow,auth,execution,board,behavior,consent,audit,public"
-      GUIDEAI_ACTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_RUN_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
-      GUIDEAI_COMPLIANCE_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai}?options=-csearch_path%3Dconsent,auth,execution,board,behavior,workflow,audit,public"
-      GUIDEAI_METRICS_PG_DSN: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry}"
+      GUIDEAI_BEHAVIOR_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dbehavior,auth,execution,board,workflow,consent,audit,public"
+      GUIDEAI_WORKFLOW_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dworkflow,auth,execution,board,behavior,consent,audit,public"
+      GUIDEAI_ACTION_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_RUN_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dexecution,auth,board,behavior,workflow,consent,audit,public"
+      GUIDEAI_COMPLIANCE_PG_DSN: "postgresql://${GUIDEAI_PG_USER:-guideai_test}:${GUIDEAI_PG_PASS:-guideai_dev}@guideai-db:5432/${GUIDEAI_PG_DB:-guideai_test}?options=-csearch_path%3Dconsent,auth,execution,board,behavior,workflow,audit,public"
+      GUIDEAI_METRICS_PG_DSN: "postgresql://${GUIDEAI_PG_USER_TELEMETRY:-telemetry_test}:${GUIDEAI_PG_PASS_TELEMETRY:-telemetry_dev}@telemetry-db:5432/${GUIDEAI_PG_DB_TELEMETRY:-telemetry_test}"
 
       # LLM provider keys for MCP-triggered agent tasks
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"

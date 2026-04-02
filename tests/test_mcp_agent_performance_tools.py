@@ -48,19 +48,11 @@ def clean_agent_perf_db():
     print(f"DEBUG: GUIDEAI_PG_PORT_METRICS={metrics_port}")
     if not dsn:
         pytest.skip("GUIDEAI_AGENT_PERFORMANCE_PG_DSN not set - run with --amprealize --env test")
-    conn = psycopg2.connect(dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                TRUNCATE TABLE agent_performance_alerts,
-                              agent_performance_daily,
-                              agent_performance_thresholds,
-                              agent_performance_snapshots
-                CASCADE;
-            """)
-        conn.commit()
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, [
+        "agent_performance_alerts", "agent_performance_daily",
+        "agent_performance_thresholds", "agent_performance_snapshots",
+    ])
 
 
 @pytest.fixture

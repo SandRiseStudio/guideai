@@ -34,11 +34,15 @@ function formatParticipantSummary(summary: BoardParticipantSummary): string {
   return parts.join(' · ');
 }
 
+function participantKindLabel(participant: BoardParticipant): string {
+  return participant.kind === 'agent' ? 'Agent' : 'Person';
+}
+
 function participantTooltip(participant: BoardParticipant): string {
   const secondary = participant.kind === 'agent'
     ? (participant.statusLine ?? participant.actor.presenceLabel)
     : (participant.roleLabel ?? participant.statusLine ?? 'Project member');
-  return `${participant.actor.displayName} • ${secondary}`;
+  return `${participant.actor.displayName} • ${participantKindLabel(participant)} • ${secondary}`;
 }
 
 export const BoardAgentPresenceRail: React.FC<BoardAgentPresenceRailProps> = ({
@@ -51,6 +55,8 @@ export const BoardAgentPresenceRail: React.FC<BoardAgentPresenceRailProps> = ({
 
   const ranked = rankBoardParticipants(participants);
   const visible = ranked.slice(0, MAX_INLINE);
+  const visibleHumans = visible.filter((participant) => participant.kind === 'human');
+  const visibleAgents = visible.filter((participant) => participant.kind === 'agent');
   const overflow = summary.total - visible.length;
 
   return (
@@ -64,14 +70,44 @@ export const BoardAgentPresenceRail: React.FC<BoardAgentPresenceRailProps> = ({
         <span className="presence-rail-line">{formatParticipantSummary(summary)}</span>
       </div>
 
-      <div className="presence-rail-roster" role="list" aria-label="Project member roster">
-        {visible.map((participant) => (
+      <div className="presence-rail-roster" aria-label="Project member roster">
+        <div className="presence-rail-roster-group" role="list" aria-label="People">
+          {visibleHumans.map((participant) => (
+            <button
+              key={participant.id}
+              type="button"
+              className={`presence-rail-avatar-button presence-rail-avatar-button--human pressable${participant.isCurrentUser ? ' presence-rail-avatar-button-current' : ''}`}
+              onClick={() => onParticipantClick?.(participant)}
+              aria-label={`${participant.actor.displayName} – ${participantKindLabel(participant)} – ${participant.roleLabel ?? 'Project member'}`}
+              title={participantTooltip(participant)}
+              data-tooltip={participantTooltip(participant)}
+              data-haptic="light"
+            >
+              <ActorAvatar
+                actor={participant.actor}
+                size="sm"
+                decorative
+                showPresenceDot={false}
+                surfaceType="badge"
+              />
+              {participant.isCurrentUser ? <span className="presence-rail-you-pill">You</span> : null}
+              <span className="presence-rail-avatar-label">{participant.actor.displayName}</span>
+            </button>
+          ))}
+        </div>
+
+        {visibleHumans.length > 0 && visibleAgents.length > 0 ? (
+          <span className="presence-rail-roster-separator" aria-hidden="true" />
+        ) : null}
+
+        <div className="presence-rail-roster-group presence-rail-roster-group--agents" role="list" aria-label="Agents">
+          {visibleAgents.map((participant) => (
           <button
             key={participant.id}
             type="button"
-            className={`presence-rail-avatar-button pressable${participant.isCurrentUser ? ' presence-rail-avatar-button-current' : ''}`}
+            className={`presence-rail-avatar-button presence-rail-avatar-button--agent pressable${participant.isCurrentUser ? ' presence-rail-avatar-button-current' : ''}`}
             onClick={() => onParticipantClick?.(participant)}
-            aria-label={`${participant.actor.displayName} – ${participant.kind === 'agent' ? participant.actor.presenceLabel : participant.roleLabel ?? 'Project member'}`}
+            aria-label={`${participant.actor.displayName} – ${participantKindLabel(participant)} – ${participant.actor.presenceLabel}`}
             title={participantTooltip(participant)}
             data-tooltip={participantTooltip(participant)}
             data-haptic="light"
@@ -86,7 +122,8 @@ export const BoardAgentPresenceRail: React.FC<BoardAgentPresenceRailProps> = ({
             {participant.isCurrentUser ? <span className="presence-rail-you-pill">You</span> : null}
             <span className="presence-rail-avatar-label">{participant.actor.displayName}</span>
           </button>
-        ))}
+          ))}
+        </div>
         {overflow > 0 && (
           <button
             type="button"

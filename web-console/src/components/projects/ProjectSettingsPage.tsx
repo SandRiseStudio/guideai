@@ -13,8 +13,6 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { WorkspaceShell } from '../workspace/WorkspaceShell';
-import { ConsoleSidebar } from '../ConsoleSidebar';
 import { useProject } from '../../api/dashboard';
 import { apiClient } from '../../api/client';
 import { razeLog } from '../../telemetry/raze';
@@ -76,9 +74,7 @@ interface GitHubBranchListResponse {
 // Component
 // ---------------------------------------------------------------------------
 
-export function ProjectSettingsPage(): React.JSX.Element {
-  const navigate = useNavigate();
-  const { projectId } = useParams<{ projectId: string }>();
+export function ProjectSettingsContent({ projectId }: { projectId: string }): React.JSX.Element {
   const { data: project, isLoading: projectLoading } = useProject(projectId);
   const { actor } = useAuth();
 
@@ -310,58 +306,22 @@ export function ProjectSettingsPage(): React.JSX.Element {
 
   if (projectLoading) {
     return (
-      <WorkspaceShell
-        sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-        documentTitle="Project Settings"
-      >
-        <div className="project-settings-page">
-          <div className="loading-state">Loading project...</div>
+        <div className="project-settings-content">
+          <div className="loading-state">Loading settings...</div>
         </div>
-      </WorkspaceShell>
     );
   }
 
   if (!project) {
     return (
-      <WorkspaceShell
-        sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-        documentTitle="Project Settings"
-      >
-        <div className="project-settings-page">
+        <div className="project-settings-content">
           <div className="error-state">Project not found</div>
         </div>
-      </WorkspaceShell>
     );
   }
 
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId="projects" onNavigate={(p) => navigate(p)} />}
-      documentTitle={`${project.name} Settings`}
-    >
-      <div className="project-settings-page">
-        <header className="project-settings-header">
-          <div className="project-settings-header-left">
-            <button
-              type="button"
-              className="project-settings-back pressable"
-              onClick={() => navigate('/projects')}
-              data-haptic="light"
-            >
-              ← Back
-            </button>
-            <div>
-              <h1 className="project-settings-title animate-fade-in-up">
-                {project.name} Settings
-              </h1>
-              <p className="project-settings-subtitle animate-fade-in-up">
-                Configure local paths, GitHub integration, and other project settings.
-              </p>
-            </div>
-          </div>
-
-        </header>
-
+      <div className="project-settings-content">
         <section className="project-settings-card" aria-label="Project settings form">
           {/* Local Project Path */}
           <div className="settings-section">
@@ -725,13 +685,6 @@ export function ProjectSettingsPage(): React.JSX.Element {
 
             <button
               type="button"
-              className="action secondary pressable"
-              onClick={() => navigate('/projects')}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
               className="action primary pressable"
               onClick={() => void handleSave()}
               disabled={isSaving}
@@ -742,6 +695,21 @@ export function ProjectSettingsPage(): React.JSX.Element {
           </div>
         </section>
       </div>
-    </WorkspaceShell>
   );
+}
+
+/**
+ * Standalone settings page (backwards-compat route wrapper).
+ */
+export function ProjectSettingsPage(): React.JSX.Element {
+  const { projectId } = useParams<{ projectId: string }>();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (projectId) {
+      navigate(`/projects/${projectId}?tab=settings`, { replace: true });
+    }
+  }, [projectId, navigate]);
+
+  return <div className="project-settings-page"><div className="loading-state">Redirecting…</div></div>;
 }

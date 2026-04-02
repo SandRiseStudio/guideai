@@ -34,6 +34,7 @@ class AuthConfig:
         jwt_algorithm: str = "HS256",
         auth_dsn: Optional[str] = None,
         skip_paths: Optional[set] = None,
+        auth_required: bool = False,
     ):
         """Initialize auth configuration.
 
@@ -42,11 +43,13 @@ class AuthConfig:
             jwt_algorithm: JWT algorithm (default: HS256).
             auth_dsn: PostgreSQL DSN for AsyncPermissionService. Falls back to GUIDEAI_AUTH_PG_DSN.
             skip_paths: Paths to skip authentication (e.g., health checks).
+            auth_required: If True, reject unauthenticated requests with 401 on non-skip paths.
         """
         self.jwt_secret = jwt_secret or os.getenv("GUIDEAI_JWT_SECRET")
         self.jwt_algorithm = jwt_algorithm
         self.auth_dsn = auth_dsn or os.getenv("GUIDEAI_AUTH_PG_DSN")
         self.skip_paths = skip_paths or {"/health", "/health/", "/metrics", "/docs", "/openapi.json"}
+        self.auth_required = auth_required
 
         if not self.jwt_secret:
             # Generate a random secret if not provided (development mode)
@@ -97,14 +100,15 @@ class AuthMiddleware:
         request = Request(scope, receive)
         path = request.url.path
 
-        # Skip auth for excluded paths
-        if path in self.config.skip_paths or any(path.startswith(p.rstrip('/')) for p in self.config.skip_paths):
-            await self.app(scope, receive, send)
-            return
+        # Determine if this is a skip (public) path — auth not enforced but tokens still parsed
+        is_skip_path = path in self.config.skip_paths or any(
+            path.startswith(p.rstrip('/')) for p in self.config.skip_paths
+        )
 
         # Extract and validate token
         auth_header = request.headers.get("Authorization")
         user_info = None
+        rejection_reason = None
 
         import logging
         logger = logging.getLogger("guideai.auth.middleware")
@@ -125,9 +129,11 @@ class AuthMiddleware:
                         "claims": df_user_info,
                     }
                     logger.info(f"AuthMiddleware: Set user_id={user_info['user_id']}")
+                else:
+                    rejection_reason = "Invalid device flow token"
 
-            # Fall back to JWT validation
-            if user_info is None:
+            # Fall back to JWT validation (skip if device flow already gave a definitive rejection)
+            if user_info is None and rejection_reason is None:
                 try:
                     payload = self.jwt_service.validate_token(token, expected_type="access")
                     user_info = {
@@ -136,14 +142,32 @@ class AuthMiddleware:
                         "claims": payload,
                     }
                 except jwt.ExpiredSignatureError:
-                    # Token expired - clear user info, don't block
                     user_info = None
+                    rejection_reason = "Token expired"
                 except jwt.InvalidTokenError:
-                    # Invalid token - clear user info, don't block
                     user_info = None
+                    rejection_reason = "Invalid token"
                 except ValueError:
-                    # Token type mismatch
                     user_info = None
+                    rejection_reason = "Invalid token"
+        elif auth_header:
+            rejection_reason = "Invalid authorization format"
+        else:
+            rejection_reason = "Authorization header missing"
+
+        # Enforce authentication if required and not a skip path
+        if self.config.auth_required and not is_skip_path and user_info is None:
+            from starlette.responses import JSONResponse
+            detail = rejection_reason or "Authentication required"
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": detail},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        elif user_info is None and auth_header:
+            logger.warning("Auth failed (non-enforcing): %s", rejection_reason)
 
         # Store user info in scope state for downstream access
         scope["state"] = scope.get("state", {})
@@ -151,10 +175,12 @@ class AuthMiddleware:
             scope["state"]["user_id"] = user_info["user_id"]
             scope["state"]["username"] = user_info["username"]
             scope["state"]["token_claims"] = user_info["claims"]
+            scope["state"]["org_id"] = user_info["claims"].get("org_id")
         else:
             scope["state"]["user_id"] = None
             scope["state"]["username"] = None
             scope["state"]["token_claims"] = None
+            scope["state"]["org_id"] = None
 
         await self.app(scope, receive, send)
 

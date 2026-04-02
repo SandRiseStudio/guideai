@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import uuid
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -605,6 +606,12 @@ class WorkItemExecutionService:
                 logger.info("Initialized ExecutionQueuePublisher for queue mode")
             except ImportError:
                 logger.warning("execution-queue package not installed, falling back to direct mode")
+                warnings.warn(
+                    "EXECUTION_MODE=direct is deprecated and will be removed in a future release. "
+                    "Install the execution-queue package for queue-based execution.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
                 self._execution_mode = "direct"
 
     def set_execution_loop(self, loop: Any) -> None:
@@ -840,7 +847,21 @@ class WorkItemExecutionService:
             logger.info(f"Enqueued execution job: {run.run_id} (priority={priority.value})")
 
         elif self._execution_loop and cycle_id:
-            # Direct mode: schedule execution in background
+            # Direct mode: schedule execution in background (DEPRECATED)
+            warnings.warn(
+                "Direct/inline execution mode is deprecated and will be removed in a future release. "
+                "Migrate to queue-based execution (EXECUTION_MODE=queue) with execution-queue package.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            logger.warning(
+                "direct-execution-deprecated",
+                extra={
+                    "run_id": run.run_id,
+                    "execution_mode": self._execution_mode,
+                    "msg": "Direct execution is deprecated — migrate to EXECUTION_MODE=queue",
+                },
+            )
             import asyncio
             asyncio.create_task(self._run_execution_loop(
                 run_id=run.run_id,

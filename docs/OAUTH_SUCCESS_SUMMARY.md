@@ -4,8 +4,8 @@
 
 ### 1. OAuth App Created
 - **Application name**: GuideAI Device Flow
-- **Client ID**: `Ov23lix7WmdKsvRWXvsS`
-- **Client Secret**: Configured (40 characters)
+- **Client ID**: See `.env.github-oauth`
+- **Client Secret**: See `.env.github-oauth`
 - **Device Flow**: ✅ Enabled
 - **Callback URL**: `http://localhost:8000/auth/callback`
 
@@ -128,8 +128,8 @@ python scripts/verify_oauth_config.py
 
 ### Start API Server with OAuth
 ```bash
-export OAUTH_CLIENT_ID=Ov23lix7WmdKsvRWXvsS
-export OAUTH_CLIENT_SECRET=361fef929c9da2747d1d1788997102ea46cf92e9
+export OAUTH_CLIENT_ID="$OAUTH_CLIENT_ID"        # from .env.github-oauth
+export OAUTH_CLIENT_SECRET="$OAUTH_CLIENT_SECRET"  # from .env.github-oauth
 export GUIDEAI_COMPLIANCE_PG_DSN="postgresql://guideai_compliance:compliance_test_pass@localhost:6437/guideai_compliance"
 uvicorn guideai.api:app --host 127.0.0.1 --port 8000
 ```

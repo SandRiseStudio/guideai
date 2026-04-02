@@ -64,9 +64,6 @@ def jwt_config():
     return {
         "secret_key": "test-secret-key-for-testing-only",
         "algorithm": "HS256",
-        "access_token_expire_minutes": 30,
-        "issuer": "guideai-test",
-        "audience": "guideai-api",
     }
 
 
@@ -76,9 +73,6 @@ def jwt_service(jwt_config):
     return JWTService(
         secret_key=jwt_config["secret_key"],
         algorithm=jwt_config["algorithm"],
-        access_token_expire_minutes=jwt_config["access_token_expire_minutes"],
-        issuer=jwt_config["issuer"],
-        audience=jwt_config["audience"],
     )
 
 
@@ -88,10 +82,8 @@ def auth_config(jwt_config):
     return AuthConfig(
         jwt_secret=jwt_config["secret_key"],
         jwt_algorithm=jwt_config["algorithm"],
-        jwt_audience=jwt_config["audience"],
-        jwt_issuer=jwt_config["issuer"],
         auth_required=True,
-        public_paths={"/health", "/v1/public"},
+        skip_paths={"/health", "/v1/public", "/v1/optional-auth"},
     )
 
 
@@ -129,7 +121,7 @@ def test_app(auth_config, jwt_service, mock_permission_service):
     # Store in app state
     app.state.auth_config = auth_config
     app.state.jwt_service = jwt_service
-    app.state.permission_service = mock_permission_service
+    app.state.async_permission_service = mock_permission_service
 
     # Add middleware
     app.add_middleware(AuthMiddleware, config=auth_config)
@@ -146,12 +138,12 @@ def test_app(auth_config, jwt_service, mock_permission_service):
     # Protected endpoints
     @app.get("/v1/protected")
     def protected_endpoint(user = Depends(get_current_user)):
-        return {"user_id": user.get("sub"), "message": "protected"}
+        return {"user_id": user["user_id"], "message": "protected"}
 
     @app.get("/v1/optional-auth")
     def optional_auth_endpoint(user = Depends(get_current_user_optional)):
         if user:
-            return {"authenticated": True, "user_id": user.get("sub")}
+            return {"authenticated": True, "user_id": user["user_id"]}
         return {"authenticated": False}
 
     # Permission-protected endpoints
@@ -172,7 +164,7 @@ def test_app(auth_config, jwt_service, mock_permission_service):
     ):
         # Check invite permission
         has_perm = await perm_service.check_org_permission(
-            user["sub"], org_id, OrgPermission.INVITE_MEMBERS
+            user["user_id"], org_id, OrgPermission.INVITE_MEMBERS
         )
         if not has_perm:
             from fastapi import HTTPException
@@ -191,26 +183,32 @@ def test_client(test_app):
 @pytest.fixture
 def valid_token(jwt_service):
     """Generate valid JWT token."""
-    return jwt_service.create_access_token(
-        subject="test-user-id",
-        extra_claims={"email": "test@example.com"},
+    return jwt_service.generate_access_token(
+        user_id="test-user-id",
+        username="testuser",
+        additional_claims={"email": "test@example.com"},
     )
 
 
 @pytest.fixture
-def expired_token(jwt_service):
+def expired_token(jwt_config):
     """Generate expired JWT token."""
-    return jwt_service.create_access_token(
-        subject="test-user-id",
-        expires_delta=timedelta(seconds=-60),  # Already expired
-    )
+    import jwt as pyjwt
+    payload = {
+        "sub": "test-user-id",
+        "username": "testuser",
+        "type": "access",
+        "exp": datetime.now(timezone.utc) - timedelta(seconds=60),
+        "iat": datetime.now(timezone.utc) - timedelta(seconds=120),
+    }
+    return pyjwt.encode(payload, jwt_config["secret_key"], algorithm=jwt_config["algorithm"])
 
 
 # =============================================================================
 # Auth Middleware Integration Tests
 # =============================================================================
 
-@pytest.mark.integration
+@pytest.mark.unit
 class TestAuthMiddlewareIntegration:
     """Test auth middleware with FastAPI endpoints."""
 
@@ -280,7 +278,7 @@ class TestAuthMiddlewareIntegration:
 # Permission Checking Integration Tests
 # =============================================================================
 
-@pytest.mark.integration
+@pytest.mark.unit
 class TestPermissionCheckingIntegration:
     """Test permission checking with endpoints."""
 

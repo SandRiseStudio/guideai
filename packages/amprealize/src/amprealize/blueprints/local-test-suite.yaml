@@ -192,11 +192,20 @@ services:
     module: console
     ports:
       - "${GATEWAY_PORT:-8080}:80"
+      - "${GATEWAY_TLS_PORT:-8443}:443"
     depends_on:
       - guideai-api
+      - web-console
     volumes:
       - "${GUIDEAI_REPO_ROOT:-.}/config/nginx/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro"
       - "${GUIDEAI_REPO_ROOT:-.}/config/nginx/docker-entrypoint.sh:/docker-entrypoint-custom.sh:ro"
+    environment:
+      # Optional TLS — set NGINX_SSL_CERT and NGINX_SSL_KEY to enable HTTPS.
+      # Mount cert/key files via additional volumes, then point these vars at
+      # the in-container paths.  NGINX_SSL_REDIRECT=true adds HTTP→HTTPS redirect.
+      NGINX_SSL_CERT: "${NGINX_SSL_CERT:-}"
+      NGINX_SSL_KEY: "${NGINX_SSL_KEY:-}"
+      NGINX_SSL_REDIRECT: "${NGINX_SSL_REDIRECT:-false}"
     command: ["/bin/sh", "/docker-entrypoint-custom.sh"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost/nginx-health >/dev/null 2>&1 || exit 1"]

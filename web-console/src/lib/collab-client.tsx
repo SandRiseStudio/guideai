@@ -1,16 +1,28 @@
 import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ActorType as _ActorType,
   ConnectionState,
   createCollabClient,
   createCollabApi,
   CollabApi,
   CollabApiError,
+  ConversationScope,
+  ConversationStreamClient,
+  createConversationStreamClient,
   ExecutionStreamClient,
+  MessageType as _MessageType,
 } from '../vendor/collab-client-dist/core.js';
+
+// Re-export enums with local binding to avoid Vite ESM analysis issues
+export const ActorType = _ActorType;
+export const MessageType = _MessageType;
 
 export {
   ConnectionState,
+  ConversationScope,
+  ConversationStreamClient,
   createCollabApi,
+  createConversationStreamClient,
   CollabApi,
   CollabApiError,
   ExecutionStreamClient,
@@ -18,6 +30,17 @@ export {
 
 export type {
   CollabClientConfig,
+  Conversation,
+  ConversationListResponse,
+  ConversationMessage,
+  ConversationMessageEventPayload,
+  ConversationParticipant,
+  ConversationParticipantEventPayload,
+  ConversationReaction,
+  ConversationReactionEventPayload,
+  ConversationReadReceiptPayload,
+  ConversationStreamConfig,
+  ConversationTypingPayload,
   Document,
   DocumentId,
   EditOperation,
@@ -33,6 +56,9 @@ export type {
   ExecutionStepEventPayload,
   ExecutionStepSnapshotPayload,
   ExecutionStepsResponse,
+  MessageListResponse,
+  SearchResult,
+  SearchResultsResponse,
   UserId,
   UserPresence,
   Workspace,

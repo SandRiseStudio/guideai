@@ -23,16 +23,11 @@ TELEMETRY_PG_DSN = os.environ.get("GUIDEAI_TELEMETRY_PG_DSN", DEFAULT_TELEMETRY_
 
 def _truncate_fact_tables(pg_dsn: str) -> None:
     """Reset telemetry fact tables to ensure validation counts match DuckDB snapshot."""
-    conn = psycopg2.connect(pg_dsn)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "TRUNCATE TABLE fact_behavior_usage, fact_compliance_steps, "
-                    "fact_execution_status, fact_token_savings RESTART IDENTITY"
-                )
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(pg_dsn, [
+        "fact_behavior_usage", "fact_compliance_steps",
+        "fact_execution_status", "fact_token_savings",
+    ])
 
 
 @pytest.fixture(scope="module", autouse=True)

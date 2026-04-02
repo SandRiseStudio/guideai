@@ -7,8 +7,7 @@
 
 import { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { WorkspaceShell } from '../workspace/WorkspaceShell';
-import { ConsoleSidebar } from '../ConsoleSidebar';
+import { useShellTitle } from '../workspace/useShell';
 import { useOrganizations } from '../../api/dashboard';
 import { useCreateOrganization } from '../../api/organizations';
 import { PERSONAL_SCOPE_DESCRIPTION, PERSONAL_SCOPE_LABEL } from '../../copy/scopeLabels';
@@ -127,11 +126,9 @@ export function OrganizationsPage(): React.JSX.Element {
     [organizations]
   );
 
+  useShellTitle('Organizations');
+
   return (
-    <WorkspaceShell
-      sidebarContent={<ConsoleSidebar selectedId="orgs" onNavigate={(p) => navigate(p)} />}
-      documentTitle="Organizations"
-    >
       <div className="orgs-page">
         <header className="orgs-header">
           <div className="orgs-header-left">
@@ -229,7 +226,6 @@ export function OrganizationsPage(): React.JSX.Element {
           )}
         </section>
       </div>
-    </WorkspaceShell>
   );
 }
 

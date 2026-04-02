@@ -42,15 +42,8 @@ NONEXISTENT_AGENT_ID = "00000000-0000-0000-0000-000000000001"
 
 def _truncate_agent_registry_tables(dsn: str) -> None:
     """Remove all data from agent registry tables to ensure test isolation."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE agent_versions, agents RESTART IDENTITY CASCADE;")
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, ["agent_versions", "agents"])
 
 
 @pytest.fixture

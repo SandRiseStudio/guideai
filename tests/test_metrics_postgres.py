@@ -58,20 +58,21 @@ def postgres_service(pg_dsn: str) -> PostgresMetricsService:
     service = PostgresMetricsService(dsn=pg_dsn, cache_ttl_seconds=30)
 
     # Cleanup tables before tests
-    _truncate_metrics_tables(service)
+    _truncate_metrics_tables(pg_dsn)
 
     yield service
 
     # Cleanup after tests
-    _truncate_metrics_tables(service)
+    _truncate_metrics_tables(pg_dsn)
 
 
-def _truncate_metrics_tables(service: PostgresMetricsService) -> None:
+def _truncate_metrics_tables(dsn: str) -> None:
     """Truncate all metrics tables for test isolation."""
-    with service._pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE metrics_snapshots, behavior_usage_events, token_usage_events, completion_events, compliance_events CASCADE")
-        conn.commit()
+    from conftest import safe_truncate
+    safe_truncate(dsn, [
+        "metrics_snapshots", "behavior_usage_events",
+        "token_usage_events", "completion_events", "compliance_events",
+    ])
 
 
 # Test Classes

@@ -32,15 +32,8 @@ NONEXISTENT_CHECKLIST_ID = "00000000-0000-0000-0000-000000000001"
 
 def _truncate_compliance_tables(dsn: str) -> None:
     """Remove all data from compliance tables to ensure test isolation."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE checklist_steps, checklists RESTART IDENTITY CASCADE;")
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, ["checklist_steps", "checklists"])
 
 
 def _create_checklist(service, **overrides):

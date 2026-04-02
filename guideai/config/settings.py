@@ -491,6 +491,41 @@ class CostOptimizationConfig(BaseSettings):
     )
 
 
+class SlackConfig(BaseSettings):
+    """Slack integration configuration for the conversation bridge.
+
+    Requires a Slack app with:
+    - Bot Token Scopes: chat:write, reactions:write, channels:read, users:read
+    - Event Subscriptions: message.channels, reaction_added, reaction_removed
+    - Slash Commands: /guideai
+    """
+
+    # Bot OAuth token (xoxb-...)
+    bot_token: Optional[str] = None
+
+    # Signing secret for verifying webhook requests
+    signing_secret: Optional[str] = None
+
+    # App-level token for Socket Mode (optional, for development)
+    app_token: Optional[str] = None
+
+    # Default bot display name (overridden per-agent)
+    default_bot_name: str = "GuideAI"
+
+    # Default bot icon emoji (overridden per-agent)
+    default_bot_icon: str = ":robot_face:"
+
+    model_config = SettingsConfigDict(
+        env_prefix="SLACK_",
+        case_sensitive=False,
+        extra="allow"
+    )
+
+    def is_configured(self) -> bool:
+        """Check if Slack integration has required credentials."""
+        return bool(self.bot_token and self.signing_secret)
+
+
 class Settings(BaseSettings):
     """Unified application settings with nested provider configurations."""
 
@@ -508,6 +543,7 @@ class Settings(BaseSettings):
     audit: AuditStorageConfig = Field(default_factory=AuditStorageConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     cost: CostOptimizationConfig = Field(default_factory=CostOptimizationConfig)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
     opensearch: OpenSearchConfig = Field(default_factory=OpenSearchConfig)
 
     # Legacy database DSN strings (backward compatibility)

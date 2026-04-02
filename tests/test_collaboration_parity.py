@@ -49,20 +49,12 @@ TEST_USER_EMAIL = "test@example.com"
 
 def _truncate_collaboration_tables(dsn: str) -> None:
     """Remove all data from collaboration tables to ensure test isolation."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("""
-                TRUNCATE collaboration_comments, collaboration_operations,
-                         collaboration_documents, collaboration_members,
-                         collaboration_workspaces
-                RESTART IDENTITY CASCADE;
-            """)
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, [
+        "collaboration_comments", "collaboration_operations",
+        "collaboration_documents", "collaboration_members",
+        "collaboration_workspaces",
+    ])
 
 
 @pytest.fixture

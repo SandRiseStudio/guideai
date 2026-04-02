@@ -1,3 +1,79 @@
+| 184 | Web Console TypeScript Blocker Cleanup | ### #184 - Web Console TypeScript Blocker Cleanup (2026-04-01)
+**Milestone:** Cleared the unrelated web-console TypeScript blockers that were preventing the sidebar refresh from validating through the TypeScript phase of the frontend build.
+
+**Implementation (Completed):**
+
+1. **Conversation + DM Type Alignment** (`web-console/src/components/boards/BoardPage.tsx`, `web-console/src/components/conversations/MessageBubble.tsx`):
+   - fixed the direct-message actor type payload to use the lowercase API contract values (`user` / `agent`)
+   - removed invalid `MessageType` type usage in `MessageBubble` and relied on the actual `ConversationMessage['message_type']` contract instead
+
+2. **Frontend Wrapper + Test Cleanup** (`web-console/src/lib/collab-client.ts`, `web-console/src/test/MessageComponents.test.tsx`):
+   - preserved the explicit `.tsx` shim export required by the app tsconfig so the wrapper resolves to the real collaboration module instead of recursively importing itself
+   - removed the unused `ConversationReaction` test import that was failing strict compilation
+
+3. **Validation**:
+   - `npx tsc -b` in `web-console` ✅
+   - `npm run build` in `web-console` ⚠️ TypeScript now passes, but Vite runtime is blocked by local environment issues: Node `20.13.1` is below the required `20.19+`, and the installed rolldown native binding is missing
+
+**Behaviors applied:** `behavior_enforce_quality_gates`, `behavior_update_docs_after_changes`
+
+_Last Updated: 2026-04-01_ |
+| 183 | Web Console Sidebar Magic Refresh | ### #183 - Web Console Sidebar Magic Refresh (2026-04-01)
+**Milestone:** The web-console sidebar now reads as a premium navigation rail instead of a utilitarian list, with stronger hierarchy, richer spatial depth, and faster-feeling project navigation that aligns more closely with the COLLAB_SAAS visual requirements.
+
+**Implementation (Completed):**
+
+1. **Sidebar Navigation Refresh** (`web-console/src/components/sidebar/SidebarNav.tsx`, `web-console/src/components/sidebar/SidebarNav.css`):
+   - added a new control-deck spotlight panel with workspace stats and quick actions for projects, creation, and behavior search
+   - upgraded nav items with icon tiles, secondary descriptions, fuller active states, and more expressive project rows
+   - rebuilt nested project board disclosure with a cleaner rail treatment and explicit collapsed-sidebar behavior so the compact icon mode still feels intentional
+
+2. **Shell Header + Footer Polish** (`web-console/src/components/workspace/WorkspaceShell.tsx`, `web-console/src/components/workspace/WorkspaceShell.css`):
+   - introduced a brighter branded sidebar header mark and caption instead of a plain text title
+   - refined the sidebar chrome with ambient color blooms, a more tactile collapse button, and a richer footer status/version treatment
+
+3. **Validation**:
+   - `npm install` in `web-console` ✅
+   - `npx eslint src/components/sidebar/SidebarNav.tsx src/components/workspace/WorkspaceShell.tsx` ✅
+   - `npm run build` in `web-console` ⚠️ blocked by unrelated existing TypeScript errors in `src/components/boards/BoardPage.tsx`, `src/components/conversations/MessageBubble.tsx`, and `src/test/MessageComponents.test.tsx`
+
+**Behaviors applied:** `behavior_validate_accessibility`, `behavior_update_docs_after_changes`
+
+_Last Updated: 2026-04-01_ |
+| 182 | Gateway Security, Consolidation & Production Readiness (GUIDEAI-409/410/411) | ### #182 - Gateway Security, Consolidation & Production Readiness (2026-03-30)
+**Milestone:** Completed three parent goals — Gateway Security Hardening (GUIDEAI-409), Gateway Consolidation (GUIDEAI-410), and Production Readiness (GUIDEAI-411) — encompassing 12 features and 36 sub-tasks.
+
+**Implementation (Completed):**
+
+1. **Auth & Tenant Middleware** (`guideai/api.py`, `guideai/auth/middleware.py`):
+   - `TenantMiddleware` mounted on the FastAPI app for automatic tenant isolation.
+   - `AuthMiddleware` enforces 401 on non-public paths; public path bypass configurable via `GUIDEAI_AUTH_ENABLED`.
+
+2. **Nginx Gateway Hardening** (`config/nginx/nginx.conf`):
+   - Strips `X-Tenant-Id` and `X-User-Id` headers at all 5 proxy locations to prevent spoofing.
+   - TLS termination via `NGINX_SSL_CERT` / `NGINX_SSL_KEY` env vars.
+   - Rate limiting: 100 req/s API, 10 req/s WebSocket.
+   - Web-console static proxy on `:8080` as canonical gateway entry.
+
+3. **CORS via Environment** (`guideai/api.py`):
+   - `GUIDEAI_CORS_ORIGINS` env var drives allowed origins; no hardcoded origins.
+
+4. **Production & Staging Blueprints** (`config/amprealize/blueprints/production.yaml`, `infra/environments.yaml`):
+   - `guideai-api` container definition with health checks.
+   - Staging (L358) and production (L509) environment profiles.
+
+5. **CI Blueprint Fix** (`config/amprealize/blueprints/ci-test-stack.yaml`):
+   - Nginx path corrected to `config/nginx/nginx.conf`.
+
+6. **Deprecated Code Cleanup** (`guideai/work_item_execution_service.py`):
+   - `DeprecationWarning` annotations on legacy execution paths.
+
+7. **Workspace Agent Archival** (`packages/_archive/workspace-agent/`):
+   - 9 files moved to `_archive/` directory; no longer part of active builds.
+
+**Board:** All 3 goals, 12 features, 36 sub-tasks marked "done".
+
+_Last Updated: 2026-03-30_ |
 | 181 | Behavior Retrieval Local Handbook Fallback | ### #181 - Behavior Retrieval Local Handbook Fallback (2026-03-29)
 **Milestone:** `guideai behaviors get-for-task` now remains useful in sandboxes and lightweight local shells by falling back to the nearest `AGENTS.md` when the behavior database is not configured or cannot be reached.
 

@@ -1,0 +1,173 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   ChatHub — avatar cluster on its own row below the filter chips.
+   Glassmorphic pill, GPU-only transitions, no shadows.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.chathub {
+  flex: 1 1 auto;
+  min-width: 0;
+  z-index: 11;
+  background: color-mix(in srgb, var(--color-bg-primary) 82%, transparent);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-1) var(--space-2);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* ── Connection Status ─────────────────────────────────────────────────────── */
+
+.chathub-connection {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.chathub-connection-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.chathub-connection-label {
+  color: inherit;
+}
+
+/* Connected — green accent */
+.chathub-connection-connected {
+  background: color-mix(in srgb, var(--status-success, #22c55e) 11%, rgba(255, 255, 255, 0.9));
+  color: color-mix(in srgb, var(--status-success, #22c55e) 84%, rgb(15, 23, 42));
+}
+
+.chathub-connection-connected .chathub-connection-dot {
+  background: var(--status-success, #22c55e);
+  box-shadow: 0 0 4px var(--status-success, #22c55e);
+}
+
+/* Connecting / Reconnecting — yellow accent with pulse */
+.chathub-connection-connecting,
+.chathub-connection-reconnecting {
+  background: color-mix(in srgb, var(--status-warning, #f59e0b) 11%, rgba(255, 255, 255, 0.9));
+  color: color-mix(in srgb, var(--status-warning, #f59e0b) 84%, rgb(15, 23, 42));
+}
+
+.chathub-connection-connecting .chathub-connection-dot,
+.chathub-connection-reconnecting .chathub-connection-dot {
+  background: var(--status-warning, #f59e0b);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+/* Disconnected — muted gray */
+.chathub-connection-disconnected {
+  background: rgba(255, 255, 255, 0.58);
+  color: color-mix(in srgb, var(--color-text-tertiary) 86%, rgb(30, 41, 59));
+}
+
+.chathub-connection-disconnected .chathub-connection-dot {
+  background: var(--color-text-tertiary);
+}
+
+@keyframes pulse-dot {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(0.85);
+  }
+}
+
+.chathub-avatars {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.chathub-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.12s ease;
+  outline: none;
+  flex-shrink: 0;
+}
+
+.chathub-avatar:hover {
+  transform: scale(1.15);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+
+.chathub-avatar:focus-visible {
+  box-shadow: 0 0 0 2px var(--color-accent);
+}
+
+.chathub-avatar-you {
+  outline: 1.5px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+.chathub-overflow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1.5px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  color: var(--color-text-secondary);
+  font-size: 0.7rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  outline: none;
+}
+
+.chathub-overflow:hover {
+  background: var(--color-bg-tertiary, var(--color-bg-secondary));
+  border-color: var(--color-border-hover);
+  color: var(--color-text-primary);
+}
+
+.chathub-overflow:focus-visible {
+  box-shadow: 0 0 0 2px var(--color-accent);
+}
+
+/* ── Responsive ────────────────────────────────────────────────────────────── */
+
+@media (max-width: 560px) {
+  .chathub {
+    right: var(--space-3);
+    padding: var(--space-1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chathub,
+  .chathub-avatar,
+  .chathub-overflow {
+    transition: none;
+  }
+}

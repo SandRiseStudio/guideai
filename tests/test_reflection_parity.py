@@ -57,19 +57,11 @@ Agent: I found and fixed the null pointer exception.
 
 def _truncate_reflection_tables(dsn: str) -> None:
     """Remove all data from reflection tables to ensure test isolation."""
-    if psycopg2 is None:
-        pytest.skip("psycopg2 not available; skipping PostgreSQL parity tests")
-    conn = psycopg2.connect(dsn)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("""
-                TRUNCATE reflection_sessions, reflection_candidates,
-                         pattern_observations, reflection_patterns
-                RESTART IDENTITY CASCADE;
-            """)
-    finally:
-        conn.close()
+    from conftest import safe_truncate
+    safe_truncate(dsn, [
+        "reflection_sessions", "reflection_candidates",
+        "pattern_observations", "reflection_patterns",
+    ])
 
 
 @pytest.fixture

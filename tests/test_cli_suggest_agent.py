@@ -43,8 +43,8 @@ class TestCLISuggestAgent:
             [
                 sys.executable, "-m", "guideai.cli",
                 "suggest-agent",
-                "test-story-001",
-                "story",
+                "test-feature-001",
+                "feature",
                 "--behavior", "coding",
                 "--max-suggestions", "3",
                 "--format", "json",

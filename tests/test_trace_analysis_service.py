@@ -69,22 +69,13 @@ def postgres_storage(postgres_dsn):
     )
 
     # Cleanup: truncate tables before tests
-    with storage._pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE extraction_jobs CASCADE")
-            cur.execute("TRUNCATE TABLE pattern_occurrences CASCADE")
-            cur.execute("TRUNCATE TABLE trace_patterns CASCADE")
-        conn.commit()
+    from conftest import safe_truncate
+    safe_truncate(postgres_dsn, ["extraction_jobs", "pattern_occurrences", "trace_patterns"])
 
     yield storage
 
     # Cleanup: truncate tables after tests
-    with storage._pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE extraction_jobs CASCADE")
-            cur.execute("TRUNCATE TABLE pattern_occurrences CASCADE")
-            cur.execute("TRUNCATE TABLE trace_patterns CASCADE")
-        conn.commit()
+    safe_truncate(postgres_dsn, ["extraction_jobs", "pattern_occurrences", "trace_patterns"])
 
 
 @pytest.fixture

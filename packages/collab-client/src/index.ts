@@ -13,6 +13,8 @@ export { CollabClient, ConnectionState, createCollabClient } from './client.js';
 export type { CollabClientConfig } from './client.js';
 export { ExecutionStreamClient, createExecutionStreamClient } from './executionClient.js';
 export type { ExecutionStreamConfig, ExecutionStreamTarget } from './executionClient.js';
+export { ConversationStreamClient, createConversationStreamClient } from './conversationClient.js';
+export type { ConversationStreamConfig } from './conversationClient.js';
 
 // REST API Client
 export { CollabApi, CollabApiError, createCollabApi } from './api.js';

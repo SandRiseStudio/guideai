@@ -432,3 +432,181 @@ export interface ExecutionStreamEvents {
   ready: (payload: ExecutionReadyEventPayload) => void;
   error: (code: string, message: string) => void;
 }
+
+// ---------------------------------------------------------------------------
+// Conversation Types (mirror guideai/conversation_contracts.py)
+// ---------------------------------------------------------------------------
+
+export enum ConversationScope {
+  ProjectRoom = 'project_room',
+  AgentDm = 'agent_dm',
+}
+
+export enum ActorType {
+  User = 'user',
+  Agent = 'agent',
+  System = 'system',
+}
+
+export enum MessageType {
+  Text = 'text',
+  StatusCard = 'status_card',
+  BlockerCard = 'blocker_card',
+  ProgressCard = 'progress_card',
+  CodeBlock = 'code_block',
+  RunSummary = 'run_summary',
+  System = 'system',
+}
+
+export enum ParticipantRole {
+  Owner = 'owner',
+  Admin = 'admin',
+  Member = 'member',
+}
+
+export enum NotificationPreference {
+  All = 'all',
+  Mentions = 'mentions',
+  None = 'none',
+}
+
+export interface Conversation {
+  id: string;
+  project_id: string;
+  org_id?: string | null;
+  scope: ConversationScope | string;
+  title?: string | null;
+  created_by: string;
+  pinned_message_id?: string | null;
+  is_archived: boolean;
+  metadata: Record<string, unknown>;
+  created_at?: string | null;
+  updated_at?: string | null;
+  participant_count: number;
+  unread_count: number;
+}
+
+export interface ConversationMessage {
+  id: string;
+  conversation_id: string;
+  sender_id: string;
+  sender_type: ActorType | string;
+  content?: string | null;
+  message_type: MessageType | string;
+  structured_payload?: Record<string, unknown> | null;
+  parent_id?: string | null;
+  run_id?: string | null;
+  behavior_id?: string | null;
+  work_item_id?: string | null;
+  is_edited: boolean;
+  edited_at?: string | null;
+  is_deleted: boolean;
+  deleted_at?: string | null;
+  metadata: Record<string, unknown>;
+  created_at?: string | null;
+  reactions: ConversationReaction[];
+  reply_count: number;
+}
+
+export interface ConversationReaction {
+  id: string;
+  message_id: string;
+  actor_id: string;
+  actor_type: ActorType | string;
+  emoji: string;
+  created_at?: string | null;
+}
+
+export interface ConversationParticipant {
+  id: string;
+  conversation_id: string;
+  actor_id: string;
+  actor_type: ActorType | string;
+  role: ParticipantRole | string;
+  joined_at?: string | null;
+  left_at?: string | null;
+  last_read_at?: string | null;
+  is_muted: boolean;
+  notification_preference: NotificationPreference | string;
+}
+
+export interface ConversationListResponse {
+  items: Conversation[];
+  total: number;
+}
+
+export interface MessageListResponse {
+  items: ConversationMessage[];
+  total: number;
+  has_more: boolean;
+}
+
+export interface SearchResult {
+  message: ConversationMessage;
+  rank: number;
+  headline?: string | null;
+}
+
+export interface SearchResultsResponse {
+  items: SearchResult[];
+  total: number;
+  query: string;
+}
+
+// ---------------------------------------------------------------------------
+// Conversation WebSocket Event Payloads
+// ---------------------------------------------------------------------------
+
+export interface ConversationReadyPayload {
+  conversation_id: string;
+  typing: string[];
+  subscriber_count: number;
+}
+
+export interface ConversationMessageEventPayload {
+  conversation_id: string;
+  message: ConversationMessage;
+}
+
+export interface ConversationReactionEventPayload {
+  conversation_id: string;
+  message_id: string;
+  reaction: ConversationReaction;
+}
+
+export interface ConversationTypingPayload {
+  conversation_id: string;
+  actor_id: string;
+  actor_type: ActorType | string;
+  is_typing: boolean;
+}
+
+export interface ConversationReadReceiptPayload {
+  conversation_id: string;
+  actor_id: string;
+  last_read_message_id: string;
+}
+
+export interface ConversationParticipantEventPayload {
+  conversation_id: string;
+  participant: ConversationParticipant;
+}
+
+// ---------------------------------------------------------------------------
+// Conversation Stream Client Events
+// ---------------------------------------------------------------------------
+
+export interface ConversationStreamEvents {
+  connected: (payload: ConversationReadyPayload) => void;
+  disconnected: (reason: string) => void;
+  'message.new': (payload: ConversationMessageEventPayload) => void;
+  'message.updated': (payload: ConversationMessageEventPayload) => void;
+  'message.deleted': (payload: ConversationMessageEventPayload) => void;
+  'reaction.added': (payload: ConversationReactionEventPayload) => void;
+  'reaction.removed': (payload: ConversationReactionEventPayload) => void;
+  'typing.indicator': (payload: ConversationTypingPayload) => void;
+  'read.receipt': (payload: ConversationReadReceiptPayload) => void;
+  'participant.joined': (payload: ConversationParticipantEventPayload) => void;
+  'participant.left': (payload: ConversationParticipantEventPayload) => void;
+  error: (code: string, message: string) => void;
+}

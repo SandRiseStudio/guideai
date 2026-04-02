@@ -1081,9 +1081,12 @@ class BehaviorService:
             )
 
         # Search for relevant behaviors
+        # NOTE: `role` is the agent consumption role (Student/Teacher/Strategist),
+        # NOT the behavior domain focus (ENGINEER/SECURITY/DEVOPS/etc.).
+        # Do not pass it as role_focus — that would filter out all behaviors.
         search_request = SearchBehaviorsRequest(
             query=task_description,
-            role_focus=role if role != "any" else None,
+            role_focus=None,
             status="APPROVED",
             limit=limit,
         )
