@@ -95,7 +95,7 @@ jobs:
 
       - name: Upload scan results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: security-scan-results
           path: security/scan_reports/
@@ -385,7 +385,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-py${{ matrix.python-version }}
           path: test-results-py${{ matrix.python-version }}.xml
@@ -432,7 +432,7 @@ jobs:
 
       - name: Upload parity report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: parity-coverage-report
           path: parity-coverage-report.txt
@@ -499,7 +499,7 @@ jobs:
         run: npm run build
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dashboard-build
           path: web-console/dashboard/dist/
@@ -539,7 +539,7 @@ jobs:
 
       - name: Upload VSIX
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vscode-extension
           path: extension/*.vsix
