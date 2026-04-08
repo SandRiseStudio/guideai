@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@preact/signals": "^1.2.3",
-    "preact": "^10.19.3",
+    "preact": "^10.29.0",
     "marked": "^12.0.2"
   },
   "devDependencies": {
